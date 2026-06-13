@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>天才交易员的养成之路</title>
+    <link rel="stylesheet" href="styles.css?v=20260604">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+</head>
+<body>
+    <div class="main-container">
+        <div id="indexBar" class="index-bar">
+            <div class="index-item" id="idx-sh">
+                <span class="index-name">上证</span>
+                <span class="index-price">--</span>
+                <span class="index-change">--</span>
+            </div>
+            <div class="index-item" id="idx-sz">
+                <span class="index-name">深证</span>
+                <span class="index-price">--</span>
+                <span class="index-change">--</span>
+            </div>
+            <div class="index-item" id="idx-cy">
+                <span class="index-name">创业板</span>
+                <span class="index-price">--</span>
+                <span class="index-change">--</span>
+            </div>
+        </div>
+        <div class="tab-nav" id="tabNav">
+            <button class="tab-btn active" data-tab="tab-quote">实时行情</button>
+            <button class="tab-btn" data-tab="tab-scan">股票筛选</button>
+            <button class="tab-btn" data-tab="tab-trend">趋势发现</button>
+            <button class="tab-btn" data-tab="tab-recommend">智能推荐</button>
+            <button class="tab-btn" data-tab="tab-review">每日收评</button>
+            <button class="tab-btn" data-tab="tab-strategy">策略优化</button>
+        </div>
+        
+        <div class="tab-content active" id="tab-quote">
+            <!-- 大盘紧急提醒区域 -->
+            <div id="market-alert-container" class="market-alert-container"></div>
+            <div class="control-section">
+                <div class="input-group">
+                    <div class="input-wrapper">
+                        <label>股票代码/名称</label>
+                        <div class="input-row">
+                            <input type="text" id="stockSymbol" class="stock-input" 
+                                   placeholder="输入6位代码：603985, 600487..." value="sh603985">
+                            <button id="fetchBtn" class="btn-primary">查询</button>
+                            <button id="refreshNowBtn" class="btn-secondary">手动刷新</button>
+                        </div>
+                        <div class="collapsible-hint collapsed">
+                            <div class="hint-toggle" onclick="toggleHint()">
+                                <span class="hint-title">使用说明（点击展开）</span>
+                                <span class="hint-arrow">▼</span>
+                            </div>
+                            <div class="hint-text" id="hintContent">
+                                输入任意6位代码 → 查询所有沪深主板A股<br>
+                                例如：<code>603985</code>恒润股份、<code>000001</code>平安银行
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="quick-stocks">
+                    <div class="quick-stocks-header">
+                        <div class="quick-stocks-title">热门股票快捷查询</div>
+                        <div class="hot-stocks-controls">
+                            <button id="refreshHotStocksBtn" class="btn-icon" title="刷新热门股票">🔄</button>
+                        </div>
+                    </div>
+                    <div class="quick-buttons"></div>
+                </div>
+                <div class="refresh-controls">
+                    <div class="toggle-section">
+                        <span class="toggle-label" id="tradingStatus">📈 智能刷新</span>
+                    </div>
+                    <div class="last-update" id="lastUpdateTime">--:--:--</div>
+                </div>
+            </div>
+            <div class="quote-section" id="quoteContainer">
+                <div class="price-card" id="priceCardLoading">
+                    <div class="loading-spinner"></div>
+                    <div style="font-size:1rem;font-weight:500;color:#64748b;">正在加载数据...</div>
+                </div>
+            </div>
+            <div id="aiDiagnosisContainer"></div>
+        </div>
+        
+        <div class="tab-content" id="tab-scan">
+            <div>
+                <div class="refresh-controls">
+                    <div class="toggle-section">
+                        <span class="toggle-label" id="scanTradingStatus">📊 自动刷新中</span>
+                    </div>
+                    <div class="last-update" id="scanLastUpdateTime">--:--:--</div>
+                </div>
+                <div class="scan-progress" id="scanProgress" style="display:none;"></div>
+                <div class="scan-summary" id="scanSummary" style="display:none;"></div>
+                <div id="scanResults">
+                    <div style="text-align:center;padding:2rem;color:#64748b;">加载中...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-trend">
+            <div>
+                <div class="refresh-controls">
+                    <div class="toggle-section">
+                        <span class="toggle-label">📊 自动刷新中</span>
+                    </div>
+                    <div class="last-update" id="trendLastScan">--</div>
+                </div>
+                <div class="trend-section">
+                    <div class="section-header">
+                        <div class="section-subtitle-small">发现的趋势股票</div>
+                        <span class="section-stats" id="trendStats"></span>
+                    </div>
+                    <div id="trendResults"></div>
+                </div>
+                <div class="pool-section">
+                    <div class="section-header">
+                        <div class="section-subtitle-small">股票池管理</div>
+                        <span class="section-stats" id="poolStats"></span>
+                    </div>
+                    <div class="add-stock-container">
+                        <div class="add-stock-wrapper">
+                            <label class="form-label">添加股票到扫描池</label>
+                            <div class="add-stock-input-group">
+                                <input type="text" id="addStockInput" placeholder="输入代码(如 sh603985) 或 名称" class="form-input">
+                                <button id="addStockBtn" class="btn-secondary">添加</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="scanPoolList"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-recommend">
+            <div>
+                <div class="section-title">AI智能选股推荐</div>
+                <div class="section-subtitle">
+                    基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示
+                </div>
+                <div class="scan-controls" style="background:#f8fafc;padding:20px;border-radius:12px;border:1px solid #e2e8f0;margin-bottom:24px;">
+                    <button id="genRecommendBtn" class="btn-scan" style="padding:12px 24px;display:flex;align-items:center;gap:8px;">
+                        <span>🎯</span> 生成今日推荐
+                    </button>
+                    <button id="saveRecommendBtn" class="btn-secondary" style="display:none;padding:12px 24px;">
+                        💾 保存推荐记录
+                    </button>
+                </div>
+                <div class="refresh-controls">
+                    <div class="toggle-section">
+                        <span class="toggle-label">推荐成功率</span>
+                    </div>
+                    <div class="last-update" id="recommendStats">--</div>
+                </div>
+                <div class="recommend-section">
+                    <div class="section-header">
+                        <div class="section-subtitle-small">今日推荐股票</div>
+                        <span class="section-stats" id="recommendDate"></span>
+                    </div>
+                    <div id="todayRecommend"></div>
+                </div>
+                <div class="history-section">
+                    <div class="section-subtitle-small">历史推荐记录</div>
+                    <div id="historyRecommend"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-review">
+            <div>
+                <div class="section-title">每日收评</div>
+                <div id="reviewContainer"></div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-strategy">
+            <div>
+                <div class="section-title">策略优化</div>
+                <div class="section-subtitle">
+                    自适应选股策略 · 每日回测验证 · 动态权重调整 · 误判分析
+                </div>
+
+                <!-- 操作按钮 -->
+                <div class="scan-controls" style="background:#f8fafc;padding:20px;border-radius:12px;border:1px solid #e2e8f0;margin-bottom:24px;display:flex;gap:12px;flex-wrap:wrap;">
+                    <button id="refreshWeightsBtn" class="btn-scan" style="padding:10px 20px;display:flex;align-items:center;gap:6px;">
+                        <span>⚖️</span> 刷新权重
+                    </button>
+                    <button id="runBacktestBtn" class="btn-scan" style="padding:10px 20px;display:flex;align-items:center;gap:6px;">
+                        <span>🔬</span> 手动回测
+                    </button>
+                    <button id="resetWeightsBtn" class="btn-secondary" style="padding:10px 20px;display:flex;align-items:center;gap:6px;">
+                        <span>🔄</span> 重置权重
+                    </button>
+                </div>
+
+                <!-- 策略权重卡片 -->
+                <div style="margin-bottom:24px;">
+                    <div class="section-subtitle-small" style="margin-bottom:12px;">当前策略权重</div>
+                    <div id="strategyWeights" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;">
+                        <div style="text-align:center;padding:2rem;color:#64748b;">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 回测历史 -->
+                <div style="margin-bottom:24px;">
+                    <div class="section-subtitle-small" style="margin-bottom:12px;">回测报告</div>
+                    <div id="backtestHistory">
+                        <div style="text-align:center;padding:2rem;color:#64748b;">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 预测记录 -->
+                <div>
+                    <div class="section-subtitle-small" style="margin-bottom:12px;">预测记录（含历史待验证）</div>
+                    <div id="predictionRecords">
+                        <div style="text-align:center;padding:2rem;color:#64748b;">加载中...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+    </div>
+
+    <!-- K线弹窗 -->
+    <div id="klineModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title" id="klineModalTitle">日K线</span>
+                <div class="kline-type-switch">
+                    <button class="kline-type-btn active" data-type="day" onclick="switchKlineType('day')">日K</button>
+                    <button class="kline-type-btn" data-type="minute" onclick="switchKlineType('minute')">分时</button>
+                </div>
+                <button id="closeKlineModal" class="close-btn">&times;</button>
+            </div>
+            <div id="klineChart" class="kline-chart-container"></div>
+        </div>
+    </div>
+
+    <script src="forbidden-keywords.js"></script>
+    <script src="stocks-config.js"></script>
+    <script src="app.js?v=20260612"></script>
+</body>
+</html>

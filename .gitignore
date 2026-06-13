@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.env
+data/
+*/__pycache__/
+.claude/
+.venv/
+
+# 本地数据库与运行时产物
+*.db
+*.db-journal
+server/ai_config.json
+.DS_Store
+Thumbs.db
+
