@@ -23,6 +23,6 @@ echo   API docs: http://localhost:3003/docs
 echo.
 
 cd /d "%~dp0"
-python main.py
+python run.py
 
 pause

@@ -2,7 +2,7 @@ node_modules/
 *.log
 .env
 data/
-*/__pycache__/
+__pycache__/
 .claude/
 .venv/
 

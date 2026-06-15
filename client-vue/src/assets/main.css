@@ -144,6 +144,13 @@
   margin-top: var(--spacing-xs);
 }
 
+/* 策略权重网格 */
+.strategy-weights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
 /* 回测报告卡片 */
 .backtest-card {
   background: var(--bg-secondary);
@@ -225,6 +232,13 @@ html {
   font-size: 16px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 body {
@@ -1552,7 +1566,7 @@ body {
 
 .pool-table .stock-table-header,
 .pool-table .stock-table-row {
-  grid-template-columns: 1.2fr 2.2fr 2.5fr;
+  grid-template-columns: 1.5fr 1fr 1.2fr 1.6fr 1.8fr;
   text-align: center;
 }
 
@@ -1588,6 +1602,142 @@ body {
   border-radius: var(--radius-sm);
 }
 
+.pool-stock-code {
+  font-family: 'SF Mono', 'Courier New', monospace;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-align: center;
+  color: var(--text-primary);
+}
+
+.pool-stock-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 var(--spacing-xs);
+  text-align: left;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.pool-stock-actions {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: var(--spacing-xs);
+}
+
+.pool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.18s ease;
+  white-space: nowrap;
+  line-height: 1;
+  user-select: none;
+}
+
+.pool-btn svg {
+  flex-shrink: 0;
+}
+
+.pool-btn-kline {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(99, 102, 241, 0.06));
+  color: #6366f1;
+  border-color: rgba(99, 102, 241, 0.25);
+}
+
+.pool-btn-kline:hover {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.22), rgba(99, 102, 241, 0.12));
+  border-color: rgba(99, 102, 241, 0.5);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.2);
+}
+
+.pool-btn-remove {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(239, 68, 68, 0.04));
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.22);
+}
+
+.pool-btn-remove:hover {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(239, 68, 68, 0.1));
+  border-color: rgba(239, 68, 68, 0.45);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.18);
+}
+
+.pool-btn:active {
+  transform: translateY(0);
+}
+
+.pool-stock-price {
+  font-family: 'SF Mono', 'Courier New', monospace;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-stock-price.price-up { color: #ef4444; }
+.pool-stock-price.price-down { color: #10b981; }
+.pool-stock-price.price-neutral { color: var(--text-secondary); }
+
+.trend-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 10px;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+
+.trend-badge.up {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.05));
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.trend-badge.down {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(16, 185, 129, 0.05));
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.trend-badge.neutral {
+  background: rgba(148, 163, 184, 0.1);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.ma-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 10px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ma-badge.up {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(245, 158, 11, 0.05));
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.ma-badge.down {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(99, 102, 241, 0.04));
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.22);
+}
+
 .stock-table-row {
   display: grid;
   grid-template-columns: 2fr 1fr 1fr 0.8fr 0.8fr 0.8fr 1.2fr;
@@ -1605,6 +1755,10 @@ body {
 
 .stock-table-row:hover {
   background: var(--bg-tertiary);
+}
+
+.stock-table-row.clickable {
+  cursor: pointer;
 }
 
 .stock-table-row .name {

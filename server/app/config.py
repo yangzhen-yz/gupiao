@@ -1,26 +1,15 @@
 import os
 
 # ========== 数据库配置 ==========
-MYSQL_CONFIG = {
-    'host': os.environ.get('MYSQL_HOST', 'localhost'),
-    'port': int(os.environ.get('MYSQL_PORT', 3306)),
-    'user': os.environ.get('MYSQL_USER', 'root'),
-    'password': os.environ.get('MYSQL_PASSWORD', '123456'),
-    'database': os.environ.get('MYSQL_DATABASE', 'gupiao'),
-    'charset': 'utf8mb4'
-}
-
-# MySQL 连接池配置
-MYSQL_POOL_MAX_CONNECTIONS = 10  # 连接池最大连接数
-MYSQL_POOL_MIN_CACHED = 2        # 连接池最小缓存连接数
+SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'gupiao.db')
 
 # ========== API 地址配置 ==========
 TENCENT_QUOTE_API = 'https://qt.gtimg.cn/q='
-TENCENT_KLINE_API = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
-EASTMONEY_HOT_LIST_API = 'https://push2.eastmoney.com/api/qt/clist/get'
+TENCENT_KLINE_API = 'https://ifzq.gtimg.cn/appstock/app/fqkline/get'
+EASTMONEY_HOT_LIST_API = 'https://push2delay.eastmoney.com/api/qt/clist/get'
 
 # ========== AI 诊断配置 ==========
-AI_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ai_config.json')
+AI_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ai_config.json')
 
 # ========== HTTP 客户端配置 ==========
 HTTP_TIMEOUT = 10.0  # HTTP 请求超时时间
@@ -40,33 +29,48 @@ SCAN_KLINE_TIMEOUT = 12.0  # 扫描K线超时时间
 SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 
 
-# ========== 趋势发现配置 ==========
-TREND_MIN_SCORE = 85  # 趋势发现最小分数阈值
-TREND_MIN_KLINE_DAYS = 120  # 趋势发现最小K线天数阈值
-TREND_LIMIT_UP_THRESHOLD = 9.8  # 趋势发现价格超过120日均线阈值
-TREND_LIMIT_UP_120_MIN = 1  # 趋势发现价格超过120日均线最小时间间隔
-TREND_LIMIT_UP_250_MIN = 2  # 趋势发现价格超过250日均线最小时间间隔
-TREND_MAX_DRAWDOWN = 30  # 趋势发现最大回撤阈值
-TREND_CONSECUTIVE_UP_BONUS = 2  # 趋势发现连续上涨奖励分数
-TREND_CONSECUTIVE_UP_MAX_BONUS = 10  # 趋势发现连续上涨最大奖励分数阈值
-TREND_IS_UP_MIN_SCORE = 60  # 趋势发现是否上涨最小分数阈值
+# ========== 趋势发现配置（中短线波段评分，满分 100 分） ==========
+# 关注周期：未来 ~1 个月
+# 评分结构：6 项基础分（100 分）+ 扣分项 + 强制排除
+TREND_MIN_SCORE = 80  # 趋势发现进入趋势池的最低分
+TREND_IS_UP_MIN_SCORE = 60  # 认定为"趋势向上"（isUp=true）的最低分
+TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
+
+# 涨停 / 跌停阈值
+TREND_LIMIT_UP_THRESHOLD = 9.8  # 涨停阈值（单日涨幅 % ≥ 此值算涨停）
+TREND_LIMIT_DOWN_THRESHOLD = -9.8  # 跌停阈值（单日涨幅 % ≤ 此值算跌停）
+
+# 维度 1：MA20 趋势（40 分）
+TREND_PRICE_ABOVE_MA20_SCORE = 20  # 价格站稳 MA20
+TREND_MA20_SLOPE_WINDOW = 3  # MA20 斜率计算窗口（近 N 日均值 vs 前 N 日均值）
+TREND_MA20_SLOPE_SCORE = 20  # MA20 斜率向上
+
+# 维度 2：资金异动（30 分）
+TREND_LIMIT_UP_20D_BONUS_1 = 12  # 近 20 日涨停 1 次得 12 分
+TREND_LIMIT_UP_20D_BONUS_2 = 20  # 近 20 日涨停 ≥2 次得 20 分
+TREND_CONSECUTIVE_BOARD_SCORE = 10  # 出现 2 连板 / 连续阳线 ≥4 根
+
+# 维度 3：量能配合（15 分）
+TREND_VOLUME_RATIO_20V60_THRESHOLD = 1.0  # 20日均量 / 60日均量 > 阈值 算"温和放大"
+
+# 维度 4：风险回撤（15 分）
+TREND_DRAWDOWN_20D_TIERS = [(15, 15), (20, 8)]  # [(<阈值%, 得分)] — 回撤<15%=15分, 15≤x<20=8分, ≥20=0分
+
+# 扣分项
+TREND_DEDUCT_MA20_BROKEN = 15  # 近 5 日内跌破 MA20 且 3 日未收回
+TREND_DEDUCT_LIMIT_DOWN = 12  # 近 20 日出现单日跌停
+TREND_DEDUCT_SHRINK_VOL = 10  # 持续缩量阴跌（成交量 < 60日均量 50%）
+
+# 强制排除阈值
+TREND_RANGE_20D_FLAT_MIN = 5  # 近 20 日振幅 < 5% 视为"完全横盘"（无短线机会）
+
+# 公告/利空数据源（东方财富公告接口）
+EASTMONEY_ANN_API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+TREND_ANNOUNCEMENT_LOOKBACK_DAYS = 20  # 公告回看天数
+TREND_ANNOUNCEMENT_CACHE_TTL = 3600  # 公告缓存秒数（1小时）
 
 # 趋势判断：是否使用盘中实时价（True=盘中跌破立即排除，可能盘中刺破收盘收复被误移除；False=仅用收盘价判断，更稳健）
 USE_INTRADAY_BREAK_CHECK = True
-
-# MA120 斜率向上：判断"近 N 日 MA120 均值 > 前 N 日 MA120 均值"时使用的窗口长度（单位：交易日）
-TREND_MA120_SLOPE_WINDOW = 5
-
-# 连续上涨加分：仅统计最近 N 个交易日的连续上涨天数（避免早期数据干扰）
-TREND_CONSECUTIVE_UP_MAX_DAYS = 30
-
-TREND_SCORE_WEIGHTS = {
-    'priceAboveMa120': 25,  # 价格超过120日均线权重
-    'ma120SlopeUp': 25,  # 120日均线斜率权重
-    'limitUp120': 20,  # 近120天涨停权重
-    'limitUp250': 10,  # 近250天涨停权重
-    'drawdown30': 10,  # 30日回撤权重
-}
 
 
 # ========== 策略综合评分配置 ==========
