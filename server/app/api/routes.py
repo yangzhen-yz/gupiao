@@ -1,5 +1,6 @@
 """routes - 所有 API 路由定义"""
-from fastapi import HTTPException, APIRouter
+from fastapi import HTTPException, APIRouter, Request
+from fastapi.responses import Response
 from typing import List, Dict, Optional, Any
 import json, asyncio, time, re
 from datetime import date, datetime
@@ -244,6 +245,34 @@ async def scan_trend_stocks(force: bool = False):
         return {"success": True, "data": _ensure_today_date(result.get("data", result))}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"扫描趋势股票失败: {str(error)}")
+
+
+@router.get("/api/debug-eastmoney-review", tags=["调试-临时"])
+async def debug_eastmoney_review():
+    import httpx
+    urls = {
+        'limit_up': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
+        'limit_down': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
+        'industry': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50&fields=f2,f3,f12,f14',
+        'concept': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50&fields=f2,f3,f12,f14',
+    }
+    out = {}
+    async with httpx.AsyncClient(timeout=10) as client:
+        for name, u in urls.items():
+            try:
+                r = await client.get(u)
+                j = r.json()
+                data = j.get('data') or {}
+                diff = data.get('diff') or []
+                out[name] = {
+                    'status': r.status_code,
+                    'total': data.get('total'),
+                    'diffCount': len(diff),
+                    'top1Pct': diff[0].get('f3') if diff else None,
+                }
+            except Exception as e:
+                out[name] = {'error': str(e)}
+    return out
 
 
 @router.get("/api/ai-diagnose/{symbol}", tags=["AI诊断"])
@@ -1125,6 +1154,38 @@ async def get_predictions(date_str: str = None, verified: int = None, include_to
         return {"success": True, "data": rows}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取预测记录失败: {str(error)}")
+
+# ========== 东方财富 API 代理（兼容生产模式） ==========
+# 前端 fetchEnrichData() 需要通过 /eastmoney/* 调用东方财富接口
+# Vite 开发模式下由 vite.config.js 代理；生产模式下由此路由代理
+
+_EM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://quote.eastmoney.com/',
+}
+
+@router.api_route("/eastmoney/{path:path}", methods=["GET", "POST"])
+async def proxy_eastmoney(request: Request, path: str):
+    """将 /eastmoney/* 请求转发到东方财富 API"""
+    import httpx
+    target_url = f"https://push2.eastmoney.com/{path}"
+    query_params = dict(request.query_params)
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=_EM_HEADERS) as client:
+            if request.method == "GET":
+                resp = await client.get(target_url, params=query_params)
+            else:
+                body = await request.body()
+                resp = await client.post(target_url, params=query_params, content=body)
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={"Content-Type": resp.headers.get("content-type", "application/json")},
+            )
+    except Exception as e:
+        print(f'[东方财富代理] 请求失败: {e}')
+        return Response(content=b"{}", status_code=502, media_type="application/json")
 
 # 最后挂载静态文件，这样API路由会先被匹配到
 

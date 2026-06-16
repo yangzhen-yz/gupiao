@@ -12,4 +12,5 @@ __pycache__/
 server/ai_config.json
 .DS_Store
 Thumbs.db
+.workbuddy/
 

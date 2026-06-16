@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD
 from db.database import get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions
 from services.stock import fetch_stock_data
+from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
 def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float = 0.0) -> Dict:
     """使用动态权重的评分函数 V2

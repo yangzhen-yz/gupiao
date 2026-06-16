@@ -1,7 +1,9 @@
 """ai_diagnose.py - split from main.py"""
 import json, httpx, os
 from typing import List, Dict, Any, Optional
+from fastapi import HTTPException
 from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS
+from services.stock import calculate_ma, get_http_client
 
 # ========== DeepSeek AI 配置 ==========
 # ========== DeepSeek AI 配置 ==========

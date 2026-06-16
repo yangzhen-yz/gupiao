@@ -2,6 +2,7 @@
 import json, asyncio, time
 from typing import List, Dict, Optional
 from datetime import date, timedelta
+from fastapi import HTTPException
 from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD,
     TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS,
     SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS,
@@ -18,7 +19,7 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG,
     TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN)
-from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, load_hot_search_ranking, load_stock_basic_info
+from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info
 from services.stock import (get_http_client, has_delisting_risk, is_main_board, get_kline_data, parse_realtime_fields,
     calculate_ma, get_cached_stock_name, fetch_with_retry, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)

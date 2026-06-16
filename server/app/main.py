@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os, sys, time, asyncio, threading
+import httpx
 from datetime import date
 
 from . import config as _cfg
@@ -143,14 +144,20 @@ app.include_router(router)
 @app.get("/eastmoney/{path:path}", tags=["东方财富代理"])
 async def eastmoney_proxy(path: str, request: Request):
     """将 /eastmoney/* 请求代理到 https://push2.eastmoney.com/*"""
-    from services.stock import get_http_client
-    client = get_http_client()
     query_string = str(request.url.query)
     target_url = f"https://push2.eastmoney.com/{path}"
     if query_string:
         target_url += f"?{query_string}"
+    # 每次新建 client，避免复用 worker 失效的旧 httpx pool（Event loop closed / Server disconnected）
+    _EM_PROXY_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://quote.eastmoney.com/',
+    }
     try:
-        resp = await client.get(target_url, timeout=8.0)
+        async with httpx.AsyncClient(timeout=8.0, headers=_EM_PROXY_HEADERS, follow_redirects=True) as client:
+            resp = await client.get(target_url)
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -158,6 +165,25 @@ async def eastmoney_proxy(path: str, request: Request):
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"代理请求失败: {str(e)}")
+
+
+@app.post("/__force_reload__", tags=["调试-临时"])
+async def _force_reload_module(module: str = ''):
+    """临时调试：手动 importlib.reload 业务模块，绕过 mtime watcher。"""
+    targets = [module] if module else ['services.stock', 'services.trend', 'services.review', 'services.recommend', 'services.market', 'services.strategy']
+    out = {}
+    for name in targets:
+        mod = sys.modules.get(name)
+        if mod is None:
+            out[name] = 'not_loaded'
+            continue
+        try:
+            importlib.reload(mod)
+            out[name] = 'reloaded'
+        except Exception as e:
+            out[name] = f'error: {e}'
+    return out
+
 
 @app.middleware("http")
 async def _config_reload_middleware(request, call_next):

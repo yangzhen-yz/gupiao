@@ -3,7 +3,7 @@ import httpx, json, re, asyncio, requests, time
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date, timedelta
 from app.config import TENCENT_QUOTE_API, TENCENT_KLINE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, HTTP_MAX_CONNECTIONS, HTTP_KEEPALIVE_CONNECTIONS, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, KLINE_START_DATE, KLINE_DATA_LIMIT, HOT_SEARCH_TOP_N, INDEX_SYMBOLS, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS
-from db.database import load_stock_basic_info, save_stock_basic_info, load_hot_search_ranking
+from db.database import load_stock_basic_info, save_stock_basic_info, load_hot_search_ranking, load_stock_concept_tags
 
 _stock_basic_info_cache = None
 _hot_search_ranking_cache = None
@@ -26,6 +26,15 @@ NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
 TENCENT_API = TENCENT_QUOTE_API
 MAX_RETRIES = 3
 
+_DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
+    'Referer': 'https://quote.eastmoney.com/',
+}
+
+
 def get_http_client() -> httpx.AsyncClient:
     global http_client
     if http_client is None or http_client.is_closed:
@@ -33,7 +42,8 @@ def get_http_client() -> httpx.AsyncClient:
             timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_KEEPALIVE_CONNECTIONS),
             http2=False,
-            follow_redirects=True
+            follow_redirects=True,
+            headers=_DEFAULT_HEADERS,
         )
     return http_client
 
