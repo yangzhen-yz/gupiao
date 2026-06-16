@@ -6,6 +6,14 @@ from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT
 from db.database import get_db_conn, save_daily_market_reviews
 from services.stock import get_http_client, fetch_stock_data
 
+_EM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Referer': 'https://quote.eastmoney.com/',
+}
+
+
 async def generate_daily_review() -> Dict:
     try:
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -40,7 +48,7 @@ async def generate_daily_review() -> Dict:
         industry_sectors = []
         concept_sectors = []
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, headers=_EM_HEADERS) as client:
                 # 行业板块
                 ind_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50'
                 ind_resp = await client.get(ind_url)
@@ -83,7 +91,7 @@ async def generate_daily_review() -> Dict:
         top_gainers = []
         top_losers = []
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=15, headers=_EM_HEADERS) as client:
                 # 涨停股：取涨幅前200名，筛选涨幅>=9.8%
                 zt_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
                 zt_resp = await client.get(zt_url)
@@ -230,12 +238,190 @@ async def generate_daily_review() -> Dict:
         if tomorrow_focus:
             focus_names = '、'.join([f['name'] for f in tomorrow_focus[:3]])
             summary_lines.append(f'明日重点关注：{focus_names}等。')
-        
+
         review['summary'] = '\n'.join(summary_lines)
-        
+
+        # ---- 情绪评分 & AI 智能分析结论 ----
+        try:
+            review['aiAnalysis'] = _build_ai_analysis(
+                market=market_data,
+                industry_sectors=industry_sectors,
+                concept_sectors=concept_sectors,
+                limit_up=limit_up_stocks,
+                limit_down=limit_down_stocks,
+                top_gainers=top_gainers,
+                top_losers=top_losers,
+                tomorrow_focus=tomorrow_focus,
+            )
+        except Exception as ai_err:
+            print(f'[收评] AI 分析生成失败: {ai_err}')
+            review['aiAnalysis'] = _empty_ai_analysis()
+
         return review
     except Exception as error:
         print(f'生成收评失败: {str(error)}')
         import traceback
         print(f'[收评] 错误堆栈: {traceback.format_exc()}')
         raise
+
+
+def _empty_ai_analysis():
+    return {
+        'sentimentScore': 50,
+        'sentimentLabel': '情绪平稳',
+        'operationAdvice': {'level': 'hold', 'title': '震荡观望', 'detail': '数据不足，建议控制仓位。'},
+        'tomorrowOutlook': {'title': '等待方向', 'detail': '明日关注大盘量能变化及板块轮动持续性。'},
+        'riskWarning': {'level': 'low', 'title': '暂无明显风险', 'detail': '市场波动有限，按既定策略执行。'},
+        'highlights': [],
+    }
+
+
+def _build_ai_analysis(market, industry_sectors, concept_sectors,
+                       limit_up, limit_down, top_gainers, top_losers, tomorrow_focus):
+    """规则引擎：根据市场/板块/涨跌停/涨跌幅生成情绪评分 + 智能分析结论"""
+    # ---- 1) 情绪评分 (0-100) ----
+    score = 50
+    factors = []
+
+    # 涨跌停差
+    lu_cnt, ld_cnt = len(limit_up), len(limit_down)
+    limit_diff = lu_cnt - ld_cnt
+    if limit_diff > 30:
+        score += 20; factors.append(f'涨停{lu_cnt}远多于跌停{ld_cnt}')
+    elif limit_diff > 10:
+        score += 12; factors.append(f'涨停{lu_cnt}明显多于跌停{ld_cnt}')
+    elif limit_diff > 0:
+        score += 5; factors.append(f'涨停{lu_cnt}略多于跌停{ld_cnt}')
+    elif limit_diff < -10:
+        score -= 15; factors.append(f'跌停{ld_cnt}明显多于涨停{lu_cnt}')
+    elif limit_diff < 0:
+        score -= 8; factors.append(f'跌停{ld_cnt}略多于涨停{lu_cnt}')
+
+    # 大盘指数
+    sh = market.get('sh000001', {})
+    sz = market.get('sz399001', {})
+    cy = market.get('sz399006', {})
+    avg_change = sum([sh.get('changePercent', 0), sz.get('changePercent', 0), cy.get('changePercent', 0)]) / 3
+    if avg_change > 1.5:
+        score += 10; factors.append(f'三大指数平均涨{avg_change:.2f}%')
+    elif avg_change > 0.3:
+        score += 5
+    elif avg_change < -1.5:
+        score -= 10; factors.append(f'三大指数平均跌{avg_change:.2f}%')
+    elif avg_change < -0.3:
+        score -= 5
+
+    # 板块轮动
+    if industry_sectors:
+        top = industry_sectors[0].get('changePercent', 0)
+        lag = industry_sectors[-1].get('changePercent', 0)
+        spread = top - lag
+        if spread > 8:
+            score += 5; factors.append(f'板块分化大({spread:.1f}%)')
+        elif spread < 2:
+            score -= 3; factors.append('板块联动弱')
+
+    # 涨停/跌停比
+    ratio = (lu_cnt / ld_cnt) if ld_cnt > 0 else (lu_cnt if lu_cnt > 0 else 1)
+    if ratio >= 5:
+        score += 5; factors.append('赚钱效应强')
+    elif ratio < 0.5 and ld_cnt > 0:
+        score -= 5; factors.append('亏钱效应扩散')
+
+    score = max(0, min(100, score))
+
+    if score >= 75: label = '情绪高涨'
+    elif score >= 60: label = '情绪偏暖'
+    elif score >= 45: label = '情绪平稳'
+    elif score >= 30: label = '情绪偏冷'
+    else: label = '情绪低迷'
+
+    # ---- 2) 操作建议 ----
+    if score >= 70:
+        op_level, op_title = 'bull', '偏多：可适度加仓'
+        op_detail = f'市场情绪{label}，涨停{lu_cnt}只显示资金活跃度高。'
+        op_detail += '可关注领涨板块中位股补涨机会，仓位建议 6-8 成。'
+    elif score >= 55:
+        op_level, op_title = 'hold', '中性偏多：精选个股'
+        op_detail = f'市场情绪{label}，结构机会存在。'
+        op_detail += '建议聚焦主线板块龙头股，仓位 4-6 成，避免追高。'
+    elif score >= 40:
+        op_level, op_title = 'hold', '震荡观望：控制仓位'
+        op_detail = f'市场情绪{label}，多空均衡。'
+        op_detail += '建议降低仓位至 3-5 成，等待方向明朗。'
+    elif score >= 25:
+        op_level, op_title = 'bear', '偏空：谨慎为主'
+        op_detail = f'市场情绪{label}，亏钱效应明显。'
+        op_detail += '建议仓位降至 2-3 成，规避高位股，关注防御性板块。'
+    else:
+        op_level, op_title = 'bear', '空仓观望'
+        op_detail = f'市场情绪{label}，系统性风险显现。'
+        op_detail += '建议空仓或极低仓位（≤2成），等待市场企稳。'
+
+    # ---- 3) 明日展望 ----
+    if industry_sectors and concept_sectors:
+        top_ind = industry_sectors[0]['name']
+        top_con = concept_sectors[0]['name']
+        if score >= 60:
+            outlook_title = '主线有望延续'
+            outlook_detail = f'关注"{top_ind}"行业及"{top_con}"概念能否持续走强。'
+            outlook_detail += '若龙头股继续封板，可挖掘板块内低吸机会。'
+        elif score >= 40:
+            outlook_title = '结构性轮动'
+            outlook_detail = f'关注"{top_ind}"是否切换，或新主线出现。'
+            outlook_detail += '建议跟踪明日早盘量能及开盘 30 分钟板块表现。'
+        else:
+            outlook_title = '防御为主'
+            outlook_detail = '情绪走弱时建议关注消费、医药等防御性板块，'
+            outlook_detail += '以及前期超跌反弹机会。'
+    else:
+        outlook_title = '数据待完善'
+        outlook_detail = '板块数据缺失，建议结合大盘走势及消息面综合判断。'
+
+    # ---- 4) 风险提示 ----
+    risk_level = 'low'
+    risk_title = '暂无明显风险'
+    risk_detail = ''
+
+    if top_gainers and top_gainers[0].get('changePercent', 0) > 19:
+        risk_level = 'mid'
+        risk_title = '高位股追涨风险'
+        risk_detail = f'今日涨幅第一{top_gainers[0]["name"]}达{top_gainers[0]["changePercent"]:.1f}%，'
+        risk_detail += '高位股分歧加大，避免追涨。'
+    elif lu_cnt >= 80 and score >= 75:
+        risk_level = 'mid'
+        risk_title = '情绪过热风险'
+        risk_detail = f'涨停{lu_cnt}只，情绪进入高潮区，谨防次日分化。'
+    elif ld_cnt >= 30 and score < 40:
+        risk_level = 'high'
+        risk_title = '系统性风险'
+        risk_detail = f'跌停{ld_cnt}只，跌停潮可能扩散，建议减仓避险。'
+    elif industry_sectors and industry_sectors[0].get('changePercent', 0) > 8:
+        risk_level = 'mid'
+        risk_title = '板块过热风险'
+        risk_detail = f'{industry_sectors[0]["name"]}涨幅{industry_sectors[0]["changePercent"]:.1f}%，注意回调。'
+    else:
+        risk_detail = '市场波动正常范围内，按策略执行。'
+
+    # ---- 5) 亮点摘要 ----
+    highlights = []
+    if factors:
+        highlights.append('情绪驱动: ' + '、'.join(factors[:3]))
+    if industry_sectors:
+        top = industry_sectors[0]
+        highlights.append(f'领涨板块: {top["name"]} +{top["changePercent"]:.2f}%')
+    if limit_up and len(limit_up) > 0:
+        # 涨停股按 changePercent 排序找连板高度
+        high = max(limit_up, key=lambda s: s.get('changePercent', 0))
+        highlights.append(f'涨停高度: {high.get("name")} +{high.get("changePercent", 0):.2f}%')
+    if lu_cnt > 0 or ld_cnt > 0:
+        highlights.append(f'涨跌停比: {lu_cnt}:{ld_cnt}')
+
+    return {
+        'sentimentScore': score,
+        'sentimentLabel': label,
+        'operationAdvice': {'level': op_level, 'title': op_title, 'detail': op_detail},
+        'tomorrowOutlook': {'title': outlook_title, 'detail': outlook_detail},
+        'riskWarning': {'level': risk_level, 'title': risk_title, 'detail': risk_detail},
+        'highlights': highlights,
+    }

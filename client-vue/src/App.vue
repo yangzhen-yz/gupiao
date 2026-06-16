@@ -25,7 +25,7 @@
       <TabRecommend />
     </div>
     <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'">
-      <TabReview />
+      <TabReview @open-kline="openKline" />
     </div>
     <div :class="['tab-content', { active: activeTab === 'tab-strategy' }]" v-show="activeTab === 'tab-strategy'">
       <TabStrategy />
