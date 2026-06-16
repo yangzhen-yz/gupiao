@@ -1,8 +1,8 @@
 """app - FastAPI 应用实例、中间件、生命周期"""
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import os, time, asyncio, threading
+import os, sys, time, asyncio, threading
 from datetime import date
 
 from . import config as _cfg
@@ -67,6 +67,15 @@ def _reload_config():
             if val is not None:
                 g[name] = val
         g['TENCENT_API'] = g['TENCENT_QUOTE_API']
+        # 同步 reload 业务模块，让它们的 from app.config import 常量重新求值
+        for mod_name in ('services.stock', 'services.trend', 'services.recommend'):
+            mod = sys.modules.get(mod_name)
+            if mod is not None:
+                try:
+                    importlib.reload(mod)
+                    print(f'[Config] 已重载 {mod_name}')
+                except Exception as e:
+                    print(f'[Config] 重载 {mod_name} 失败: {e}')
         print('[Config] 热加载完成 (config.py 已变更)')
         return True
     except Exception as e:
@@ -130,6 +139,25 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # 注册路由
 from app.api.routes import router
 app.include_router(router)
+
+@app.get("/eastmoney/{path:path}", tags=["东方财富代理"])
+async def eastmoney_proxy(path: str, request: Request):
+    """将 /eastmoney/* 请求代理到 https://push2.eastmoney.com/*"""
+    from services.stock import get_http_client
+    client = get_http_client()
+    query_string = str(request.url.query)
+    target_url = f"https://push2.eastmoney.com/{path}"
+    if query_string:
+        target_url += f"?{query_string}"
+    try:
+        resp = await client.get(target_url, timeout=8.0)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"代理请求失败: {str(e)}")
 
 @app.middleware("http")
 async def _config_reload_middleware(request, call_next):

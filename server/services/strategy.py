@@ -162,17 +162,137 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         }
     }
 async def backtest_yesterday_predictions() -> Dict:
-    """回溯验证昨日预测，计算准确率，调整权重"""
+    """回溯验证未验证的预测，计算准确率，调整权重
+    
+    优先回测最近一个交易日的预测，同时补验所有历史未验证的预测。
+    """
     try:
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
-        # 如果今天是周一，则回测周五
-        if date.today().weekday() == 0:  # Monday
-            yesterday = (date.today() - timedelta(days=3)).isoformat()
+        today = date.today()
+        # 确定最近一个交易日（跳过周末）
+        if today.weekday() == 0:  # 周一 → 回测上周五
+            latest_trading_day = (today - timedelta(days=3))
+        elif today.weekday() == 6:  # 周日 → 回测上周五
+            latest_trading_day = (today - timedelta(days=2))
+        elif today.weekday() == 5:  # 周六 → 回测上周五
+            latest_trading_day = (today - timedelta(days=1))
+        else:
+            latest_trading_day = (today - timedelta(days=1))
+        
+        yesterday = latest_trading_day.isoformat()
 
         conn = get_db_conn()
         cursor = conn.cursor()
 
-        # 获取昨日未验证的预测
+        # 先补验所有历史未验证的预测（非今日）
+        from datetime import datetime as _dt
+        today_str = today.isoformat()
+        cursor.execute(
+            'SELECT DISTINCT predict_date FROM strategy_predict_records WHERE verified = 0 AND predict_date < ? ORDER BY predict_date',
+            (today_str,)
+        )
+        unverified_dates = [row['predict_date'] for row in cursor.fetchall()]
+        
+        backfilled_count = 0
+        for ud in unverified_dates:
+            if ud == yesterday:
+                continue  # 昨天的在主流程中处理
+            # 跳过周末：周六/周日不生成回测报告（但仍验证预测记录）
+            try:
+                ud_weekday = _dt.strptime(ud, '%Y-%m-%d').weekday()
+            except Exception:
+                ud_weekday = 0
+            is_weekend = ud_weekday >= 5
+            
+            cursor.execute(
+                'SELECT * FROM strategy_predict_records WHERE predict_date = ? AND verified = 0',
+                (ud,)
+            )
+            old_preds = cursor.fetchall()
+            for pred in old_preds:
+                try:
+                    stock_data = await fetch_stock_data(pred['symbol'])
+                    if not stock_data:
+                        continue
+                    actual_change = stock_data.get('parsed', {}).get('changePercent', 0)
+                    actual_dir = 'bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'
+                    is_correct = pred['predict_direction'] == actual_dir
+                    cursor.execute(
+                        '''UPDATE strategy_predict_records
+                           SET verified=1, actual_change=?, actual_direction=?, is_correct=?
+                           WHERE predict_date=? AND symbol=?''',
+                        (actual_change, actual_dir, 1 if is_correct else 0, ud, pred['symbol'])
+                    )
+                    backfilled_count += 1
+                except Exception:
+                    continue
+            
+            if is_weekend:
+                # 周末不生成回测报告
+                print(f'[回测] 跳过周末日期 {ud}（不生成回测报告）')
+                continue
+            
+            # 为补验日期生成回测报告（如果不存在）
+            cursor.execute(
+                'SELECT id FROM strategy_backtest_reports WHERE backtest_date = ?', (ud,)
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    'SELECT * FROM strategy_predict_records WHERE predict_date = ? AND verified = 1', (ud,)
+                )
+                all_verified = cursor.fetchall()
+                if all_verified:
+                    correct = sum(1 for r in all_verified if r['is_correct'] == 1)
+                    # 统计看涨/看跌误判
+                    bull_misjudge = []
+                    bear_misjudge = []
+                    for r in all_verified:
+                        if r['is_correct'] == 1:
+                            continue
+                        item = {
+                            'symbol': r['symbol'],
+                            'name': r['name'],
+                            'score': r['score'],
+                            'predict_change': float(r['change_percent']),
+                            'actual_change': float(r['actual_change']),
+                            'outer_ratio': float(r['outer_ratio']),
+                            'volume_ratio': float(r['volume_ratio']),
+                            'weibi': float(r['weibi']),
+                        }
+                        if r['predict_direction'] == 'bull':
+                            bull_misjudge.append(item)
+                        else:
+                            bear_misjudge.append(item)
+                    # 调用分析函数生成误判分析
+                    ud_market_change = 0.0
+                    try:
+                        idx_data = await fetch_stock_data('sh000001')
+                        if idx_data:
+                            ud_market_change = idx_data.get('parsed', {}).get('changePercent', 0)
+                    except Exception:
+                        pass
+                    weights_bk = load_strategy_factor_weights()
+                    misjudge_analysis = await _analyze_misjudgments(bull_misjudge, bear_misjudge, ud_market_change, weights_bk)
+                    import json
+                    cursor.execute(
+                        '''INSERT OR REPLACE INTO strategy_backtest_reports
+                           (backtest_date, market_change, total_predictions, correct_count, accuracy,
+                            bull_accuracy, bear_accuracy, bull_misjudge_count, bear_misjudge_count,
+                            misjudge_analysis, weight_adjustments)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                        (ud, ud_market_change, len(all_verified), correct,
+                         round(correct / len(all_verified) * 100, 2) if all_verified else 0,
+                         round(sum(1 for r in all_verified if r['predict_direction'] == 'bull' and r['is_correct'] == 1) / max(1, sum(1 for r in all_verified if r['predict_direction'] == 'bull')) * 100, 2),
+                         round(sum(1 for r in all_verified if r['predict_direction'] == 'bear' and r['is_correct'] == 1) / max(1, sum(1 for r in all_verified if r['predict_direction'] == 'bear')) * 100, 2),
+                         len(bull_misjudge), len(bear_misjudge),
+                         json.dumps(misjudge_analysis, ensure_ascii=False),
+                         json.dumps([], ensure_ascii=False))
+                    )
+        
+        if backfilled_count > 0:
+            print(f'[回测] 补验了 {backfilled_count} 条历史未验证预测（日期：{", ".join(unverified_dates)}）')
+            conn.commit()
+
+        # 获取最近交易日未验证的预测
         cursor.execute(
             'SELECT * FROM strategy_predict_records WHERE predict_date = ? AND verified = 0',
             (yesterday,)
@@ -188,7 +308,7 @@ async def backtest_yesterday_predictions() -> Dict:
             existing = cursor.fetchone()
             if existing:
                 conn.close()
-                return {'date': yesterday, 'message': '回测报告已存在'}
+                return {'date': yesterday, 'message': '回测报告已存在', 'backfilled': backfilled_count}
             
             # 没有回测报告但预测已验证，从已验证预测生成报告
             cursor.execute(
@@ -198,7 +318,7 @@ async def backtest_yesterday_predictions() -> Dict:
             predictions = cursor.fetchall()
             if not predictions:
                 conn.close()
-                return {'date': yesterday, 'message': '无待验证的预测记录'}
+                return {'date': yesterday, 'message': '无待验证的预测记录', 'backfilled': backfilled_count}
 
         # 获取昨日大盘涨跌
         market_change = 0.0
@@ -220,10 +340,10 @@ async def backtest_yesterday_predictions() -> Dict:
             symbol = pred['symbol']
             predict_dir = pred['predict_direction']
             
-            if pred.get('verified') and pred.get('actual_change') is not None:
+            if pred['verified'] and pred['actual_change'] is not None:
                 actual_change = float(pred['actual_change'])
-                actual_dir = pred.get('actual_direction', ('bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'))
-                is_correct = bool(pred.get('is_correct'))
+                actual_dir = pred['actual_direction'] if pred['actual_direction'] else ('bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral')
+                is_correct = bool(pred['is_correct'])
             else:
                 try:
                     stock_data = await fetch_stock_data(symbol)

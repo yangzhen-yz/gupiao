@@ -32,37 +32,52 @@ SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 # ========== 趋势发现配置（中短线波段评分，满分 100 分） ==========
 # 关注周期：未来 ~1 个月
 # 评分结构：6 项基础分（100 分）+ 扣分项 + 强制排除
-TREND_MIN_SCORE = 80  # 趋势发现进入趋势池的最低分
-TREND_IS_UP_MIN_SCORE = 60  # 认定为"趋势向上"（isUp=true）的最低分
+TREND_MIN_SCORE = 60  # 趋势发现进入趋势池的最低分（原85，V3 评分下经 268 样本实测 found=21 合理）
+TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分（原60，调低）
 TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
 
 # 涨停 / 跌停阈值
 TREND_LIMIT_UP_THRESHOLD = 9.8  # 涨停阈值（单日涨幅 % ≥ 此值算涨停）
 TREND_LIMIT_DOWN_THRESHOLD = -9.8  # 跌停阈值（单日涨幅 % ≤ 此值算跌停）
 
-# 维度 1：MA20 趋势（40 分）
-TREND_PRICE_ABOVE_MA20_SCORE = 20  # 价格站稳 MA20
-TREND_MA20_SLOPE_WINDOW = 3  # MA20 斜率计算窗口（近 N 日均值 vs 前 N 日均值）
-TREND_MA20_SLOPE_SCORE = 20  # MA20 斜率向上
+# 维度 1：短期均线趋势（30 分，多档制）
+TREND_D1_FULL_SCORE = 30  # 近10日收盘价全部在MA20上方 + 近5日MA20连续抬升
+TREND_D1_PARTIAL_SCORE = 20  # 近7日仅1日短暂跌破MA20（次日收回）+ MA20走平或向上
+TREND_D1_BARE_SCORE = 10  # 近3日反复穿插MA20但现价站稳
 
-# 维度 2：资金异动（30 分）
-TREND_LIMIT_UP_20D_BONUS_1 = 12  # 近 20 日涨停 1 次得 12 分
-TREND_LIMIT_UP_20D_BONUS_2 = 20  # 近 20 日涨停 ≥2 次得 20 分
-TREND_CONSECUTIVE_BOARD_SCORE = 10  # 出现 2 连板 / 连续阳线 ≥4 根
+# 维度 2：短期资金异动（30 分，多档制；涨停次数与连阳数分别计算，取高分）
+TREND_D2_LIMIT_UP_TIERS = [(3, 30), (2, 20), (1, 10)]  # [(≥涨停次数, 得分)]
+TREND_D2_YANG_LINE_TIERS = [(6, 30), (4, 20), (3, 10)]  # [(≥连阳数, 得分)] — 2连板直接30分
 
-# 维度 3：量能配合（15 分）
-TREND_VOLUME_RATIO_20V60_THRESHOLD = 1.0  # 20日均量 / 60日均量 > 阈值 算"温和放大"
+# 维度 3：量能配合（20 分，多档制；同时需价涨量增）
+TREND_D3_VOLUME_TIERS = [(1.5, 20), (1.3, 15), (1.0, 8)]  # [(20日均量/60日均量 ≥ 倍数, 得分)]
 
-# 维度 4：风险回撤（15 分）
-TREND_DRAWDOWN_20D_TIERS = [(15, 15), (20, 8)]  # [(<阈值%, 得分)] — 回撤<15%=15分, 15≤x<20=8分, ≥20=0分
+# 维度 4：风险回撤（20 分，5 档）
+TREND_D4_DRAWDOWN_TIERS = [(8, 20), (12, 15), (15, 10), (20, 5)]  # [(<回撤%, 得分)]
 
 # 扣分项
-TREND_DEDUCT_MA20_BROKEN = 15  # 近 5 日内跌破 MA20 且 3 日未收回
-TREND_DEDUCT_LIMIT_DOWN = 12  # 近 20 日出现单日跌停
-TREND_DEDUCT_SHRINK_VOL = 10  # 持续缩量阴跌（成交量 < 60日均量 50%）
+TREND_DEDUCT_POSITION_HIGH = 10  # 现价位于250日分位 ≥ 80%（原20，减半）
+TREND_DEDUCT_MA60_MA120_BEAR = 8  # MA60 + MA120 同步向下（原15，减半）
+TREND_DEDUCT_POSITION_MID = 5  # 60% ≤ 分位 < 80% 或 MA60向下/MA120向上（原10，减半）
+TREND_DEDUCT_MA20_BROKEN = 6  # 近 5 日内跌破 MA20 且 3 日未收回（原12，减半）
+TREND_DEDUCT_LIMIT_DOWN = 15  # 近 20 日出现单日跌停
+TREND_DEDUCT_SHRINK_VOL = 10  # 持续缩量阴跌
+TREND_DEDUCT_VOLUME_SPIKE = 10  # 单日成交量创20日新高，当日涨幅<1%或收跌
+TREND_DEDUCT_VOLUME_DIVERGENCE = 6  # 近5日股价小幅抬升但20日均量逐级放大超30%（原12，减半）
+TREND_DEDUCT_EXTREME_VOLATILITY = 8  # 近20日振幅≥15%且收跌
+TREND_DEDUCT_SINGLE_DAY_CRASH = 8  # 单日大跌超-7%且次日未修复
+TREND_DEDUCT_AMPLITUDE_FLAT = 10  # 近20日振幅<5%（完全横盘）
+TREND_DEDUCT_NON_MAIN_BOARD = 5  # 非主板（创业板/科创板）
+
+# 加分项（额外奖励，总分不封顶，用于排序 + 平衡低位分位）
+TREND_BONUS_BULL_ALIGNMENT = 5  # MA20>MA60>MA120 标准多头排列 + 现价分位<60%
+TREND_BONUS_VOLUME_BREAKOUT = 5  # 近3日出现倍量突破（日成交量≥20日均量×2 + 涨幅≥5%）
+TREND_BONUS_CONSECUTIVE_YANG = 3  # 近5日连续阳线 + 每日涨幅≥1%
 
 # 强制排除阈值
-TREND_RANGE_20D_FLAT_MIN = 5  # 近 20 日振幅 < 5% 视为"完全横盘"（无短线机会）
+TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN = 3  # 近20日出现连续N个跌停 → 直接剔除
+TREND_EXCLUDE_MARKET_CAP_MIN = 20  # 总市值 < N亿 直接剔除（可配置）
+TREND_RANGE_20D_FLAT_MIN = 5  # 近 20 日振幅 < 5% 视为"完全横盘"（转入扣分项，不再直接排除）
 
 # 公告/利空数据源（东方财富公告接口）
 EASTMONEY_ANN_API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'

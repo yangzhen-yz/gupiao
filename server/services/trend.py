@@ -6,11 +6,17 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS,
     SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS,
     STRATEGY_PREDICT_BULL_MIN_SCORE, SCAN_KLINE_TIMEOUT,
-    TREND_PRICE_ABOVE_MA20_SCORE, TREND_MA20_SLOPE_WINDOW, TREND_MA20_SLOPE_SCORE,
-    TREND_LIMIT_UP_20D_BONUS_1, TREND_LIMIT_UP_20D_BONUS_2, TREND_CONSECUTIVE_BOARD_SCORE,
-    TREND_VOLUME_RATIO_20V60_THRESHOLD,
-    TREND_DRAWDOWN_20D_TIERS,
+    TREND_D1_FULL_SCORE, TREND_D1_PARTIAL_SCORE, TREND_D1_BARE_SCORE,
+    TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS,
+    TREND_D3_VOLUME_TIERS,
+    TREND_D4_DRAWDOWN_TIERS,
+    TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID,
     TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL,
+    TREND_DEDUCT_VOLUME_SPIKE, TREND_DEDUCT_VOLUME_DIVERGENCE,
+    TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH,
+    TREND_DEDUCT_AMPLITUDE_FLAT, TREND_DEDUCT_NON_MAIN_BOARD,
+    TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG,
+    TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN)
 from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, load_hot_search_ranking, load_stock_basic_info
 from services.stock import (get_http_client, has_delisting_risk, is_main_board, get_kline_data, parse_realtime_fields,
@@ -32,41 +38,23 @@ def _ensure_today_date(data: Dict) -> Dict:
 
 def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 negative_announcement: Optional[Dict] = None,
-                stock_name: str = '') -> Dict:
+                stock_name: str = '',
+                market_cap: Optional[float] = None,
+                is_mainboard: bool = True) -> Dict:
     """
-    中短线波段趋势判断（满分 100 分）
+    中短线波段趋势判断 V3.0（对标 项目说明.md §2.1-2.5）
 
-    关注周期：未来 ~1 个月
-    评分结构（6 项基础分 = 100 分 + 扣分 + 强制排除）：
-      维度 1 短期均线趋势（核心，40 分）
-        ① 价格站稳 MA20：              20 分
-        ② MA20 斜率向上（3 日区间）：   20 分
-      维度 2 短期资金异动（活跃度，30 分）
-        ③ 近 20 日涨停次数：           0 / 12 / 20 分
-        ④ 2 连板或连续阳线 ≥4 根：      0 / 10 分
-      维度 3 量能配合（短线灵魂，15 分）
-        ⑤ 20日均量 > 60日均量 × 阈值： 0 / 15 分
-      维度 4 风险回撤（风控，15 分）
-        ⑥ 近 20 日最大回撤：           0 / 8 / 15 分
+    评分结构：基础分(100分) - 扣分项 + 加分项 = 最终总分
+    维度 1 短期均线趋势    30 分（多档：30/20/10/0）
+    维度 2 短期资金异动    30 分（多档：涨停次数/连阳数取高分）
+    维度 3 量能配合        20 分（多档：20/15/8/0）
+    维度 4 风险回撤        20 分（5 档：20/15/10/5/0）
 
-    扣分项（实盘必用，总分直接扣减，可叠加）：
-      - 近 5 日内收盘价跌破 MA20 且 3 日内未收回：  -15
-      - 近 20 日出现单日跌停：                      -12
-      - 持续缩量阴跌（量 < 60日均量 50%）：          -10
+    扣分项（12 项，可叠加）：高位追高/双空头/破位/跌停/缩量/放量滞涨/量价背离等
+    加分项（3 项）：多头排列/倍量突破/连续阳线
 
-    强制排除（无论得分多少，直接剔除）：
-      - 近 20 日有重大利空 / 减持 / 立案 / 调查 公告
-      - ST / *ST / 退市风险警示
-      - 非沪深主板
-      - 近 20 日振幅 < 5%（完全横盘，无短线机会）
-
-    入选门槛：总分 ≥ 60 为 isUp=true，≥ 80 进入趋势发现列表。
-
-    :param kline_data: K线数据（按日期升序），每项 [日期, 开, 收, 高, 低, 量, ...]
-    :param realtime_price: 实时价（盘中校准，可选）
-    :param negative_announcement: 预拉的利空检测结果 {hasNegative, hits}，由调用方在循环外并发拉取
-    :param stock_name: 股票名称（用于 ST 风险检查）
-    :return: 趋势判断结果 dict
+    :param market_cap: 总市值（亿元），用于小微盘排除
+    :param is_mainboard: 是否沪深主板（False = 创业板/科创板扣 -5）
     """
     # ========== 数据完整性检查 ==========
     if not kline_data or len(kline_data) < TREND_MIN_KLINE_DAYS:
@@ -95,6 +83,17 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     ma20 = calculate_ma(kline_data, 20)
     ma20_val = ma20[latest_idx] if ma20[latest_idx] else None
 
+    # 近 20 日振幅（用于扣分项）
+    win20_start_idx = max(0, n - 20)
+    last20_highs = highs[win20_start_idx:]
+    last20_lows = lows[win20_start_idx:]
+    if last20_highs and last20_lows:
+        win20_high = max(last20_highs)
+        win20_low = min(last20_lows)
+        amplitude_20d = (win20_high - win20_low) / win20_low * 100 if win20_low > 0 else 0
+    else:
+        amplitude_20d = 0
+
     # ========== 强制排除项（在评分前先过） ==========
     exclusions = []
     # 1. ST / *ST 风险
@@ -104,18 +103,13 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     if negative_announcement and negative_announcement.get('hasNegative'):
         hits = negative_announcement.get('hits', [])[:3]
         exclusions.append(f'近20日有重大利空公告：{"；".join(hits)[:120]}')
-    # 3. 近 20 日振幅 < TREND_RANGE_20D_FLAT_MIN%（横盘）
-    win20_start = max(0, n - 20)
-    last20_highs = highs[win20_start:]
-    last20_lows = lows[win20_start:]
-    if last20_highs and last20_lows:
-        win20_high = max(last20_highs)
-        win20_low = min(last20_lows)
-        amplitude_20d = (win20_high - win20_low) / win20_low * 100 if win20_low > 0 else 0
-    else:
-        amplitude_20d = 0
-    if amplitude_20d < TREND_RANGE_20D_FLAT_MIN:
-        exclusions.append(f'近20日振幅仅{amplitude_20d:.1f}%，完全横盘')
+    # 3. 近 20 日出现连续 3 个跌停
+    consecutive_limit_down = _check_consecutive_limit_down(opens, closes, win20_start_idx, n)
+    if consecutive_limit_down:
+        exclusions.append('近20日出现连续3个跌停')
+    # 4. 总市值 < 20 亿（小微盘庄股）
+    if market_cap is not None and market_cap < TREND_EXCLUDE_MARKET_CAP_MIN:
+        exclusions.append(f'总市值仅{market_cap:.1f}亿（<{TREND_EXCLUDE_MARKET_CAP_MIN}亿）')
 
     if exclusions:
         return {
@@ -124,24 +118,58 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
             'deducts': [], 'exclusions': exclusions
         }
 
-    # ========== 维度 1：MA20 趋势（40 分） ==========
-    # ① 价格站稳 MA20
-    if ma20_val and check_price > ma20_val:
-        s_price_ma20 = TREND_PRICE_ABOVE_MA20_SCORE
-    else:
-        s_price_ma20 = 0
-    # ② MA20 斜率向上（近 N 日均值 > 前 N 日均值）
-    slope_w = TREND_MA20_SLOPE_WINDOW
-    s_ma20_slope = 0
-    if (latest_idx >= 2 * slope_w and ma20[latest_idx]
-            and all(ma20[latest_idx - k] is not None for k in range(2 * slope_w + 1))):
-        recent_avg = sum(ma20[latest_idx - k] for k in range(slope_w)) / slope_w
-        prev_avg = sum(ma20[latest_idx - slope_w - k] for k in range(slope_w)) / slope_w
-        if recent_avg > prev_avg:
-            s_ma20_slope = TREND_MA20_SLOPE_SCORE
+    # ========== 计算额外均线（MA60、MA120 用于扣分/加分） ==========
+    ma60 = calculate_ma(kline_data, 60)
+    ma120 = calculate_ma(kline_data, 120)
 
-    # ========== 维度 2：资金异动（30 分） ==========
-    win20_start_idx = max(0, n - 20)
+    # 计算 250 日分位（现价在近250日收盘价中的百分位）
+    position_pct = None
+    if n >= 250:
+        win250_closes = closes[-250:]
+        lower = sum(1 for c in win250_closes if c <= check_price)
+        position_pct = lower / 250 * 100
+    elif n >= 60:
+        win_all = closes[-min(60, n):]
+        lower = sum(1 for c in win_all if c <= check_price)
+        position_pct = lower / len(win_all) * 100
+
+    # ========== 维度 1：短期均线趋势（30 分，多档制） ==========
+    # 30分: 近10日收盘价全部在MA20上方 + 近5日MA20连续抬升
+    # 20分: 近7日仅1日短暂跌破MA20（次日收回）+ MA20走平或向上
+    # 10分: 近3日反复穿插MA20但现价站稳MA20
+    # 0分:  跌破MA20且近3日无法收回
+    s_d1 = 0
+    if ma20_val:
+        above_count_10 = sum(1 for i in range(max(0, latest_idx - 9), latest_idx + 1) if closes[i] > ma20[i]) if latest_idx >= 0 else 0
+        ma20_rising_5d = True
+        if latest_idx >= 5 and all(ma20[i] is not None for i in range(latest_idx - 4, latest_idx + 1)):
+            for i in range(latest_idx - 3, latest_idx + 1):
+                if ma20[i] <= ma20[i - 1]:
+                    ma20_rising_5d = False
+                    break
+        else:
+            ma20_rising_5d = False
+        if above_count_10 >= 10 and ma20_rising_5d:
+            s_d1 = 30
+        else:
+            # 近7日仅1日跌破且次日收回 + MA20走平或向上
+            brief_break_count = 0
+            brief_break_recovered = True
+            for i in range(max(0, latest_idx - 6), latest_idx + 1):
+                if closes[i] <= ma20[i]:
+                    brief_break_count += 1
+                    if i + 1 <= latest_idx and closes[i + 1] <= ma20[i + 1]:
+                        brief_break_recovered = False
+            ma20_flat_or_up = True
+            if latest_idx >= 2 and all(ma20[i] is not None for i in range(latest_idx - 2, latest_idx + 1)):
+                if ma20[latest_idx] < ma20[latest_idx - 2]:
+                    ma20_flat_or_up = False
+            if brief_break_count <= 1 and brief_break_recovered and ma20_flat_or_up:
+                s_d1 = 20
+            elif check_price > ma20_val:
+                s_d1 = 10
+
+    # ========== 维度 2：短期资金异动（30 分，涨停分+连阳分取高） ==========
     # ③ 近 20 日涨停次数
     limit_up_20d = 0
     for i in range(win20_start_idx, n):
@@ -149,28 +177,44 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         change_pct = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
         if change_pct >= TREND_LIMIT_UP_THRESHOLD:
             limit_up_20d += 1
-    if limit_up_20d >= 2:
-        s_limit_up_20d = TREND_LIMIT_UP_20D_BONUS_2
-    elif limit_up_20d == 1:
-        s_limit_up_20d = TREND_LIMIT_UP_20D_BONUS_1
-    else:
-        s_limit_up_20d = 0
-    # ④ 2 连板 或 连续阳线 ≥4 根
-    consecutive_board_or_yang = _check_consecutive_board_or_yang(closes, win20_start_idx, n)
-    s_consecutive = TREND_CONSECUTIVE_BOARD_SCORE if consecutive_board_or_yang else 0
+    s_limit_up = 0
+    for cnt, sc in TREND_D2_LIMIT_UP_TIERS:
+        if limit_up_20d >= cnt:
+            s_limit_up = sc
+            break
 
-    # ========== 维度 3：量能配合（15 分） ==========
+    # ④ 2 连板 或 连续阳线得分
+    has_2_consecutive_board = _check_2_consecutive_board(closes, win20_start_idx, n)
+    consecutive_yang_count = _count_consecutive_yang(closes, win20_start_idx, n)
+    s_yang = 0
+    if has_2_consecutive_board:
+        s_yang = 30
+    else:
+        for cnt, sc in TREND_D2_YANG_LINE_TIERS:
+            if consecutive_yang_count >= cnt:
+                s_yang = sc
+                break
+    s_d2 = max(s_limit_up, s_yang)
+
+    # ========== 维度 3：量能配合（20 分，多档制） ==========
     win60_start_idx = max(0, n - 60)
     avg_vol_20 = sum(vols[max(0, n - 20):]) / min(20, n) if n > 0 else 0
     avg_vol_60 = sum(vols[win60_start_idx:]) / max(1, n - win60_start_idx) if n - win60_start_idx > 0 else 0
-    # 仅在 20 日均量 > 60 日均量且 20 日均量 > 0 时给分（温和放大 + 量价同步）
-    if avg_vol_60 > 0 and avg_vol_20 > avg_vol_60 * TREND_VOLUME_RATIO_20V60_THRESHOLD:
-        s_volume = 15
-    else:
-        s_volume = 0
+    vol_ratio = avg_vol_20 / avg_vol_60 if avg_vol_60 > 0 else 0
+    # 检查"价涨量增"：近5日收盘价整体上涨
+    price_rising = False
+    if latest_idx >= 4:
+        price_rising = closes[latest_idx] > closes[latest_idx - 4]
+    s_d3 = 0
+    for ratio, sc in TREND_D3_VOLUME_TIERS:
+        if vol_ratio >= ratio:
+            s_d3 = sc
+            break
+    # 20 分档位额外需要"价涨量增"
+    if s_d3 == 20 and not price_rising:
+        s_d3 = 15  # 量够但价不涨，降一档
 
-    # ========== 维度 4：风险回撤（15 分） ==========
-    # 近 20 日最大回撤：(峰值 - 谷值) / 峰值 × 100%
+    # ========== 维度 4：风险回撤（20 分，5 档） ==========
     peak = closes[win20_start_idx] if win20_start_idx < n else closes[0]
     max_dd_20 = 0.0
     for i in range(win20_start_idx, n):
@@ -179,41 +223,103 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         dd = (peak - closes[i]) / peak * 100 if peak > 0 else 0
         if dd > max_dd_20:
             max_dd_20 = dd
-    # 分档
-    s_drawdown = 0
-    for thr, sc in TREND_DRAWDOWN_20D_TIERS:
+    s_d4 = 0
+    for thr, sc in TREND_D4_DRAWDOWN_TIERS:
         if max_dd_20 < thr:
-            s_drawdown = sc
+            s_d4 = sc
             break
-    if max_dd_20 >= TREND_DRAWDOWN_20D_TIERS[-1][0]:
-        s_drawdown = 0
 
     # ========== 基础分合计 ==========
-    base_score = s_price_ma20 + s_ma20_slope + s_limit_up_20d + s_consecutive + s_volume + s_drawdown
+    base_score = s_d1 + s_d2 + s_d3 + s_d4
 
-    # ========== 扣分项 ==========
-    deducts = []  # (name, points)
-    # (1) 近 5 日内跌破 MA20 且 3 日内未收回
-    #    解读：最近 5 个交易日中，最新一个交易日往前数 3 日内有跌破 MA20，且最新一个交易日未收回
+    # ========== 扣分项（12 项，可叠加） ==========
+    deducts = []
+
+    # (1) 现价位于250日分位 ≥ 80%（年度高位）
+    if position_pct is not None and position_pct >= 80:
+        base_score -= TREND_DEDUCT_POSITION_HIGH
+        deducts.append(('年度高位(分位{:d}%)'.format(int(position_pct)), TREND_DEDUCT_POSITION_HIGH))
+
+    # (2) MA60 与 MA120 同步向下（中长期双空头）
+    ma60_down = _ma_slope_down(ma60, latest_idx, window=5)
+    ma120_down = _ma_slope_down(ma120, latest_idx, window=5)
+    if ma60_down and ma120_down:
+        base_score -= TREND_DEDUCT_MA60_MA120_BEAR
+        deducts.append(('MA60+MA120双空头', TREND_DEDUCT_MA60_MA120_BEAR))
+    elif position_pct is not None and 60 <= position_pct < 80:
+        base_score -= TREND_DEDUCT_POSITION_MID
+        deducts.append(('中高位(分位{:d}%)'.format(int(position_pct)), TREND_DEDUCT_POSITION_MID))
+    elif ma60_down and not ma120_down:
+        base_score -= TREND_DEDUCT_POSITION_MID
+        deducts.append(('MA60向下/MA120向上', TREND_DEDUCT_POSITION_MID))
+
+    # (3) 近 5 日跌破 MA20 且 3 日未收回
     ma20_broken = _check_ma20_recently_broken(closes, ma20, latest_idx, window=5, recovery_days=3)
     if ma20_broken:
         base_score -= TREND_DEDUCT_MA20_BROKEN
-        deducts.append(('近5日跌破MA20且3日内未收回', TREND_DEDUCT_MA20_BROKEN))
+        deducts.append(('近5日跌破MA20未收回', TREND_DEDUCT_MA20_BROKEN))
 
-    # (2) 近 20 日出现单日跌停
-    has_limit_down_20d = _check_limit_down_in_window(opens, closes, win20_start_idx, n)
-    if has_limit_down_20d:
+    # (4) 近 20 日出现单日跌停
+    if _check_limit_down_in_window(opens, closes, win20_start_idx, n):
         base_score -= TREND_DEDUCT_LIMIT_DOWN
         deducts.append(('近20日单日跌停', TREND_DEDUCT_LIMIT_DOWN))
 
-    # (3) 持续缩量阴跌：最近 5 日成交量持续 < 60日均量 50%
-    shrink = _check_shrink_volume(vols, avg_vol_60, n, days=5, ratio=0.5)
-    if shrink:
+    # (5) 持续缩量阴跌
+    if _check_shrink_volume(vols, avg_vol_60, n, days=5, ratio=0.5):
         base_score -= TREND_DEDUCT_SHRINK_VOL
-        deducts.append(('近5日缩量阴跌（<60日均量50%）', TREND_DEDUCT_SHRINK_VOL))
+        deducts.append(('近5日缩量阴跌', TREND_DEDUCT_SHRINK_VOL))
+
+    # (6) 放量滞涨（单日成交量创20日新高 + 涨幅<1%或收跌）
+    if _check_volume_spike(vols, closes, win20_start_idx, n):
+        base_score -= TREND_DEDUCT_VOLUME_SPIKE
+        deducts.append(('放量滞涨', TREND_DEDUCT_VOLUME_SPIKE))
+
+    # (7) 量价顶背离（近5日股价微涨 + 20日均量放大超30%）
+    if _check_volume_divergence(closes, vols, n):
+        base_score -= TREND_DEDUCT_VOLUME_DIVERGENCE
+        deducts.append(('量价顶背离', TREND_DEDUCT_VOLUME_DIVERGENCE))
+
+    # (8) 近20日振幅≥15%且收跌（天地板/炸板）
+    if amplitude_20d >= 15 and closes[latest_idx] < closes[latest_idx - 1] if latest_idx > 0 else False:
+        base_score -= TREND_DEDUCT_EXTREME_VOLATILITY
+        deducts.append(('天地板/炸板', TREND_DEDUCT_EXTREME_VOLATILITY))
+
+    # (9) 单日大跌超-7%且次日未修复
+    if _check_single_day_crash(opens, closes, latest_idx):
+        base_score -= TREND_DEDUCT_SINGLE_DAY_CRASH
+        deducts.append(('单日大跌未修复', TREND_DEDUCT_SINGLE_DAY_CRASH))
+
+    # (10) 近20日振幅<5%（完全横盘，从强制排除改为扣分）
+    if amplitude_20d < TREND_RANGE_20D_FLAT_MIN:
+        base_score -= TREND_DEDUCT_AMPLITUDE_FLAT
+        deducts.append(('横盘(<5%)', TREND_DEDUCT_AMPLITUDE_FLAT))
+
+    # (11) 非主板（创业板/科创板）— 不强制排除，扣分
+    if not is_mainboard:
+        base_score -= TREND_DEDUCT_NON_MAIN_BOARD
+        deducts.append(('非主板', TREND_DEDUCT_NON_MAIN_BOARD))
+
+    # ========== 加分项（3 项，额外奖励） ==========
+    bonus_score = 0
+    bonuses = []
+
+    # ① MA20 > MA60 > MA120 标准多头排列 + 现价分位 < 60%
+    if _check_bull_alignment(ma20, ma60, ma120, latest_idx) and (position_pct is None or position_pct < 60):
+        bonus_score += TREND_BONUS_BULL_ALIGNMENT
+        bonuses.append(('多头排列+低位', TREND_BONUS_BULL_ALIGNMENT))
+
+    # ② 近3日倍量突破（日成交量 ≥ 20日均量×2 + 涨幅≥5%）
+    if _check_volume_breakout(vols, avg_vol_20, closes, n, days=3):
+        bonus_score += TREND_BONUS_VOLUME_BREAKOUT
+        bonuses.append(('倍量突破', TREND_BONUS_VOLUME_BREAKOUT))
+
+    # ③ 近5日连续阳线 + 每日涨幅 ≥ 1%
+    if _check_consecutive_yang_bonus(closes, latest_idx):
+        bonus_score += TREND_BONUS_CONSECUTIVE_YANG
+        bonuses.append(('连续阳线(≥1%/日)', TREND_BONUS_CONSECUTIVE_YANG))
 
     # 总分（下界 0）
-    total_score = max(0, base_score)
+    total_score = max(0, base_score + bonus_score)
 
     # ========== 入选判断 ==========
     is_trend_up = total_score >= TREND_IS_UP_MIN_SCORE
@@ -239,30 +345,36 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
 
     details = {
         # 维度 1
-        'sPriceAboveMa20': s_price_ma20,
+        'sD1': s_d1,
         'ma20': round(ma20_val, 2) if ma20_val else None,
-        'sMa20SlopeUp': s_ma20_slope,
-        'ma20SlopeWindow': slope_w,
         # 维度 2
-        'sLimitUp20d': s_limit_up_20d,
+        'sD2': s_d2,
         'limitUpCount20d': limit_up_20d,
-        'sConsecutiveBoardOrYang': s_consecutive,
+        'consecutiveYangCount': consecutive_yang_count,
+        'has2ConsecutiveBoard': has_2_consecutive_board,
         # 维度 3
-        'sVolume': s_volume,
+        'sD3': s_d3,
         'avgVol20': round(avg_vol_20, 0),
         'avgVol60': round(avg_vol_60, 0),
+        'volRatio': round(vol_ratio, 2),
         # 维度 4
-        'sDrawdown20d': s_drawdown,
+        'sD4': s_d4,
         'maxDrawdown20d': round(max_dd_20, 2),
         'amplitude20d': round(amplitude_20d, 2),
+        # 250日分位
+        'positionPct': round(position_pct, 1) if position_pct is not None else None,
+        # MA60/MA120
+        'ma60Down': ma60_down,
+        'ma120Down': ma120_down,
         # 通用
         'latestClose': latest_close,
         'checkPrice': check_price,
         'isRealtime': is_realtime,
-        'limitDown20d': has_limit_down_20d,
-        # 展示用：连涨/连跌天数（与评分无关）
+        # 展示用：连涨/连跌天数
         'consecutiveUpDays': consecutive_up_days,
         'consecutiveDownDays': consecutive_down_days,
+        # 加分
+        'bonusScore': bonus_score,
     }
 
     return {
@@ -270,6 +382,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'score': total_score,
         'details': details,
         'deducts': [{'name': d[0], 'points': d[1]} for d in deducts],
+        'bonuses': [{'name': b[0], 'points': b[1]} for b in bonuses],
         'ma20': ma20[-10:] if len(ma20) >= 10 else ma20,
         'latestPrice': latest_close,
         'checkPrice': check_price,
@@ -278,19 +391,14 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     }
 
 
-def _check_consecutive_board_or_yang(closes: List[float], start: int, end: int) -> bool:
-    """
-    在 [start, end) 区间内，是否出现 2 连板 或 连续阳线 ≥4 根。
-    2 连板 = 连续 2 个交易日涨幅 ≥ 9.8%。
-    连续阳线 ≥4 = 连续 4 个交易日 closes[i] > closes[i-1]。
-    """
+def _check_2_consecutive_board(closes: List[float], start: int, end: int) -> bool:
+    """区间内是否出现 2 连板（连续 2 个交易日涨幅 ≥ 9.8%）"""
     n = end - start
     if n < 2:
         return False
-    # 2 连板
     board_run = 0
     for i in range(start + 1, end):
-        prev_c = closes[i - 1] if i - 1 > 0 else closes[i]
+        prev_c = closes[i - 1]
         change_pct = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
         if change_pct >= TREND_LIMIT_UP_THRESHOLD:
             board_run += 1
@@ -298,16 +406,24 @@ def _check_consecutive_board_or_yang(closes: List[float], start: int, end: int) 
                 return True
         else:
             board_run = 0
-    # 连续阳线 ≥4
-    yang_run = 0
+    return False
+
+
+def _count_consecutive_yang(closes: List[float], start: int, end: int) -> int:
+    """区间内最长连续阳线天数（closes[i] > closes[i-1]）"""
+    n = end - start
+    if n < 1:
+        return 0
+    max_run = 0
+    run = 0
     for i in range(start + 1, end):
         if closes[i] > closes[i - 1]:
-            yang_run += 1
-            if yang_run >= 4:
-                return True
+            run += 1
+            if run > max_run:
+                max_run = run
         else:
-            yang_run = 0
-    return False
+            run = 0
+    return max_run
 
 
 def _check_ma20_recently_broken(closes: List[float], ma20: List[Optional[float]],
@@ -347,6 +463,135 @@ def _check_shrink_volume(vols: List[float], avg_vol_60: float, n: int,
         return False
     for i in range(n - days, n):
         if vols[i] >= avg_vol_60 * ratio:
+            return False
+    return True
+
+
+def _ma_slope_down(ma: List[Optional[float]], idx: int, window: int = 5) -> bool:
+    """检查均线在窗口内是否向下（近期均值 < 远期均值）"""
+    if idx < 2 * window:
+        return False
+    if any(ma[idx - k] is None for k in range(2 * window)):
+        return False
+    recent = sum(ma[idx - k] for k in range(window)) / window
+    older = sum(ma[idx - window - k] for k in range(window)) / window
+    return recent < older
+
+
+def _check_volume_spike(vols: List[float], closes: List[float], start: int, end: int) -> bool:
+    """单日成交量创20日新高 + 当日涨幅<1%或收跌 → 放量滞涨"""
+    if end - start < 5:
+        return False
+    max_vol_20 = max(vols[start:end])
+    if max_vol_20 <= 0:
+        return False
+    for i in range(start + 1, end):
+        if vols[i] == max_vol_20:
+            prev_c = closes[i - 1] if i > 0 else closes[i]
+            change = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
+            if change < 1.0 and change >= 0:
+                return True
+            if closes[i] < prev_c:
+                return True
+    return False
+
+
+def _check_volume_divergence(closes: List[float], vols: List[float], n: int) -> bool:
+    """近5日股价小幅抬升 + 20日均量逐级放大超30% → 量价顶背离"""
+    if n < 25:
+        return False
+    if closes[n - 1] <= closes[n - 5]:
+        return False
+    price_rise = (closes[n - 1] - closes[n - 5]) / closes[n - 5] * 100 if closes[n - 5] > 0 else 0
+    if price_rise < 1.0:
+        return False
+    # 20日均量近5日变化
+    if n >= 25:
+        avg_vol_first = sum(vols[n - 25:n - 20]) / 5
+        avg_vol_last = sum(vols[n - 5:n]) / 5
+        if avg_vol_first > 0 and avg_vol_last > avg_vol_first * 1.3:
+            return True
+    return False
+
+
+def _check_single_day_crash(opens: List[float], closes: List[float], idx: int) -> bool:
+    """单日大跌超-7%且次日未修复"""
+    if idx < 1:
+        return False
+    for i in [idx, idx - 1]:
+        if i > 0 and opens[i] > 0:
+            prev_c = closes[i - 1]
+            change = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
+            if change <= -7.0:
+                # 次日是否修复
+                if i + 1 <= idx:
+                    next_prev = closes[i] if closes[i] > 0 else prev_c
+                    next_change = (closes[i + 1] - next_prev) / next_prev * 100 if next_prev > 0 else 0
+                    if next_change > 3.0:
+                        return False
+                return True
+    return False
+
+
+def _check_consecutive_limit_down(opens: List[float], closes: List[float], start: int, end: int) -> bool:
+    """近20日是否出现连续3个跌停"""
+    n = end - start
+    if n < 3:
+        return False
+    run = 0
+    for i in range(start, end):
+        prev_c = closes[i - 1] if i > 0 else opens[i]
+        if prev_c <= 0:
+            continue
+        change = (closes[i] - prev_c) / prev_c * 100
+        if change <= TREND_LIMIT_DOWN_THRESHOLD:
+            run += 1
+            if run >= 3:
+                return True
+        else:
+            run = 0
+    return False
+
+
+def _check_bull_alignment(ma20: list, ma60: list, ma120: list, idx: int) -> bool:
+    """MA20 > MA60 > MA120 标准多头排列"""
+    if idx < 0:
+        return False
+    v20 = ma20[idx] if idx < len(ma20) and ma20[idx] is not None else None
+    v60 = ma60[idx] if idx < len(ma60) and ma60[idx] is not None else None
+    v120 = ma120[idx] if idx < len(ma120) and ma120[idx] is not None else None
+    if v20 and v60 and v120:
+        return v20 > v60 > v120
+    return False
+
+
+def _check_volume_breakout(vols: List[float], avg_vol_20: float, closes: List[float],
+                           n: int, days: int = 3) -> bool:
+    """近N日出现倍量突破（日成交量≥20日均量×2 + 涨幅≥5%）"""
+    if n < days or avg_vol_20 <= 0:
+        return False
+    for i in range(max(0, n - days), n):
+        if vols[i] >= avg_vol_20 * 2:
+            prev_c = closes[i - 1] if i > 0 else closes[0]
+            if prev_c > 0:
+                change = (closes[i] - prev_c) / prev_c * 100
+                if change >= 5.0:
+                    return True
+    return False
+
+
+def _check_consecutive_yang_bonus(closes: List[float], idx: int) -> bool:
+    """近5日连续阳线 + 每日涨幅≥1%"""
+    if idx < 5:
+        return False
+    for i in range(idx - 4, idx + 1):
+        if i <= 0:
+            continue
+        prev_c = closes[i - 1]
+        if prev_c <= 0:
+            return False
+        change = (closes[i] - prev_c) / prev_c * 100
+        if change < 1.0:
             return False
     return True
 
@@ -707,9 +952,8 @@ async def scan_trend_scan_results(force: bool = False):
                     if not name or name == symbol:
                         return None
 
-                    # 非沪深主板 → 直接排除（中短线不参与）
-                    if not is_main_board(symbol):
-                        return None
+                    # 沪深主板标记（非主板改为扣 -5 分，不再直接排除）
+                    _is_mainboard = is_main_board(symbol)
 
                     # 并发拉取近 20 日公告用于利空检测（失败不阻塞，仅视为无利空）
                     try:
@@ -717,12 +961,20 @@ async def scan_trend_scan_results(force: bool = False):
                     except Exception:
                         neg_ann = {'hasNegative': False, 'hits': []}
 
-                    # 趋势判断（新版中短线 100 分制）
+                    # 市值（概算：从实时数据取，若不可用则为 None=不触发小微盘排除）
+                    _market_cap = None
+                    if realtime_data:
+                        # 腾讯 API 返回的 marketCap 可能在某些字段中，取不到则留 None
+                        _market_cap = realtime_data.get('marketCap')
+
+                    # 趋势判断（V3.0 综合评分）
                     trend_result = is_up_trend(
                         kline,
                         realtime_price=realtime_price,
                         negative_announcement=neg_ann,
                         stock_name=name,
+                        market_cap=_market_cap,
+                        is_mainboard=_is_mainboard,
                     )
                     if not trend_result['isUp']:
                         return None
@@ -746,6 +998,7 @@ async def scan_trend_scan_results(force: bool = False):
                         'ma20': trend_result.get('ma20'),
                         'recent5Days': trend_result.get('recent5Days'),
                         'deducts': trend_result.get('deducts', []),
+                        'bonuses': trend_result.get('bonuses', []),
                         'strategyScore': strategy_score,
                         'realtimeData': realtime_data
                     }

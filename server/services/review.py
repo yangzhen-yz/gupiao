@@ -83,9 +83,9 @@ async def generate_daily_review() -> Dict:
         top_gainers = []
         top_losers = []
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                # 涨停股
-                zt_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=30&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f4,f12,f14,f15,f16,f17,f62,f184,f66,f69,f72,f75,f78,f81,f84,f105,f1'
+            async with httpx.AsyncClient(timeout=15) as client:
+                # 涨停股：取涨幅前200名，筛选涨幅>=9.8%
+                zt_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
                 zt_resp = await client.get(zt_url)
                 zt_json = zt_resp.json()
                 if zt_json.get('data') and zt_json['data'].get('diff'):
@@ -100,9 +100,10 @@ async def generate_daily_review() -> Dict:
                                 'mainNetInflow': item.get('f62', 0),
                                 'turnoverRate': item.get('f8', 0),
                             })
+                print(f'[收评] 涨停股获取: {len(limit_up_stocks)} 只')
                 
-                # 跌停股
-                dt_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=30&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f4,f12,f14,f15,f16,f17,f62,f184,f66,f69,f72,f75,f78,f81,f84,f105,f1'
+                # 跌停股：取跌幅前200名，筛选涨幅<=-9.8%
+                dt_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
                 dt_resp = await client.get(dt_url)
                 dt_json = dt_resp.json()
                 if dt_json.get('data') and dt_json['data'].get('diff'):
@@ -117,6 +118,7 @@ async def generate_daily_review() -> Dict:
                                 'mainNetInflow': item.get('f62', 0),
                                 'turnoverRate': item.get('f8', 0),
                             })
+                print(f'[收评] 跌停股获取: {len(limit_down_stocks)} 只')
                 
                 # 涨幅前20（非涨停）
                 gain_url = 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f62,f184,f66,f69,f72,f75,f78,f81'
