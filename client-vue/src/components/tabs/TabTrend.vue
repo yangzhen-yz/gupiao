@@ -133,12 +133,16 @@
       <div class="pool-table" v-if="poolStocks.length > 0">
         <div class="stock-table-header">
           <span>名称</span>
-          <span>最新价</span>
-          <span>连涨/跌</span>
+          <span class="sortable-header" @click="togglePoolSort('price')">
+            最新价<span class="sort-arrow" :class="{ active: poolSortBy === 'price' }">{{ poolSortBy === 'price' ? (poolSortOrder === 'asc' ? '▲' : '▼') : '▽' }}</span>
+          </span>
+          <span class="sortable-header" @click="togglePoolSort('consecutive')">
+            连涨/跌<span class="sort-arrow" :class="{ active: poolSortBy === 'consecutive' }">{{ poolSortBy === 'consecutive' ? (poolSortOrder === 'asc' ? '▲' : '▼') : '▽' }}</span>
+          </span>
           <span>5日线</span>
           <span style="text-align:center;">操作</span>
         </div>
-        <div v-for="s in poolStocks" :key="s.symbol || s.code" class="stock-table-row">
+        <div v-for="s in sortedPoolStocks" :key="s.symbol || s.code" class="stock-table-row">
           <span class="pool-stock-name">{{ s.name || stockNameMap[s.symbol || s.code] || (s.symbol || s.code) }}</span>
           <span class="pool-stock-price" :class="getPriceClass(s)">
             {{ s.latestPrice > 0 ? s.latestPrice.toFixed(2) : '--' }}
@@ -183,6 +187,40 @@ const poolStocks = ref([])
 const lastScan = ref('--')
 const expanded = ref(null)
 const addInput = ref('')
+
+// 股票池排序
+const poolSortBy = ref(null)       // 'price' | 'consecutive' | null
+const poolSortOrder = ref('desc')  // 'asc' | 'desc'
+
+function togglePoolSort(field) {
+  if (poolSortBy.value === field) {
+    poolSortOrder.value = poolSortOrder.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    poolSortBy.value = field
+    poolSortOrder.value = 'desc'   // 默认降序
+  }
+}
+
+// 获取连涨/连跌天数（正值=连涨，负值=连跌）
+function getConsecutiveDelta(s) {
+  if (s.consecutiveUp > 0) return s.consecutiveUp
+  if (s.consecutiveDown > 0) return -s.consecutiveDown
+  return 0
+}
+
+const sortedPoolStocks = computed(() => {
+  if (!poolSortBy.value) return poolStocks.value
+  const order = poolSortOrder.value === 'asc' ? 1 : -1
+  return [...poolStocks.value].sort((a, b) => {
+    if (poolSortBy.value === 'price') {
+      return ((a.latestPrice || 0) - (b.latestPrice || 0)) * order
+    }
+    if (poolSortBy.value === 'consecutive') {
+      return (getConsecutiveDelta(a) - getConsecutiveDelta(b)) * order
+    }
+    return 0
+  })
+})
 
 const TREND_PAGE_SIZE = 15
 const trendPage = ref(1)

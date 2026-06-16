@@ -1730,10 +1730,23 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   padding: 0 var(--spacing-xs);
-  text-align: left;
+  text-align: center;
   color: var(--text-primary);
   font-weight: 600;
 }
+
+/* 可排序表头 */
+.sortable-header {
+  cursor: pointer;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  transition: color 0.15s;
+}
+.sortable-header:hover { color: var(--accent-primary); }
+.sortable-header .sort-arrow { font-size: 0.7rem; opacity: 0.4; }
+.sortable-header .sort-arrow.active { opacity: 1; color: var(--accent-primary); }
 
 .pool-stock-actions {
   display: flex;
