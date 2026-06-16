@@ -73,6 +73,15 @@ export function calculateScore(data) {
   return { score: normalized, label, details }
 }
 
+// 统一评级：标签 + 颜色（前后端共用同一份阈值）
+export function getRating(score) {
+  if (score >= 80) return { label: '强烈看涨', short: '看涨', color: 'var(--red)' }
+  if (score >= 70) return { label: '建议关注', short: '看涨', color: 'var(--red)' }
+  if (score >= 55) return { label: '中性观望', short: '观望', color: 'var(--orange)' }
+  if (score >= 40) return { label: '谨慎回调', short: '回调', color: 'var(--orange)' }
+  return { label: '强烈避险', short: '看跌', color: 'var(--green)' }
+}
+
 function getPlateRelation(data) {
   const outer = data.outerPlateRaw || 0
   const inner = data.innerPlateRaw || 0

@@ -36,7 +36,7 @@
           </div>
           <div class="recommend-stat-box">
             <span class="recommend-stat-label">AI 综合评分</span>
-            <span class="recommend-stat-value" :style="{ color: r.score >= 70 ? 'var(--accent-danger)' : r.score >= 50 ? 'var(--accent-warning)' : 'var(--accent-success)' }">{{ r.score }} 分</span>
+            <span class="recommend-stat-value" :style="{ color: r.score >= 70 ? 'var(--accent-danger)' : r.score >= 40 ? 'var(--accent-warning)' : 'var(--accent-success)' }">{{ r.score }} 分</span>
           </div>
         </div>
         <div v-if="r.buySellPoints || r.buyPoint" class="recommend-points-row">

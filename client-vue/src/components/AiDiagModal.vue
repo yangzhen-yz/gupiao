@@ -152,7 +152,7 @@ const scoreLabels = { volume: '成交量', capital: '主力资金', technique: '
 const analysisLabels = { volume: '成交量分析', capital: '主力资金分析', technique: '技术面分析', market: '大盘环境分析', fundamental: '基本面分析' }
 
 function getScoreColor(score) {
-  if (score >= 60) return '#dc2626'
+  if (score >= 70) return '#dc2626'
   if (score >= 40) return '#f59e0b'
   return '#16a34a'
 }

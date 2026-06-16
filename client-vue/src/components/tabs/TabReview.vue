@@ -7,9 +7,6 @@
         <div class="review-header">
           <span class="review-date">{{ review.date }}</span>
           <span v-if="currentPage === 1" class="tag-bull">最新</span>
-          <div class="review-tabs">
-            <button v-for="tab in reviewTabs" :key="tab.key" class="review-tab" :class="{ active: activeTab === tab.key }" @click="activeTab = tab.key">{{ tab.label }}</button>
-          </div>
         </div>
 
         <!-- 顶部摘要带：大盘情绪条 -->
@@ -18,21 +15,25 @@
             <span class="sentiment-label">大盘</span>
             <span class="sentiment-value" :class="getMarketSentiment(review) > 0 ? 'up' : 'down'">{{ getMarketSentiment(review) > 0 ? '普涨' : '普跌' }}</span>
           </div>
+          <div class="sentiment-divider"></div>
           <div class="sentiment-item">
             <span class="sentiment-label">涨停</span>
-            <span class="sentiment-value up">{{ getTotalLimitUp(review) }}</span>
+            <span class="sentiment-value" :class="getTotalLimitUp(review) > 0 ? 'up' : 'neutral'">{{ getTotalLimitUp(review) }}</span>
           </div>
           <div class="sentiment-item">
             <span class="sentiment-label">跌停</span>
-            <span class="sentiment-value down">{{ getTotalLimitDown(review) }}</span>
+            <span class="sentiment-value" :class="getTotalLimitDown(review) > 0 ? 'down' : 'neutral'">{{ getTotalLimitDown(review) }}</span>
           </div>
-          <div class="sentiment-item">
+          <div class="sentiment-divider"></div>
+          <div class="sentiment-item sentiment-item-wide">
             <span class="sentiment-label">行业领涨</span>
-            <span class="sentiment-value up">{{ getLeadIndustry(review) }}</span>
+            <span class="sentiment-value up" v-if="getLeadIndustry(review) && getLeadIndustry(review) !== '--'">{{ getLeadIndustry(review) }}</span>
+            <span class="sentiment-value neutral" v-else>—</span>
           </div>
-          <div class="sentiment-item">
+          <div class="sentiment-item sentiment-item-wide">
             <span class="sentiment-label">行业领跌</span>
-            <span class="sentiment-value down">{{ getLagIndustry(review) }}</span>
+            <span class="sentiment-value down" v-if="getLagIndustry(review) && getLagIndustry(review) !== '--'">{{ getLagIndustry(review) }}</span>
+            <span class="sentiment-value neutral" v-else>—</span>
           </div>
         </div>
 
@@ -60,8 +61,8 @@
           </div>
         </div>
 
-        <!-- 行业板块 Tab -->
-        <div v-if="activeTab === 'industry' && (getIndustryTop(review).length || getIndustryLag(review).length)" class="review-section">
+        <!-- 行业板块 -->
+        <div v-if="getIndustryTop(review).length || getIndustryLag(review).length" class="review-section">
           <div class="section-title-small">行业板块</div>
           <div class="industry-row">
             <div class="industry-col">
@@ -86,7 +87,7 @@
         </div>
 
         <!-- 概念板块 -->
-        <div v-if="activeTab === 'industry' && (review.conceptSectors || []).length" class="review-section">
+        <div v-if="(review.conceptSectors || []).length" class="review-section">
           <div class="section-title-small">概念板块（涨）</div>
           <div class="industry-row">
             <div class="industry-list" style="flex-direction:row;flex-wrap:wrap;gap:8px;">
@@ -98,8 +99,8 @@
           </div>
         </div>
 
-        <!-- 个股排行 Tab -->
-        <div v-if="activeTab === 'stocks' && ((review.topGainers || []).length || (review.topLosers || []).length)" class="review-section">
+        <!-- 个股涨幅榜 -->
+        <div v-if="(review.topGainers || []).length" class="review-section">
           <div class="section-title-small">个股涨幅榜</div>
           <div class="stock-rank-list">
             <div v-for="(s, i) in review.topGainers" :key="s.code" class="stock-rank-item up">
@@ -116,7 +117,8 @@
           </div>
         </div>
 
-        <div v-if="activeTab === 'stocks' && (review.topLosers || []).length" class="review-section">
+        <!-- 个股跌幅榜 -->
+        <div v-if="(review.topLosers || []).length" class="review-section">
           <div class="section-title-small">个股跌幅榜</div>
           <div class="stock-rank-list">
             <div v-for="(s, i) in review.topLosers" :key="s.code" class="stock-rank-item down">
@@ -133,8 +135,8 @@
           </div>
         </div>
 
-        <!-- 涨跌停明细 Tab -->
-        <div v-if="activeTab === 'limit' && ((review.limitUpStocks || []).length || (review.limitDownStocks || []).length)" class="review-section">
+        <!-- 涨跌停明细 -->
+        <div v-if="(review.limitUpStocks || []).length || (review.limitDownStocks || []).length" class="review-section">
           <div class="limit-row">
             <div class="limit-col">
               <div class="limit-col-label up">涨停股 ({{ (review.limitUpStocks || []).length }})</div>
@@ -154,7 +156,7 @@
         </div>
 
         <!-- 涨停/跌停 数值（从summary解析） -->
-        <div v-if="activeTab === 'limit' && parsedData(review).limitUpCount" class="review-section">
+        <div v-if="parsedData(review).limitUpCount" class="review-section">
           <div class="section-title-small">市场情绪指标</div>
           <div class="sentiment-grid">
             <div class="metric-card up">
@@ -180,8 +182,8 @@
           </div>
         </div>
 
-        <!-- 明日关注 Tab -->
-        <div v-if="activeTab === 'tomorrow' && (review.tomorrowFocus || parsedData(review).tomorrowFocus.length)" class="review-section">
+        <!-- 明日关注 -->
+        <div v-if="(review.tomorrowFocus && review.tomorrowFocus.length) || parsedData(review).tomorrowFocus.length" class="review-section">
           <div class="section-title-small">明日重点关注</div>
           <div class="stock-tags">
             <span v-for="s in (review.tomorrowFocus || []).map(x => x.name || x)" :key="s" class="stock-tag blue">{{ s }}</span>
@@ -194,10 +196,10 @@
         </div>
 
         <!-- 收评摘要 -->
-        <details class="summary-details" v-if="review.summary">
-          <summary>查看完整收评文本</summary>
-          <div class="review-summary" style="white-space:pre-line;line-height:1.8;font-size:0.85rem;margin-top:8px;padding:12px;background:var(--bg-tertiary);border-radius:var(--radius-md);">{{ review.summary }}</div>
-        </details>
+        <div v-if="review.summary" class="summary-section">
+          <div class="section-title-small">📝 收评摘要</div>
+          <div class="review-summary">{{ review.summary }}</div>
+        </div>
       </div>
       <div v-if="totalPages > 1" class="history-pagination">
         <button class="page-btn" :disabled="currentPage <= 1" @click="currentPage--">上一页</button>
@@ -215,22 +217,15 @@ import { apiFetch } from '../../utils/helpers'
 const reviews = ref([])
 const currentPage = ref(1)
 const PAGE_SIZE = 1
-const activeTab = ref('industry')
-const reviewTabs = [
-  { key: 'industry', label: '板块' },
-  { key: 'stocks', label: '个股' },
-  { key: 'limit', label: '涨跌停' },
-  { key: 'tomorrow', label: '明日关注' }
-]
+
 const totalPages = computed(() => Math.ceil(reviews.value.length / PAGE_SIZE))
 const pagedReviews = computed(() => {
   const start = (currentPage.value - 1) * PAGE_SIZE
   return reviews.value.slice(start, start + PAGE_SIZE)
 })
 
-// 缓存：避免重复请求东方财富
 const CACHE_KEY = 'review_enrich_cache'
-const CACHE_TTL = 10 * 60 * 1000 // 10分钟
+const CACHE_TTL = 10 * 60 * 1000
 
 function getCachedEnrichData() {
   try {
@@ -245,7 +240,6 @@ function setCachedEnrichData(data) {
   try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data })) } catch {}
 }
 
-// 前端从东方财富API补全数据
 async function fetchEnrichData() {
   const cached = getCachedEnrichData()
   if (cached) return cached
@@ -290,7 +284,6 @@ function applyEnrichData(review, data) {
   if (!review.topLosers || !review.topLosers.length) review.topLosers = data.topLosers
 }
 
-// 解析summary
 function parsedData(review) {
   const summary = review.summary || ''
   const result = { industryLead: null, industryLag: null, conceptLead: null, limitUpCount: 0, limitDownCount: 0, tomorrowFocus: [] }
@@ -370,7 +363,6 @@ async function loadDailyReviews() {
     if (result.success && result.data) {
       reviews.value = result.data
       currentPage.value = 1
-      // 异步补全数据，不阻塞渲染
       fetchEnrichData().then(data => {
         if (data) {
           reviews.value.slice(0, 3).forEach(r => applyEnrichData(r, data))
@@ -392,17 +384,16 @@ onMounted(() => {
 .review-header { display: flex; align-items: center; gap: var(--spacing-sm); margin-bottom: var(--spacing-md); flex-wrap: wrap; }
 .review-date { font-weight: 700; font-size: 1.1rem; color: var(--text-primary); font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .tag-bull { background: var(--accent-danger); color: white; padding: 2px 8px; border-radius: var(--radius-pill); font-size: 0.7rem; font-weight: 600; }
-.review-tabs { margin-left: auto; display: flex; gap: 4px; background: var(--bg-tertiary); border-radius: var(--radius-md); padding: 2px; }
-.review-tab { background: transparent; border: 0; padding: 4px 12px; border-radius: var(--radius-sm); font-size: 0.8rem; color: var(--text-secondary); cursor: pointer; transition: all 0.15s; }
-.review-tab.active { background: var(--bg-secondary); color: var(--text-primary); font-weight: 600; box-shadow: var(--shadow-xs); }
-.review-tab:hover { color: var(--text-primary); }
 
-.market-sentiment-bar { display: flex; flex-wrap: wrap; gap: var(--spacing-md); padding: var(--spacing-md); background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-canvas) 100%); border-radius: var(--radius-md); margin-bottom: var(--spacing-md); border: 1px solid var(--border-subtle); }
-.sentiment-item { display: flex; align-items: baseline; gap: 6px; }
-.sentiment-label { font-size: 0.75rem; color: var(--text-tertiary); }
-.sentiment-value { font-weight: 700; font-size: 0.95rem; font-family: 'SF Mono', monospace; }
+.market-sentiment-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--spacing-md); padding: var(--spacing-md) var(--spacing-lg); background: var(--bg-tertiary); border-radius: var(--radius-md); margin-bottom: var(--spacing-md); border: 1px solid var(--border-subtle); }
+.sentiment-item { display: flex; align-items: center; gap: 6px; }
+.sentiment-item-wide { min-width: 0; }
+.sentiment-divider { width: 1px; height: 16px; background: var(--border-medium); opacity: 0.6; }
+.sentiment-label { font-size: 0.75rem; color: var(--text-tertiary); font-weight: 500; }
+.sentiment-value { font-weight: 700; font-size: 0.95rem; font-family: 'SF Mono', 'JetBrains Mono', monospace; color: var(--text-primary); }
 .sentiment-value.up { color: var(--accent-danger); }
 .sentiment-value.down { color: var(--accent-success); }
+.sentiment-value.neutral { color: var(--text-tertiary); }
 
 .review-section { margin-bottom: var(--spacing-lg); }
 .section-title-small { font-size: 0.85rem; font-weight: 700; color: var(--text-secondary); margin-bottom: var(--spacing-sm); letter-spacing: 0.5px; text-transform: uppercase; }
@@ -483,4 +474,14 @@ onMounted(() => {
 .summary-details summary { cursor: pointer; font-size: 0.85rem; color: var(--text-secondary); padding: 6px 0; user-select: none; }
 .summary-details summary:hover { color: var(--text-primary); }
 .summary-details[open] summary { margin-bottom: var(--spacing-sm); }
+
+.summary-section { margin-top: var(--spacing-md); padding: var(--spacing-md); background: var(--bg-tertiary); border-radius: var(--radius-md); border: 1px solid var(--border-subtle); }
+.summary-section .section-title-small { margin-bottom: var(--spacing-sm); }
+.review-summary { white-space: pre-line; line-height: 1.8; font-size: 0.875rem; color: var(--text-primary); }
+
+.history-pagination { display: flex; justify-content: center; align-items: center; gap: var(--spacing-md); margin-top: var(--spacing-lg); }
+.page-btn { padding: 6px 16px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-secondary); color: var(--text-primary); font-size: 0.85rem; cursor: pointer; transition: all 0.15s; }
+.page-btn:hover:not(:disabled) { background: var(--bg-tertiary); border-color: var(--border-medium); }
+.page-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.page-info { font-size: 0.85rem; color: var(--text-secondary); font-family: 'SF Mono', monospace; }
 </style>

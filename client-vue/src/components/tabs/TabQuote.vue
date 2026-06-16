@@ -107,13 +107,20 @@
           <div class="collapsible-content">
             <div class="score-card" style="margin-bottom:0;border-left:none;">
               <div class="score-header">
-                <span class="score-title"></span>
-                <span class="score-badge" :style="{ background: scoreBarColor }">{{ scoreLabel }}</span>
+                <div class="score-main">
+                  <div class="score-big" :style="{ color: scoreBarColor }">{{ scoreResult.score }}</div>
+                  <div class="score-unit">
+                    <div class="score-unit-text">分</div>
+                    <div class="score-tag" :style="{ color: scoreBarColor, background: scoreBarColor + '1a', borderColor: scoreBarColor + '55' }">{{ scoreLabel }}</div>
+                  </div>
+                </div>
+                <div class="score-summary" :style="{ color: rating.color, background: rating.color + '1a', borderColor: rating.color + '55' }">{{ rating.label }}</div>
               </div>
               <div class="score-bar-track">
-                <div class="score-bar-fill" :style="{ width: scoreResult.score + '%', background: scoreBarColor }"></div>
+                <div class="score-bar-fill" :style="{ width: scoreResult.score + '%', background: scoreBarColor }">
+                  <span class="score-bar-text">{{ scoreResult.score }}%</span>
+                </div>
               </div>
-              <div class="score-value">{{ scoreResult.score }}分 · {{ scoreResult.label }}</div>
               <div class="score-details">
                 <div v-for="d in scoreResult.details" :key="d.label" class="score-detail-item">
                   <span>{{ d.label }}</span>
@@ -189,7 +196,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay, getTradingStatusText, formatNowTime, formatNumber } from '../../utils/helpers'
-import { calculateScore, getEnhancedAnalysis } from '../../utils/score'
+import { calculateScore, getEnhancedAnalysis, getRating } from '../../utils/score'
 import { useStockData } from '../../composables/useStockData'
 
 const emit = defineEmits(['open-kline', 'open-ai-diag'])
@@ -212,8 +219,9 @@ const isInHot = computed(() => {
 })
 
 const scoreResult = computed(() => quoteData.value ? calculateScore(quoteData.value) : { score: 0, label: '', details: [] })
-const scoreBarColor = computed(() => scoreResult.value.score >= 60 ? 'var(--red)' : scoreResult.value.score >= 40 ? 'var(--orange)' : 'var(--green)')
-const scoreLabel = computed(() => scoreResult.value.score >= 60 ? '看涨' : scoreResult.value.score >= 40 ? '观望' : '看跌')
+const rating = computed(() => getRating(scoreResult.value.score))
+const scoreBarColor = computed(() => rating.value.color)
+const scoreLabel = computed(() => rating.value.short)
 const analysis = computed(() => quoteData.value ? getEnhancedAnalysis(quoteData.value) : null)
 const tradingStatusText = computed(() => getTradingStatusText())
 
@@ -414,6 +422,15 @@ async function checkMarketPredict() {
 
 onMounted(async () => {
   await Promise.all([loadStockMap(), loadQuickStocks(), loadScanPool()])
+  // 默认加载热门股票快捷查询中的第一只股票
+  if (quickStocks.value && quickStocks.value.length > 0) {
+    const first = quickStocks.value[0]
+    const sym = first.code || first.symbol
+    if (sym) {
+      currentSymbol.value = sym
+      stockInput.value = sym
+    }
+  }
   fetchStockQuote(currentSymbol.value)
   scheduleRefresh()
   checkMarketPredict()

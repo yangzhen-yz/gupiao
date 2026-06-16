@@ -153,7 +153,7 @@
           <div v-for="r in pagedPredictions" :key="r.id" class="stock-table-row">
             <span style="font-size:0.75rem;color:var(--text-secondary);font-weight:500;">{{ r.predict_date ? r.predict_date.slice(5) : '' }}</span>
             <span class="name">{{ r.name }}<br><small style="color:var(--text-tertiary);">{{ (r.symbol || '').toUpperCase() }}</small></span>
-            <span :style="{ fontWeight: 600, color: r.score >= 60 ? 'var(--accent-danger)' : r.score >= 40 ? 'var(--accent-warning)' : 'var(--accent-success)' }">{{ r.score }}</span>
+            <span :style="{ fontWeight: 600, color: r.score >= 70 ? 'var(--accent-danger)' : r.score >= 40 ? 'var(--accent-warning)' : 'var(--accent-success)' }">{{ r.score }}</span>
             <span :style="{ color: parseFloat(r.change_percent) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">{{ parseFloat(r.change_percent) >= 0 ? '+' : '' }}{{ parseFloat(r.change_percent).toFixed(2) }}%</span>
             <span>{{ parseFloat(r.outer_ratio).toFixed(1) }}%</span>
             <span>{{ parseFloat(r.volume_ratio).toFixed(2) }}</span>
