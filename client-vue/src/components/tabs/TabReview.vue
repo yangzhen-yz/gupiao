@@ -190,72 +190,79 @@
             <div v-if="(review.conceptSectors || []).length" class="mini-section">
               <div class="mini-label purple">热门概念（涨）</div>
               <div class="mini-pill-list">
-                <div v-for="(s, i) in review.conceptSectors.slice(0, 6)" :key="s.code" class="mini-pill purple" @click="openSectorModal(s)">
+                <div v-for="(s, i) in review.conceptSectors.slice(0, 5)" :key="s.code" class="mini-pill purple" @click="openSectorModal(s)">
                   <span class="mini-pill-rank">{{ i + 1 }}</span>
                   <span class="mini-pill-name">{{ s.name }}</span>
                   <span class="mini-pill-change">+{{ s.changePercent?.toFixed(2) }}%</span>
                 </div>
               </div>
             </div>
+            <div v-if="!getIndustryTop(review).length && !getIndustryLag(review).length && !(review.conceptSectors || []).length" class="empty-tip">暂无板块数据</div>
           </div>
 
-          <!-- 右：个股热度 -->
+          <!-- 右：个股热度（仅显示热度前5） -->
           <div class="dual-col">
             <div class="section-title-row">
               <div class="section-title-small">🔥 个股热度</div>
               <div class="tab-switch">
                 <button :class="['tab-btn', stockTab === 'gainer' ? 'active' : '']" @click="stockTab = 'gainer'">涨幅榜</button>
                 <button :class="['tab-btn', stockTab === 'loser' ? 'active' : '']" @click="stockTab = 'loser'">跌幅榜</button>
-                <button :class="['tab-btn', stockTab === 'limit' ? 'active' : '']" @click="stockTab = 'limit'">涨跌停</button>
+                <button :class="['tab-btn', stockTab === 'funds' ? 'active' : '']" @click="stockTab = 'funds'">主力资金</button>
               </div>
             </div>
 
-            <div v-if="stockTab === 'gainer' && (review.topGainers || []).length" class="stock-list">
-              <div v-for="(s, i) in review.topGainers.slice(0, 8)" :key="s.code" class="stock-row up" @click="openStockKline(s)">
-                <span class="stock-rank">{{ i + 1 }}</span>
-                <div class="stock-info">
-                  <div class="stock-name">{{ s.name }}</div>
-                  <div class="stock-code">{{ s.code }}</div>
+            <div v-if="stockTab === 'gainer'" class="stock-list">
+              <template v-if="getTop5Gainers(review).length">
+                <div v-for="(s, i) in getTop5Gainers(review)" :key="s.code" class="stock-row up" @click="openStockKline(s)">
+                  <span class="stock-rank">{{ i + 1 }}</span>
+                  <div class="stock-info">
+                    <div class="stock-name">{{ s.name }}</div>
+                    <div class="stock-code">{{ s.code }}</div>
+                  </div>
+                  <div class="stock-data">
+                    <div class="stock-change">+{{ s.changePercent?.toFixed(2) }}%</div>
+                    <div class="stock-meta" v-if="s.turnoverRate">换手 {{ s.turnoverRate?.toFixed(2) }}%</div>
+                  </div>
+                  <span class="stock-arrow">›</span>
                 </div>
-                <div class="stock-data">
-                  <div class="stock-change">+{{ s.changePercent?.toFixed(2) }}%</div>
-                  <div class="stock-meta" v-if="s.turnoverRate">换手 {{ s.turnoverRate?.toFixed(2) }}%</div>
-                </div>
-                <span class="stock-arrow">›</span>
-              </div>
+              </template>
+              <div v-else class="empty-tip">暂无数据</div>
             </div>
 
-            <div v-else-if="stockTab === 'loser' && (review.topLosers || []).length" class="stock-list">
-              <div v-for="(s, i) in review.topLosers.slice(0, 8)" :key="s.code" class="stock-row down" @click="openStockKline(s)">
-                <span class="stock-rank">{{ i + 1 }}</span>
-                <div class="stock-info">
-                  <div class="stock-name">{{ s.name }}</div>
-                  <div class="stock-code">{{ s.code }}</div>
+            <div v-else-if="stockTab === 'loser'" class="stock-list">
+              <template v-if="getTop5Losers(review).length">
+                <div v-for="(s, i) in getTop5Losers(review)" :key="s.code" class="stock-row down" @click="openStockKline(s)">
+                  <span class="stock-rank">{{ i + 1 }}</span>
+                  <div class="stock-info">
+                    <div class="stock-name">{{ s.name }}</div>
+                    <div class="stock-code">{{ s.code }}</div>
+                  </div>
+                  <div class="stock-data">
+                    <div class="stock-change">{{ s.changePercent?.toFixed(2) }}%</div>
+                    <div class="stock-meta" v-if="s.turnoverRate">换手 {{ s.turnoverRate?.toFixed(2) }}%</div>
+                  </div>
+                  <span class="stock-arrow">›</span>
                 </div>
-                <div class="stock-data">
-                  <div class="stock-change">{{ s.changePercent?.toFixed(2) }}%</div>
-                  <div class="stock-meta" v-if="s.turnoverRate">换手 {{ s.turnoverRate?.toFixed(2) }}%</div>
-                </div>
-                <span class="stock-arrow">›</span>
-              </div>
+              </template>
+              <div v-else class="empty-tip">暂无数据</div>
             </div>
 
-            <div v-else-if="stockTab === 'limit'" class="limit-section">
-              <div v-if="(review.limitUpStocks || []).length" class="mini-section">
-                <div class="mini-label up">涨停 ({{ (review.limitUpStocks || []).length }})</div>
-                <div class="stock-tags">
-                  <span v-for="s in review.limitUpStocks.slice(0, 12)" :key="s.code" class="stock-tag up" @click="openStockKline(s)">{{ s.name }}</span>
-                  <span v-if="(review.limitUpStocks || []).length > 12" class="more-tag">+{{ review.limitUpStocks.length - 12 }}</span>
+            <div v-else-if="stockTab === 'funds'" class="stock-list">
+              <template v-if="getTop5Funds(review).length">
+                <div v-for="(s, i) in getTop5Funds(review)" :key="s.code" class="stock-row up" @click="openStockKline(s)">
+                  <span class="stock-rank">{{ i + 1 }}</span>
+                  <div class="stock-info">
+                    <div class="stock-name">{{ s.name }}</div>
+                    <div class="stock-code">{{ s.code }}</div>
+                  </div>
+                  <div class="stock-data">
+                    <div class="stock-change" :class="(s.changePercent || 0) >= 0 ? '' : 'down-c'">{{ (s.changePercent || 0) >= 0 ? '+' : '' }}{{ (s.changePercent || 0).toFixed(2) }}%</div>
+                    <div class="stock-meta" v-if="s.mainNetInflow">净流入 {{ formatInflow(s.mainNetInflow) }}</div>
+                  </div>
+                  <span class="stock-arrow">›</span>
                 </div>
-              </div>
-              <div v-if="(review.limitDownStocks || []).length" class="mini-section">
-                <div class="mini-label down">跌停 ({{ (review.limitDownStocks || []).length }})</div>
-                <div class="stock-tags">
-                  <span v-for="s in review.limitDownStocks.slice(0, 12)" :key="s.code" class="stock-tag down" @click="openStockKline(s)">{{ s.name }}</span>
-                  <span v-if="(review.limitDownStocks || []).length > 12" class="more-tag">+{{ review.limitDownStocks.length - 12 }}</span>
-                </div>
-              </div>
-              <div v-if="!(review.limitUpStocks || []).length && !(review.limitDownStocks || []).length" class="empty-tip">无涨跌停数据</div>
+              </template>
+              <div v-else class="empty-tip">暂无主力资金数据</div>
             </div>
 
             <div v-else class="empty-tip">暂无数据</div>
@@ -327,7 +334,7 @@
                   {{ s.changePercent >= 0 ? '+' : '' }}{{ s.changePercent?.toFixed(2) }}%
                 </div>
                 <div class="stock-meta" v-if="s.mainNetInflow != null">
-                  {{ s.mainNetInflow > 0 ? '净流入' : '净流出' }} {{ Math.abs(s.mainNetInflow).toFixed(0) }}万
+                  {{ s.mainNetInflow > 0 ? '净流入' : '净流出' }} {{ formatInflow(Math.abs(s.mainNetInflow)) }}
                 </div>
               </div>
               <span class="stock-arrow">›</span>
@@ -432,12 +439,30 @@ function getLimitRatioSimple(review) {
   return `${u}:${d}`
 }
 function getIndustryTop(review) {
-  if (review.industrySectors && review.industrySectors.length) return review.industrySectors.slice(0, 6)
+  if (review.industrySectors && review.industrySectors.length) return review.industrySectors.slice(0, 5)
   return []
 }
 function getIndustryLag(review) {
-  if (review.industrySectorsLag && review.industrySectorsLag.length) return review.industrySectorsLag.slice(0, 6)
+  if (review.industrySectorsLag && review.industrySectorsLag.length) return review.industrySectorsLag.slice(0, 5)
   return []
+}
+// 个股热度：优先用后端收评里的数据，取前5（涨幅榜/跌幅榜 > 涨停股降级补充）
+function getTop5Gainers(review) {
+  const src = review.topGainers && review.topGainers.length ? review.topGainers : (review.limitUpStocks || [])
+  return src.slice(0, 5)
+}
+function getTop5Losers(review) {
+  const src = review.topLosers && review.topLosers.length ? review.topLosers : (review.limitDownStocks || [])
+  return src.slice(0, 5)
+}
+// 主力资金：全市场按主力净流入排序前5（后端 review.topFunds 按 f62 全市场排序取前20，直接 slice(0,5)）
+function getTop5Funds(review) {
+  return (review.topFunds || []).slice(0, 5)
+}
+function formatInflow(n) {
+  if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + '亿'
+  if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(0) + '万'
+  return n.toFixed(0)
 }
 function getProfitEffect(review) {
   const top = review.industrySectors?.[0]?.changePercent || 0
@@ -522,11 +547,10 @@ function closeSectorModal() {
   sectorModal.show = false
 }
 function openLimitList(review, kind) {
-  // 切换到涨跌停 tab
-  stockTab.value = 'limit'
-  // 平滑滚动到该区块
+  // 涨跌停数据已整合在涨幅榜/跌幅榜中，点击跳转到对应 tab
+  stockTab.value = kind === 'up' ? 'gainer' : 'loser'
   setTimeout(() => {
-    const el = document.querySelector('.limit-section')
+    const el = document.querySelector('.stock-list')
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, 50)
 }
@@ -537,11 +561,26 @@ async function loadDailyReviews() {
     if (result.success && result.data) {
       reviews.value = result.data
       currentPage.value = 1
+      // 尝试用实时数据补全（若后端数据缺失），但不阻塞渲染
       fetchEnrichData().then(data => {
         if (data) {
           reviews.value.slice(0, 3).forEach(r => applyEnrichData(r, data))
         }
-      })
+      }).catch(() => {/* 实时补充失败时静默忽略 */})
+      // 若 topGainers 为空，用热搜榜数据做降级
+      const latest = reviews.value[0]
+      if (latest && !(latest.topGainers?.length)) {
+        apiFetch('/api/hot_search_ranking').then(hsr => {
+          if (hsr.success && hsr.data?.stocks?.length) {
+            const stocks = hsr.data.stocks
+            // 按 hotRank 排序，涨幅>0为涨幅榜，<0为跌幅榜
+            reviews.value.forEach(r => {
+              if (!r.topGainers?.length) r.topGainers = stocks.filter(s => (s.changePercent || 0) > 0).sort((a, b) => (b.changePercent || 0) - (a.changePercent || 0)).slice(0, 5).map(s => ({ name: s.name, code: s.code, changePercent: s.changePercent, turnoverRate: 0 }))
+              if (!r.topLosers?.length) r.topLosers = stocks.filter(s => (s.changePercent || 0) < 0).sort((a, b) => (a.changePercent || 0) - (b.changePercent || 0)).slice(0, 5).map(s => ({ name: s.name, code: s.code, changePercent: s.changePercent, turnoverRate: 0 }))
+            })
+          }
+        }).catch(() => {})
+      }
     }
   } catch (e) { console.error('加载收评失败:', e) }
 }
@@ -691,7 +730,7 @@ onMounted(() => {
 .stock-data { text-align: right; }
 .stock-change { font-size: 0.85rem; font-weight: 700; font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .stock-change.up, .stock-row.up .stock-change { color: var(--accent-danger); }
-.stock-change.down, .stock-row.down .stock-change { color: var(--accent-success); }
+.stock-change.down, .stock-row.down .stock-change, .stock-change.down-c { color: var(--accent-success); }
 .stock-meta { font-size: 0.65rem; color: var(--text-secondary); }
 .stock-arrow { color: var(--text-secondary); font-size: 1.2rem; }
 

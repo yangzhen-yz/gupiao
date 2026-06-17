@@ -64,7 +64,7 @@
                   <span class="trend-metric-label">风险回撤</span>
                   <span class="trend-metric-value" :class="(stock.details.sD4 || 0) >= 15 ? 'metric-on' : (stock.details.sD4 || 0) >= 10 ? 'metric-warn' : 'metric-off'">
                     <span class="metric-icon">{{ stock.details.sD4 || 0 }}分</span>
-                    <span class="metric-sub">{{ stock.details.maxDrawdown20d || 0 }}%</span>
+                    <span class="metric-sub">{{ stock.details.currentDrawdown || 0 }}%</span>
                   </span>
                 </div>
                 <div class="trend-metric-item" v-if="stock.details.consecutiveUpDays" :title="metricTip('consecutive')">
@@ -246,10 +246,10 @@ function toggleExpand(symbol) {
 
 // 指标说明（hover 提示）
 const METRIC_TIPS = {
-  d1: '维度1：短期均线趋势（满分30分）。30=近10日全在MA20上+MA20连续抬升；20=近7日仅1日短暂跌破次日收回；10=现价站稳MA20；0=跌破未收回。',
+  d1: '维度1：短期均线趋势（满分30分=趋势方向20+乖离惩罚0~-10）。趋势：20=近10日全在MA20上+MA20连升；15=近7日仅1日跌破次日收回；8=现价站稳MA20。乖离惩罚：偏离MA20≥15%扣10分；≥10%扣6分；≥5%扣3分。',
   d2: '维度2：短期资金异动（满分30分）。涨停次数与连阳数分别计分取高者：≥3板/2连板/≥6阳=30分；2板/4~5阳=20分；1板/3阳=10分。',
-  d3: '维度3：量能配合（满分20分）。20日均量/60日均量≥1.5=20分；≥1.3=15分；≥1.0=8分；缩量=0分。20分档需价涨量增。',
-  d4: '维度4：风险回撤（满分20分）。近20日最大回撤<8%=20分；8~12%=15分；12~15%=10分；15~20%=5分；≥20%=0分。',
+  d3: '维度3：量能配合（满分20分=量比10+量能趋势5+量能稳定性5）。量比：20日/60日均量≥1.5→10分；趋势：量能斜率陡升→5分；稳定性：CV≤0.3→5分（越小越健康）。',
+  d4: '维度4：风险回撤（满分20分）。当前距近10日高点回撤<8%=20分；8~12%=15分；12~15%=10分；15~20%=5分；≥20%=0分。已创新高者回撤≈0得满分。',
   position: '年度分位：现价在近250日收盘价中的百分位。≥80%视为高位（扣-20分），60~80%中高位（扣-10分）。',
   consecutive: '从最新一天往回数连续阳线天数，与评分无关，仅作展示。',
 }

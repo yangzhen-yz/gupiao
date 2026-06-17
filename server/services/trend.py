@@ -7,16 +7,22 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS,
     SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS,
     STRATEGY_PREDICT_BULL_MIN_SCORE, SCAN_KLINE_TIMEOUT,
-    TREND_D1_FULL_SCORE, TREND_D1_PARTIAL_SCORE, TREND_D1_BARE_SCORE,
+    TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE,
+    TREND_D1_DIVERGENCE_PENALTY_TIERS,
     TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS,
-    TREND_D3_VOLUME_TIERS,
+    TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS,
     TREND_D4_DRAWDOWN_TIERS,
     TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID,
     TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL,
     TREND_DEDUCT_VOLUME_SPIKE, TREND_DEDUCT_VOLUME_DIVERGENCE,
     TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH,
     TREND_DEDUCT_AMPLITUDE_FLAT, TREND_DEDUCT_NON_MAIN_BOARD,
+    TREND_DEDUCT_GROUPS,
+    TREND_POSITION_BREAKTHROUGH_GAIN,
+    TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS,
     TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG,
+    TREND_BONUS_POCKET_PIVOT,
+    TREND_SECTOR_MOMENTUM_WEIGHT, TREND_SECTOR_HOT_RANK_MIN,
     TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN)
 from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info
@@ -43,19 +49,18 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 market_cap: Optional[float] = None,
                 is_mainboard: bool = True) -> Dict:
     """
-    中短线波段趋势判断 V3.0（对标 项目说明.md §2.1-2.5）
+    中短线波段趋势判断 V4.0
 
-    评分结构：基础分(100分) - 扣分项 + 加分项 = 最终总分
-    维度 1 短期均线趋势    30 分（多档：30/20/10/0）
-    维度 2 短期资金异动    30 分（多档：涨停次数/连阳数取高分）
-    维度 3 量能配合        20 分（多档：20/15/8/0）
-    维度 4 风险回撤        20 分（5 档：20/15/10/5/0）
+    评分结构：基础分(100分) - 扣分项(含互斥衰减) + 加分项 + 板块动量修正 = 最终总分
 
-    扣分项（12 项，可叠加）：高位追高/双空头/破位/跌停/缩量/放量滞涨/量价背离等
-    加分项（3 项）：多头排列/倍量突破/连续阳线
+    维度 1 短期均线趋势    30 分（趋势方向20 + 乖离惩罚0~-10）
+    维度 2 短期资金异动    30 分（涨停次数/连阳数取高分）
+    维度 3 量能配合        20 分（量比10 + 量能趋势斜率5 + 量能稳定性5）
+    维度 4 风险回撤        20 分（当前距10日高点回撤，5档）
 
-    :param market_cap: 总市值（亿元），用于小微盘排除
-    :param is_mainboard: 是否沪深主板（False = 创业板/科创板扣 -5）
+    扣分项（12项，分3组互斥/衰减）：高位追高/双空头/破位/跌停(可豁免)/缩量/放量滞涨/量价背离等
+    加分项（5项）：多头排列/倍量突破/连续阳线/口袋支点/低位蓄力
+    板块动量修正：叠加 ±20%（占位接口，当前 0）
     """
     # ========== 数据完整性检查 ==========
     if not kline_data or len(kline_data) < TREND_MIN_KLINE_DAYS:
@@ -134,12 +139,9 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         lower = sum(1 for c in win_all if c <= check_price)
         position_pct = lower / len(win_all) * 100
 
-    # ========== 维度 1：短期均线趋势（30 分，多档制） ==========
-    # 30分: 近10日收盘价全部在MA20上方 + 近5日MA20连续抬升
-    # 20分: 近7日仅1日短暂跌破MA20（次日收回）+ MA20走平或向上
-    # 10分: 近3日反复穿插MA20但现价站稳MA20
-    # 0分:  跌破MA20且近3日无法收回
-    s_d1 = 0
+    # ========== 维度 1：短期均线趋势（满分 30 分 = 趋势方向 20 + 乖离惩罚 0~-10） ==========
+    # 趋势方向分：近10日 vs MA20 的位置关系 + MA20 斜率
+    s_d1_trend = 0
     if ma20_val:
         above_count_10 = sum(1 for i in range(max(0, latest_idx - 9), latest_idx + 1) if closes[i] > ma20[i]) if latest_idx >= 0 else 0
         ma20_rising_5d = True
@@ -151,9 +153,8 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         else:
             ma20_rising_5d = False
         if above_count_10 >= 10 and ma20_rising_5d:
-            s_d1 = 30
+            s_d1_trend = TREND_D1_TREND_FULL  # 20
         else:
-            # 近7日仅1日跌破且次日收回 + MA20走平或向上
             brief_break_count = 0
             brief_break_recovered = True
             for i in range(max(0, latest_idx - 6), latest_idx + 1):
@@ -166,9 +167,19 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 if ma20[latest_idx] < ma20[latest_idx - 2]:
                     ma20_flat_or_up = False
             if brief_break_count <= 1 and brief_break_recovered and ma20_flat_or_up:
-                s_d1 = 20
+                s_d1_trend = TREND_D1_TREND_PARTIAL  # 15
             elif check_price > ma20_val:
-                s_d1 = 10
+                s_d1_trend = TREND_D1_TREND_BARE  # 8
+
+    # 乖离率惩罚：当前价偏离MA20过远 → 追高风险
+    d1_divergence_penalty = 0
+    if ma20_val and ma20_val > 0:
+        divergence = abs(check_price - ma20_val) / ma20_val * 100
+        for thr, penalty in TREND_D1_DIVERGENCE_PENALTY_TIERS:
+            if divergence >= thr:
+                d1_divergence_penalty = penalty
+                break
+    s_d1 = max(0, s_d1_trend + d1_divergence_penalty)
 
     # ========== 维度 2：短期资金异动（30 分，涨停分+连阳分取高） ==========
     # ③ 近 20 日涨停次数
@@ -197,36 +208,70 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 break
     s_d2 = max(s_limit_up, s_yang)
 
-    # ========== 维度 3：量能配合（20 分，多档制） ==========
+    # ========== 维度 3：量能配合（满分 20 分 = 量比 10 + 量能趋势 5 + 稳定性 5） ==========
     win60_start_idx = max(0, n - 60)
     avg_vol_20 = sum(vols[max(0, n - 20):]) / min(20, n) if n > 0 else 0
     avg_vol_60 = sum(vols[win60_start_idx:]) / max(1, n - win60_start_idx) if n - win60_start_idx > 0 else 0
     vol_ratio = avg_vol_20 / avg_vol_60 if avg_vol_60 > 0 else 0
-    # 检查"价涨量增"：近5日收盘价整体上涨
+
+    # 子维度 1：量比得分（0~10）
+    s_d3_ratio = 0
+    for ratio, sc in TREND_D3_RATIO_TIERS:
+        if vol_ratio >= ratio:
+            s_d3_ratio = sc
+            break
+
+    # 子维度 2：量能趋势斜率（0~5）— 近20日5日滚动均量的线性回归斜率
+    s_d3_slope = 0
+    if n >= 25:
+        rolling_avgs = []
+        for i in range(max(0, n - 20), n):
+            start_i = max(0, i - 4)
+            window_vols = vols[start_i:i + 1]
+            rolling_avgs.append(sum(window_vols) / len(window_vols))
+        if len(rolling_avgs) >= 5 and sum(rolling_avgs) > 0:
+            mean_vol = sum(rolling_avgs) / len(rolling_avgs)
+            x_mean = (len(rolling_avgs) - 1) / 2
+            num = sum((i - x_mean) * (rolling_avgs[i] - mean_vol) for i in range(len(rolling_avgs)))
+            den = sum((i - x_mean) ** 2 for i in range(len(rolling_avgs)))
+            if den > 0:
+                raw_slope = num / den
+                norm_slope = raw_slope / mean_vol if mean_vol > 0 else 0  # 归一化斜率
+                for thr, sc in TREND_D3_SLOPE_TIERS:
+                    if norm_slope >= thr:
+                        s_d3_slope = sc
+                        break
+
+    # 子维度 3：量能稳定性（0~5）— 近20日 CV 越小越健康
+    s_d3_stability = 0
+    recent_vols = vols[max(0, n - 20):]
+    if len(recent_vols) >= 5:
+        mean_v = sum(recent_vols) / len(recent_vols)
+        if mean_v > 0:
+            std_v = (sum((v - mean_v) ** 2 for v in recent_vols) / len(recent_vols)) ** 0.5
+            cv = std_v / mean_v
+            for thr, sc in TREND_D3_STABILITY_TIERS:
+                if cv <= thr:
+                    s_d3_stability = sc
+                    break
+
+    # 检查"价涨量增"：近5日收盘价整体上涨（量比满分但价不涨降一档）
     price_rising = False
     if latest_idx >= 4:
         price_rising = closes[latest_idx] > closes[latest_idx - 4]
-    s_d3 = 0
-    for ratio, sc in TREND_D3_VOLUME_TIERS:
-        if vol_ratio >= ratio:
-            s_d3 = sc
-            break
-    # 20 分档位额外需要"价涨量增"
-    if s_d3 == 20 and not price_rising:
-        s_d3 = 15  # 量够但价不涨，降一档
+    if s_d3_ratio >= 10 and not price_rising:
+        s_d3_ratio = 8  # 量够但价不涨，降一档
+
+    s_d3 = s_d3_ratio + s_d3_slope + s_d3_stability
 
     # ========== 维度 4：风险回撤（20 分，5 档） ==========
-    peak = closes[win20_start_idx] if win20_start_idx < n else closes[0]
-    max_dd_20 = 0.0
-    for i in range(win20_start_idx, n):
-        if closes[i] > peak:
-            peak = closes[i]
-        dd = (peak - closes[i]) / peak * 100 if peak > 0 else 0
-        if dd > max_dd_20:
-            max_dd_20 = dd
+    # 使用"当前距近10日高点回撤"替代"20日历史最大回撤"
+    # V型反转/已创新高的股票当前回撤≈0得满分，避免被历史回撤误伤
+    recent_peak_10d = max(closes[max(0, latest_idx - 9):latest_idx + 1])
+    current_dd = (recent_peak_10d - check_price) / recent_peak_10d * 100 if recent_peak_10d > 0 else 0
     s_d4 = 0
     for thr, sc in TREND_D4_DRAWDOWN_TIERS:
-        if max_dd_20 < thr:
+        if current_dd < thr:
             s_d4 = sc
             break
 
@@ -237,9 +282,12 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     deducts = []
 
     # (1) 现价位于250日分位 ≥ 80%（年度高位）
+    # 豁免：近20日涨幅≥20%视为"新高突破"，强势信号不扣分
     if position_pct is not None and position_pct >= 80:
-        base_score -= TREND_DEDUCT_POSITION_HIGH
-        deducts.append(('年度高位(分位{:d}%)'.format(int(position_pct)), TREND_DEDUCT_POSITION_HIGH))
+        gain_20d = (check_price - closes[win20_start_idx]) / closes[win20_start_idx] * 100 if win20_start_idx < n and closes[win20_start_idx] > 0 else 0
+        if gain_20d < TREND_POSITION_BREAKTHROUGH_GAIN:
+            base_score -= TREND_DEDUCT_POSITION_HIGH
+            deducts.append(('年度高位(分位{:d}%)'.format(int(position_pct)), TREND_DEDUCT_POSITION_HIGH))
 
     # (2) MA60 与 MA120 同步向下（中长期双空头）
     ma60_down = _ma_slope_down(ma60, latest_idx, window=5)
@@ -260,8 +308,15 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         base_score -= TREND_DEDUCT_MA20_BROKEN
         deducts.append(('近5日跌破MA20未收回', TREND_DEDUCT_MA20_BROKEN))
 
-    # (4) 近 20 日出现单日跌停
-    if _check_limit_down_in_window(opens, closes, win20_start_idx, n):
+    # (4) 近 20 日出现单日跌停（豁免：近3日≥2次涨停 → 洗盘/利空出尽后的强势修复）
+    recent_boards = 0
+    for i in range(max(0, latest_idx - 2), latest_idx + 1):
+        if i > 0:
+            prev_c = closes[i - 1]
+            change_pct = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
+            if change_pct >= TREND_LIMIT_UP_THRESHOLD:
+                recent_boards += 1
+    if recent_boards < 2 and _check_limit_down_in_window(opens, closes, win20_start_idx, n):
         base_score -= TREND_DEDUCT_LIMIT_DOWN
         deducts.append(('近20日单日跌停', TREND_DEDUCT_LIMIT_DOWN))
 
@@ -270,7 +325,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         base_score -= TREND_DEDUCT_SHRINK_VOL
         deducts.append(('近5日缩量阴跌', TREND_DEDUCT_SHRINK_VOL))
 
-    # (6) 放量滞涨（单日成交量创20日新高 + 涨幅<1%或收跌）
+    # (6) 放量滞涨（单日成交量创20日新高 + 股价无力上涨 -1%~1%，排除大跌恐慌盘和涨停进攻）
     if _check_volume_spike(vols, closes, win20_start_idx, n):
         base_score -= TREND_DEDUCT_VOLUME_SPIKE
         deducts.append(('放量滞涨', TREND_DEDUCT_VOLUME_SPIKE))
@@ -290,17 +345,14 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         base_score -= TREND_DEDUCT_SINGLE_DAY_CRASH
         deducts.append(('单日大跌未修复', TREND_DEDUCT_SINGLE_DAY_CRASH))
 
-    # (10) 近20日振幅<5%（完全横盘，从强制排除改为扣分）
-    if amplitude_20d < TREND_RANGE_20D_FLAT_MIN:
-        base_score -= TREND_DEDUCT_AMPLITUDE_FLAT
-        deducts.append(('横盘(<5%)', TREND_DEDUCT_AMPLITUDE_FLAT))
+    # (10) 近20日振幅<5% — 稍后结合位置判断（移到加分后处理）
 
     # (11) 非主板（创业板/科创板）— 不强制排除，扣分
     if not is_mainboard:
         base_score -= TREND_DEDUCT_NON_MAIN_BOARD
         deducts.append(('非主板', TREND_DEDUCT_NON_MAIN_BOARD))
 
-    # ========== 加分项（3 项，额外奖励） ==========
+    # ========== 加分项（4 项 + 横盘位置判断，额外奖励） ==========
     bonus_score = 0
     bonuses = []
 
@@ -319,8 +371,42 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         bonus_score += TREND_BONUS_CONSECUTIVE_YANG
         bonuses.append(('连续阳线(≥1%/日)', TREND_BONUS_CONSECUTIVE_YANG))
 
-    # 总分（下界 0）
-    total_score = max(0, base_score + bonus_score)
+    # ④ 口袋支点：倍量 + 收于当日高点附近(>80%) + 收盘价>前日高点
+    if _check_pocket_pivot(opens, closes, highs, vols, avg_vol_20, latest_idx):
+        bonus_score += TREND_BONUS_POCKET_PIVOT
+        bonuses.append(('口袋支点', TREND_BONUS_POCKET_PIVOT))
+
+    # ⑤ 横盘位置判断（移到此处，bonus_score 已定义）
+    if amplitude_20d < TREND_RANGE_20D_FLAT_MIN:
+        if position_pct is not None and position_pct < TREND_SIDEWAYS_LOW_PCT:
+            bonus_score += TREND_SIDEWAYS_BONUS
+            bonuses.append(('低位蓄力(横盘)', TREND_SIDEWAYS_BONUS))
+        elif position_pct is not None and position_pct < TREND_SIDEWAYS_MID_PCT:
+            base_score -= TREND_DEDUCT_AMPLITUDE_FLAT // 2
+            deducts.append(('中位横盘(<5%)', TREND_DEDUCT_AMPLITUDE_FLAT // 2))
+        else:
+            base_score -= TREND_DEDUCT_AMPLITUDE_FLAT
+            deducts.append(('高位横盘(<5%)', TREND_DEDUCT_AMPLITUDE_FLAT))
+
+    # ========== 扣分项互斥/衰减（同类风险只取扣分最大的一项） ==========
+    deduct_names = {d[0]: d[1] for d in deducts}
+    for group_name, keys in TREND_DEDUCT_GROUPS.items():
+        triggered = [(k, deduct_names.get(k, 0)) for k in keys if k in deduct_names]
+        if len(triggered) >= 2:
+            # 取扣分最大的保留，其余退还
+            triggered.sort(key=lambda x: x[1], reverse=True)
+            for k, pts in triggered[1:]:
+                base_score += pts  # 退还扣分
+                deducts = [d for d in deducts if d[0] != k]  # 移除非最大扣分项
+
+    # ========== 板块动量因子（环境加成/折价 ±20%） ==========
+    sector_factor = 0  # 默认无修正
+    # TODO: 从收评板块数据中获取该股所属板块的动量，实际运行时填充
+    # 目前留接口：该因子在扫描阶段由 scan_trend_scan_results 注入
+
+    # 总分（下界 0，含板块动量修正）
+    raw_score = max(0, base_score + bonus_score)
+    total_score = round(raw_score * (1 + sector_factor))
 
     # ========== 入选判断 ==========
     is_trend_up = total_score >= TREND_IS_UP_MIN_SCORE
@@ -347,6 +433,8 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     details = {
         # 维度 1
         'sD1': s_d1,
+        'sD1Trend': s_d1_trend,
+        'd1DivergencePenalty': d1_divergence_penalty,
         'ma20': round(ma20_val, 2) if ma20_val else None,
         # 维度 2
         'sD2': s_d2,
@@ -355,12 +443,15 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'has2ConsecutiveBoard': has_2_consecutive_board,
         # 维度 3
         'sD3': s_d3,
+        'sD3Ratio': s_d3_ratio,
+        'sD3Slope': s_d3_slope,
+        'sD3Stability': s_d3_stability,
         'avgVol20': round(avg_vol_20, 0),
         'avgVol60': round(avg_vol_60, 0),
         'volRatio': round(vol_ratio, 2),
         # 维度 4
         'sD4': s_d4,
-        'maxDrawdown20d': round(max_dd_20, 2),
+        'currentDrawdown': round(current_dd, 2),
         'amplitude20d': round(amplitude_20d, 2),
         # 250日分位
         'positionPct': round(position_pct, 1) if position_pct is not None else None,
@@ -376,6 +467,8 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'consecutiveDownDays': consecutive_down_days,
         # 加分
         'bonusScore': bonus_score,
+        # 板块动量因子
+        'sectorFactor': round(sector_factor, 2),
     }
 
     return {
@@ -480,7 +573,8 @@ def _ma_slope_down(ma: List[Optional[float]], idx: int, window: int = 5) -> bool
 
 
 def _check_volume_spike(vols: List[float], closes: List[float], start: int, end: int) -> bool:
-    """单日成交量创20日新高 + 当日涨幅<1%或收跌 → 放量滞涨"""
+    """单日成交量创20日新高 + 股价无力上涨（涨幅<1%且跌幅≤1%）→ 放量滞涨
+    排除条件：大跌放量（跌幅>1%）是恐慌盘/筹码交换，不是滞涨；涨停放量是进攻信号"""
     if end - start < 5:
         return False
     max_vol_20 = max(vols[start:end])
@@ -490,9 +584,9 @@ def _check_volume_spike(vols: List[float], closes: List[float], start: int, end:
         if vols[i] == max_vol_20:
             prev_c = closes[i - 1] if i > 0 else closes[i]
             change = (closes[i] - prev_c) / prev_c * 100 if prev_c > 0 else 0
-            if change < 1.0 and change >= 0:
-                return True
-            if closes[i] < prev_c:
+            # 仅当涨幅<1%且跌幅≤1%时判定为滞涨（微涨+巨量或微跌+巨量）
+            # 大跌放量是恐慌抛售/筹码交换，涨停放量是进攻，均不在此列
+            if -1.0 <= change < 1.0:
                 return True
     return False
 
@@ -595,6 +689,39 @@ def _check_consecutive_yang_bonus(closes: List[float], idx: int) -> bool:
         if change < 1.0:
             return False
     return True
+
+
+def _check_pocket_pivot(opens: List[float], closes: List[float], highs: List[float],
+                         vols: List[float], avg_vol_20: float, idx: int) -> bool:
+    """口袋支点：倍量突破 + 收于当日高点附近(>80%位置) + 收盘价>前日高点"""
+    if idx < 1 or avg_vol_20 <= 0:
+        return False
+    if vols[idx] < avg_vol_20 * 1.5:
+        return False
+    today_range = highs[idx] - opens[idx] if opens[idx] > 0 else highs[idx] - closes[idx]
+    if today_range <= 0:
+        return False
+    close_position = (closes[idx] - opens[idx]) / today_range if opens[idx] > 0 else 0
+    if close_position < 0.8:
+        return False
+    if closes[idx] <= highs[idx - 1]:
+        return False
+    return True
+
+
+def compute_sector_momentum(symbol: str, name: str) -> float:
+    """
+    计算板块动量因子（0~1之间的修正系数）
+
+    基于个股概念标签与当日收评板块数据的匹配度，对个股评分做环境修正：
+    - 处于热门板块 → 正修正（bonus multiplier > 0）
+    - 处于冷门板块 → 负修正（penalty multiplier < 0）
+    - 无法判断 → 0（不做修正）
+
+    当前阶段：占位实现，返回 0.0。
+    后续在 scan_trend_scan_results 中传入收评板块数据后填充实际逻辑。
+    """
+    return 0.0
 
 
 def calc_pool_stock_indicators(kline_data: List[List], realtime_price: float = 0) -> Dict:

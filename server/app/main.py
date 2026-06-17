@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os, sys, time, asyncio, threading
-import httpx
+import json
 from datetime import date
 
 from . import config as _cfg
@@ -143,21 +143,35 @@ app.include_router(router)
 
 @app.get("/eastmoney/{path:path}", tags=["东方财富代理"])
 async def eastmoney_proxy(path: str, request: Request):
-    """将 /eastmoney/* 请求代理到 https://push2.eastmoney.com/*"""
+    """将 /eastmoney/* 请求代理到 https://push2delay.eastmoney.com/*（使用 requests 同步库，避免 httpx 断连）"""
+    import requests as _req
+    import asyncio, time as _time
     query_string = str(request.url.query)
-    target_url = f"https://push2.eastmoney.com/{path}"
+    target_url = f"https://push2delay.eastmoney.com/{path}"
     if query_string:
         target_url += f"?{query_string}"
-    # 每次新建 client，避免复用 worker 失效的旧 httpx pool（Event loop closed / Server disconnected）
     _EM_PROXY_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
+        'Accept': '*/*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
         'Referer': 'https://quote.eastmoney.com/',
+        'Origin': 'https://quote.eastmoney.com',
     }
+    
+    def _do_req():
+        last_err = None
+        for attempt in range(3):
+            try:
+                return _req.get(target_url, headers=_EM_PROXY_HEADERS, timeout=10)
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    _time.sleep(0.5 * (attempt + 1))
+        raise last_err
+
     try:
-        async with httpx.AsyncClient(timeout=8.0, headers=_EM_PROXY_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(target_url)
+        resp = await asyncio.to_thread(_do_req)
         return Response(
             content=resp.content,
             status_code=resp.status_code,

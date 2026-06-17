@@ -133,7 +133,7 @@ async def fetch_stock_data(symbol: str, client: Optional[httpx.AsyncClient] = No
 async def fetch_eastmoney_hot_list():
     """
     获取东方财富沪深主板热股榜。
-    改用 requests 同步请求：服务器环境下 httpx 访问 push2.eastmoney.com
+    改用 requests 同步请求：服务器环境下 httpx 访问 push2delay.eastmoney.com
     会触发 RemoteProtocolError (Server disconnected without sending a response)，
     而 requests 库能正常返回。
     """

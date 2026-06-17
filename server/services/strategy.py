@@ -6,16 +6,22 @@ from db.database import get_db_conn, load_strategy_factor_weights, save_strategy
 from services.stock import fetch_stock_data
 from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
-def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float = 0.0) -> Dict:
-    """使用动态权重的评分函数 V2
+def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float = 0.0,
+                        trend_result: Dict = None) -> Dict:
+    """使用动态权重的评分函数 V2 (V4.1 融合趋势评分)
     
     Args:
-        data: 股票特征数据
+        data: 股票特征数据（实时行情/日内因子）
         weights: 策略因子权重
         market_change: 大盘涨跌幅，用于根据市场环境动态调整评分阈值
+        trend_result: 趋势评分结果（来自 is_up_trend），包含 score(0-100) 等字段。
+                      提供后，最终评分 = 50% 日内因子 + 50% 趋势因子
     """
     if weights is None:
         weights = load_strategy_factor_weights()
+
+    # 趋势评分（若提供，后续与日内因子混合）
+    trend_score = trend_result.get('score', 0) if trend_result else None
 
     outer_ratio = data.get('outerRatio', 50)
     volume_ratio = data.get('volumeRatio', 0)
@@ -147,11 +153,31 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
 
     predict_direction = 'bull' if total >= bull_threshold else 'bear' if total < STRATEGY_BEAR_THRESHOLD else 'neutral'
 
+    # V4.1: 融合趋势评分（50% 日内 + 50% 趋势），仅当 trend_result 提供时生效
+    intraday_score = total
+    if trend_score is not None:
+        total = round(intraday_score * 0.5 + trend_score * 0.5)
+        total = min(100, max(0, total))
+        # 融合后重新判定标签和方向
+        if total >= strong_bull_threshold:
+            label = '强烈看涨'
+        elif total >= label_bull_threshold:
+            label = '偏多看涨'
+        elif total >= 45:
+            label = '震荡观望'
+        elif total >= 30:
+            label = '偏空看跌'
+        else:
+            label = '强烈看跌'
+        predict_direction = 'bull' if total >= bull_threshold else 'bear' if total < STRATEGY_BEAR_THRESHOLD else 'neutral'
+
     return {
         'total': total,
         'label': label,
         'predict_direction': predict_direction,
         'base_scores': base_scores,
+        'intraday_score': intraday_score,  # V4.1: 日内原始分
+        'trend_score': trend_score,         # V4.1: 趋势分
         'factor_values': {
             'outer_ratio': outer_ratio,
             'volume_ratio': volume_ratio,

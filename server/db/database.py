@@ -692,6 +692,10 @@ def load_daily_market_reviews() -> List[Dict]:
                 review['tomorrowFocus'] = json.loads(row['focus_json'])
             else:
                 review['tomorrowFocus'] = []
+            if 'top_funds_json' in row.keys() and row['top_funds_json']:
+                review['topFunds'] = json.loads(row['top_funds_json'])
+            else:
+                review['topFunds'] = []
             # 旧格式兼容
             if 'trend_json' in row.keys() and row['trend_json']:
                 review['trendStocks'] = json.loads(row['trend_json'])
@@ -708,7 +712,7 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
         conn = get_db_conn()
         cursor = conn.cursor()
         # 确保新字段存在
-        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json']
+        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json']
         for col in new_cols:
             try:
                 cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
@@ -727,12 +731,13 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             top_gainers_json = json.dumps(review.get('topGainers', []), ensure_ascii=False)
             top_losers_json = json.dumps(review.get('topLosers', []), ensure_ascii=False)
             focus_json = json.dumps(review.get('tomorrowFocus', []), ensure_ascii=False)
+            top_funds_json = json.dumps(review.get('topFunds', []), ensure_ascii=False)
             trend_json = json.dumps(review.get('trendStocks', {}), ensure_ascii=False)
             pool_json = json.dumps(review.get('stockPool', {}), ensure_ascii=False)
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json))
+                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json))
         conn.commit()
         conn.close()
         return True

@@ -4,7 +4,6 @@ from fastapi.responses import Response
 from typing import List, Dict, Optional, Any
 import json, asyncio, time, re
 from datetime import date, datetime
-import httpx
 from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, HOT_SEARCH_TOP_N, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS, KLINE_START_DATE, INDEX_SYMBOLS, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, TENCENT_QUOTE_API, TENCENT_KLINE_API, TREND_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, SCAN_CONCURRENCY, HOT_STOCK_POOL)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, save_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS)
 from services.stock import (get_http_client, parse_realtime_fields, fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, has_delisting_risk, calculate_ma, fetch_with_retry)
@@ -249,30 +248,33 @@ async def scan_trend_stocks(force: bool = False):
 
 @router.get("/api/debug-eastmoney-review", tags=["调试-临时"])
 async def debug_eastmoney_review():
-    import httpx
+    import requests as _req
+    import asyncio
     urls = {
-        'limit_up': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
-        'limit_down': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
-        'industry': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50&fields=f2,f3,f12,f14',
-        'concept': 'https://push2.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50&fields=f2,f3,f12,f14',
+        'limit_up': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
+        'limit_down': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
+        'industry': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50&fields=f2,f3,f12,f14',
+        'concept': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50&fields=f2,f3,f12,f14',
     }
-    out = {}
-    async with httpx.AsyncClient(timeout=10) as client:
-        for name, u in urls.items():
-            try:
-                r = await client.get(u)
-                j = r.json()
-                data = j.get('data') or {}
-                diff = data.get('diff') or []
-                out[name] = {
-                    'status': r.status_code,
-                    'total': data.get('total'),
-                    'diffCount': len(diff),
-                    'top1Pct': diff[0].get('f3') if diff else None,
-                }
-            except Exception as e:
-                out[name] = {'error': str(e)}
-    return out
+    hdrs = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}
+    
+    def _fetch_one(name, u):
+        try:
+            r = _req.get(u, headers=hdrs, timeout=10)
+            j = r.json()
+            data = j.get('data') or {}
+            diff = data.get('diff') or []
+            return name, {
+                'status': r.status_code,
+                'total': data.get('total'),
+                'diffCount': len(diff),
+                'top1Pct': diff[0].get('f3') if diff else None,
+            }
+        except Exception as e:
+            return name, {'error': str(e)}
+    
+    results = await asyncio.gather(*[asyncio.to_thread(_fetch_one, n, u) for n, u in urls.items()])
+    return dict(results)
 
 
 @router.get("/api/ai-diagnose/{symbol}", tags=["AI诊断"])
@@ -1160,29 +1162,44 @@ async def get_predictions(date_str: str = None, verified: int = None, include_to
 # Vite 开发模式下由 vite.config.js 代理；生产模式下由此路由代理
 
 _EM_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Referer': 'https://quote.eastmoney.com/',
+    'Origin': 'https://quote.eastmoney.com',
 }
 
 @router.api_route("/eastmoney/{path:path}", methods=["GET", "POST"])
 async def proxy_eastmoney(request: Request, path: str):
-    """将 /eastmoney/* 请求转发到东方财富 API"""
-    import httpx
-    target_url = f"https://push2.eastmoney.com/{path}"
+    """将 /eastmoney/* 请求转发到东方财富 API（requests + 重试，解决 RemoteDisconnected）"""
+    import requests as _req
+    import asyncio, time as _time
+    target_url = f"https://push2delay.eastmoney.com/{path}"
     query_params = dict(request.query_params)
+    
+    def _do_request():
+        last_err = None
+        for attempt in range(3):
+            try:
+                if request.method == "GET":
+                    return _req.get(target_url, params=query_params, headers=_EM_HEADERS, timeout=15)
+                else:
+                    body_bytes = request._body
+                    return _req.post(target_url, params=query_params, data=body_bytes, headers=_EM_HEADERS, timeout=15)
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    _time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s 退避
+        raise last_err
+
     try:
-        async with httpx.AsyncClient(timeout=15.0, headers=_EM_HEADERS) as client:
-            if request.method == "GET":
-                resp = await client.get(target_url, params=query_params)
-            else:
-                body = await request.body()
-                resp = await client.post(target_url, params=query_params, content=body)
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers={"Content-Type": resp.headers.get("content-type", "application/json")},
-            )
+        resp = await asyncio.to_thread(_do_request)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={"Content-Type": resp.headers.get("content-type", "application/json")},
+        )
     except Exception as e:
         print(f'[东方财富代理] 请求失败: {e}')
         return Response(content=b"{}", status_code=502, media_type="application/json")
