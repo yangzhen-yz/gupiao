@@ -409,6 +409,22 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     total_score = round(raw_score * (1 + sector_factor))
 
     # ========== 入选判断 ==========
+    # 强化过滤：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制 isUp=False
+    # （避免"短线反弹但中长期下跌"的票误判为趋势向上）
+    if ma20_val and check_price < ma20_val:
+        recent60_close = closes[max(0, n - 60)]
+        if recent60_close > 0:
+            drop_60d = (check_price - recent60_close) / recent60_close * 100
+            if drop_60d < -15:
+                return {
+                    'isUp': False, 'score': total_score,
+                    'reason': f'中期下跌过滤：60日累计跌幅{drop_60d:.1f}%，且现价位于MA20下方',
+                    'details': details, 'deducts': [{'name': d[0], 'points': d[1]} for d in deducts],
+                    'bonuses': [{'name': b[0], 'points': b[1]} for b in bonuses],
+                    'ma20': ma20[-10:] if len(ma20) >= 10 else ma20,
+                    'latestPrice': latest_close, 'checkPrice': check_price,
+                    'consecutiveUpDays': consecutive_up_days, 'consecutiveDownDays': consecutive_down_days,
+                }
     is_trend_up = total_score >= TREND_IS_UP_MIN_SCORE
 
     # ========== 连涨/连跌天数（仅供前端展示，与评分无关） ==========
