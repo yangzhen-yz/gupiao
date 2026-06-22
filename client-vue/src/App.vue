@@ -35,9 +35,12 @@
     <!-- AI诊断弹窗 -->
     <AiDiagModal :visible="aiDiagVisible" :symbol="aiDiagSymbol" @close="aiDiagVisible = false" />
     <!-- 全局通知 -->
-    <div class="notification-container" v-if="notifications.length">
-      <div v-for="n in notifications" :key="n.id" class="notification">{{ n.message }}</div>
-    </div>
+    <TransitionGroup name="toast" tag="div" class="notification-container">
+      <div v-for="n in notifications" :key="n.id" :class="['notification', `toast-${n.type}`]">
+        <span class="toast-icon">{{ TYPE_ICONS[n.type] || TYPE_ICONS.info }}</span>
+        <span class="toast-msg">{{ n.message }}</span>
+      </div>
+    </TransitionGroup>
   </div>
 </template>
 
@@ -55,7 +58,7 @@ import KlineModal from './components/KlineModal.vue'
 import AiDiagModal from './components/AiDiagModal.vue'
 
 const activeTab = ref('tab-quote')
-const { notifications, showNotification } = useNotification()
+const { notifications, showNotification, TYPE_ICONS } = useNotification()
 
 provide('showNotification', showNotification)
 

@@ -1,9 +1,17 @@
 """ai_diagnose.py - split from main.py"""
-import json, httpx, os
+import json, httpx, os, asyncio
 from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
 from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS
 from services.stock import calculate_ma, get_http_client
+
+# 东方财富板块数据请求头（与 review.py 保持一致，避免被反爬）
+_EM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Referer': 'https://quote.eastmoney.com/',
+}
 
 # ========== DeepSeek AI 配置 ==========
 # ========== DeepSeek AI 配置 ==========
@@ -166,7 +174,70 @@ def _calc_support_resistance(kline_data: List[List]) -> Dict:
     supports = sorted(set(supports), reverse=True)[:3]
     resistances = sorted(set(resistances))[:3]
     return {'support': supports, 'resistance': resistances}
-def _build_diagnosis_prompt(stock_info: Dict, kline_data: List, market_data: Dict) -> str:
+
+async def _fetch_hot_sectors() -> Dict:
+    """获取当日热点行业板块和概念板块（东方财富API）"""
+    import requests
+    result = {'industry': [], 'concept': []}
+
+    def _sync_fetch():
+        _h = {**_EM_HEADERS}
+        ind_list, con_list = [], []
+        try:
+            ind_url = (
+                'https://push2delay.eastmoney.com/api/qt/clist/get'
+                '?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2'
+                '&ut=b2884a393a59ad64002292a3e90d46a5'
+                '&fs=m:90+t:2+f:!50'
+                '&fields=f2,f3,f8,f12,f14,f62,f104,f105'
+            )
+            r = requests.get(ind_url, headers=_h, timeout=10)
+            data = r.json()
+            if data.get('data') and data['data'].get('diff'):
+                for i, item in enumerate(data['data']['diff']):
+                    ind_list.append({
+                        'name': item.get('f14', ''),
+                        'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0),
+                        'mainNetInflow': item.get('f62', 0) or 0,
+                        'riseCount': item.get('f104', 0) or 0,
+                        'fallCount': item.get('f105', 0) or 0,
+                        'rank': i + 1,
+                    })
+        except Exception as e:
+            print(f'[AI诊断] 行业板块请求失败: {e}')
+        try:
+            con_url = (
+                'https://push2delay.eastmoney.com/api/qt/clist/get'
+                '?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2'
+                '&ut=b2884a393a59ad64002292a3e90d46a5'
+                '&fs=m:90+t:3+f:!50'
+                '&fields=f2,f3,f8,f12,f14,f62,f104,f105'
+            )
+            r = requests.get(con_url, headers=_h, timeout=10)
+            data = r.json()
+            if data.get('data') and data['data'].get('diff'):
+                for i, item in enumerate(data['data']['diff']):
+                    con_list.append({
+                        'name': item.get('f14', ''),
+                        'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0),
+                        'mainNetInflow': item.get('f62', 0) or 0,
+                        'riseCount': item.get('f104', 0) or 0,
+                        'fallCount': item.get('f105', 0) or 0,
+                        'rank': i + 1,
+                    })
+        except Exception as e:
+            print(f'[AI诊断] 概念板块请求失败: {e}')
+        return ind_list, con_list
+
+    try:
+        result['industry'], result['concept'] = await asyncio.to_thread(_sync_fetch)
+    except Exception as e:
+        print(f'[AI诊断] 板块数据获取异常: {e}')
+    return result
+
+def _build_diagnosis_prompt(stock_info: Dict, kline_data: List, market_data: Dict, stock_concepts: List[str] = None, hot_sectors: Dict = None) -> str:
     name = stock_info.get('name', '')
     symbol = stock_info.get('symbol', '')
     price = stock_info.get('price', 0)
@@ -295,38 +366,93 @@ def _build_diagnosis_prompt(stock_info: Dict, kline_data: List, market_data: Dic
 ## 基本面
 - 市盈率: {pe if pe > 0 else '亏损'}
 
----
+## 板块与概念热度
+"""
+    # ---- 构建板块/概念分析数据 ----
+    concepts = stock_concepts or []
+    hot_concepts = hot_sectors.get('concept', []) if hot_sectors else []
+    hot_industries = hot_sectors.get('industry', []) if hot_sectors else []
 
+    # 概念匹配：个股的概念标签中哪些是当前热门概念
+    hot_concept_names = {c['name'] for c in hot_concepts}
+    matched_concepts = [tag for tag in concepts if tag in hot_concept_names]
+    unmatched_concepts = [tag for tag in concepts if tag not in hot_concept_names]
+
+    if concepts:
+        prompt += f"- 所属概念标签: {', '.join(concepts)}\n"
+        if matched_concepts:
+            prompt += "- 当前热门概念匹配:\n"
+            for tag in matched_concepts:
+                matched = next((c for c in hot_concepts if c['name'] == tag), None)
+                if matched:
+                    prompt += (
+                        f"  · {tag}: 涨幅{matched['changePercent']:+.2f}%, "
+                        f"概念排名第{matched['rank']}/{len(hot_concepts)}, "
+                        f"上涨{matched['riseCount']}家/下跌{matched['fallCount']}家, "
+                        f"主力净流入{matched['mainNetInflow']/10000:.1f}万\n"
+                    )
+        if unmatched_concepts:
+            prompt += f"- 未进热门的概念: {', '.join(unmatched_concepts)}（概念轮动中，热度下降）\n"
+    else:
+        prompt += "- 所属概念: 暂无标签数据\n"
+
+    if hot_industries:
+        top_n = min(5, len(hot_industries))
+        prompt += f"\n## 今日热门行业板块 (涨幅前{top_n})\n"
+        for s in hot_industries[:top_n]:
+            prompt += (
+                f"  · {s['name']}: {s['changePercent']:+.2f}%, "
+                f"排名第{s['rank']}, "
+                f"涨{s['riseCount']}家/跌{s['fallCount']}家, "
+                f"主力净流入{s['mainNetInflow']/10000:.1f}万\n"
+            )
+
+    if hot_concepts:
+        top_n = min(8, len(hot_concepts))
+        prompt += f"\n## 今日热门概念板块 (涨幅前{top_n})\n"
+        for s in hot_concepts[:top_n]:
+            marker = " ★" if s['name'] in (concepts or []) else ""
+            prompt += (
+                f"  · {s['name']}{marker}: {s['changePercent']:+.2f}%, "
+                f"排名第{s['rank']}{marker}\n"
+            )
+
+    prompt += """
+---
 ## 分析要求
 
 请严格按照以下JSON格式输出分析结果（不要输出其他内容）：
 
-{{
+{
   "direction": "方向，必须是以下之一：强烈买入/买入/轻仓关注/观望/减仓/卖出",
   "confidence": 75,
   "summary": "一句话总结核心观点，要具体有数据支撑",
-  "scores": {{
+  "scores": {
     "volume": 0,
     "capital": 0,
     "technique": 0,
     "market": 0,
-    "fundamental": 0
-  }},
-  "analysis": {{
+    "fundamental": 0,
+    "sector": 0,
+    "concept": 0
+  },
+  "analysis": {
     "volume": "成交量分析：结合量比、换手率、成交额变化，判断资金参与度",
     "capital": "主力资金分析：结合外盘占比、委比（注意虚假挂单）、内外盘差，判断主力意图",
     "technique": "技术面分析：结合均线排列、MACD/RSI/KDJ指标、K线形态、支撑压力位，判断趋势方向",
     "market": "大盘环境分析：大盘走势对个股的影响",
-    "fundamental": "基本面分析：市盈率、流通市值的合理性"
-  }},
-  "keySignals": {{
+    "fundamental": "基本面分析：市盈率、流通市值的合理性",
+    "sector": "板块热度分析：个股所属行业板块今日涨跌排名、资金流入情况，判断板块是否处于风口",
+    "concept": "概念热度分析：个股所属概念标签中哪些是当前热门概念，概念轮动中的位置，判断是否有题材催化"
+  },
+  "keySignals": {
     "bullish": ["看多信号1", "看多信号2"],
     "bearish": ["看空信号1", "看空信号2"]
-  }},
+  },
   "triggerCondition": "转为买入/加仓的具体条件（如：放量突破XX元、RSI回落至30以下等）",
   "risk": "主要风险提示",
   "suggestion": "具体操作建议（含仓位比例和关键价位）"
-}}
+}
 
 ## 重要规则：
 1. direction不要默认给"观望"，必须根据数据给出有倾向性的判断
@@ -335,7 +461,10 @@ def _build_diagnosis_prompt(stock_info: Dict, kline_data: List, market_data: Dic
 4. 如果放量上涨+外盘占优+均线多头，应给"买入"或"强烈买入"
 5. scores中每项0-100分，50为中性，>60偏多，<40偏空
 6. keySignals必须列出至少1个看多和1个看空信号
-7. triggerCondition必须给出具体的价位或指标条件"""
+7. triggerCondition必须给出具体的价位或指标条件
+8. sector评分：个股所属板块如果处于涨幅前列（排名前5），给70-90分；如果板块下跌或排名靠后，给30-50分
+9. concept评分：个股概念标签中匹配到热门概念越多、概念涨幅越大，评分越高（70-95分）；无匹配概念给40-50分
+10. 板块/概念热度是最重要的短线催化剂，当个股概念与热点高度吻合时，应给予更高的方向倾向性"""
 
     return prompt
 async def _call_deepseek_api(prompt: str) -> str:
@@ -351,7 +480,7 @@ async def _call_deepseek_api(prompt: str) -> str:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
-            {"role": "system", "content": "你是专业的A股量化分析师，擅长根据成交量、主力资金、技术面、基本面和大盘环境给出精准的买卖建议。请始终以JSON格式回复。"},
+            {"role": "system", "content": "你是专业的A股量化分析师，擅长根据成交量、主力资金、技术面、基本面、板块热度和概念催化七个维度给出精准的买卖建议。请始终以JSON格式回复。"},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3,

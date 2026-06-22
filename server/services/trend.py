@@ -25,7 +25,7 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_SECTOR_MOMENTUM_WEIGHT, TREND_SECTOR_HOT_RANK_MIN,
     TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN)
-from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info
+from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons
 from services.stock import (get_http_client, has_delisting_risk, is_main_board, get_kline_data, parse_realtime_fields,
     calculate_ma, get_cached_stock_name, fetch_with_retry, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)
@@ -1000,17 +1000,31 @@ async def scan_trend_scan_results(force: bool = False):
         
         scan_pool = []
         source = ''
-        
+
+        # ===== 固定底仓：HOT_STOCK_POOL（config.py 配置）+ hot_stock_buttons（用户快捷查询）=====
+        # 两者始终并入扫描池，与热搜榜来源无关，保证用户关注的票不被遗漏
+        fixed_pool: List[str] = list(HOT_STOCK_POOL)  # config 配置池
+        try:
+            buttons = load_hot_stock_buttons()
+            btn_symbols = [b['code'].lower() for b in buttons if b.get('code')]
+            btn_symbols = [s for s in btn_symbols if s not in fixed_pool]
+            fixed_pool = list(dict.fromkeys(fixed_pool + btn_symbols))
+        except Exception as e:
+            print(f'[趋势扫描] 加载快捷查询股票池失败: {str(e)}')
+
         if hot_search_ranking_data.get('stocks') and len(hot_search_ranking_data['stocks']) > 0:
-            scan_pool = [s['symbol'] for s in hot_search_ranking_data['stocks']]
-            source = 'eastmoney-hot'
-            print(f'[趋势扫描] 使用热搜榜数据，共 {len(scan_pool)} 只股票 (更新时间: {hot_search_ranking_data.get("updateTime")})')
+            hot_symbols = [s['symbol'] for s in hot_search_ranking_data['stocks']]
+            # 合并：热搜榜 ∪ 固定底仓（去重保持热搜榜顺序在前）
+            scan_pool = list(dict.fromkeys(hot_symbols + fixed_pool))
+            source = 'eastmoney-hot+fixed'
+            added_fixed = len(scan_pool) - len(hot_symbols)
+            print(f'[趋势扫描] 热搜榜 {len(hot_symbols)} 只 + 固定底仓新增 {added_fixed} 只，共 {len(scan_pool)} 只 (更新时间: {hot_search_ranking_data.get("updateTime")})')
         else:
             local_map = load_stock_basic_info()
             map_symbols = list(local_map.keys())
-            scan_pool = list(set(HOT_STOCK_POOL + map_symbols))
+            scan_pool = list(dict.fromkeys(fixed_pool + map_symbols))
             source = 'fallback'
-            print(f'[趋势扫描] 热搜榜数据为空，使用备选池，共 {len(scan_pool)} 只股票')
+            print(f'[趋势扫描] 热搜榜数据为空，使用备选池（固定底仓 + 本地基础信息），共 {len(scan_pool)} 只股票')
 
         # 把"上一次趋势列表"也并入扫描池，确保昨天在趋势列表里、今天从热搜榜掉出的股票也会被重新评估
         try:

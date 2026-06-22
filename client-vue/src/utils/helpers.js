@@ -73,15 +73,34 @@ export function formatNumber(numStr) {
 const notifications = ref([])
 let notifId = 0
 
+const TYPE_ICONS = {
+  success: '✓',
+  error:   '✕',
+  warning: '!',
+  info:    'i'
+}
+
 export function useNotification() {
-  function showNotification(message, duration = 3000) {
+  function showNotification(message, type = null, duration = 3000) {
+    // 兼容旧调用：showNotification(msg, duration)
+    if (type !== null && typeof type === 'number') {
+      duration = type
+      type = null
+    }
+    // 未指定类型时，从消息内容自动推断
+    if (!type) {
+      if (/失败|错误/.test(message))      type = 'error'
+      else if (/成功|完成|已添加|已移出|已保存/.test(message)) type = 'success'
+      else if (/请输入|请先/.test(message)) type = 'warning'
+      else                               type = 'info'
+    }
     const id = ++notifId
-    notifications.value.push({ id, message })
+    notifications.value.unshift({ id, message, type })
     setTimeout(() => {
       notifications.value = notifications.value.filter(n => n.id !== id)
     }, duration)
   }
-  return { notifications, showNotification }
+  return { notifications, showNotification, TYPE_ICONS }
 }
 
 // API 请求封装

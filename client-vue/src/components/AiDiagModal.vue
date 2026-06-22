@@ -13,7 +13,7 @@
         <div v-if="loading" class="diag-loading">
           <div class="loading-spinner"></div>
           <div class="diag-loading-text">AI 正在分析中…</div>
-          <div class="diag-loading-sub">获取行情数据 · K线数据 · 大盘环境 · 调用 AI 模型</div>
+          <div class="diag-loading-sub">获取行情数据 · K线数据 · 板块概念 · 大盘环境 · 调用 AI 模型</div>
         </div>
         <!-- 错误 -->
         <div v-else-if="error" class="diag-error">
@@ -201,8 +201,8 @@ const confidenceLevel = computed(() => {
   return 'conf-low'
 })
 
-const scoreLabels = { volume: '成交量', capital: '主力资金', technique: '技术面', market: '大盘环境', fundamental: '基本面' }
-const analysisLabels = { volume: '成交量分析', capital: '主力资金分析', technique: '技术面分析', market: '大盘环境分析', fundamental: '基本面分析' }
+const scoreLabels = { volume: '成交量', capital: '主力资金', technique: '技术面', market: '大盘环境', fundamental: '基本面', sector: '板块热度', concept: '概念热度' }
+const analysisLabels = { volume: '成交量分析', capital: '主力资金分析', technique: '技术面分析', market: '大盘环境分析', fundamental: '基本面分析', sector: '板块热度分析', concept: '概念热度分析' }
 
 function scoreLevel(v) {
   if (v >= 70) return 'sc-hi'
@@ -521,6 +521,8 @@ watch(() => props.visible, (val) => {
 .diag-analysis-technique   { border-left: 3px solid #14b8a6; }
 .diag-analysis-market      { border-left: 3px solid #0ea5e9; }
 .diag-analysis-fundamental { border-left: 3px solid #84cc16; }
+.diag-analysis-sector      { border-left: 3px solid #ec4899; }
+.diag-analysis-concept     { border-left: 3px solid #8b5cf6; }
 .diag-analysis-card-title {
   font-size: 0.76rem;
   font-weight: 600;

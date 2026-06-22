@@ -9,7 +9,7 @@ from db.database import (get_db_conn, load_daily_recommendations, save_daily_rec
 from services.stock import (get_http_client, parse_realtime_fields, fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, has_delisting_risk, calculate_ma, fetch_with_retry)
 from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2
 from services.trend import scan_trend_scan_results, scan_trend_task, scan_and_remove_below_ma10, is_up_trend, calc_pool_stock_indicators
-from services.ai import _build_diagnosis_prompt, _call_deepseek_api, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
+from services.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
 from services.recommend import auto_generate_recommendations_task, calc_buy_sell_points
 from services.review import generate_daily_review
 from services.market import predict_market_risk, check_market_crash
@@ -361,7 +361,21 @@ async def ai_diagnose(symbol: str):
             except:
                 market_data[key] = {'name': info['name'], 'price': 0, 'changePercent': 0}
 
-        prompt = _build_diagnosis_prompt(stock_info, kline_data, market_data)
+        # 获取个股概念标签
+        try:
+            all_tags = load_stock_concept_tags()
+            stock_concepts = all_tags.get(symbol, [])
+        except:
+            stock_concepts = []
+
+        # 获取热点板块和概念数据
+        try:
+            hot_sectors = await _fetch_hot_sectors()
+        except Exception as e:
+            print(f'[AI诊断] 热点板块获取失败: {e}')
+            hot_sectors = {'industry': [], 'concept': []}
+
+        prompt = _build_diagnosis_prompt(stock_info, kline_data, market_data, stock_concepts, hot_sectors)
         ai_result = await _call_deepseek_api(prompt)
 
         try:
