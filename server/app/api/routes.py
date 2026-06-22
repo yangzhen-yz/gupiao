@@ -2,7 +2,7 @@
 from fastapi import HTTPException, APIRouter, Request
 from fastapi.responses import Response
 from typing import List, Dict, Optional, Any
-import json, asyncio, time, re
+import json, asyncio, time, re, inspect
 from datetime import date, datetime
 from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, HOT_SEARCH_TOP_N, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS, KLINE_START_DATE, INDEX_SYMBOLS, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, TENCENT_QUOTE_API, TENCENT_KLINE_API, TREND_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, SCAN_CONCURRENCY, HOT_STOCK_POOL)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, save_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS)
@@ -459,7 +459,7 @@ async def get_user_scan_pool_api():
 
                 async def fetch_one(sym: str) -> Dict:
                     async with sem:
-                        info = {'symbol': sym, 'code': sym, 'name': quote_map.get(sym, {}).get('name') or get_stock_name(sym)}
+                        info = {'symbol': sym, 'code': sym, 'name': (quote_map.get(sym, {}) or {}).get('name') or get_stock_name(sym)}
                         realtime = 0
                         try:
                             realtime = float(quote_map.get(sym, {}).get('price', 0) or 0)
@@ -468,19 +468,25 @@ async def get_user_scan_pool_api():
                         info['realtimePrice'] = realtime
                         try:
                             kline = await get_kline_data(sym)
-                            indicators = calc_pool_stock_indicators(kline, realtime)
-                            info.update(indicators)
-                        except Exception:
+                            indicators = calc_pool_stock_indicators(kline or [], realtime)
+                            # 防御：剥离 coroutine（极端情况）
+                            clean = {k: v for k, v in indicators.items() if not inspect.iscoroutine(v)}
+                            info.update(clean)
+                        except Exception as inner_err:
+                            print(f'[custom-scan-pool] {sym} 指标计算失败: {inner_err}')
                             info.update({'latestPrice': realtime, 'consecutiveUp': 0, 'consecutiveDown': 0, 'aboveMa5': False, 'ma5': None})
                         return info
 
                 stocks_info = await asyncio.gather(*[fetch_one(s) for s in symbols])
             except Exception as e:
-                # 拉取行情失败时，至少返回代码列表
+                import traceback
+                print(f'[custom-scan-pool] 拉取行情失败: {e}\n{traceback.format_exc()}')
                 stocks_info = [{'symbol': s, 'code': s, 'name': get_stock_name(s), 'latestPrice': 0, 'consecutiveUp': 0, 'consecutiveDown': 0, 'aboveMa5': False, 'ma5': None} for s in symbols]
         return {"success": True, "data": {"symbols": symbols, "count": len(symbols), "stocks": stocks_info}}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取自定义扫描池失败")
+        import traceback
+        print(f'[custom-scan-pool] 顶层异常: {error}\n{traceback.format_exc()}')
+        raise HTTPException(status_code=500, detail=f"获取自定义扫描池失败: {error}")
 
 @router.post("/api/custom-scan-pool", tags=["自定义扫描池"])
 async def update_user_scan_pool_api(data: Dict):
