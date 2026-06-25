@@ -1741,9 +1741,20 @@ body {
   user-select: none;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 2px;
   transition: color 0.15s;
 }
+
+/* 股票池表格表头所有列统一居中对齐 */
+.pool-table .stock-table-header span,
+.pool-table .stock-table-header .sortable-header {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+
 .sortable-header:hover { color: var(--accent-primary); }
 .sortable-header .sort-arrow { font-size: 0.7rem; opacity: 0.4; }
 .sortable-header .sort-arrow.active { opacity: 1; color: var(--accent-primary); }
@@ -1810,6 +1821,24 @@ body {
   font-family: 'SF Mono', 'Courier New', monospace;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.pool-stock-trend {
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.pool-stock-ma5 {
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .pool-stock-price.price-up { color: #ef4444; }
@@ -2859,6 +2888,32 @@ body {
     font-size: 0.75rem;
     color: var(--text-tertiary);
     opacity: 0.75;
+}
+
+.auto-add-hint {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0 12px;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    background: linear-gradient(135deg, #fef3c7, #fde68a);
+    border: 1px solid #f59e0b;
+    border-radius: 6px;
+}
+
+.auto-add-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f59e0b;
+}
+
+.auto-add-count {
+    margin-left: auto;
+    font-weight: 600;
+    color: #b45309;
 }
 
 /* Trend Section */

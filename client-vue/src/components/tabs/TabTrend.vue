@@ -12,6 +12,11 @@
           <span v-if="trendStocks.length - filteredTrendStocks.length > 0" class="section-stats-hint">（已隐藏 {{ trendStocks.length - filteredTrendStocks.length }} 只在自选池中）</span>
         </span>
       </div>
+      <div v-if="autoAddThreshold > 0" class="auto-add-hint">
+        <span class="auto-add-dot"></span>
+        自动加池阈值：≥{{ autoAddThreshold }}分
+        <span v-if="lastAutoAdded.length > 0" class="auto-add-count">（本次已自动加入 {{ lastAutoAdded.length }} 只）</span>
+      </div>
       <div v-if="trendStocks.length === 0" style="text-align:center;padding:2rem;color:#64748b;">暂无趋势股票，正在自动扫描中...</div>
       <div v-else-if="filteredTrendStocks.length === 0" style="text-align:center;padding:2rem;color:#64748b;">🎉 当前 {{ trendStocks.length }} 只趋势股已全部加入自选池</div>
       <div v-else class="trend-card-list">
@@ -187,6 +192,8 @@ const poolStocks = ref([])
 const lastScan = ref('--')
 const expanded = ref(null)
 const addInput = ref('')
+const autoAddThreshold = ref(80)
+const lastAutoAdded = ref([])
 
 // 股票池排序
 const poolSortBy = ref(null)       // 'price' | 'consecutive' | null
@@ -289,6 +296,9 @@ async function loadTrendStocks() {
     const result = await apiFetch('/api/trend-stocks')
     if (result.success && result.data) {
       trendStocks.value = result.data.stocks || []
+      if (typeof result.data.autoAddThreshold === 'number') {
+        autoAddThreshold.value = result.data.autoAddThreshold
+      }
       // 旧数据无 consecutiveUpDays 字段 → 自动触发一次重新扫描刷新数据
       const needRescan = trendStocks.value.length > 0 &&
         trendStocks.value.every(s => !s.details || typeof s.details.consecutiveUpDays === 'undefined')
@@ -309,6 +319,14 @@ async function scanTrendStocks() {
     const result = await apiFetch('/api/scan-trend-stocks')
     if (result.success) {
       await loadTrendStocks()
+      await loadPoolWithIndicators()
+      if (typeof result.data.autoAddThreshold === 'number') {
+        autoAddThreshold.value = result.data.autoAddThreshold
+      }
+      lastAutoAdded.value = result.data.autoAdded || []
+      if (lastAutoAdded.value.length > 0) {
+        showNotification(`已自动加入 ${lastAutoAdded.value.length} 只≥${autoAddThreshold.value}分股票到股票池`)
+      }
       lastScan.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
     }
   } catch (e) { showNotification('趋势扫描失败') }

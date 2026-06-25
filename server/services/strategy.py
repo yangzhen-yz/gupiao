@@ -51,17 +51,41 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     elif weibi > STRATEGY_WEBI_VERIFY['weibi_high'] and volume_ratio < STRATEGY_WEBI_VERIFY['volume_ratio_low']:
         base_scores['weibi'] = 4
         
-    # AI回测优化建议规则1: 结合分时图量价关系，当外盘占比低于50%且量比>3时，降低看涨权重 (惩罚分数)
-    if outer_ratio < 50 and volume_ratio > 3:
-        # 如果是这种典型的诱多出货形态，直接扣除部分外盘和量比的分数
-        base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
-        base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
+    # ====== 放量出货 / 诱多检测（分级：涨停/非涨停用不同阈值） ======
+    # 
+    # 核心原则：涨停板本身也可能是诱多出货（尾盘拉板、反复开板对倒、虚假封单），
+    # 不能简单豁免。但涨停时的正常封板交易也会产生高量比+外盘≈50%，
+    # 所以涨停股需要更高的"异常阈值"来区分真龙头 vs 涨停出货。
+    #
+    # 涨停股阈值：
+    #   - 天量开板（vol>8x 且 outer<45%）→ 出货嫌疑，重罚 -5
+    #   - 放量偏弱（vol>5x 且 outer<48%）→ 封板质量欠缺，轻罚 -3
+    #   - 温和放量（vol≤5x）→ 正常封板，不罚
+    # 非涨停股阈值：
+    #   - 放量但外盘不占优（vol>3x 且 outer<50%）→ 诱多出货
+    #   - 量比偏高 + 外盘不突出（vol>1.5x 且 outer<55%）→ 对倒嫌疑
 
-    # 2026-06-11 策略优化建议：增加放量出货检测（骗线过滤）
-    # 当量比显著（>1.5）且外盘占比并未显著超过内盘（<55%）时，可能存在主力利用对倒放量吸引关注后悄悄出货。
-    if volume_ratio > 1.5 and outer_ratio < 55:
-        base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
-        base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
+    is_limit_up = change_percent >= 9.8
+
+    if is_limit_up:
+        # --- 涨停股：用更高的异常阈值区分封板质量 ---
+        if volume_ratio > 8 and outer_ratio < 45:
+            # 天量换手 + 卖盘占优：典型的涨停开板出货
+            base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
+            base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
+        elif volume_ratio > 5 and outer_ratio < 48:
+            # 放量封板但卖压偏大：封板质量存疑，减半惩罚
+            base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 3)
+            base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 3)
+        # vol ≤ 5x 或 outer ≥ 48%：正常涨停交易特征，不罚
+    else:
+        # --- 非涨停股：保持原有规则 ---
+        if outer_ratio < 50 and volume_ratio > 3:
+            base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
+            base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
+        if volume_ratio > 1.5 and outer_ratio < 55:
+            base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
+            base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
         
     # 2026-06-11 策略优化建议：不再盲目惩罚涨幅，而是区分“强势启动”与“力竭赶顶”
     # 2026-06-11 策略优化建议：拥抱强势龙头股。涨停不代表风险，往往代表次日的高溢价。

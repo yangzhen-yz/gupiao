@@ -35,6 +35,7 @@ SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 TREND_MIN_SCORE = 60  # 趋势发现进入趋势池的最低分（原85，V3 评分下经 268 样本实测 found=21 合理）
 TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分（原60，调低）
 TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
+TREND_AUTO_ADD_POOL_THRESHOLD = 80  # 趋势评分 ≥ 此值时自动加入用户股票池（0 表示关闭）
 
 # 涨停 / 跌停阈值
 TREND_LIMIT_UP_THRESHOLD = 9.8  # 涨停阈值（单日涨幅 % ≥ 此值算涨停）

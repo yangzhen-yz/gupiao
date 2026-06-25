@@ -4,7 +4,7 @@
       <div class="modal-header">
         <div class="modal-header-left">
           <span class="modal-title">🤖 AI 智能诊断</span>
-          <span v-if="diagData" class="modal-subtitle">DeepSeek 多维度量化分析</span>
+          <span v-if="diagData" class="modal-subtitle">豆包 DeepSeek V4 多维度量化分析</span>
         </div>
         <button class="close-btn" @click="close">&times;</button>
       </div>

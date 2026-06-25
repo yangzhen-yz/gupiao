@@ -13,11 +13,10 @@ _EM_HEADERS = {
     'Referer': 'https://quote.eastmoney.com/',
 }
 
-# ========== DeepSeek AI 配置 ==========
-# ========== DeepSeek AI 配置 ==========
+# ========== AI 配置（兼容 DeepSeek / Agnes AI 等 OpenAI 格式接口） ==========
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
 DEEPSEEK_BASE_URL = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-DEEPSEEK_MODEL = os.environ.get('DEEPSEEK_MODEL', 'DeepSeek-V4-Flash')
+DEEPSEEK_MODEL = os.environ.get('DEEPSEEK_MODEL', 'deepseek-chat')
 AI_CONFIG_MTIME = 0.0
 
 def load_ai_config():
@@ -469,10 +468,15 @@ def _build_diagnosis_prompt(stock_info: Dict, kline_data: List, market_data: Dic
     return prompt
 async def _call_deepseek_api(prompt: str) -> str:
     if not DEEPSEEK_API_KEY:
-        raise HTTPException(status_code=400, detail="未配置DeepSeek API Key，请设置环境变量 DEEPSEEK_API_KEY")
+        raise HTTPException(status_code=400, detail="未配置AI API Key，请在设置中配置")
 
     client = get_http_client()
-    url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
+    # 兼容 baseUrl 末尾已含 /v1 /v3 等版本路径的情况，避免拼出 /v1/v1/chat/completions
+    base = DEEPSEEK_BASE_URL.rstrip('/')
+    if base.endswith(('/v1', '/v2', '/v3', '/v4')):
+        url = f"{base}/chat/completions"
+    else:
+        url = f"{base}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -497,10 +501,10 @@ async def _call_deepseek_api(prompt: str) -> str:
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="AI诊断超时，请稍后重试")
     except httpx.HTTPStatusError as e:
-        detail = f"DeepSeek API错误: {e.response.status_code}"
+        detail = f"AI API错误: {e.response.status_code}"
         try:
             err_body = e.response.json()
-            detail = f"DeepSeek API错误: {err_body.get('error', {}).get('message', str(e.response.status_code))}"
+            detail = f"AI API错误: {err_body.get('error', {}).get('message', str(e.response.status_code))}"
         except:
             pass
         raise HTTPException(status_code=502, detail=detail)

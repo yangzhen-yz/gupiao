@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD,
     TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS,
     SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS,
-    STRATEGY_PREDICT_BULL_MIN_SCORE, SCAN_KLINE_TIMEOUT,
+    STRATEGY_PREDICT_BULL_MIN_SCORE, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD,
     TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE,
     TREND_D1_DIVERGENCE_PENALTY_TIERS,
     TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS,
@@ -409,8 +409,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     total_score = round(raw_score * (1 + sector_factor))
 
     # ========== 入选判断 ==========
-    # 强化过滤：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制 isUp=False
-    # （避免"短线反弹但中长期下跌"的票误判为趋势向上）
+    # 过滤规则 1：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制排除（原有逻辑保留）
     if ma20_val and check_price < ma20_val:
         recent60_close = closes[max(0, n - 60)]
         if recent60_close > 0:
@@ -419,12 +418,64 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 return {
                     'isUp': False, 'score': total_score,
                     'reason': f'中期下跌过滤：60日累计跌幅{drop_60d:.1f}%，且现价位于MA20下方',
-                    'details': details, 'deducts': [{'name': d[0], 'points': d[1]} for d in deducts],
+                    'details': {}, 'deducts': [{'name': d[0], 'points': d[1]} for d in deducts],
                     'bonuses': [{'name': b[0], 'points': b[1]} for b in bonuses],
                     'ma20': ma20[-10:] if len(ma20) >= 10 else ma20,
                     'latestPrice': latest_close, 'checkPrice': check_price,
-                    'consecutiveUpDays': consecutive_up_days, 'consecutiveDownDays': consecutive_down_days,
                 }
+    
+    # 过滤规则 2：下跌趋势中的短暂反弹过滤（v5.3 增强）
+    # 条件：① 中长期均线结构偏空（满足任意一项即视为偏空）：
+    #          a. MA60 + MA120 双空头（5日斜率均向下）
+    #          b. MA60 < MA120 死亡交叉未修复
+    #          c. 现价 < MA120（股价尚未收复半年线，中长期趋势未逆转）
+    #        ② 现价距全量历史最高点回撤 > 20%
+    # → 即使近期反弹至 MA20 甚至 MA60 上方，中长期趋势仍偏空，
+    #   属于"下跌中继反弹"而非趋势反转，强制排除
+    # 
+    # v5.2→v5.3 改动说明：
+    #   和邦生物 (sh603077)：MA60(2.725) > MA120(2.642) 形成伪金叉
+    #   + MA120 已走平，双重检测全部返回 False，过滤被完全绕过。
+    #   实测 score=62 isUp=True，但该股距历史高点 3.54 回撤 29.4%，
+    #   且现价 2.5 仍在 MA120(2.642) 之下，属于典型下跌中继反弹。
+    #   v5.3 新增条件 c：股价 < MA120 也是中长期偏空的有效信号。
+    ma60_val = ma60[latest_idx] if latest_idx < len(ma60) else None
+    ma120_val = ma120[latest_idx] if latest_idx < len(ma120) else None
+
+    ma_long_bearish = ma60_down and ma120_down
+    if not ma_long_bearish:
+        # 死亡交叉（MA60 < MA120）是稳健的中长期熊市信号
+        if ma60_val is not None and ma120_val is not None and ma60_val < ma120_val:
+            ma_long_bearish = True
+    if not ma_long_bearish:
+        # 股价尚未收复 MA120（半年线）：中长期趋势仍未逆转
+        # 典型案例：和邦生物 MA60 > MA120 伪金叉 + MA120 走平，
+        # 但现价 2.5 仍在 MA120(2.642) 下方，说明中长期均线组整体
+        # 对股价形成压制，反弹只是短暂的
+        if ma120_val is not None and check_price < ma120_val:
+            ma_long_bearish = True
+
+    if ma_long_bearish:
+        # 使用全量历史数据找最高点，而非仅限 60 日内
+        all_time_high = max(highs) if highs else 0
+        peak_drawdown = (all_time_high - check_price) / all_time_high * 100 if all_time_high > 0 else 0
+        if peak_drawdown > 20:
+            signal_desc = []
+            if ma60_down and ma120_down:
+                signal_desc.append('双空头')
+            elif ma60_val is not None and ma120_val is not None and ma60_val < ma120_val:
+                signal_desc.append('死亡交叉')
+            elif ma120_val is not None and check_price < ma120_val:
+                signal_desc.append(f'股价仍低于MA120({ma120_val:.2f})')
+            return {
+                'isUp': False, 'score': total_score,
+                'reason': (f'下跌趋势中的短暂反弹：{",".join(signal_desc)}，'
+                           f'距全量历史高点{all_time_high:.2f}回撤{peak_drawdown:.1f}%'),
+                'details': {}, 'deducts': [{'name': d[0], 'points': d[1]} for d in deducts],
+                'bonuses': [{'name': b[0], 'points': b[1]} for b in bonuses],
+                'latestPrice': latest_close, 'checkPrice': check_price,
+            }
+
     is_trend_up = total_score >= TREND_IS_UP_MIN_SCORE
 
     # ========== 连涨/连跌天数（仅供前端展示，与评分无关） ==========
@@ -989,6 +1040,37 @@ async def scan_and_remove_below_ma10():
             
     except Exception as error:
         print(f'[10日线检查] 扫描失败: {str(error)}')
+def auto_add_high_score_to_pool(trend_results: List[Dict]) -> List[str]:
+    """
+    将评分 ≥ TREND_AUTO_ADD_POOL_THRESHOLD 的趋势股自动加入用户股票池。
+    阈值 ≤ 0 时关闭自动加入。
+    返回实际新增的股票代码列表（已在池中的会自动去重）。
+    """
+    threshold = TREND_AUTO_ADD_POOL_THRESHOLD
+    if threshold <= 0:
+        return []
+
+    current_pool = [s.lower() for s in load_user_scan_pool()]
+    pool_set = set(current_pool)
+    to_add = []
+
+    for r in trend_results:
+        score = r.get('score', 0)
+        symbol = (r.get('symbol') or '').lower()
+        if score >= threshold and symbol and symbol not in pool_set:
+            to_add.append(symbol)
+            pool_set.add(symbol)
+
+    if to_add:
+        new_pool = current_pool + to_add
+        save_user_scan_pool(new_pool)
+        print(f'[趋势扫描] 自动加入股票池 {len(to_add)} 只（≥{threshold}分）: {to_add}')
+    else:
+        print(f'[趋势扫描] 无高分股达到自动加入阈值（≥{threshold}分）')
+
+    return to_add
+
+
 async def scan_trend_scan_results(force: bool = False):
     global _last_scan_result, _last_scan_date, _last_scan_ts
     
@@ -1213,13 +1295,18 @@ async def scan_trend_scan_results(force: bool = False):
                 save_predictions(predictions)
                 print(f'[趋势扫描] 保存了 {len(predictions)} 条策略预测记录')
             
+            # 自动将高分趋势股加入用户股票池（阈值由 config.py 控制）
+            auto_added = auto_add_high_score_to_pool(trend_scan_results)
+
             result = {
                 'date': today,
                 'totalScanned': len(scan_pool),
                 'found': len(trend_scan_results),
                 'stocks': cleaned_results,
                 'scanTime': f'{(time.time() - t0):.1f}s',
-                'source': source
+                'source': source,
+                'autoAdded': auto_added,
+                'autoAddThreshold': TREND_AUTO_ADD_POOL_THRESHOLD,
             }
             
             save_trend_scan_results(result)
