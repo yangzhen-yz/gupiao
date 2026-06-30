@@ -3,7 +3,7 @@ import json, httpx, asyncio, requests as _requests
 from typing import List, Dict
 from datetime import date, datetime, timedelta
 from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOP_SECTORS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, INDEX_SYMBOLS, TENCENT_QUOTE_API, MARKET_CRASH_THRESHOLD
-from db.database import get_db_conn, save_daily_market_reviews
+from db.database import get_db_conn, save_daily_market_reviews, load_daily_recommendations, load_trend_scan_results
 from services.stock import get_http_client, fetch_stock_data
 
 _EM_HEADERS = {
@@ -150,10 +150,43 @@ async def generate_daily_review() -> Dict:
         except Exception as e:
             print(f'获取涨跌停数据失败: {e}')
         
-        # 4. 明日关注个股（结合策略预测 + 今日强势股）
+        # 4. 明日关注个股（独立三层来源，不再退化到涨幅榜）
+        # 第一层：智能推荐（50%日内+50%趋势融合，最权威）
+        # 第二层：策略预测（今日 scan 时记录的高分看涨票）
+        # 第三层：趋势扫描（趋势分≥60 的票）
+        # 三层去重合并；与"今日涨幅榜"完全独立
         tomorrow_focus = []
+        seen_codes = set()
+        source_tags = {}
+
+        # 第一层：智能推荐
         try:
-            # 从今日预测记录中选取高分看涨的票
+            recs = load_daily_recommendations() or []
+            # 取最新一天
+            today_recs = []
+            if recs and isinstance(recs[0], dict) and 'daily_recommendations' in recs[0]:
+                today_recs = recs[0].get('daily_recommendations', []) or []
+            elif recs and isinstance(recs[0], dict):
+                today_recs = recs
+            for r in today_recs:
+                code = r.get('symbol') or r.get('code')
+                if not code or code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                source_tags[code] = '智能推荐'
+                score = r.get('score', 0) or 0
+                tomorrow_focus.append({
+                    'name': r.get('name', ''),
+                    'code': code,
+                    'score': score,
+                    'reason': f"智能推荐融合分{score}分，{r.get('reason', '')}" if r.get('reason') else f"智能推荐融合分{score}分",
+                    'predictDirection': 'bull',
+                })
+        except Exception as e:
+            print(f'[收评] 智能推荐加载失败: {e}')
+
+        # 第二层：策略预测（今日高分看涨票）
+        try:
             conn = get_db_conn()
             cursor = conn.cursor()
             cursor.execute(
@@ -163,27 +196,49 @@ async def generate_daily_review() -> Dict:
             predictions = cursor.fetchall()
             conn.close()
             for p in predictions:
+                code = p['symbol']
+                if code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                source_tags[code] = '策略预测'
                 tomorrow_focus.append({
                     'name': p['name'],
-                    'code': p['symbol'],
+                    'code': code,
                     'score': p['score'],
-                    'reason': f"评分{p['score']}分，外盘占比{float(p['outer_ratio']):.1f}%，量比{float(p['volume_ratio']):.2f}，委比{float(p['weibi']):.1f}%",
+                    'reason': f"策略评分{p['score']}分，外盘占比{float(p['outer_ratio']):.1f}%，量比{float(p['volume_ratio']):.2f}，委比{float(p['weibi']):.1f}%",
                     'predictDirection': 'bull',
                 })
         except Exception as e:
-            print(f'获取明日关注失败: {e}')
-        
-        # 如果策略预测不够，从涨幅前列补充
-        if len(tomorrow_focus) < 5:
-            for g in top_gainers[:REVIEW_TOP_SECTORS_COUNT]:
-                if not any(f['code'] == g['code'] for f in tomorrow_focus):
-                    tomorrow_focus.append({
-                        'name': g['name'],
-                        'code': g['code'],
-                        'score': 0,
-                        'reason': f"今日涨幅{g['changePercent']:.2f}%，资金净流入{g.get('mainNetInflow', 0):.0f}万",
-                        'predictDirection': 'bull',
-                    })
+            print(f'[收评] 策略预测加载失败: {e}')
+
+        # 第三层：趋势扫描高分票
+        try:
+            trend_data = load_trend_scan_results() or {}
+            for t in (trend_data.get('stocks') or [])[:REVIEW_TOMORROW_FOCUS_COUNT]:
+                code = t.get('symbol', '')
+                if not code or code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                source_tags[code] = '趋势扫描'
+                trend_score = t.get('score', 0) or 0
+                tomorrow_focus.append({
+                    'name': t.get('name', ''),
+                    'code': code,
+                    'score': trend_score,
+                    'reason': f"趋势扫描分{trend_score}分，{t.get('details', {}).get('shortNote', '趋势向上')}（中线关注）",
+                    'predictDirection': 'bull',
+                })
+        except Exception as e:
+            print(f'[收评] 趋势扫描加载失败: {e}')
+
+        # 截取前 N 只
+        tomorrow_focus = tomorrow_focus[:REVIEW_TOMORROW_FOCUS_COUNT]
+
+        # 标注来源到 reason 中便于前端展示
+        for f in tomorrow_focus:
+            tag = source_tags.get(f['code'], '')
+            if tag and tag not in f['reason']:
+                f['reason'] = f"[{tag}] " + f['reason']
         
         # 5. 生成收评
         review = {

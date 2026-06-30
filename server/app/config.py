@@ -31,9 +31,9 @@ SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 
 # ========== 趋势发现配置（中短线波段评分，满分 100 分） ==========
 # 关注周期：未来 ~1 个月
-# 评分结构：6 项基础分（100 分）+ 扣分项 + 强制排除
-TREND_MIN_SCORE = 60  # 趋势发现进入趋势池的最低分（原85，V3 评分下经 268 样本实测 found=21 合理）
-TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分（原60，调低）
+# 评分结构：4 维度基础分（100 分）+ 扣分项 + 加分项(缩放0~5) + 强制排除
+TREND_MIN_SCORE = 60  # 趋势发现进入趋势池的最低分
+TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分
 TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
 TREND_AUTO_ADD_POOL_THRESHOLD = 80  # 趋势评分 ≥ 此值时自动加入用户股票池（0 表示关闭）
 
@@ -61,13 +61,13 @@ TREND_D4_DRAWDOWN_TIERS = [(8, 20), (12, 15), (15, 10), (20, 5)]  # [(<回撤%, 
 
 # 扣分项（12 项，分 3 组做互斥/衰减）
 TREND_DEDUCT_POSITION_HIGH = 10  # 现价位于250日分位 ≥ 80%（新高突破可豁免）
-TREND_DEDUCT_MA60_MA120_BEAR = 8  # MA60 + MA120 同步向下（原15，减半）
-TREND_DEDUCT_POSITION_MID = 5  # 60% ≤ 分位 < 80% 或 MA60向下/MA120向上（原10，减半）
-TREND_DEDUCT_MA20_BROKEN = 6  # 近 5 日内跌破 MA20 且 3 日未收回（原12，减半）
+TREND_DEDUCT_MA60_MA120_BEAR = 8  # MA60 + MA120 同步向下
+TREND_DEDUCT_POSITION_MID = 5  # 60% ≤ 分位 < 80% 或 MA60向下/MA120向上
+TREND_DEDUCT_MA20_BROKEN = 6  # 近 5 日内跌破 MA20 且 3 日未收回
 TREND_DEDUCT_LIMIT_DOWN = 15  # 近 20 日出现单日跌停
 TREND_DEDUCT_SHRINK_VOL = 10  # 持续缩量阴跌
 TREND_DEDUCT_VOLUME_SPIKE = 10  # 单日成交量创20日新高，股价无力上涨（-1%~1%）→ 放量滞涨
-TREND_DEDUCT_VOLUME_DIVERGENCE = 6  # 近5日股价小幅抬升但20日均量逐级放大超30%（原12，减半）
+TREND_DEDUCT_VOLUME_DIVERGENCE = 6  # 近5日股价小幅抬升但20日均量逐级放大超30%
 TREND_DEDUCT_EXTREME_VOLATILITY = 8  # 近20日振幅≥15%且收跌
 TREND_DEDUCT_SINGLE_DAY_CRASH = 8  # 单日大跌超-7%且次日未修复
 TREND_DEDUCT_AMPLITUDE_FLAT = 10  # 近20日振幅<5%（完全横盘，高位扣满/低位豁免）
@@ -88,10 +88,12 @@ TREND_SIDEWAYS_MID_PCT = 60   # 分位 < 此值视为中位横盘（减半扣）
 TREND_SIDEWAYS_BONUS = 3      # 低位横盘蓄力加分
 
 # 加分项（额外奖励，用于拉开分差 + 平衡低位分位）
-TREND_BONUS_BULL_ALIGNMENT = 12    # MA20>MA60>MA120 标准多头排列 + 现价分位<60%（原5，提升）
-TREND_BONUS_VOLUME_BREAKOUT = 10   # 近3日出现倍量突破（日成交量≥20日均量×2 + 涨幅≥5%）（原5，提升）
-TREND_BONUS_CONSECUTIVE_YANG = 5   # 近5日连续阳线 + 每日涨幅≥1%（原3，提升）
-TREND_BONUS_POCKET_PIVOT = 8       # 口袋支点：倍量突破 + 当日收于当日高点附近 + 收盘价>前日高点
+# 注意：基础分满分100 + 加分项最大 18 = 118，融合时再按比例归一化到 100，
+# 避免"基础分顶格+全触发加分"导致 6 只票都拿 100 分无法区分
+TREND_BONUS_BULL_ALIGNMENT = 5    # MA20>MA60>MA120 标准多头排列 + 现价分位<60%
+TREND_BONUS_VOLUME_BREAKOUT = 4   # 近3日出现倍量突破（日成交量≥20日均量×2 + 涨幅≥5%）
+TREND_BONUS_CONSECUTIVE_YANG = 3  # 近5日连续阳线 + 每日涨幅≥1%
+TREND_BONUS_POCKET_PIVOT = 3      # 口袋支点：倍量突破 + 当日收于当日高点附近 + 收盘价>前日高点
 
 # 板块动量因子（环境修正：±20% 权重，叠加到总分）
 TREND_SECTOR_MOMENTUM_WEIGHT = 0.20  # 板块动量占整体评分的权重
@@ -252,6 +254,13 @@ SCHEDULE_MA10_CHECK_TIME = '15:05'  # 检查10日均线时间
 SCHEDULE_DAILY_REVIEW_TIME = '15:10'  # 每日审核时间
 SCHEDULE_BACKTEST_TIME = '15:20'  # 回测时间
 SCHEDULE_RECOMMENDATION_TIMES = ['09:45', '13:30']  # 智能推荐生成时间（上午开盘后、下午开盘后）
+
+# 趋势发现自动扫描：交易日 9:00 ~ 15:00 每 30 分钟一次（覆盖盘前/盘中/收盘后）
+# 包含 9:00（盘前预热）、9:30/10:00/10:30/11:00/11:30（上午盘中）、
+# 12:00/12:30（午休过渡）、13:00/13:30/14:00/14:30/15:00（下午盘中+收盘）
+SCHEDULE_TREND_SCAN_INTERVAL_MIN = 30  # 扫描间隔（分钟）
+SCHEDULE_TREND_SCAN_START = '09:00'   # 扫描起始时间
+SCHEDULE_TREND_SCAN_END = '15:00'     # 扫描结束时间
 
 # ========== 数据查询限制 ==========
 QUERY_DAILY_RECOMMENDATIONS_LIMIT = 30  # 每日推荐股票数量限制

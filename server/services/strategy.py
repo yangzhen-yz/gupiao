@@ -89,29 +89,25 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         
     # 2026-06-11 策略优化建议：不再盲目惩罚涨幅，而是区分“强势启动”与“力竭赶顶”
     # 2026-06-11 策略优化建议：拥抱强势龙头股。涨停不代表风险，往往代表次日的高溢价。
+    # 修复：单因子分上限 22（不再 25），让"基础分都顶格"的票之间有区分度
     if change_percent > 9.5:
-        # 涨停股评分逻辑：如果委比极高且换手率适中，说明封单坚决，给予高分
         if weibi > 80 and 2 <= turnover_rate <= 15:
-            base_scores['change_percent'] = 25 # 龙头股奖励分，鼓励次日竞价关注
+            base_scores['change_percent'] = 22 # 龙头股高分（适度）
         else:
-            base_scores['change_percent'] = 15 # 普通封板
+            base_scores['change_percent'] = 14 # 普通封板
     elif change_percent > 7.0:
-        # 高位强势，如果不放量滞涨，给予高分奖励
         if volume_ratio < 2.5:
-            base_scores['change_percent'] = 20
+            base_scores['change_percent'] = 18
         else:
-            base_scores['change_percent'] = 12
+            base_scores['change_percent'] = 11
     elif change_percent > 3.0:
-        # 强势区间：量价齐升则给满分
         if 1.0 <= volume_ratio <= 2.2 and outer_ratio > 56:
-            base_scores['change_percent'] = 20
+            base_scores['change_percent'] = 18
         else:
-            base_scores['change_percent'] = 15
+            base_scores['change_percent'] = 14
     elif change_percent > 0:
-        # 稳健启动区
-        base_scores['change_percent'] = 18
+        base_scores['change_percent'] = 16
     else:
-        # 下跌股保持原逻辑
         pass
 
     # 2026-06-11 策略优化建议：大盘上涨时的优选策略

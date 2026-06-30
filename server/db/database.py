@@ -424,7 +424,11 @@ def load_strategy_factor_weights() -> Dict:
                     for k, v in DEFAULT_WEIGHTS.items()}
         result = {}
         for row in rows:
-            result[row['factor_name']] = {
+            factor_name = row['factor_name']
+            # 过滤掉数据库中的孤儿因子（不再使用的旧 key），避免前端显示英文 key
+            if factor_name not in DEFAULT_WEIGHTS:
+                continue
+            result[factor_name] = {
                 'weight': float(row['weight']),
                 'accuracy': float(row['accuracy']),
                 'sample_count': int(row['sample_count']),
@@ -446,6 +450,9 @@ def save_strategy_factor_weights(weights_data: Dict) -> bool:
         conn = get_db_conn()
         cursor = conn.cursor()
         for factor_name, data in weights_data.items():
+            # 跳过非法因子 key（防止前端传入未识别的英文 key 写入数据库）
+            if factor_name not in DEFAULT_WEIGHTS:
+                continue
             weight = data.get('weight', 1.0)
             accuracy = data.get('accuracy', 50.0)
             sample_count = data.get('sample_count', 0)
@@ -454,6 +461,14 @@ def save_strategy_factor_weights(weights_data: Dict) -> bool:
                 '''INSERT OR REPLACE INTO strategy_factor_weights (factor_name, weight, accuracy, sample_count, correct_count)
                    VALUES (?, ?, ?, ?, ?)''',
                 (factor_name, weight, accuracy, sample_count, correct_count)
+            )
+        # 清理数据库中已不存在的孤儿因子（防止历史脏数据残留）
+        valid_keys = tuple(DEFAULT_WEIGHTS.keys())
+        if valid_keys:
+            placeholders = ','.join(['?'] * len(valid_keys))
+            cursor.execute(
+                f'DELETE FROM strategy_factor_weights WHERE factor_name NOT IN ({placeholders})',
+                valid_keys
             )
         conn.commit()
         conn.close()

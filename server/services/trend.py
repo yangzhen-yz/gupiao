@@ -404,9 +404,22 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     # TODO: 从收评板块数据中获取该股所属板块的动量，实际运行时填充
     # 目前留接口：该因子在扫描阶段由 scan_trend_scan_results 注入
 
-    # 总分（下界 0，含板块动量修正）
-    raw_score = max(0, base_score + bonus_score)
-    total_score = round(raw_score * (1 + sector_factor))
+    # 总分（下界 0，封顶 100，含板块动量修正）
+    # 修复：原本 raw_score = max(0, base + bonus) 无上限，涨停龙头可拿到 135+，融合后 6 只全 100
+    # 新版：基础分满分 100 不变；加分项最大 15 → 缩放为 0-5 的"附加奖励"叠加在基础分上，
+    # 板块动量 ±20% 修正后封顶 100。这样：
+    # - 基础分非顶格的票 trend_score < 100（区分明显）
+    # - 基础分顶格的票 trend_score = 100 + 加分缩放(0~5) → 仍封顶 100，但内部用附加分区分
+    # - 板块动量 +20% 后封顶 100（不再溢出）
+    base_score_capped = min(100, base_score)
+    max_bonus = (TREND_BONUS_BULL_ALIGNMENT + TREND_BONUS_VOLUME_BREAKOUT +
+                 TREND_BONUS_CONSECUTIVE_YANG + TREND_BONUS_POCKET_PIVOT +
+                 TREND_SIDEWAYS_BONUS)  # = 15 + 3 = 18
+    bonus_contrib = (bonus_score / max_bonus) * 5 if max_bonus > 0 else 0
+    raw_score = base_score_capped + bonus_contrib  # 100 + (0~5) = 100~105
+    raw_score = min(100, raw_score)  # 封顶
+    total_score = round(raw_score * (1 + sector_factor), 1)
+    total_score = min(100, max(0, total_score))
 
     # ========== 入选判断 ==========
     # 过滤规则 1：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制排除（原有逻辑保留）
