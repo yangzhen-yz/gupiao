@@ -295,15 +295,21 @@ async def get_stock_name(symbol: str) -> Optional[str]:
         pass
     return symbol
 
-async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Optional[List[List]]:
+async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None, return_realtime: bool = False):
+    """获取股票K线数据
+
+    Args:
+        return_realtime: 若为 True，返回 (kline, realtime_raw) 元组，
+                         realtime_raw 为内部已拉的实时行情原始字符串，供调用方复用避免重复请求
+    """
     today = date.today().isoformat()
     start_date = KLINE_START_DATE
     url = f'{TENCENT_KLINE_API}?param={symbol},day,{start_date},{today},{KLINE_DATA_LIMIT},qfq'
     cl = client or get_http_client()
-    
+
     try:
         kline = []
-        
+
         try:
             response = await cl.get(url)
             response.raise_for_status()
@@ -312,24 +318,25 @@ async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None
                 kline = data['data'][symbol].get('qfqday', []) or data['data'][symbol].get('day', [])
         except Exception as e:
             print(f'[K线API请求] {str(e)}')
-        
+
         if not kline or len(kline) < 30:
-            return None
-        
+            return (None, None) if return_realtime else None
+
+        realtime_raw = None
         try:
-            realtime_data = await fetch_with_retry(symbol, cl)
-            if realtime_data:
-                fields = parse_realtime_fields(realtime_data)
+            realtime_raw = await fetch_with_retry(symbol, cl)
+            if realtime_raw:
+                fields = parse_realtime_fields(realtime_raw)
                 if fields and fields['price']:
                     latest_kline = kline[-1] if kline else None
                     latest_date = latest_kline[0] if latest_kline else ''
-                    
+
                     open_val = fields['open'] or fields['price']
                     price_val = fields['price']
                     high_val = fields['high'] or fields['price']
                     low_val = fields['low'] or fields['price']
                     vol_val = fields['volume'] or 0
-                    
+
                     if latest_date != today:
                         kline.append([today, open_val, price_val, high_val, low_val, vol_val])
                     else:
@@ -338,11 +345,13 @@ async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None
                         latest_kline[4] = min(float(latest_kline[4]), float(low_val))
         except Exception as e:
             pass
-        
+
+        if return_realtime:
+            return (kline, realtime_raw)
         return kline
     except Exception as e:
         print(f'[K线获取失败] {symbol}: {str(e)}')
-        return None
+        return (None, None) if return_realtime else None
 def parse_tencent_batch_data(data: str) -> List[Dict]:
     results = []
     lines = re.split(r'[\n;]+', data.strip())

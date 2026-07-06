@@ -2334,6 +2334,91 @@ body {
   font-weight: 500;
 }
 
+/* ========== P4-1 趋势回测样式（2026-07-01）========== */
+.backtest-accuracy-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 6px 0 10px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
+  border: 1px solid #bae6fd;
+  font-size: 0.8125rem;
+  color: #0369a1;
+  flex-wrap: wrap;
+}
+.backtest-badge-label { font-weight: 700; white-space: nowrap; }
+.backtest-badge-stat { white-space: nowrap; }
+.backtest-badge-stat strong { font-size: 0.9rem; }
+.backtest-badge-detail { color: #64748b; font-size: 0.75rem; }
+.backtest-badge-date { margin-left: auto; color: #64748b; font-size: 0.75rem; }
+
+.win-rate-high { color: #16a34a; }
+.win-rate-mid { color: #f59e0b; }
+.win-rate-low { color: #dc2626; }
+
+.backtest-history-section {
+  margin-top: 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fafbfc;
+}
+.backtest-history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  cursor: pointer;
+  background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+  transition: background 0.2s;
+}
+.backtest-history-header:hover { background: linear-gradient(135deg, #f1f5f9, #e2e8f0); }
+.backtest-history-title { font-size: 0.875rem; font-weight: 700; color: #1e293b; }
+.backtest-history-toggle { font-size: 0.75rem; color: #64748b; }
+.backtest-history-content { padding: 8px 12px; max-height: 400px; overflow-y: auto; }
+.backtest-history-item {
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+}
+.backtest-item-date { font-size: 0.8125rem; font-weight: 700; color: #334155; margin-bottom: 6px; }
+.backtest-item-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.backtest-item-cell { text-align: center; }
+.backtest-item-cell .cell-label { font-size: 0.7rem; color: #64748b; margin-bottom: 2px; }
+.backtest-item-cell .cell-value { font-size: 1.1rem; font-weight: 800; }
+.backtest-item-cell .cell-detail { font-size: 0.7rem; color: #94a3b8; }
+.backtest-item-segments {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.segment-tag {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.seg-60-70 { background: #fef3c7; color: #92400e; }
+.seg-70-80 { background: #dbeafe; color: #1e40af; }
+.seg-80-plus { background: #dcfce7; color: #166534; }
+
+.yesterday-backtest-tag {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.yesterday-backtest-tag.tag-correct { background: #dcfce7; color: #166534; }
+.yesterday-backtest-tag.tag-wrong { background: #fee2e2; color: #991b1b; }
+
 .recommend-actions {
   display: flex;
   gap: var(--spacing-xs);
@@ -3881,6 +3966,34 @@ body {
   .page-info { color: var(--text-tertiary) !important; }
   .page-btn { background: var(--bg-tertiary) !important; border-color: var(--border-medium) !important; color: var(--text-secondary) !important; }
   .page-btn:hover:not(:disabled) { background: var(--bg-primary) !important; color: var(--text-primary) !important; }
+
+  /* P4-1 趋势回测组件（暗色模式） */
+  .backtest-accuracy-badge {
+    background: linear-gradient(135deg, var(--bg-tertiary), var(--bg-secondary)) !important;
+    border-color: var(--border-medium) !important;
+    color: var(--text-secondary) !important;
+  }
+  .backtest-badge-detail, .backtest-badge-date { color: var(--text-tertiary) !important; }
+  .backtest-history-section {
+    border-color: var(--border-medium) !important;
+    background: var(--bg-tertiary) !important;
+  }
+  .backtest-history-header {
+    background: linear-gradient(135deg, var(--bg-tertiary), var(--bg-secondary)) !important;
+  }
+  .backtest-history-title { color: var(--text-primary) !important; }
+  .backtest-history-toggle { color: var(--text-tertiary) !important; }
+  .backtest-history-item {
+    background: var(--bg-primary) !important;
+    border-color: var(--border-medium) !important;
+  }
+  .backtest-item-date { color: var(--text-primary) !important; }
+  .backtest-item-cell .cell-label, .backtest-item-cell .cell-detail { color: var(--text-tertiary) !important; }
+  .segment-tag.seg-60-70 { background: rgba(245, 158, 11, 0.2) !important; color: #fbbf24 !important; }
+  .segment-tag.seg-70-80 { background: rgba(59, 130, 246, 0.2) !important; color: #60a5fa !important; }
+  .segment-tag.seg-80-plus { background: rgba(22, 163, 74, 0.2) !important; color: #4ade80 !important; }
+  .yesterday-backtest-tag.tag-correct { background: rgba(22, 163, 74, 0.25) !important; color: #4ade80 !important; }
+  .yesterday-backtest-tag.tag-wrong { background: rgba(220, 38, 38, 0.25) !important; color: #f87171 !important; }
 
   /* 趋势指标卡（暗色模式） */
   .trend-metric-item { background: var(--bg-tertiary) !important; border-color: var(--border-subtle) !important; }

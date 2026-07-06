@@ -1,21 +1,56 @@
 """strategy.py - split from main.py"""
+import asyncio
 from typing import List, Dict, Optional
 from datetime import date, timedelta
-from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD
+from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD
 from db.database import get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions
-from services.stock import fetch_stock_data
+from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
+
+def _score_main_inflow(main_inflow_ratio: Optional[float]) -> float:
+    """P1-1 主力净流入因子评分（2026-06-30）
+
+    基于主力净流入/流通市值占比(%)评分：
+    - ≥3%（强力吸筹）→ 15 分
+    - ≥1%（持续流入）→ 10 分
+    - ≥0%（小幅流入）→ 7 分
+    - ≥-1%（小幅流出）→ 4 分
+    - <-1%（主力出逃）→ 2 分
+    - None（无数据）→ 7 分（no_data 中档，避免无数据股票总分被拖累）
+
+    与外盘占比、量比形成数据层防护：避免"价涨但主力出货"的诱多票被高分推荐。
+    """
+    vals = STRATEGY_SCORE_VALUES['main_capital_inflow']
+    if main_inflow_ratio is None:
+        return vals['no_data']
+    thr = STRATEGY_SCORE_THRESHOLDS['main_capital_inflow']
+    if main_inflow_ratio >= thr['high']:
+        return vals['high']
+    if main_inflow_ratio >= thr['mid']:
+        return vals['mid']
+    if main_inflow_ratio >= thr['low']:
+        return vals['low']
+    if main_inflow_ratio >= thr['negative']:
+        return vals['low']  # 0~-1% 小幅流出，仍给 low 分
+    return vals['negative']
+
+
 def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float = 0.0,
-                        trend_result: Dict = None) -> Dict:
-    """使用动态权重的评分函数 V2 (V4.1 融合趋势评分)
-    
+                        trend_result: Dict = None,
+                        fund_flow_data: Optional[Dict] = None) -> Dict:
+    """使用动态权重的评分函数 V2 (V4.1 融合趋势评分 + P1-1 新增主力净流入因子)
+
     Args:
         data: 股票特征数据（实时行情/日内因子）
         weights: 策略因子权重
         market_change: 大盘涨跌幅，用于根据市场环境动态调整评分阈值
         trend_result: 趋势评分结果（来自 is_up_trend），包含 score(0-100) 等字段。
                       提供后，最终评分 = 50% 日内因子 + 50% 趋势因子
+        fund_flow_data: 主力资金流向数据（P1-1 新增），格式：
+                        {'main_net_inflow': float(元), 'main_inflow_ratio': float(%),
+                         'circ_mv': float(元)}
+                        提供后，新增第9因子 main_capital_inflow 参与评分
     """
     if weights is None:
         weights = load_strategy_factor_weights()
@@ -32,6 +67,17 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     amplitude = data.get('amplitude', 0)
     pe = data.get('pe', 0)
 
+    # P1-1 主力净流入占比（%）— 无数据时为 None，评分时给 no_data 中档分
+    main_inflow_ratio = None
+    if fund_flow_data:
+        # 优先用已计算好的占比，否则用 main_net_inflow / circ_mv 现算
+        if fund_flow_data.get('main_inflow_ratio') is not None:
+            main_inflow_ratio = float(fund_flow_data['main_inflow_ratio'])
+        elif fund_flow_data.get('main_net_inflow') is not None and fund_flow_data.get('circ_mv'):
+            mv = float(fund_flow_data['circ_mv'])
+            if mv > 0:
+                main_inflow_ratio = float(fund_flow_data['main_net_inflow']) / mv * 100
+
     # 基础得分（与原逻辑一致）
     base_scores = {
         'outer_ratio': STRATEGY_SCORE_VALUES['outer_ratio']['high'] if outer_ratio >= STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high'] else STRATEGY_SCORE_VALUES['outer_ratio']['mid'] if outer_ratio >= STRATEGY_SCORE_THRESHOLDS['outer_ratio']['mid'] else STRATEGY_SCORE_VALUES['outer_ratio']['low'],
@@ -41,6 +87,8 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         'weibi': STRATEGY_SCORE_VALUES['weibi']['high'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['high'] else STRATEGY_SCORE_VALUES['weibi']['mid'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['mid'] else STRATEGY_SCORE_VALUES['weibi']['low'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['low'] else STRATEGY_SCORE_VALUES['weibi']['negative'],
         'avg_price_deviation': STRATEGY_SCORE_VALUES['avg_price_deviation']['high'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['high'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['mid'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['mid'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['normal'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['low'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['low'],
         'amplitude': STRATEGY_SCORE_VALUES['amplitude']['high'] if (STRATEGY_SCORE_THRESHOLDS['amplitude']['high'][0] < amplitude <= STRATEGY_SCORE_THRESHOLDS['amplitude']['high'][1]) else STRATEGY_SCORE_VALUES['amplitude']['mid'] if (STRATEGY_SCORE_THRESHOLDS['amplitude']['mid'][0] < amplitude <= STRATEGY_SCORE_THRESHOLDS['amplitude']['mid'][1]) else STRATEGY_SCORE_VALUES['amplitude']['low'],
+        # P1-1 主力净流入因子（2026-06-30）：无数据给 no_data 中档分，避免拖累总分
+        'main_capital_inflow': _score_main_inflow(main_inflow_ratio),
     }
     if weibi > STRATEGY_WEBI_VERIFY['weibi_high'] and change_percent < 0:
         base_scores['weibi'] = 3
@@ -65,7 +113,7 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     #   - 放量但外盘不占优（vol>3x 且 outer<50%）→ 诱多出货
     #   - 量比偏高 + 外盘不突出（vol>1.5x 且 outer<55%）→ 对倒嫌疑
 
-    is_limit_up = change_percent >= 9.8
+    is_limit_up = change_percent >= TREND_LIMIT_UP_THRESHOLD
 
     if is_limit_up:
         # --- 涨停股：用更高的异常阈值区分封板质量 ---
@@ -87,14 +135,22 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
             base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
             base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
         
-    # 2026-06-11 策略优化建议：不再盲目惩罚涨幅，而是区分“强势启动”与“力竭赶顶”
+    # 2026-06-11 策略优化建议：不再盲目惩罚涨幅，而是区分"强势启动"与"力竭赶顶"
     # 2026-06-11 策略优化建议：拥抱强势龙头股。涨停不代表风险，往往代表次日的高溢价。
-    # 修复：单因子分上限 22（不再 25），让"基础分都顶格"的票之间有区分度
+    # P1-2 涨停质量增强（2026-06-30）：用委比+换手+量比组合代理封板质量
+    # 业界共识：封板质量是次日溢价的关键——强力封板次日高开概率高，烂板次日低开概率高
+    # 分档：强力封板25 / 优质封板22 / 普通封板18 / 弱封板14 / 烂板8
     if change_percent > 9.5:
-        if weibi > 80 and 2 <= turnover_rate <= 15:
-            base_scores['change_percent'] = 22 # 龙头股高分（适度）
+        if weibi > 95 and 2 <= turnover_rate <= 8 and volume_ratio < 3:
+            base_scores['change_percent'] = 25  # 强力封板（一字/秒板，委比极高压单小，次日高溢价）
+        elif weibi > 80 and 2 <= turnover_rate <= 15:
+            base_scores['change_percent'] = 22  # 优质封板（原"龙头股高分"逻辑保留）
+        elif weibi > 50 and turnover_rate <= 20:
+            base_scores['change_percent'] = 18  # 普通封板（封单一般，有换手但未爆量）
+        elif weibi > 0:
+            base_scores['change_percent'] = 14  # 弱封板（封单被砸过，委比偏低）
         else:
-            base_scores['change_percent'] = 14 # 普通封板
+            base_scores['change_percent'] = 8   # 烂板/开板（委比为负，封单被砸开）
     elif change_percent > 7.0:
         if volume_ratio < 2.5:
             base_scores['change_percent'] = 18
@@ -138,10 +194,16 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         w = weights.get(factor, {}).get('weight', 1.0)
         total += base_score * w
 
-    # 归一化到100分（8个因子满分总和为95，乘以平均权重后需要归一化）
-    max_possible = sum([
-        15, 10, 10, 20, 10, 15, 5, 15  # 各因子满分
-    ]) * sum(weights.get(f, {}).get('weight', 1.0) for f in base_scores) / len(base_scores)
+    # 归一化到100分（动态计算各因子满分总和，支持因子扩展）
+    # P1-1：从 8 因子扩展到 9 因子（新增 main_capital_inflow），硬编码改为动态计算
+    def _factor_max(f: str) -> float:
+        """从 STRATEGY_SCORE_VALUES 提取该因子的最大档位分值"""
+        vals = STRATEGY_SCORE_VALUES.get(f, {})
+        # 过滤掉非数值的 key（如 'no_data'）后取最大
+        numeric_vals = [v for v in vals.values() if isinstance(v, (int, float))]
+        return max(numeric_vals) if numeric_vals else 0
+    max_possible = sum(_factor_max(f) for f in base_scores) * \
+                   sum(weights.get(f, {}).get('weight', 1.0) for f in base_scores) / len(base_scores)
     if max_possible > 0:
         total = round(total / max_possible * 100)
     total = min(100, max(0, total))
@@ -206,8 +268,81 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
             'weibi': weibi,
             'avg_price_deviation': avg_price_deviation,
             'amplitude': amplitude,
+            'main_capital_inflow': main_inflow_ratio,  # P1-1: 主力净流入占比(%)，None=无数据
         }
     }
+
+
+def apply_industry_neutralization(stocks: List[Dict], industry_map: Dict[str, str]) -> None:
+    """P3-2 行业中性化：按行业分位数调整 strategy_score.total（原地修改，2026-06-30）
+
+    对 calc_stock_score_v2 输出的 total 做后处理，避免热门行业股票因整体高
+    volume_ratio/turnover/change 而集体虚高。trend_score 已有 sector_factor 做环境修正，
+    不再叠加，避免双重修正。
+
+    Args:
+        stocks: 待评分股票列表，每个元素须含 stock['score']['total'] 和 stock['symbol']。
+                score 须是 dict（calc_stock_score_v2 的返回值）。
+        industry_map: {symbol_lower: industry_name}，来自 fetch_batch_fund_flow 的 f100 字段。
+                      industry 为空字符串归入 '其他'。
+
+    原则：
+      - 单行业样本 < STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE(5) → 跳过（统计无意义）
+      - 行业内总分 ≥ P80 → +STRATEGY_INDUSTRY_P80_BONUS(2)
+      - 行业内总分 ≤ P20 → +STRATEGY_INDUSTRY_P20_PENALTY(-2)
+      - 中间不动
+      - 原地写回 stock['score']['total']（钳制 0-100），并记录 stock['score']['industryAdjust']
+    """
+    if not STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED or not stocks or not industry_map:
+        # 未启用或无行业数据：所有 stock 标记 industryAdjust=0，保持一致性
+        for s in stocks:
+            if isinstance(s.get('score'), dict):
+                s['score']['industryAdjust'] = 0
+        return
+
+    # 1. 按 industry 分组收集 (stock_ref, total)
+    groups: Dict[str, List[Dict]] = {}
+    for s in stocks:
+        if not isinstance(s.get('score'), dict):
+            continue
+        sym = (s.get('symbol') or '').lower()
+        ind = industry_map.get(sym, '') or '其他'
+        if not ind:
+            ind = '其他'
+        groups.setdefault(ind, []).append(s)
+
+    # 2. 每个行业计算 p20/p80 并调整
+    for ind, members in groups.items():
+        # 默认 industryAdjust=0
+        for m in members:
+            m['score']['industryAdjust'] = 0
+        if len(members) < STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE:
+            continue  # 样本不足，不调整
+        totals = sorted(m['score']['total'] for m in members)
+        # 分位数：用线性插值近似（index = pct × (n-1)）
+        n = len(totals)
+        def _quantile(p: float) -> float:
+            if n == 1:
+                return totals[0]
+            pos = p * (n - 1)
+            lo = int(pos)
+            hi = min(lo + 1, n - 1)
+            frac = pos - lo
+            return totals[lo] * (1 - frac) + totals[hi] * frac
+        p20 = _quantile(0.20)
+        p80 = _quantile(0.80)
+        for m in members:
+            t = m['score']['total']
+            if t >= p80:
+                adj = STRATEGY_INDUSTRY_P80_BONUS
+            elif t <= p20:
+                adj = STRATEGY_INDUSTRY_P20_PENALTY
+            else:
+                adj = 0
+            m['score']['industryAdjust'] = adj
+            m['score']['total'] = max(0, min(100, t + adj))
+
+
 async def backtest_yesterday_predictions() -> Dict:
     """回溯验证未验证的预测，计算准确率，调整权重
     
@@ -376,7 +511,48 @@ async def backtest_yesterday_predictions() -> Dict:
         except Exception:
             pass
 
-        # 逐个验证
+        # 性能优化（2026-07-02）：收集所有未验证的 symbols，一次性批量拉取行情（消除 N+1）
+        unverified_preds = [p for p in predictions if not (p['verified'] and p['actual_change'] is not None)]
+        unverified_symbols = list({p['symbol'] for p in unverified_preds})
+        actual_change_map: Dict[str, float] = {}
+        if unverified_symbols:
+            # 分批拉取（每批最多100只）
+            _b_size = 100
+            async def _fetch_batch(syms):
+                try:
+                    _raw = await fetch_with_retry(','.join(syms))
+                    return parse_tencent_batch_data(_raw)
+                except Exception as e:
+                    print(f'  [回测] 批量拉取失败({len(syms)}只): {e}')
+                    return []
+            _b_tasks = [
+                _fetch_batch(unverified_symbols[i:i + _b_size])
+                for i in range(0, len(unverified_symbols), _b_size)
+            ]
+            _b_results = await asyncio.gather(*_b_tasks, return_exceptions=True)
+            for r in _b_results:
+                if isinstance(r, Exception) or not r:
+                    continue
+                for s in r:
+                    sym = s.get('symbol', '').lower()
+                    if sym:
+                        actual_change_map[sym] = s.get('changePercent', 0)
+
+            # 兜底（2026-07-03 修复）：如果批量拉取后 map 为空（如非交易时间被 except 吞掉），
+            # 降级为单只串行拉取，确保 0% 准确率 bug 不再出现
+            if not actual_change_map and unverified_symbols:
+                print(f'  [回测] 批量拉取返回空，降级为单只串行拉取({len(unverified_symbols)}只)...')
+                for sym in unverified_symbols:
+                    try:
+                        _raw = await fetch_with_retry(sym)
+                        _parsed = parse_tencent_batch_data(_raw)
+                        if _parsed:
+                            actual_change_map[_parsed[0]['symbol'].lower()] = _parsed[0].get('changePercent', 0)
+                    except Exception:
+                        pass
+                print(f'  [回测] 降级拉取完成，actual_change_map 填充 {len(actual_change_map)} 条')
+
+        # 逐个验证（用 actual_change_map 替代 N+1 await）
         correct_count = 0
         total_count = len(predictions)
         bull_correct = 0
@@ -392,13 +568,10 @@ async def backtest_yesterday_predictions() -> Dict:
                 actual_dir = pred['actual_direction'] if pred['actual_direction'] else ('bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral')
                 is_correct = bool(pred['is_correct'])
             else:
-                try:
-                    stock_data = await fetch_stock_data(symbol)
-                    if not stock_data:
-                        continue
-                    actual_change = stock_data.get('parsed', {}).get('changePercent', 0)
-                except Exception:
-                    continue
+                # 性能优化（2026-07-02）：从 actual_change_map 取值，不再 N+1 await
+                actual_change = actual_change_map.get(symbol.lower(), 0)
+                if actual_change == 0 and symbol.lower() not in actual_change_map:
+                    continue  # 拉取失败的跳过
 
                 actual_dir = 'bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'
                 is_correct = predict_dir == actual_dir

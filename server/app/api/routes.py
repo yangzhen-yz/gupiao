@@ -4,15 +4,17 @@ from fastapi.responses import Response
 from typing import List, Dict, Optional, Any
 import json, asyncio, time, re, inspect
 from datetime import date, datetime
-from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, HOT_SEARCH_TOP_N, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS, KLINE_START_DATE, INDEX_SYMBOLS, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, TENCENT_QUOTE_API, TENCENT_KLINE_API, TREND_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, SCAN_CONCURRENCY, HOT_STOCK_POOL)
-from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, save_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS)
-from services.stock import (get_http_client, parse_realtime_fields, fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, has_delisting_risk, calculate_ma, fetch_with_retry)
-from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2
-from services.trend import scan_trend_scan_results, scan_trend_task, scan_and_remove_below_ma10, is_up_trend, calc_pool_stock_indicators
+from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, HOT_SEARCH_TOP_N, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS, KLINE_START_DATE, INDEX_SYMBOLS, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, TENCENT_QUOTE_API, TENCENT_KLINE_API, TREND_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES)
+from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, save_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
+from services.stock import (get_http_client, fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry)
+from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
+from services.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
+from services.trend_backtest import backtest_trend_predictions
 from services.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
-from services.recommend import auto_generate_recommendations_task, calc_buy_sell_points
+from services.recommend import auto_generate_recommendations_task
 from services.review import generate_daily_review
 from services.market import predict_market_risk, check_market_crash
+from services.utils import ensure_today_date
 
 router = APIRouter()
 
@@ -51,7 +53,7 @@ async def update_hot_search_ranking_api():
 async def get_stock(symbol: str):
     if not re.match(r'^(sh|sz)\d{6}$', symbol.lower()):
         raise HTTPException(status_code=400, detail="无效的股票代码格式，示例: sh603985, sz000001")
-    
+
     try:
         print(f'[单只查询] {symbol}')
         data = await fetch_with_retry(symbol.lower())
@@ -59,6 +61,54 @@ async def get_stock(symbol: str):
         return PlainTextResponse(content=data, media_type="text/plain")
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"获取股票数据失败: {str(error)}")
+
+
+@router.get("/api/stock/{symbol}/analysis", tags=["股票行情"])
+async def get_stock_analysis(symbol: str):
+    """单只股票 9 因子评分分析（2026-07-06 修复 TabQuote 评分始终为 0）
+
+    返回 JSON：含 parse 后的行情数据 + calc_stock_score_v2 算出的 score/label/details。
+    与 /api/stock/{symbol}（返回腾讯原始字符串）解耦，避免破坏 IndexBar 等现有调用方。
+    前端 TabQuote 在 parseTencentData 拿到行情后并行调用本端点补 score。
+    """
+    if not re.match(r'^(sh|sz)\d{6}$', symbol.lower()):
+        raise HTTPException(status_code=400, detail="无效的股票代码格式，示例: sh603985, sz000001")
+    sym = symbol.lower()
+    try:
+        raw = await fetch_with_retry(sym)
+        parsed_list = parse_tencent_batch_data(raw)
+        if not parsed_list:
+            raise HTTPException(status_code=502, detail="行情数据解析失败")
+        stock_data = parsed_list[0]
+        # 9 因子评分（V2 权威评分，权重由后端统一维护）
+        result = calc_stock_score_v2(stock_data)
+        base_scores = result.get('base_scores', {})
+        # 构造前端期望的 details 格式：{label(中文), score(实际得分), max(该因子满分)}
+        # 前端 TabQuote.vue:125-128 渲染 {{ d.label }} {{ d.score }}/{{ d.max }}
+        details = []
+        for factor_key, score_val in base_scores.items():
+            vals = STRATEGY_SCORE_VALUES.get(factor_key, {})
+            numeric_vals = [v for v in vals.values() if isinstance(v, (int, float))]
+            max_val = max(numeric_vals) if numeric_vals else 0
+            details.append({
+                "label": FACTOR_DESCRIPTIONS.get(factor_key, factor_key),  # 中文映射，兜底原 key
+                "score": int(score_val) if isinstance(score_val, (int, float)) else 0,
+                "max": int(max_val),
+            })
+        return {
+            "success": True,
+            "data": {
+                "symbol": stock_data.get('symbol'),
+                "score": result.get('total', 0),
+                "label": result.get('label', '无评分'),
+                "predictDirection": result.get('predict_direction', 'neutral'),
+                "details": details,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(error)}")
 
 @router.get("/api/stocks", tags=["股票行情"])
 async def get_stocks(symbols: str):
@@ -82,6 +132,11 @@ async def get_daily_recommendations():
         daily_recommendations = load_daily_recommendations()
         # 实时计算历史推荐盈利
         today_str = date.today().isoformat()
+
+        # 性能优化（2026-07-02）：原实现每条历史记录串行 await client.get（最多29次，4-9s）
+        # 改为：先收集所有历史 symbols，一次性批量拉取，再回填
+        # Step 1: 标记 isToday + 收集所有历史 symbols
+        all_history_symbols = []
         for record in daily_recommendations:
             rec_date = record.get('date', '')
             if rec_date >= today_str:
@@ -89,59 +144,86 @@ async def get_daily_recommendations():
                 continue
             record['isToday'] = False
             stocks = record.get('daily_recommendations') or record.get('stocks') or []
-            # 批量获取当前价格
-            symbols = [s.get('symbol', '') for s in stocks if s.get('symbol')]
-            if symbols:
-                try:
-                    client = get_http_client()
-                    codes_str = ','.join(symbols)
-                    url = f"{TENCENT_QUOTE_API}{codes_str}"
-                    resp = await client.get(url, timeout=5)
-                    text = resp.text.strip()
-                    if text:
-                        price_map = {}
-                        for line in text.split(';'):
-                            line = line.strip()
-                            if not line or '=' not in line:
-                                continue
-                            parts = line.split('~')
-                            if len(parts) > 3:
-                                # parts[2]是纯代码如"000657"，需要加上前缀匹配symbol
-                                raw_code = parts[2].lower().strip()
-                                try:
-                                    cur_price = float(parts[3])
-                                except (ValueError, IndexError):
-                                    cur_price = 0
-                                if cur_price > 0:
-                                    # 根据代码判断市场前缀
-                                    prefix = 'sz' if raw_code.startswith(('0', '3')) else 'sh'
-                                    full_sym = prefix + raw_code
-                                    price_map[full_sym] = cur_price
-                                    price_map[raw_code] = cur_price
-                        for s in stocks:
-                            sym = s.get('symbol', '').lower()
-                            cur = price_map.get(sym, 0)
-                            if cur > 0:
-                                s['currentPrice'] = cur
-                                buy_price = 0
-                                bsp = s.get('buySellPoints')
-                                if bsp and bsp.get('buy'):
-                                    try:
-                                        buy_price = float(bsp['buy'])
-                                    except (ValueError, TypeError):
-                                        pass
-                                if buy_price <= 0:
-                                    try:
-                                        buy_price = float(s.get('price', 0))
-                                    except (ValueError, TypeError):
-                                        pass
-                                if buy_price > 0:
-                                    s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
-                except Exception:
-                    pass
+            for s in stocks:
+                sym = s.get('symbol', '')
+                if sym:
+                    all_history_symbols.append(sym)
+
+        # Step 2: 一次性批量拉取所有历史 symbols 的实时行情
+        price_map = {}
+        if all_history_symbols:
+            try:
+                # 去重
+                unique_symbols = list(set(all_history_symbols))
+                # 分批拉取（每批最多100只，避免URL过长）
+                batch_size = 100
+                async def _fetch_quote_batch(syms):
+                    try:
+                        client = get_http_client()
+                        codes_str = ','.join(syms)
+                        url = f"{TENCENT_QUOTE_API}{codes_str}"
+                        resp = await client.get(url, timeout=5)
+                        return resp.text.strip()
+                    except Exception as _e:
+                        print(f'[历史推荐] 行情批量拉取失败: {_e}')
+                        return ''
+
+                batch_tasks = [
+                    _fetch_quote_batch(unique_symbols[i:i + batch_size])
+                    for i in range(0, len(unique_symbols), batch_size)
+                ]
+                batch_texts = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+                for text in batch_texts:
+                    if isinstance(text, Exception) or not text:
+                        continue
+                    for line in text.split(';'):
+                        line = line.strip()
+                        if not line or '=' not in line:
+                            continue
+                        parts = line.split('~')
+                        if len(parts) > 3:
+                            raw_code = parts[2].lower().strip()
+                            try:
+                                cur_price = float(parts[3])
+                            except (ValueError, IndexError):
+                                cur_price = 0
+                            if cur_price > 0:
+                                prefix = 'sz' if raw_code.startswith(('0', '3')) else 'sh'
+                                full_sym = prefix + raw_code
+                                price_map[full_sym] = cur_price
+                                price_map[raw_code] = cur_price
+            except Exception as _e:
+                print(f'[历史推荐] 行情解析失败: {_e}')
+
+        # Step 3: 回填每条记录的 currentPrice + profitRatio
+        for record in daily_recommendations:
+            if record.get('isToday'):
+                continue
+            stocks = record.get('daily_recommendations') or record.get('stocks') or []
+            for s in stocks:
+                sym = s.get('symbol', '').lower()
+                cur = price_map.get(sym, 0)
+                if cur > 0:
+                    s['currentPrice'] = cur
+                    buy_price = 0
+                    bsp = s.get('buySellPoints')
+                    if bsp and bsp.get('buy'):
+                        try:
+                            buy_price = float(bsp['buy'])
+                        except (ValueError, TypeError):
+                            pass
+                    if buy_price <= 0:
+                        try:
+                            buy_price = float(s.get('price', 0))
+                        except (ValueError, TypeError):
+                            pass
+                    if buy_price > 0:
+                        s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
+
         return {"success": True, "data": daily_recommendations}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取推荐记录失败")
+        raise HTTPException(status_code=500, detail=f"获取推荐记录失败: {str(error)}")
 
 @router.post("/api/daily_recommendations", tags=["推荐记录"])
 async def post_daily_recommendations(record: Dict):
@@ -169,11 +251,11 @@ async def post_daily_recommendations(record: Dict):
         if saved:
             return {"success": True, "message": "推荐记录保存成功"}
         else:
-            raise HTTPException(status_code=500, detail="保存推荐记录失败")
+            raise HTTPException(status_code=500, detail=f"保存推荐记录失败: {str(error)}")
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(status_code=500, detail="保存推荐记录失败")
+        raise HTTPException(status_code=500, detail=f"保存推荐记录失败: {str(error)}")
 
 @router.delete("/api/daily_recommendations/{date}", tags=["推荐记录"])
 async def delete_recommendation(date: str):
@@ -191,7 +273,7 @@ async def delete_recommendation(date: str):
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(status_code=500, detail="删除推荐记录失败")
+        raise HTTPException(status_code=500, detail=f"删除推荐记录失败: {str(error)}")
 
 
 @router.post("/api/generate-recommendations", tags=["推荐记录"])
@@ -223,10 +305,8 @@ async def scan_ma10_api():
 
 
 def _ensure_today_date(data: Dict) -> Dict:
-    if data:
-        data['scanDate'] = data.get('date', '')
-        data['date'] = date.today().isoformat()
-    return data
+    # 2026-07-06 C-5: 已合并到 services.utils.ensure_today_date，此处保留薄壳透传以最小化改动
+    return ensure_today_date(data)
 
 @router.get("/api/trend-stocks", tags=["趋势发现"])
 async def get_trend_scan_results():
@@ -234,7 +314,7 @@ async def get_trend_scan_results():
         trend_data = load_trend_scan_results()
         return {"success": True, "data": _ensure_today_date(trend_data)}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取趋势股票失败")
+        raise HTTPException(status_code=500, detail=f"获取趋势股票失败: {str(error)}")
 
 
 @router.get("/api/scan-trend-stocks", tags=["趋势发现"])
@@ -246,35 +326,45 @@ async def scan_trend_stocks(force: bool = False):
         raise HTTPException(status_code=500, detail=f"扫描趋势股票失败: {str(error)}")
 
 
-@router.get("/api/debug-eastmoney-review", tags=["调试-临时"])
-async def debug_eastmoney_review():
-    import requests as _req
-    import asyncio
-    urls = {
-        'limit_up': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
-        'limit_down': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f12,f14',
-        'industry': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50&fields=f2,f3,f12,f14',
-        'concept': 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50&fields=f2,f3,f12,f14',
-    }
-    hdrs = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://quote.eastmoney.com/'}
-    
-    def _fetch_one(name, u):
-        try:
-            r = _req.get(u, headers=hdrs, timeout=10)
-            j = r.json()
-            data = j.get('data') or {}
-            diff = data.get('diff') or []
-            return name, {
-                'status': r.status_code,
-                'total': data.get('total'),
-                'diffCount': len(diff),
-                'top1Pct': diff[0].get('f3') if diff else None,
-            }
-        except Exception as e:
-            return name, {'error': str(e)}
-    
-    results = await asyncio.gather(*[asyncio.to_thread(_fetch_one, n, u) for n, u in urls.items()])
-    return dict(results)
+# ========== P4-1 趋势评分回测验证 API（2026-07-01）==========
+@router.post("/api/trend/backtest", tags=["趋势发现"])
+async def run_trend_backtest():
+    """手动触发趋势回测验证（扫描所有 verified=0 的历史记录）"""
+    try:
+        result = await backtest_trend_predictions()
+        return {"success": True, "data": result}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"趋势回测失败: {str(error)}")
+
+
+@router.get("/api/trend/backtest-history", tags=["趋势发现"])
+async def get_trend_backtest_history(limit: int = 30):
+    """获取趋势回测历史报告列表"""
+    try:
+        reports = load_trend_backtest_reports(limit=limit)
+        return {"success": True, "data": reports}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取回测历史失败: {str(error)}")
+
+
+@router.get("/api/trend/backtest-latest", tags=["趋势发现"])
+async def get_trend_backtest_latest():
+    """获取最新一条趋势回测报告（前端徽章用）"""
+    try:
+        report = load_latest_trend_backtest_report()
+        return {"success": True, "data": report}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取最新回测报告失败: {str(error)}")
+
+
+@router.get("/api/trend/backtest-records", tags=["趋势发现"])
+async def get_trend_backtest_records(predict_date: str = None, symbol: str = None, limit: int = 100):
+    """获取趋势回测明细记录（支持按日期/symbol 过滤）"""
+    try:
+        records = load_trend_backtest_records(predict_date=predict_date, symbol=symbol, limit=limit)
+        return {"success": True, "data": records}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取回测明细失败: {str(error)}")
 
 
 @router.get("/api/ai-diagnose/{symbol}", tags=["AI诊断"])
@@ -358,14 +448,16 @@ async def ai_diagnose(symbol: str):
                         'price': idx_parsed[0].get('price', 0),
                         'changePercent': idx_parsed[0].get('changePercent', 0)
                     }
-            except:
+            except Exception as _e:
+                print(f'[AI诊断] 大盘指数 {key} 获取失败: {_e}')
                 market_data[key] = {'name': info['name'], 'price': 0, 'changePercent': 0}
 
         # 获取个股概念标签
         try:
             all_tags = load_stock_concept_tags()
             stock_concepts = all_tags.get(symbol, [])
-        except:
+        except Exception as _e:
+            print(f'[AI诊断] 概念标签加载失败: {_e}')
             stock_concepts = []
 
         # 获取热点板块和概念数据
@@ -380,7 +472,8 @@ async def ai_diagnose(symbol: str):
 
         try:
             diagnosis = json.loads(ai_result)
-        except:
+        except Exception as _e:
+            print(f'[AI诊断] AI 返回非 JSON: {_e}')
             diagnosis = {"raw": ai_result}
 
         return {
@@ -416,7 +509,7 @@ async def get_stock_basic_info_api():
         name_search = load_stock_alias_map()
         return {"success": True, "data": stock_basic_info, "nameSearch": name_search}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取股票映射失败")
+        raise HTTPException(status_code=500, detail=f"获取股票映射失败: {str(error)}")
 
 @router.post("/api/update-stock-map", tags=["股票映射"])
 async def update_stock_basic_info_api(data: Dict):
@@ -488,6 +581,18 @@ async def get_user_scan_pool_api():
         print(f'[custom-scan-pool] 顶层异常: {error}\n{traceback.format_exc()}')
         raise HTTPException(status_code=500, detail=f"获取自定义扫描池失败: {error}")
 
+@router.get("/api/custom-scan-pool/symbols", tags=["自定义扫描池"])
+async def get_user_scan_pool_symbols_api():
+    """轻量端点：仅返回扫描池代码列表，不拉 K 线/行情
+    性能优化（2026-07-02）：TabQuote/TabScan 只需 symbols 列表，
+    原先调 /api/custom-scan-pool 会触发 N 次 K 线计算（2-4s 纯浪费）。
+    """
+    try:
+        symbols = load_user_scan_pool()
+        return {"success": True, "data": {"symbols": symbols, "count": len(symbols)}}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取扫描池代码列表失败: {error}")
+
 @router.post("/api/custom-scan-pool", tags=["自定义扫描池"])
 async def update_user_scan_pool_api(data: Dict):
     try:
@@ -555,105 +660,13 @@ async def remove_from_user_scan_pool_api(data: Dict):
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
 
-@router.post("/api/custom-scan-pool/check-ma10", tags=["自定义扫描池"])
-async def check_ma10_api():
-    """手动触发10日线检查并删除跌破股票"""
-    try:
-        print('[手动触发] 开始执行10日线检查...')
-        
-        # 加载股票池
-        symbols = load_user_scan_pool()
-        if not symbols:
-            return {
-                "success": True, 
-                "data": {
-                    "message": "股票池为空，无需检查",
-                    "removed": [],
-                    "kept": [],
-                    "details": []
-                }
-            }
-        
-        removed_symbols = []
-        kept_symbols = []
-        details = []
-        
-        # 逐个检查股票
-        for symbol in symbols:
-            try:
-                # 获取K线数据
-                kline_data = await get_kline_data(symbol.lower())
-                if not kline_data:
-                    stock_name = get_cached_stock_name(symbol) or symbol
-                    detail = {
-                        "symbol": symbol,
-                        "name": stock_name,
-                        "shouldRemove": False,
-                        "reason": "获取K线数据失败，跳过"
-                    }
-                    details.append(detail)
-                    kept_symbols.append(symbol)
-                    continue
-                
-                # 检查是否跌破10日线
-                result = check_below_ma10(kline_data)
-                stock_name = get_cached_stock_name(symbol) or symbol
-                
-                detail = {
-                    "symbol": symbol,
-                    "name": stock_name,
-                    "shouldRemove": result['shouldRemove'],
-                    "reason": result['reason'],
-                    "latestClose": result['latestClose'],
-                    "ma10": result['ma10']
-                }
-                details.append(detail)
-                
-                if result['shouldRemove']:
-                    removed_symbols.append(symbol)
-                else:
-                    kept_symbols.append(symbol)
-                
-            except Exception as e:
-                stock_name = get_cached_stock_name(symbol) or symbol
-                detail = {
-                    "symbol": symbol,
-                    "name": stock_name,
-                    "shouldRemove": False,
-                    "reason": f"检查失败: {str(e)}"
-                }
-                details.append(detail)
-                kept_symbols.append(symbol)
-                continue
-        
-        # 保存更新后的股票池
-        if removed_symbols:
-            save_user_scan_pool(kept_symbols)
-            message = f"扫描完成！共删除{len(removed_symbols)}只股票，保留{len(kept_symbols)}只股票"
-        else:
-            message = "扫描完成！没有需要删除的股票"
-        
-        return {
-            "success": True,
-            "data": {
-                "message": message,
-                "removed": removed_symbols,
-                "kept": kept_symbols,
-                "details": details
-            }
-        }
-        
-    except Exception as error:
-        print(f'[手动触发] 10日线检查失败: {str(error)}')
-        raise HTTPException(status_code=500, detail=str(error))
-
 @router.delete("/api/custom-scan-pool", tags=["自定义扫描池"])
 async def clear_user_scan_pool_api():
     try:
         save_user_scan_pool([])
         return {"success": True, "message": "自定义扫描池已清空"}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="清空自定义扫描池失败")
+        raise HTTPException(status_code=500, detail=f"清空自定义扫描池失败: {str(error)}")
 
 @router.get("/api/hot-stocks-scan", tags=["股票扫描"])
 async def hot_stock_buttons_scan(codes: str = ''):
@@ -670,38 +683,77 @@ async def hot_stock_buttons_scan(codes: str = ''):
             codes_list = codes_list[:100]
         
         print(f'[批量扫描] 开始扫描 {len(codes_list)} 只股票...')
-        
-        batch_size = 20
+
+        # 性能优化（2026-07-02）：腾讯行情接口支持批量，单次拉取 100 只以减少 RTT
+        # 原 batch_size=20 会产生 5 次请求，改为 100 只 1 次请求
+        batch_size = 100
         all_results = []
-        
-        for i in range(0, len(codes_list), batch_size):
-            batch = codes_list[i:i + batch_size]
+
+        async def _fetch_one_batch(batch):
             symbols = ','.join(batch)
-            
             try:
                 data = await fetch_with_retry(symbols)
-                parsed = parse_tencent_batch_data(data)
-                all_results.extend(parsed)
-                print(f'  [批次 {i // batch_size + 1}] {len(parsed)} 只成功')
+                return parse_tencent_batch_data(data)
             except Exception as e:
-                print(f'  [批次 {i // batch_size + 1}] 失败: {str(e)}')
-        
+                print(f'  [批次] 失败: {e}')
+                return []
+
+        batch_tasks = [
+            _fetch_one_batch(codes_list[i:i + batch_size])
+            for i in range(0, len(codes_list), batch_size)
+        ]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        for idx, r in enumerate(batch_results, 1):
+            if isinstance(r, Exception):
+                print(f'  [批次 {idx}] 异常: {r}')
+                continue
+            all_results.extend(r)
+
+        # 性能优化（2026-07-02）：大盘涨跌幅 + 主力资金流向 并发
+        async def _fetch_market_change() -> float:
+            try:
+                # 优先从缓存获取（如果需要进一步优化可以加缓存逻辑）
+                idx_data = await fetch_stock_data('sh000001')
+                if idx_data:
+                    return idx_data.get('parsed', {}).get('changePercent', 0)
+            except Exception as _e:
+                print(f'[批量扫描] 大盘涨跌幅获取失败: {_e}')
+            return 0.0
+
+        async def _fetch_fund_flow() -> Dict:
+            try:
+                from services.recommend import fetch_batch_fund_flow
+                return await fetch_batch_fund_flow([s.get('symbol', '') for s in all_results])
+            except Exception as e:
+                print(f'[批量扫描] 资金流向获取失败: {e}')
+                return {}
+
+        market_change, fund_flow_map = await asyncio.gather(
+            _fetch_market_change(),
+            _fetch_fund_flow()
+        )
+
+        # 评分（传入 market_change + fund_flow_data，与 recommend 路径对齐）
         for stock in all_results:
-            stock['score'] = calc_stock_score_v2(stock)
-        
+            sym = stock.get('symbol', '').lower()
+            ff = fund_flow_map.get(sym)
+            stock['score'] = calc_stock_score_v2(stock, market_change=market_change, fund_flow_data=ff)
+
+        # P3-2 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total
+        # industry_map 来自 fetch_batch_fund_flow 的 f100 字段；样本<5/行业跳过
+        if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED:
+            industry_map = {sym: (ff or {}).get('industry', '') for sym, ff in fund_flow_map.items()}
+            apply_industry_neutralization(all_results, industry_map)
+            # 持久化行业映射（增量更新，失败不阻塞）
+            try:
+                save_stock_industry(industry_map)
+            except Exception as e:
+                print(f'[批量扫描] 行业映射持久化失败（不影响评分）: {e}')
+
         all_results.sort(key=lambda x: x['score']['total'], reverse=True)
-        
+
         # 过滤掉60分以下的数据
         all_results = [s for s in all_results if s['score']['total'] >= 60]
-        
-        # 获取大盘涨跌用于预测记录
-        market_change = 0.0
-        try:
-            idx_data = await fetch_stock_data('sh000001')
-            if idx_data:
-                market_change = idx_data.get('parsed', {}).get('changePercent', 0)
-        except Exception:
-            pass
         
         # 保存预测记录 - 只记录看涨的
         today_str = date.today().isoformat()
@@ -747,6 +799,10 @@ async def hot_stock_buttons_scan(codes: str = ''):
                 'pe': s['pe'],
                 'weibi': s['weibi'],
                 'outerRatio': s['outerRatio'],
+                # P1-1: 附加主力净流入占比(%)，供前端 score.js calculateScore 使用
+                'mainInflowRatio': (fund_flow_map.get(s['symbol'].lower(), {}) or {}).get('main_inflow_ratio'),
+                # P3-2: 行业中性化调整值（±2/0），供前端展示
+                'industryAdjust': s['score'].get('industryAdjust', 0),
                 'score': s['score']['total'],
                 'scoreLabel': s['score']['label'],
                 'predictDirection': s['score']['predict_direction'],
@@ -778,12 +834,13 @@ async def get_hot_stock_buttons_api():
                         s['price'] = 0.0
                 # 按股价降序排序
                 stocks.sort(key=lambda x: x.get('price', 0), reverse=True)
-            except Exception:
+            except Exception as _e:
+                print(f'[热门股票] 实时行情批量获取失败，price 置 0: {_e}')
                 for s in stocks:
                     s['price'] = 0.0
         return {"success": True, "data": {"stocks": stocks, "count": len(stocks)}}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取热门股票失败")
+        raise HTTPException(status_code=500, detail=f"获取热门股票失败: {str(error)}")
 
 @router.post("/api/hot-stocks", tags=["热门股票"])
 async def update_hot_stock_buttons_api(data: Dict):
@@ -865,7 +922,7 @@ async def get_stock_concept_tags_api():
         tags = load_stock_concept_tags()
         return {"success": True, "data": {"tags": tags, "count": len(tags)}}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取股票标签失败")
+        raise HTTPException(status_code=500, detail=f"获取股票标签失败: {str(error)}")
 
 @router.get("/api/stock-tags/{symbol}", tags=["股票标签"])
 async def get_stock_concept_tags_by_symbol_api(symbol: str):
@@ -873,7 +930,7 @@ async def get_stock_concept_tags_by_symbol_api(symbol: str):
         tags = load_stock_concept_tags()
         return {"success": True, "data": {"symbol": symbol, "tags": tags.get(symbol.lower(), [])}}
     except Exception as error:
-        raise HTTPException(status_code=500, detail="获取股票标签失败")
+        raise HTTPException(status_code=500, detail=f"获取股票标签失败: {str(error)}")
 
 @router.post("/api/stock-tags/{symbol}", tags=["股票标签"])
 async def add_stock_concept_tags_api(symbol: str, data: Dict):
@@ -927,7 +984,7 @@ async def get_market_predict_api():
         return {"success": True, "data": result}
     except Exception as error:
         print(f'[大盘预测API] 错误: {str(error)}')
-        raise HTTPException(status_code=500, detail="获取大盘预测失败")
+        raise HTTPException(status_code=500, detail=f"获取大盘预测失败: {str(error)}")
 
 @router.get("/api/market-index", tags=["大盘指数"])
 async def get_market_index_api():
@@ -937,7 +994,7 @@ async def get_market_index_api():
         return {"success": True, "data": result}
     except Exception as error:
         print(f'[大盘指数API] 错误: {str(error)}')
-        raise HTTPException(status_code=500, detail="获取大盘指数失败")
+        raise HTTPException(status_code=500, detail=f"获取大盘指数失败: {str(error)}")
 
 @router.get("/api/kline/{symbol}", tags=["K线数据"])
 async def get_kline(symbol: str):
@@ -973,7 +1030,7 @@ async def get_kline(symbol: str):
         }
     except Exception as error:
         print(f'[K线API] 错误: {str(error)}')
-        raise HTTPException(status_code=500, detail="获取K线数据失败")
+        raise HTTPException(status_code=500, detail=f"获取K线数据失败: {str(error)}")
 
 @router.get("/api/kline/{symbol}/minute", tags=["K线数据"])
 async def get_minute_kline(symbol: str):
@@ -1041,7 +1098,7 @@ async def get_minute_kline(symbol: str):
         }
     except Exception as error:
         print(f'[分时K线API] 错误: {str(error)}')
-        raise HTTPException(status_code=500, detail="获取分时数据失败")
+        raise HTTPException(status_code=500, detail=f"获取分时数据失败: {str(error)}")
 
 
 @router.post("/api/daily-review/generate", tags=["收评"])
@@ -1135,13 +1192,13 @@ async def get_backtest_history(days: int = STRATEGY_BACKTEST_HISTORY_DAYS):
                             for s in parsed['suggestions']
                         ]
                     d['misjudge_analysis'] = parsed
-                except Exception:
-                    pass
+                except Exception as _e:
+                    print(f'[回测历史] misjudge_analysis JSON 解析失败(id={d.get("id")}): {_e}')
             if d.get('weight_adjustments'):
                 try:
                     d['weight_adjustments'] = json.loads(d['weight_adjustments'])
-                except Exception:
-                    pass
+                except Exception as _e:
+                    print(f'[回测历史] weight_adjustments JSON 解析失败(id={d.get("id")}): {_e}')
             result_rows.append(d)
         return {"success": True, "data": result_rows}
     except Exception as error:
@@ -1180,33 +1237,40 @@ async def get_predictions(date_str: str = None, verified: int = None, include_to
 # ========== 东方财富 API 代理（兼容生产模式） ==========
 # 前端 fetchEnrichData() 需要通过 /eastmoney/* 调用东方财富接口
 # Vite 开发模式下由 vite.config.js 代理；生产模式下由此路由代理
+# 2026-07-02 C-5: 请求头统一使用 config.EASTMONEY_HEADERS
+# 2026-07-06 A-P3-2: 模块级 requests.Session 复用连接池，避免每次请求新建 TCP 连接
+import requests as _req
+_eastmoney_session: Optional[_req.Session] = None
 
-_EM_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Referer': 'https://quote.eastmoney.com/',
-    'Origin': 'https://quote.eastmoney.com',
-}
+def _get_eastmoney_session() -> _req.Session:
+    """获取模块级 requests.Session（懒初始化，复用连接池）"""
+    global _eastmoney_session
+    if _eastmoney_session is None:
+        _eastmoney_session = _req.Session()
+        _eastmoney_session.headers.update(EASTMONEY_HEADERS)
+        # 配置 HTTPAdapter 复用连接池（pool_connections=连接数, pool_maxsize=最大并发）
+        adapter = _req.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+        _eastmoney_session.mount('https://', adapter)
+        _eastmoney_session.mount('http://', adapter)
+    return _eastmoney_session
 
 @router.api_route("/eastmoney/{path:path}", methods=["GET", "POST"])
 async def proxy_eastmoney(request: Request, path: str):
-    """将 /eastmoney/* 请求转发到东方财富 API（requests + 重试，解决 RemoteDisconnected）"""
-    import requests as _req
+    """将 /eastmoney/* 请求转发到东方财富 API（requests Session + 重试，解决 RemoteDisconnected）"""
     import asyncio, time as _time
     target_url = f"https://push2delay.eastmoney.com/{path}"
     query_params = dict(request.query_params)
-    
+    session = _get_eastmoney_session()
+
     def _do_request():
         last_err = None
         for attempt in range(3):
             try:
                 if request.method == "GET":
-                    return _req.get(target_url, params=query_params, headers=_EM_HEADERS, timeout=15)
+                    return session.get(target_url, params=query_params, timeout=15)
                 else:
                     body_bytes = request._body
-                    return _req.post(target_url, params=query_params, data=body_bytes, headers=_EM_HEADERS, timeout=15)
+                    return session.post(target_url, params=query_params, data=body_bytes, timeout=15)
             except Exception as e:
                 last_err = e
                 if attempt < 2:

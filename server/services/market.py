@@ -1,5 +1,5 @@
 """market.py - split from main.py"""
-import json, asyncio, httpx, re
+import asyncio, re
 from typing import List, Dict, Optional
 from datetime import date, datetime
 from app.config import INDEX_SYMBOLS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, TENCENT_QUOTE_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
@@ -32,19 +32,22 @@ async def get_market_index(index_symbol: str) -> Optional[Dict]:
 
 async def check_market_crash() -> Dict:
     """检查大盘是否大跌"""
+    # 性能优化（2026-07-02）：3 指数串行改 asyncio.gather，3 RTT → 1 RTT
+    index_tasks = [get_market_index(info['symbol']) for info in INDEX_SYMBOLS.values()]
+    index_results = await asyncio.gather(*index_tasks, return_exceptions=True)
+
     indexes = []
     any_crash = False
     any_severe_crash = False
-    
-    for key, info in INDEX_SYMBOLS.items():
-        index_data = await get_market_index(info['symbol'])
-        if index_data:
-            indexes.append(index_data)
-            # 检查跌幅
-            if index_data['changePercent'] <= MARKET_CRASH_THRESHOLD:
-                any_crash = True
-            if index_data['changePercent'] <= MARKET_SEVERE_CRASH_THRESHOLD:
-                any_severe_crash = True
+
+    for r in index_results:
+        if isinstance(r, Exception) or r is None:
+            continue
+        indexes.append(r)
+        if r['changePercent'] <= MARKET_CRASH_THRESHOLD:
+            any_crash = True
+        if r['changePercent'] <= MARKET_SEVERE_CRASH_THRESHOLD:
+            any_severe_crash = True
     
     # 判断整体市场状态
     market_status = 'normal'
@@ -112,8 +115,19 @@ def get_crash_suggestion(market_status: str, indexes: List[Dict]) -> Dict:
         }
 
 # ========== 大盘预测系统（主力资金流向预测） ==========
+# 性能优化（2026-07-02）：60 秒内存缓存，避免 TabQuote/TabStrategy 重复触发 500 只股票扫描
+_market_predict_cache: Dict[str, tuple] = {}  # {date_str: (timestamp, result)}
+_MARKET_PREDICT_CACHE_TTL = 60  # 秒
+
 async def predict_market_risk() -> Dict:
     """基于全市场股票数据预测大盘风险（主力资金流向预测）"""
+    # 缓存检查：60 秒内同日命中直接返回
+    today_str = date.today().isoformat()
+    cached = _market_predict_cache.get(today_str)
+    now_ts = datetime.now().timestamp()
+    if cached and (now_ts - cached[0]) < _MARKET_PREDICT_CACHE_TTL:
+        return cached[1]
+
     # 收集所有可用的股票池数据
     hot_search_ranking_data = load_hot_search_ranking()
     hot_stock_buttons = load_hot_stock_buttons()
@@ -168,21 +182,31 @@ async def predict_market_risk() -> Dict:
         stocks = [s['symbol'] for s in hot_search_ranking_stocks]
     
     # 分批获取实时数据（最多取500只代表性股票）
+    # 性能优化（2026-07-02）：batch 20→100 + asyncio.gather 并发 + 复用 get_http_client
+    # 旧实现：500只/20=25 批串行 await + 新建 httpx.AsyncClient，5-12s
+    # 新实现：500只/100=5 批 gather 并发 + 复用全局 client，1-2s
     all_symbols = stocks[:500]
-    batch_size = 20
+    batch_size = 100
     all_data = []
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for i in range(0, len(all_symbols), batch_size):
-            batch = all_symbols[i:i + batch_size]
-            try:
-                symbols_str = ','.join(batch)
-                raw_data = await fetch_with_retry(symbols_str, client)
-                parsed = parse_tencent_batch_data(raw_data)
-                all_data.extend(parsed)
-            except Exception as e:
-                print(f'[预测扫描] 批次 {i // batch_size + 1} 失败: {str(e)}')
-                continue
+
+    async def _fetch_one_batch(batch):
+        try:
+            symbols_str = ','.join(batch)
+            raw_data = await fetch_with_retry(symbols_str)
+            return parse_tencent_batch_data(raw_data)
+        except Exception as e:
+            print(f'[预测扫描] 批次失败: {e}')
+            return []
+
+    batch_tasks = [
+        _fetch_one_batch(all_symbols[i:i + batch_size])
+        for i in range(0, len(all_symbols), batch_size)
+    ]
+    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+    for r in batch_results:
+        if isinstance(r, Exception):
+            continue
+        all_data.extend(r)
     
     if not all_data:
         return {
@@ -431,8 +455,8 @@ async def predict_market_risk() -> Dict:
             'shouldSell': False,
             'urgency': 0
         }
-    
-    return {
+
+    result = {
         'updateTime': datetime.now().isoformat(),
         'predictStatus': predict_status,
         'riskScore': risk_score,
@@ -486,3 +510,6 @@ async def predict_market_risk() -> Dict:
             'weibiHeavyNegCount': weibi_heavy_neg_count
         }
     }
+    # 写入缓存
+    _market_predict_cache[today_str] = (now_ts, result)
+    return result

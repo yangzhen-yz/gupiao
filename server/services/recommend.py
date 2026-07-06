@@ -1,12 +1,85 @@
 """recommend.py - split from main.py"""
-import json, asyncio, re
-from typing import List, Dict
+import json, asyncio, re, requests
+from typing import List, Dict, Optional
 from datetime import datetime, date
-from app.config import HOT_STOCK_POOL, STRATEGY_PREDICT_BULL_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT
-from db.database import get_db_conn, load_daily_recommendations, save_daily_recommendations, load_user_scan_pool, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags
-from services.stock import get_http_client, fetch_stock_data, parse_realtime_fields, get_stock_name, fetch_with_retry, parse_tencent_batch_data
-from services.trend import scan_trend_scan_results
-from services.strategy import calc_stock_score_v2
+from app.config import HOT_STOCK_POOL, STRATEGY_PREDICT_BULL_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD
+from db.database import get_db_conn, load_daily_recommendations, save_daily_recommendations, load_user_scan_pool, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry
+from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
+from services.strategy import calc_stock_score_v2, apply_industry_neutralization
+from services.utils import to_float as _to_float
+
+
+async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
+    """批量获取主力资金流向数据（P4-3 靶向优化，2026-07-02）
+
+    改用东方财富 ulist.get 接口，通过 secids 直接获取指定股票的资金流向。
+    相比 P4-2 的全市场分页扫描（~6s），靶向请求耗时降至 ~200ms。
+
+    Args:
+        codes: 股票代码列表（小写，如 ['sh600519', 'sz000858']）
+
+    Returns:
+        {symbol: {'main_net_inflow': float(元), 'main_inflow_ratio': float(%),
+                  'circ_mv': float(元), 'industry': str}}
+    """
+    if not codes:
+        return {}
+    
+    # 构建 secids: 1.600519 (沪), 0.000858 (深)
+    secids = []
+    for c in codes:
+        code = c[2:]
+        market = '1' if c.startswith('sh') else '0'
+        secids.append(f"{market}.{code}")
+    
+    _HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Referer': 'https://quote.eastmoney.com/',
+    }
+
+    def _fetch_targeted():
+        # ulist.get 支持批量获取指定 secids
+        params = {
+            'pi': 0, 'pz': len(secids), 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
+            'fields': 'f12,f13,f62,f21,f100',
+            'secids': ','.join(secids)
+        }
+        # 使用 EASTMONEY_HOT_LIST_API 的基础域名，但接口路径不同
+        # 实际地址示例: https://push2.eastmoney.com/api/qt/ulist/get
+        url = EASTMONEY_HOT_LIST_API.replace('/clist/get', '/ulist/get')
+        r = requests.get(url, params=params, headers=_HEADERS, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        return data.get('data', {}).get('diff', []) or []
+
+    # 2026-07-06 C-5: _to_float 已合并到 services.utils.to_float（顶部 import 别名 _to_float）
+    # 此处原局部函数定义已删除
+
+    try:
+        items = await asyncio.to_thread(_fetch_targeted)
+        found: Dict[str, Dict] = {}
+        for item in items:
+            code = item.get('f12', '')
+            if not code: continue
+            market = item.get('f13', 0)
+            symbol = f'{"sh" if market == 1 else "sz"}{code}'.lower()
+            main_inflow = _to_float(item.get('f62'))
+            circ_mv = _to_float(item.get('f21'))
+            main_ratio = (main_inflow / circ_mv * 100) if circ_mv > 0 else 0.0
+            industry = item.get('f100', '') or ''
+            found[symbol] = {
+                'main_net_inflow': main_inflow,
+                'main_inflow_ratio': main_ratio,
+                'circ_mv': circ_mv,
+                'industry': industry,
+            }
+        print(f'[资金流向] 靶向获取 {len(found)}/{len(codes)} 只股票数据')
+        return found
+    except Exception as e:
+        print(f'[资金流向] 靶向获取失败: {e}')
+        return {}
+
 
 def calc_buy_sell_points(stock: Dict) -> Dict:
     """计算买入点、当前价、卖出点（V4.1 智能版）
@@ -24,7 +97,7 @@ def calc_buy_sell_points(stock: Dict) -> Dict:
     amplitude = float(stock.get('amplitude', 0) or 0)
 
     # 涨停板：不设固定买点，提示竞价关注
-    if change_pct >= 9.8:
+    if change_pct >= TREND_LIMIT_UP_THRESHOLD:
         # 卖出价：封单坚决 +2%，普通封板 +4%
         weibi = float(stock.get('weibi', 0) or 0)
         turnover = float(stock.get('turnoverRate', 0) or 0)
@@ -94,7 +167,7 @@ def gen_recommend_reason_server(stock: Dict, score_result: Dict) -> str:
 
         # 风险提示
         change_pct = float(stock.get('changePercent', 0) or 0)
-        if change_pct >= 9.8:
+        if change_pct >= TREND_LIMIT_UP_THRESHOLD:
             if weibi < 50 or turnover_rate > 15:
                 reasons.append('⚠ 涨停但封单偏弱/换手偏高，追板有风险')
             else:
@@ -153,41 +226,76 @@ async def auto_generate_recommendations_task():
             return
 
         # ===== 2. 获取大盘涨跌幅 =====
-        market_change = 0.0
-        try:
-            idx_data = await fetch_stock_data('sh000001')
-            if idx_data:
-                market_change = idx_data.get('parsed', {}).get('changePercent', 0)
-        except Exception as e:
-            print(f'[智能推荐] 获取大盘数据失败: {str(e)}')
+        # 性能优化（2026-07-02）：大盘拉取与股票池批量行情并发
+        async def _fetch_market_change() -> float:
+            try:
+                idx_data = await fetch_stock_data('sh000001')
+                if idx_data:
+                    return idx_data.get('parsed', {}).get('changePercent', 0)
+            except Exception:
+                pass
+            return 0.0
 
         # ===== 3. 批量扫描行情 =====
-        batch_size = 20
-        all_results = []
-        for i in range(0, len(codes_list), batch_size):
-            batch = codes_list[i:i + batch_size]
-            symbols = ','.join(batch)
+        # 性能优化（2026-07-02）：batch 20→100 + asyncio.gather 并发（大盘一并并发），参考 /api/hot-stocks-scan 模式
+        batch_size = 100
+
+        async def _fetch_one_batch(batch):
             try:
-                data = await fetch_with_retry(symbols)
-                parsed = parse_tencent_batch_data(data)
-                all_results.extend(parsed)
+                data = await fetch_with_retry(','.join(batch))
+                return parse_tencent_batch_data(data)
             except Exception as e:
-                print(f'  [智能推荐] 批次 {i // batch_size + 1} 失败: {str(e)}')
+                print(f'  [智能推荐] 批次失败: {e}')
+                return []
+
+        batch_tasks = [
+            _fetch_one_batch(codes_list[i:i + batch_size])
+            for i in range(0, len(codes_list), batch_size)
+        ]
+        # 大盘 + 所有批次 gather 一起
+        gather_results = await asyncio.gather(
+            _fetch_market_change(),
+            *[t for t in batch_tasks],
+            return_exceptions=True
+        )
+        market_change = gather_results[0] if not isinstance(gather_results[0], Exception) else 0.0
+        all_results = []
+        for r in gather_results[1:]:
+            if isinstance(r, Exception):
+                continue
+            all_results.extend(r)
 
         if not all_results:
             print('[智能推荐] 未获取到任何股票行情数据')
             return
 
-        # ===== 4. 混合评分（P0: 50%日内 + 50%趋势） =====
+        # ===== 4. 混合评分（P0: 50%日内 + 50%趋势 + P1-1 主力资金因子） =====
         concept_tags_raw = load_stock_concept_tags()
         concept_tags = {k.lower(): v for k, v in concept_tags_raw.items()}  # 统一小写
+        # P1-1: 批量预取主力资金流向，注入第9因子
+        fund_flow_map = {}
+        try:
+            fund_flow_map = await fetch_batch_fund_flow([s.get('symbol', '') for s in all_results])
+        except Exception as e:
+            print(f'[智能推荐] 资金流向预取失败（降级为无数据）: {e}')
         for stock in all_results:
             sym = stock.get('symbol', '').lower()
             trend = trend_map.get(sym)  # 趋势扫描已有的结果
-            stock['score'] = calc_stock_score_v2(stock, market_change=market_change, trend_result=trend)
+            ff = fund_flow_map.get(sym)
+            stock['score'] = calc_stock_score_v2(stock, market_change=market_change,
+                                                 trend_result=trend, fund_flow_data=ff)
             # 预取概念标签用于行业分散
             tags = concept_tags.get(sym)
             stock['primary_tag'] = tags[0] if tags else '其他'
+
+        # P3-2 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total（与 routes 路径对齐）
+        if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED:
+            industry_map = {sym: (ff or {}).get('industry', '') for sym, ff in fund_flow_map.items()}
+            apply_industry_neutralization(all_results, industry_map)
+            try:
+                save_stock_industry(industry_map)
+            except Exception as e:
+                print(f'[智能推荐] 行业映射持久化失败（不影响评分）: {e}')
 
         all_results.sort(key=lambda x: x['score']['total'], reverse=True)
 

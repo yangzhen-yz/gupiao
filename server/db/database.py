@@ -89,6 +89,9 @@ def init_db():
                 is_correct INTEGER DEFAULT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(predict_date, symbol))''')
+        # 索引（2026-07-06 A-P3-1）：strategy_predict_records 按日期查询 + 未验证筛选是高频路径
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_date ON strategy_predict_records(predict_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_verified ON strategy_predict_records(verified)')
         # 策略权重表（动态调整的评分权重）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS strategy_factor_weights (
@@ -181,6 +184,73 @@ def init_db():
                 symbol TEXT NOT NULL UNIQUE,
                 tags_json TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
+        # P4-1 趋势回测记录表（三周期字段并存于同一行，补验时只 UPDATE 对应周期）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trend_backtest_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                predict_date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                score INTEGER DEFAULT 0,
+                predict_direction TEXT DEFAULT 'bull',
+                sector_factor REAL DEFAULT 0,
+                chip_factor REAL DEFAULT 0,
+                pattern TEXT DEFAULT '',
+                pattern_factor REAL DEFAULT 0,
+                market_regime TEXT DEFAULT 'range',
+                total_factor REAL DEFAULT 0,
+                verified_1d INTEGER DEFAULT 0,
+                actual_change_1d REAL DEFAULT 0,
+                market_change_1d REAL DEFAULT 0,
+                is_correct_1d INTEGER DEFAULT 0,
+                verified_at_1d TEXT DEFAULT '',
+                verified_3d INTEGER DEFAULT 0,
+                actual_change_3d REAL DEFAULT 0,
+                market_change_3d REAL DEFAULT 0,
+                is_correct_3d INTEGER DEFAULT 0,
+                verified_at_3d TEXT DEFAULT '',
+                verified_5d INTEGER DEFAULT 0,
+                actual_change_5d REAL DEFAULT 0,
+                market_change_5d REAL DEFAULT 0,
+                is_correct_5d INTEGER DEFAULT 0,
+                verified_at_5d TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(predict_date, symbol))''')
+        # 索引（2026-07-06 A-P3-1）：trend_backtest_records 回测验证按 verified_1d/3d/5d 筛选未验证记录是高频路径
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_1d ON trend_backtest_records(verified_1d)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_3d ON trend_backtest_records(verified_3d)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_5d ON trend_backtest_records(verified_5d)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_predict_date ON trend_backtest_records(predict_date)')
+        # P4-1 趋势回测聚合报告表（按 predict_date 聚合，三周期统计字段并存）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trend_backtest_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                predict_date TEXT NOT NULL,
+                total_count INTEGER DEFAULT 0,
+                verified_1d_count INTEGER DEFAULT 0,
+                win_1d_count INTEGER DEFAULT 0,
+                win_rate_1d REAL DEFAULT 0,
+                verified_3d_count INTEGER DEFAULT 0,
+                win_3d_count INTEGER DEFAULT 0,
+                win_rate_3d REAL DEFAULT 0,
+                verified_5d_count INTEGER DEFAULT 0,
+                win_5d_count INTEGER DEFAULT 0,
+                win_rate_5d REAL DEFAULT 0,
+                score_60_70_total INTEGER DEFAULT 0,
+                score_60_70_win_1d INTEGER DEFAULT 0,
+                score_60_70_win_3d INTEGER DEFAULT 0,
+                score_60_70_win_5d INTEGER DEFAULT 0,
+                score_70_80_total INTEGER DEFAULT 0,
+                score_70_80_win_1d INTEGER DEFAULT 0,
+                score_70_80_win_3d INTEGER DEFAULT 0,
+                score_70_80_win_5d INTEGER DEFAULT 0,
+                score_80_plus_total INTEGER DEFAULT 0,
+                score_80_plus_win_1d INTEGER DEFAULT 0,
+                score_80_plus_win_3d INTEGER DEFAULT 0,
+                score_80_plus_win_5d INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(predict_date))''')
         try:
             cursor.execute('ALTER TABLE hot_search_ranking ADD COLUMN hot_rank INTEGER DEFAULT 0')
         except Exception:
@@ -189,6 +259,11 @@ def init_db():
             cursor.execute('ALTER TABLE trend_scan_results DROP COLUMN hot_rank')
         except Exception:
             pass
+        # P3-2 行业中性化：stock_basic_info 表增加 industry 列
+        try:
+            cursor.execute('ALTER TABLE stock_basic_info ADD COLUMN industry TEXT DEFAULT ""')
+        except Exception:
+            pass  # 列已存在
         conn.commit()
         print('[数据库] 表初始化完成')
     except Exception as e:
@@ -354,6 +429,220 @@ def save_trend_scan_results(data: Dict) -> bool:
     except Exception as error:
         print(f'保存趋势股票失败: {str(error)}')
         return False
+
+
+# ========== P4-1 趋势回测函数（2026-07-01）==========
+def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
+    """P4-1 保存趋势回测预测记录（每次趋势扫描后调用）
+
+    Args:
+        predict_date: 预测日期（即趋势扫描日期）
+        results: cleaned_results 列表，每项含 symbol/name/score/details
+                 details 子字典内含 sectorFactor/chipFactor/pattern/patternFactor/marketRegime/totalFactor
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for r in results:
+            details = r.get('details', {}) or {}
+            cursor.execute('''
+                INSERT OR REPLACE INTO trend_backtest_records
+                    (predict_date, symbol, name, score, predict_direction,
+                     sector_factor, chip_factor, pattern, pattern_factor, market_regime, total_factor)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                predict_date,
+                r.get('symbol', ''),
+                r.get('name', ''),
+                int(r.get('score', 0) or 0),
+                'bull',
+                float(details.get('sectorFactor', 0) or 0),
+                float(details.get('chipFactor', 0) or 0),
+                str(details.get('pattern', '') or ''),
+                float(details.get('patternFactor', 0) or 0),
+                str(details.get('marketRegime', 'range') or 'range'),
+                float(details.get('totalFactor', 0) or 0),
+            ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'[趋势回测] 保存预测记录失败: {str(error)}')
+        return False
+
+
+def load_trend_backtest_records(predict_date: str = None, symbol: str = None, limit: int = 100) -> List[Dict]:
+    """P4-1 加载趋势回测明细记录（支持按 predict_date / symbol 过滤）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        sql = 'SELECT * FROM trend_backtest_records'
+        conditions = []
+        params = []
+        if predict_date:
+            conditions.append('predict_date = ?')
+            params.append(predict_date)
+        if symbol:
+            conditions.append('symbol = ?')
+            params.append(symbol)
+        if conditions:
+            sql += ' WHERE ' + ' AND '.join(conditions)
+        sql += ' ORDER BY predict_date DESC, score DESC LIMIT ?'
+        params.append(limit)
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as error:
+        print(f'[趋势回测] 加载明细失败: {str(error)}')
+        return []
+
+
+def load_trend_backtest_records_pending_verification() -> List[Dict]:
+    """P4-1 加载所有未完全验证的记录（verified_1d=0 OR verified_3d=0 OR verified_5d=0）
+
+    返回所有待补验的记录，按 predict_date 分组由调用方处理。
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM trend_backtest_records
+            WHERE verified_1d = 0 OR verified_3d = 0 OR verified_5d = 0
+            ORDER BY predict_date ASC, score DESC
+        ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as error:
+        print(f'[趋势回测] 加载待验证记录失败: {str(error)}')
+        return []
+
+
+def update_trend_backtest_verification(predict_date: str, symbol: str, period: str,
+                                       actual_change: float, market_change: float,
+                                       is_correct: bool) -> bool:
+    """P4-1 补验单条记录的指定周期
+
+    Args:
+        period: '1d' / '3d' / '5d'
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        from datetime import datetime
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        sql = f'''UPDATE trend_backtest_records
+                  SET verified_{period} = 1,
+                      actual_change_{period} = ?,
+                      market_change_{period} = ?,
+                      is_correct_{period} = ?,
+                      verified_at_{period} = ?
+                  WHERE predict_date = ? AND symbol = ?'''
+        cursor.execute(sql, (
+            float(actual_change), float(market_change),
+            1 if is_correct else 0, now,
+            predict_date, symbol
+        ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'[趋势回测] 更新验证记录失败: {str(error)}')
+        return False
+
+
+def upsert_trend_backtest_report(predict_date: str, total_count: int,
+                                 period_stats: Dict, score_segment_stats: Dict) -> bool:
+    """P4-1 UPSERT 趋势回测聚合报告
+
+    Args:
+        predict_date: 预测日期
+        total_count: 该日入选趋势股总数
+        period_stats: {'1d': {'verified': n, 'win': n, 'win_rate': r}, '3d': {...}, '5d': {...}}
+        score_segment_stats: {'60_70': {'total': n, 'win_1d': n, 'win_3d': n, 'win_5d': n},
+                              '70_80': {...}, '80_plus': {...}}
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        from datetime import datetime
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        p1 = period_stats.get('1d', {})
+        p3 = period_stats.get('3d', {})
+        p5 = period_stats.get('5d', {})
+        s60 = score_segment_stats.get('60_70', {})
+        s70 = score_segment_stats.get('70_80', {})
+        s80 = score_segment_stats.get('80_plus', {})
+        cursor.execute('''
+            INSERT INTO trend_backtest_reports (
+                predict_date, total_count,
+                verified_1d_count, win_1d_count, win_rate_1d,
+                verified_3d_count, win_3d_count, win_rate_3d,
+                verified_5d_count, win_5d_count, win_rate_5d,
+                score_60_70_total, score_60_70_win_1d, score_60_70_win_3d, score_60_70_win_5d,
+                score_70_80_total, score_70_80_win_1d, score_70_80_win_3d, score_70_80_win_5d,
+                score_80_plus_total, score_80_plus_win_1d, score_80_plus_win_3d, score_80_plus_win_5d,
+                updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(predict_date) DO UPDATE SET
+                total_count = excluded.total_count,
+                verified_1d_count = excluded.verified_1d_count, win_1d_count = excluded.win_1d_count, win_rate_1d = excluded.win_rate_1d,
+                verified_3d_count = excluded.verified_3d_count, win_3d_count = excluded.win_3d_count, win_rate_3d = excluded.win_rate_3d,
+                verified_5d_count = excluded.verified_5d_count, win_5d_count = excluded.win_5d_count, win_rate_5d = excluded.win_rate_5d,
+                score_60_70_total = excluded.score_60_70_total, score_60_70_win_1d = excluded.score_60_70_win_1d, score_60_70_win_3d = excluded.score_60_70_win_3d, score_60_70_win_5d = excluded.score_60_70_win_5d,
+                score_70_80_total = excluded.score_70_80_total, score_70_80_win_1d = excluded.score_70_80_win_1d, score_70_80_win_3d = excluded.score_70_80_win_3d, score_70_80_win_5d = excluded.score_70_80_win_5d,
+                score_80_plus_total = excluded.score_80_plus_total, score_80_plus_win_1d = excluded.score_80_plus_win_1d, score_80_plus_win_3d = excluded.score_80_plus_win_3d, score_80_plus_win_5d = excluded.score_80_plus_win_5d,
+                updated_at = excluded.updated_at
+        ''', (
+            predict_date, total_count,
+            p1.get('verified', 0), p1.get('win', 0), p1.get('win_rate', 0),
+            p3.get('verified', 0), p3.get('win', 0), p3.get('win_rate', 0),
+            p5.get('verified', 0), p5.get('win', 0), p5.get('win_rate', 0),
+            s60.get('total', 0), s60.get('win_1d', 0), s60.get('win_3d', 0), s60.get('win_5d', 0),
+            s70.get('total', 0), s70.get('win_1d', 0), s70.get('win_3d', 0), s70.get('win_5d', 0),
+            s80.get('total', 0), s80.get('win_1d', 0), s80.get('win_3d', 0), s80.get('win_5d', 0),
+            now,
+        ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'[趋势回测] 保存报告失败: {str(error)}')
+        return False
+
+
+def load_trend_backtest_reports(limit: int = 30) -> List[Dict]:
+    """P4-1 加载历史回测报告列表（按 predict_date DESC）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT * FROM trend_backtest_reports ORDER BY predict_date DESC LIMIT ?',
+            (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as error:
+        print(f'[趋势回测] 加载报告列表失败: {str(error)}')
+        return []
+
+
+def load_latest_trend_backtest_report() -> Dict:
+    """P4-1 加载最新一条回测报告（前端徽章用）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT * FROM trend_backtest_reports ORDER BY predict_date DESC LIMIT 1')
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else {}
+    except Exception as error:
+        print(f'[趋势回测] 加载最新报告失败: {str(error)}')
+        return {}
+
+
 def load_stock_basic_info() -> Dict:
     try:
         conn = get_db_conn()
@@ -382,6 +671,27 @@ def save_stock_basic_info(stock_basic_info: Dict) -> bool:
     except Exception as error:
         print(f'保存股票映射失败: {str(error)}')
         return False
+
+def save_stock_industry(industry_map: Dict[str, str]) -> bool:
+    """P3-2 批量更新 symbol → industry（增量更新，不删除已有名称）（2026-06-30）"""
+    if not industry_map:
+        return False
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for symbol, industry in industry_map.items():
+            if not industry:
+                continue
+            cursor.execute(
+                'UPDATE stock_basic_info SET industry = ?, updated_at = CURRENT_TIMESTAMP WHERE symbol = ?',
+                (industry, symbol.lower())
+            )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存股票行业映射失败: {str(error)}')
+        return False
 def load_stock_alias_map() -> Dict:
     """加载名称搜索映射（名称 -> 代码）"""
     try:
@@ -398,9 +708,6 @@ def load_stock_alias_map() -> Dict:
 # ========== 自适应选股策略系统 ==========
 
 # 因子说明
-# ========== 自适应选股策略系统 ==========
-
-# 因子说明
 FACTOR_DESCRIPTIONS = {
     'outer_ratio': '外盘占比',
     'volume_ratio': '量比',
@@ -410,6 +717,7 @@ FACTOR_DESCRIPTIONS = {
     'avg_price_deviation': '均价偏离',
     'amplitude': '振幅',
     'position': '位置评估',
+    'main_capital_inflow': '主力净流入',  # P1-1（2026-06-30）：第 9 因子，配套展示中文
 }
 def load_strategy_factor_weights() -> Dict:
     """加载动态权重，如果数据库无数据则返回默认权重"""

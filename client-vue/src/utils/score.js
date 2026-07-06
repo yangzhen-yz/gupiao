@@ -1,85 +1,32 @@
-// 综合评分计算
-export function calculateScore(data) {
-  const outerRatio = data.outerRatio || 50
-  const turnoverRate = data.turnoverRate || 0
-  const volumeRatio = data.volumeRatio || 0
-  const weibi = data.weibi || 0
-  const avgPriceDeviation = data.avgPriceDeviation || 0
-  const amplitude = data.amplitude || 0
-  const changePercent = data.changePercent || 0
-  const pe = data.pe || 0
+// ==============================
+// 2026-07-02 C-6 重构 / 2026-07-06 P3-2 收尾：前端评分工具改纯展示工具
+// ==============================
+// 评分权威在后端 calc_stock_score_v2（services/strategy.py）
+// 本文件仅提供：
+//   - getRating(score): 统一评级标签（前后端共用阈值，project_memory 硬约束）
+//   - calculateScore(data): 纯透传薄壳，直接返回后端注入的 data.score + data.scoreDetails
+//     （不再做任何本地权重计算，权重由后端统一维护，避免前后端分叉）
+//   - getEnhancedAnalysis(data): 盘面增强分析（不依赖分数，纯规则）
+// ==============================
 
-  const details = []
 
-  let scoreOuter = 5
-  if (outerRatio >= 60) scoreOuter = 20
-  else if (outerRatio >= 55) scoreOuter = 15
-  else if (outerRatio >= 50) scoreOuter = 10
-  details.push({ label: `外盘占比(${outerRatio.toFixed(1)}%)`, score: scoreOuter, max: 20 })
-
-  let scoreVolume = 5
-  if (volumeRatio > 1.8 && outerRatio < 52) scoreVolume = 0
-  else if (volumeRatio >= 1.5) scoreVolume = outerRatio > 55 ? 10 : 5
-  else if (volumeRatio >= 1) scoreVolume = 15
-  else if (volumeRatio >= 0.5) scoreVolume = 8
-  details.push({ label: `量比(${volumeRatio.toFixed(2)})`, score: scoreVolume, max: 15 })
-
-  let scoreTurnover = 3
-  if (turnoverRate >= 3 && turnoverRate <= 10) scoreTurnover = 10
-  else if (turnoverRate >= 1 && turnoverRate < 3) scoreTurnover = 7
-  else if (turnoverRate > 10) scoreTurnover = 5
-  details.push({ label: `换手率(${turnoverRate.toFixed(2)}%)`, score: scoreTurnover, max: 10 })
-
-  let scoreChange = 0
-  if (changePercent > 9.5) scoreChange = 5
-  else if (changePercent > 7) scoreChange = 12
-  else if (changePercent > 3) scoreChange = (volumeRatio >= 1.2 && outerRatio > 58) ? 20 : 15
-  else if (changePercent > 0) scoreChange = 20
-  else if (changePercent > -2) scoreChange = 10
-  details.push({ label: `涨幅(${changePercent > 0 ? '+' : ''}${changePercent.toFixed(2)}%)`, score: scoreChange, max: 20 })
-
-  let scoreWeibi = 2
-  if (weibi >= 99 && outerRatio < 60) scoreWeibi = 0
-  else if (weibi > 30) scoreWeibi = 10
-  else if (weibi > 0) scoreWeibi = 7
-  else if (weibi > -30) scoreWeibi = 4
-  details.push({ label: `委比(${weibi > 0 ? '+' : ''}${weibi.toFixed(2)}%)`, score: scoreWeibi, max: 10 })
-
-  let scoreAvg = 2
-  if (avgPriceDeviation > 1.5) scoreAvg = 5
-  else if (avgPriceDeviation > 0) scoreAvg = 15
-  else if (avgPriceDeviation > -1) scoreAvg = 8
-  details.push({ label: `均价偏离(${avgPriceDeviation > 0 ? '+' : ''}${avgPriceDeviation.toFixed(2)}%)`, score: scoreAvg, max: 15 })
-
-  let scoreAmplitude = 2
-  if (amplitude > 2 && amplitude <= 6) scoreAmplitude = 5
-  else if (amplitude > 1 && amplitude <= 2) scoreAmplitude = 3
-  details.push({ label: `振幅(${amplitude.toFixed(2)}%)`, score: scoreAmplitude, max: 5 })
-
-  let scorePosition = 5
-  if (pe < 0) scorePosition = 2
-  details.push({ label: '基本面修正', score: scorePosition, max: 5 })
-
-  const totalScore = scoreOuter + scoreVolume + scoreTurnover + scoreChange + scoreWeibi + scoreAvg + scoreAmplitude + scorePosition
-  const normalized = Math.min(100, Math.round(totalScore))
-
-  let label = ''
-  if (normalized >= 80) label = '强烈看涨'
-  else if (normalized >= 70) label = '建议关注'
-  else if (normalized >= 55) label = '中性观望'
-  else if (normalized >= 40) label = '谨慎回调'
-  else label = '强烈避险'
-
-  return { score: normalized, label, details }
-}
-
-// 统一评级：标签 + 颜色（前后端共用同一份阈值）
+// 统一评级：标签 + 颜色（前后端共用同一份阈值，project_memory 硬约束）
 export function getRating(score) {
   if (score >= 80) return { label: '强烈看涨', short: '看涨', color: 'var(--red)' }
   if (score >= 70) return { label: '建议关注', short: '看涨', color: 'var(--red)' }
   if (score >= 55) return { label: '中性观望', short: '观望', color: 'var(--orange)' }
   if (score >= 40) return { label: '谨慎回调', short: '回调', color: 'var(--orange)' }
   return { label: '强烈避险', short: '看跌', color: 'var(--green)' }
+}
+
+// 综合评分（2026-07-06 P3-2：纯透传薄壳，权重由后端统一维护）
+// 直接返回后端注入的 data.score + data.scoreDetails，前端不做任何本地估算。
+// 若 data 无 score（理论上不应发生），返回 0 + 空分项。
+export function calculateScore(data) {
+  if (data && typeof data.score === 'number' && data.score > 0) {
+    return { score: data.score, label: getRating(data.score).label, details: data.scoreDetails || [] }
+  }
+  return { score: 0, label: '无评分', details: [] }
 }
 
 function getPlateRelation(data) {

@@ -38,8 +38,9 @@ export function useStockData() {
   }
 
   async function loadScanPool() {
+    // 性能优化（2026-07-02）：改调轻量端点，仅返回代码列表，不触发 N 次 K 线计算
     try {
-      const result = await apiFetch('/api/custom-scan-pool')
+      const result = await apiFetch('/api/custom-scan-pool/symbols')
       if (result.success && result.data) {
         scanStockPool.value = result.data.symbols || []
       }

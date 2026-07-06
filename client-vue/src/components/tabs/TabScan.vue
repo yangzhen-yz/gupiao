@@ -110,7 +110,7 @@ function scheduleScanRefresh() {
   if (autoScanTimer) clearTimeout(autoScanTimer)
   const tick = async () => {
     await startScan(true)
-    autoScanTimer = setTimeout(tick, isTradingTime() ? 5000 : getNextRefreshDelay())
+    autoScanTimer = setTimeout(tick, isTradingTime() ? 30000 : getNextRefreshDelay())
   }
   tick()
 }

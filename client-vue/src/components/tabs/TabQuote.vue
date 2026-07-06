@@ -202,7 +202,7 @@ import { useStockData } from '../../composables/useStockData'
 const emit = defineEmits(['open-kline', 'open-ai-diag'])
 const showNotification = inject('showNotification')
 
-const { quickStocks, loadQuickStocks, loadScanPool, scanStockPool, stockNameMap, loadStockMap } = useStockData()
+const { quickStocks, loadQuickStocks, stockNameMap, loadStockMap } = useStockData()
 
 const stockInput = ref('sh603985')
 const currentSymbol = ref('sh603985')
@@ -292,9 +292,18 @@ async function fetchStockQuote(symbol, silent = false) {
     error.value = ''
   }
   try {
-    const resp = await fetch(`/api/stock/${formatted}`)
-    const raw = await resp.text()
-    const parsed = parseTencentData(raw)
+    // 并行：1) 拉行情原始数据  2) 拉9因子评分（修复评分始终为 0）
+    const [quoteResp, analysisResp] = await Promise.all([
+      fetch(`/api/stock/${formatted}`).then(r => r.text()),
+      fetch(`/api/stock/${formatted}/analysis`).then(r => r.json()).catch(() => null),
+    ])
+    const parsed = parseTencentData(quoteResp)
+    // 注入后端 score（后端 calc_stock_score_v2 是权威评分源）
+    if (parsed && analysisResp && analysisResp.success) {
+      parsed.score = analysisResp.data.score
+      parsed.scoreDetails = analysisResp.data.details || []
+      parsed.label = analysisResp.data.label
+    }
     if (parsed) {
       if (silent && quoteData.value && quoteData.value.symbol === parsed.symbol) {
         // 静默刷新：只更新真正变化的字段，避免不必要的DOM重渲染
@@ -421,7 +430,7 @@ async function checkMarketPredict() {
 }
 
 onMounted(async () => {
-  await Promise.all([loadStockMap(), loadQuickStocks(), loadScanPool()])
+  await Promise.all([loadStockMap(), loadQuickStocks()])
   // 默认加载热门股票快捷查询中的第一只股票
   if (quickStocks.value && quickStocks.value.length > 0) {
     const first = quickStocks.value[0]

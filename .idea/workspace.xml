@@ -6,12 +6,15 @@
   <component name="ChangeListManager">
     <list default="true" id="a931a422-ee0d-4b97-b76d-716cab2c4154" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/client-vue/src/utils/score.js" beforeDir="false" afterPath="$PROJECT_DIR$/client-vue/src/utils/score.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/server/app/api/routes.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/app/api/routes.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/server/app/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/app/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/server/services/review.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/services/review.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/server/db/database.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/db/database.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/server/services/recommend.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/services/recommend.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/server/services/strategy.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/services/strategy.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/server/services/trend.py" beforeDir="false" afterPath="$PROJECT_DIR$/server/services/trend.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/server/static/assets/index-CSRj-1TY.js" beforeDir="false" afterPath="$PROJECT_DIR$/server/static/assets/index-CSRj-1TY.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/server/static/assets/index-DnlQS5Uo.css" beforeDir="false" afterPath="$PROJECT_DIR$/server/static/assets/index-DnlQS5Uo.css" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/server/static/assets/index-CSRj-1TY.js" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/server/static/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/server/static/index.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -21,10 +24,10 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "customColor": "",
-  "associatedIndex": 1
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;customColor&quot;: &quot;&quot;,
+  &quot;associatedIndex&quot;: 1
+}</component>
   <component name="ProjectId" id="3FpodcIcQWYSrVCIcf3R6fihg8q" />
   <component name="ProjectViewState">
     <option name="autoscrollFromSource" value="true" />
@@ -37,6 +40,7 @@
   "keyToString": {
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "git-widget-placeholder": "main",
+    "last_opened_file_path": "D:/Desktop/aaa/cmes-business-forecast",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
@@ -62,6 +66,7 @@
       <option name="presentableId" value="Default" />
       <updated>1782781460401</updated>
       <workItem from="1782781461724" duration="1930000" />
+      <workItem from="1782868610025" duration="22000" />
     </task>
     <servers />
   </component>

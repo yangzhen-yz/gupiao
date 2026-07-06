@@ -17,6 +17,21 @@
         自动加池阈值：≥{{ autoAddThreshold }}分
         <span v-if="lastAutoAdded.length > 0" class="auto-add-count">（本次已自动加入 {{ lastAutoAdded.length }} 只）</span>
       </div>
+      <!-- P4-1: 昨日回测准确率徽章 -->
+      <div v-if="latestBacktest" class="backtest-accuracy-badge">
+        <span class="backtest-badge-label">🎯 昨日趋势回测</span>
+        <span class="backtest-badge-stat">
+          1日胜率 <strong :class="getWinRateClass(latestBacktest.winRate1d)">{{ (latestBacktest.winRate1d * 100).toFixed(0) }}%</strong>
+          <span class="backtest-badge-detail">({{ latestBacktest.win1dCount }}/{{ latestBacktest.verified1dCount }})</span>
+        </span>
+        <span class="backtest-badge-stat" v-if="latestBacktest.verified3dCount > 0">
+          · 3日 <strong :class="getWinRateClass(latestBacktest.winRate3d)">{{ (latestBacktest.winRate3d * 100).toFixed(0) }}%</strong>
+        </span>
+        <span class="backtest-badge-stat" v-if="latestBacktest.verified5dCount > 0">
+          · 5日 <strong :class="getWinRateClass(latestBacktest.winRate5d)">{{ (latestBacktest.winRate5d * 100).toFixed(0) }}%</strong>
+        </span>
+        <span class="backtest-badge-date">{{ latestBacktest.predictDate }}</span>
+      </div>
       <div v-if="trendStocks.length === 0" style="text-align:center;padding:2rem;color:#64748b;">暂无趋势股票，正在自动扫描中...</div>
       <div v-else-if="filteredTrendStocks.length === 0" style="text-align:center;padding:2rem;color:#64748b;">🎉 当前 {{ trendStocks.length }} 只趋势股已全部加入自选池</div>
       <div v-else class="trend-card-list">
@@ -31,6 +46,10 @@
             </div>
             <div class="trend-card-consecutive">
               <span class="trend-consecutive-badge" :class="getConsecutiveClass(stock)">{{ stock.details?.consecutiveUpDays || 0 }}天</span>
+              <!-- P4-1: 昨测结果标签 -->
+              <span v-if="getStockBacktestTag(stock)" class="yesterday-backtest-tag" :class="getStockBacktestTag(stock).cls">
+                {{ getStockBacktestTag(stock).text }}
+              </span>
             </div>
             <div class="trend-card-score">
               <div class="trend-score-ring" :style="getScoreStyle(stock)">
@@ -120,6 +139,46 @@
         <span class="page-info">第 {{ trendPage }} / {{ trendTotalPages }} 页</span>
         <button class="page-btn" :disabled="trendPage >= trendTotalPages" @click="trendPage++">下一页</button>
       </div>
+      <!-- P4-1: 回测历史区（可折叠） -->
+      <div v-if="backtestHistory.length > 0" class="backtest-history-section">
+        <div class="backtest-history-header" @click="toggleBacktestHistory">
+          <span class="backtest-history-title">📈 趋势评分回测历史（{{ backtestHistory.length }} 期）</span>
+          <span class="backtest-history-toggle">{{ showBacktestHistory ? '收起 ▲' : '展开 ▼' }}</span>
+        </div>
+        <div v-show="showBacktestHistory" class="backtest-history-content">
+          <div v-for="report in backtestHistory" :key="report.predictDate" class="backtest-history-item">
+            <div class="backtest-item-date">{{ report.predictDate }}</div>
+            <div class="backtest-item-grid">
+              <div class="backtest-item-cell">
+                <div class="cell-label">1日胜率</div>
+                <div class="cell-value" :class="getWinRateClass(report.winRate1d)">
+                  {{ report.verified1dCount > 0 ? (report.winRate1d * 100).toFixed(0) + '%' : '—' }}
+                </div>
+                <div class="cell-detail">{{ report.win1dCount }}/{{ report.verified1dCount }}</div>
+              </div>
+              <div class="backtest-item-cell">
+                <div class="cell-label">3日胜率</div>
+                <div class="cell-value" :class="getWinRateClass(report.winRate3d)">
+                  {{ report.verified3dCount > 0 ? (report.winRate3d * 100).toFixed(0) + '%' : '—' }}
+                </div>
+                <div class="cell-detail">{{ report.win3dCount }}/{{ report.verified3dCount }}</div>
+              </div>
+              <div class="backtest-item-cell">
+                <div class="cell-label">5日胜率</div>
+                <div class="cell-value" :class="getWinRateClass(report.winRate5d)">
+                  {{ report.verified5dCount > 0 ? (report.winRate5d * 100).toFixed(0) + '%' : '—' }}
+                </div>
+                <div class="cell-detail">{{ report.win5dCount }}/{{ report.verified5dCount }}</div>
+              </div>
+            </div>
+            <div class="backtest-item-segments" v-if="report.score80PlusTotal > 0 || report.score7080Total > 0 || report.score6070Total > 0">
+              <span class="segment-tag seg-60-70">60-70分: {{ report.score6070Win1d }}/{{ report.score6070Total }}</span>
+              <span class="segment-tag seg-70-80">70-80分: {{ report.score7080Win1d }}/{{ report.score7080Total }}</span>
+              <span class="segment-tag seg-80-plus">80+分: {{ report.score80PlusWin1d }}/{{ report.score80PlusTotal }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="pool-section">
       <div class="section-header">
@@ -194,6 +253,12 @@ const expanded = ref(null)
 const addInput = ref('')
 const autoAddThreshold = ref(80)
 const lastAutoAdded = ref([])
+
+// P4-1 趋势回测相关
+const latestBacktest = ref(null)
+const backtestHistory = ref([])
+const showBacktestHistory = ref(false)
+const backtestRecordsMap = ref({})  // { symbol: { isCorrect1d, isCorrect3d, isCorrect5d } }
 
 // 股票池排序
 const poolSortBy = ref(null)       // 'price' | 'consecutive' | null
@@ -407,11 +472,90 @@ function scheduleTrendRefresh() {
   tick()
 }
 
+// ========== P4-1 趋势回测相关方法 ==========
+async function loadLatestBacktest() {
+  try {
+    const result = await apiFetch('/api/trend/backtest-latest')
+    if (result.success && result.data) {
+      const d = result.data
+      latestBacktest.value = {
+        predictDate: d.predict_date,
+        winRate1d: d.win_rate_1d || 0, win1dCount: d.win_1d_count || 0, verified1dCount: d.verified_1d_count || 0,
+        winRate3d: d.win_rate_3d || 0, win3dCount: d.win_3d_count || 0, verified3dCount: d.verified_3d_count || 0,
+        winRate5d: d.win_rate_5d || 0, win5dCount: d.win_5d_count || 0, verified5dCount: d.verified_5d_count || 0,
+      }
+    }
+  } catch (e) { console.warn('加载最新回测失败', e) }
+}
+
+async function loadBacktestHistory() {
+  try {
+    const result = await apiFetch('/api/trend/backtest-history?limit=30')
+    if (result.success && result.data) {
+      backtestHistory.value = result.data.map(d => ({
+        predictDate: d.predict_date,
+        winRate1d: d.win_rate_1d || 0, win1dCount: d.win_1d_count || 0, verified1dCount: d.verified_1d_count || 0,
+        winRate3d: d.win_rate_3d || 0, win3dCount: d.win_3d_count || 0, verified3dCount: d.verified_3d_count || 0,
+        winRate5d: d.win_rate_5d || 0, win5dCount: d.win_5d_count || 0, verified5dCount: d.verified_5d_count || 0,
+        score6070Total: d.score_60_70_total || 0, score6070Win1d: d.score_60_70_win_1d || 0,
+        score7080Total: d.score_70_80_total || 0, score7080Win1d: d.score_70_80_win_1d || 0,
+        score80PlusTotal: d.score_80_plus_total || 0, score80PlusWin1d: d.score_80_plus_win_1d || 0,
+      }))
+    }
+  } catch (e) { console.warn('加载回测历史失败', e) }
+}
+
+async function loadYesterdayBacktestRecords() {
+  try {
+    // 性能优化（2026-07-02）：3 次串行 await 改 Promise.all 并发，3 RTT → 1 RTT
+    const dates = [1, 2, 3].map(i => {
+      const d = new Date(Date.now() - i * 86400000)
+      return d.toISOString().slice(0, 10)
+    })
+    const results = await Promise.all(
+      dates.map(dateStr => apiFetch(`/api/trend/backtest-records?predict_date=${dateStr}&limit=200`))
+    )
+    const records = {}
+    results.forEach(result => {
+      if (result.success && result.data) {
+        result.data.forEach(r => {
+          if (r.verified_1d === 1) {
+            records[r.symbol] = { isCorrect1d: r.is_correct_1d }
+          }
+        })
+      }
+    })
+    backtestRecordsMap.value = records
+  } catch (e) { console.warn('加载昨测明细失败', e) }
+}
+
+function toggleBacktestHistory() {
+  showBacktestHistory.value = !showBacktestHistory.value
+}
+
+function getWinRateClass(rate) {
+  if (rate >= 0.6) return 'win-rate-high'
+  if (rate >= 0.5) return 'win-rate-mid'
+  return 'win-rate-low'
+}
+
+function getStockBacktestTag(stock) {
+  const sym = (stock.symbol || stock.code || '').toLowerCase()
+  const rec = backtestRecordsMap.value[sym]
+  if (!rec || rec.isCorrect1d === undefined || rec.isCorrect1d === null) return null
+  return rec.isCorrect1d === 1
+    ? { text: '昨测✓', cls: 'tag-correct' }
+    : { text: '昨测✗', cls: 'tag-wrong' }
+}
+
 onMounted(async () => {
-  await loadStockMap()
-  await loadPoolWithIndicators()
-  await loadTrendStocks()
+  // 性能优化（2026-07-02）：三个串行 await 改 Promise.all，首屏 = max(三者) 而非 sum
+  await Promise.all([loadStockMap(), loadPoolWithIndicators(), loadTrendStocks()])
   scheduleTrendRefresh()
+  // P4-1: 加载回测数据（非阻塞，不依赖趋势数据）
+  loadLatestBacktest()
+  loadBacktestHistory()
+  loadYesterdayBacktestRecords()
 })
 
 onUnmounted(() => {

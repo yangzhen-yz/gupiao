@@ -39,6 +39,10 @@ _CONFIG_SAME_NAMES = [
     'SCHEDULE_UPDATE_HOT_SEARCH_TIMES', 'SCHEDULE_MA10_CHECK_TIME',
     'SCHEDULE_DAILY_REVIEW_TIME', 'SCHEDULE_BACKTEST_TIME',
     'SCHEDULE_RECOMMENDATION_TIMES',
+    'SCHEDULE_TREND_SCAN_INTERVAL_MIN', 'SCHEDULE_TREND_SCAN_START', 'SCHEDULE_TREND_SCAN_END',
+    'SCHEDULE_TREND_BACKTEST_TIME',
+    'TREND_BACKTEST_PERIODS', 'TREND_BACKTEST_KLINE_CONCURRENCY',
+    'TREND_BACKTEST_MARKET_SYMBOL', 'TREND_BACKTEST_SCORE_SEGMENTS',
     'QUERY_DAILY_RECOMMENDATIONS_LIMIT', 'QUERY_TREND_RESULTS_LIMIT',
     'QUERY_MARKET_REVIEWS_LIMIT',
     'REVIEW_TOP_GAINERS_COUNT', 'REVIEW_TOP_LOSERS_COUNT', 'REVIEW_TOP_SECTORS_COUNT',
@@ -179,24 +183,6 @@ async def eastmoney_proxy(path: str, request: Request):
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"代理请求失败: {str(e)}")
-
-
-@app.post("/__force_reload__", tags=["调试-临时"])
-async def _force_reload_module(module: str = ''):
-    """临时调试：手动 importlib.reload 业务模块，绕过 mtime watcher。"""
-    targets = [module] if module else ['services.stock', 'services.trend', 'services.review', 'services.recommend', 'services.market', 'services.strategy']
-    out = {}
-    for name in targets:
-        mod = sys.modules.get(name)
-        if mod is None:
-            out[name] = 'not_loaded'
-            continue
-        try:
-            importlib.reload(mod)
-            out[name] = 'reloaded'
-        except Exception as e:
-            out[name] = f'error: {e}'
-    return out
 
 
 @app.middleware("http")

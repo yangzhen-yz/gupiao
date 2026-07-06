@@ -2,16 +2,10 @@
 import json, httpx, os, asyncio
 from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
-from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS
+from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS, EASTMONEY_HEADERS
 from services.stock import calculate_ma, get_http_client
 
-# 东方财富板块数据请求头（与 review.py 保持一致，避免被反爬）
-_EM_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Referer': 'https://quote.eastmoney.com/',
-}
+# 2026-07-02 C-5: _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 
 # ========== AI 配置（兼容 DeepSeek / Agnes AI 等 OpenAI 格式接口） ==========
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
@@ -180,7 +174,7 @@ async def _fetch_hot_sectors() -> Dict:
     result = {'industry': [], 'concept': []}
 
     def _sync_fetch():
-        _h = {**_EM_HEADERS}
+        _h = {**EASTMONEY_HEADERS}
         ind_list, con_list = [], []
         try:
             ind_url = (

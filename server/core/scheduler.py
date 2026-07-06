@@ -2,11 +2,12 @@
 import asyncio, schedule, threading, time
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END)
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME)
 
 from services.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
-from services.trend import scan_and_remove_below_ma10, scan_trend_task
+from services.trend import scan_and_remove_below_ma10, scan_trend_task, scan_trend_scan_results
+from services.trend_backtest import backtest_trend_predictions
 from services.review import generate_daily_review
 from services.strategy import backtest_yesterday_predictions
 from services.recommend import auto_generate_recommendations_task
@@ -62,15 +63,6 @@ async def backtest_task():
     except Exception as error:
         print(f'[定时任务] 回测验证失败: {str(error)}')
 
-async def scan_trend_task(force: bool = False):
-    try:
-        print('[趋势扫描] 定时任务开始...')
-        await scan_trend_scan_results(force=force)
-    except Exception as e:
-        print(f'[趋势扫描] 定时任务失败: {e}')
-
-
-
 def run_scheduler():
     def job_update_hot_search_ranking():
         asyncio.run(update_hot_search_ranking_task())
@@ -86,7 +78,10 @@ def run_scheduler():
     
     def job_scan_trend():
         asyncio.run(scan_trend_task())
-    
+
+    def job_trend_backtest():
+        asyncio.run(backtest_trend_predictions())
+
     def job_generate_recommendations():
         asyncio.run(auto_generate_recommendations_task())
 
@@ -109,7 +104,10 @@ def run_scheduler():
     )
     for t in trend_scan_times:
         schedule.every().day.at(t).do(job_scan_trend)
-    
+
+    # P4-1: 每天 15:30 对历史趋势预测做 N 日（1/3/5 日）回测验证
+    schedule.every().day.at(SCHEDULE_TREND_BACKTEST_TIME).do(job_trend_backtest)
+
     # 新增：每天自动生成智能推荐股票
     for t in SCHEDULE_RECOMMENDATION_TIMES:
         schedule.every().day.at(t).do(job_generate_recommendations)
@@ -120,6 +118,7 @@ def run_scheduler():
     print(f'[定时任务]   - {SCHEDULE_MA10_CHECK_TIME}: 检查10日线并删除跌破股票')
     print(f'[定时任务]   - {SCHEDULE_DAILY_REVIEW_TIME}: 自动生成每日收评')
     print(f'[定时任务]   - {SCHEDULE_BACKTEST_TIME}: 回测验证昨日预测并调整策略权重')
+    print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: P4-1 趋势评分回测验证（1/3/5日跑赢大盘胜率）')
     print(f'[定时任务]   - {"/".join(SCHEDULE_RECOMMENDATION_TIMES)}: 自动生成智能推荐股票')
     
     while True:

@@ -2,35 +2,29 @@
 import json, httpx, asyncio, requests as _requests
 from typing import List, Dict
 from datetime import date, datetime, timedelta
-from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOP_SECTORS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, INDEX_SYMBOLS, TENCENT_QUOTE_API, MARKET_CRASH_THRESHOLD
+from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOP_SECTORS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, INDEX_SYMBOLS, TENCENT_QUOTE_API, MARKET_CRASH_THRESHOLD, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, EASTMONEY_HEADERS
+# 2026-07-02 C-5: _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 from db.database import get_db_conn, save_daily_market_reviews, load_daily_recommendations, load_trend_scan_results
 from services.stock import get_http_client, fetch_stock_data
-
-_EM_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Referer': 'https://quote.eastmoney.com/',
-}
-
 
 async def generate_daily_review() -> Dict:
     try:
         today_str = datetime.now().strftime('%Y-%m-%d')
         
-        # 1. 获取大盘指数数据
+        # 1. 获取大盘指数数据（2026-07-06 A-P3-3：3 指数串行 → asyncio.gather 并发）
         market_data = {}
         indices = [
             {'code': 'sh000001', 'name': '上证指数'},
             {'code': 'sz399001', 'name': '深证成指'},
             {'code': 'sz399006', 'name': '创业板指'}
         ]
-        for idx in indices:
+
+        async def _fetch_index(idx):
             try:
                 idx_data = await fetch_stock_data(idx['code'])
                 if idx_data:
                     parsed = idx_data.get('parsed', {})
-                    market_data[idx['code']] = {
+                    return idx['code'], {
                         'name': idx['name'],
                         'price': parsed.get('price'),
                         'change': parsed.get('change'),
@@ -43,12 +37,18 @@ async def generate_daily_review() -> Dict:
                     }
             except Exception as e:
                 print(f'获取指数 {idx["name"]} 数据失败: {e}')
+            return idx['code'], None
+
+        _idx_results = await asyncio.gather(*[_fetch_index(idx) for idx in indices])
+        for code, data in _idx_results:
+            if data is not None:
+                market_data[code] = data
         
         # 2. 获取行业板块涨跌排行（东方财富API）— 改用 requests 同步，避免 httpx 被封
         industry_sectors = []
         concept_sectors = []
         def _sync_fetch_sectors():
-            _h = {**_EM_HEADERS}
+            _h = {**EASTMONEY_HEADERS}
             ind_list, con_list = [], []
             try:
                 ind_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50'
@@ -82,7 +82,7 @@ async def generate_daily_review() -> Dict:
         top_losers = []
         top_funds = []  # 全市场主力净流入前20
         def _sync_fetch_stocks():
-            _h = {**_EM_HEADERS}
+            _h = {**EASTMONEY_HEADERS}
             result = {'limit_up': [], 'limit_down': [], 'gainers': [], 'losers': [], 'top_funds': []}
             # 涨停股
             try:
@@ -92,7 +92,7 @@ async def generate_daily_review() -> Dict:
                 if data.get('data') and data['data'].get('diff'):
                     for item in data['data']['diff']:
                         pct = item.get('f3', 0)
-                        if pct is not None and pct >= 9.8:
+                        if pct is not None and pct >= TREND_LIMIT_UP_THRESHOLD:
                             result['limit_up'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': pct, 'price': item.get('f2', 0), 'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0)})
             except Exception as e:
                 print(f'[收评] 涨停股请求失败: {e}')
@@ -104,7 +104,7 @@ async def generate_daily_review() -> Dict:
                 if data.get('data') and data['data'].get('diff'):
                     for item in data['data']['diff']:
                         pct = item.get('f3', 0)
-                        if pct is not None and pct <= -9.8:
+                        if pct is not None and pct <= TREND_LIMIT_DOWN_THRESHOLD:
                             result['limit_down'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': pct, 'price': item.get('f2', 0), 'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0)})
             except Exception as e:
                 print(f'[收评] 跌停股请求失败: {e}')
