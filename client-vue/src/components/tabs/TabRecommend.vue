@@ -53,6 +53,16 @@
             <div class="recommend-point-value" style="color:var(--accent-danger)">{{ r.buySellPoints?.sell || r.sellPoint }}</div>
           </div>
         </div>
+        <div v-if="r.riskControl" class="recommend-risk-box">
+          <div class="recommend-risk-title">🛡️ 风控建议</div>
+          <div class="recommend-risk-row">
+            <span class="risk-badge" :class="riskLevelClass(r.riskControl?.risk_level)">{{ riskLabel(r.riskControl?.risk_level) }}</span>
+            <span class="recommend-risk-item">止损价 <b>{{ r.riskControl?.stop_loss }}</b><small>（−{{ r.riskControl?.stop_loss_pct }}%）</small></span>
+            <span class="recommend-risk-item">{{ r.riskControl?.position_suggest }}</span>
+          </div>
+          <div v-if="r.valuation?.overvalued" class="val-badge over">估值高估 PE{{ r.valuation?.pe_pct }}% · PB{{ r.valuation?.pb_pct }}%</div>
+          <div class="recommend-risk-note">{{ r.riskControl?.risk_note }}</div>
+        </div>
         <div class="recommend-reason-box">
           <div class="recommend-reason-text">{{ r.reason }}</div>
         </div>
@@ -130,6 +140,13 @@ function getProfitValue(r) {
   return parseFloat(val)
 }
 
+function riskLabel(level) {
+  return { low: '低风险', mid: '中风险', high: '高风险' }[level] || '中风险'
+}
+function riskLevelClass(level) {
+  return { low: 'low', mid: 'mid', high: 'high' }[level] || 'mid'
+}
+
 async function generateRecommendations() {
   generating.value = true
   try {
@@ -196,3 +213,43 @@ onMounted(() => {
   loadRecommendations()
 })
 </script>
+
+<style scoped>
+.recommend-risk-box {
+  margin: 0.75rem 0 0.5rem;
+  padding: 0.75rem 0.875rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+}
+.recommend-risk-title {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: #334155;
+  margin-bottom: 0.5rem;
+}
+.recommend-risk-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.875rem;
+}
+.recommend-risk-item {
+  font-size: 0.8125rem;
+  color: #475569;
+}
+.recommend-risk-item b {
+  color: var(--accent-danger);
+  font-size: 0.9375rem;
+}
+.recommend-risk-item small {
+  color: #94a3b8;
+  font-weight: 400;
+}
+.recommend-risk-note {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: #64748b;
+  line-height: 1.5;
+}
+</style>

@@ -1,5 +1,5 @@
 // ==============================
-// 2026-07-02 C-6 重构 / 2026-07-06 P3-2 收尾：前端评分工具改纯展示工具
+// 2026-07-02 重构 / 2026-07-06 收尾：前端评分工具改纯展示工具
 // ==============================
 // 评分权威在后端 calc_stock_score_v2（services/strategy.py）
 // 本文件仅提供：
@@ -19,7 +19,7 @@ export function getRating(score) {
   return { label: '强烈避险', short: '看跌', color: 'var(--green)' }
 }
 
-// 综合评分（2026-07-06 P3-2：纯透传薄壳，权重由后端统一维护）
+// 综合评分（2026-07-06 ：纯透传薄壳，权重由后端统一维护）
 // 直接返回后端注入的 data.score + data.scoreDetails，前端不做任何本地估算。
 // 若 data 无 score（理论上不应发生），返回 0 + 空分项。
 export function calculateScore(data) {

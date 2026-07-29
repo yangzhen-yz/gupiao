@@ -1,11 +1,11 @@
 """ai_diagnose.py - split from main.py"""
-import json, httpx, os, asyncio
+import json, os, asyncio, requests
 from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
-from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS, EASTMONEY_HEADERS
-from services.stock import calculate_ma, get_http_client
+from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS, EASTMONEY_HEADERS, HTTP_TIMEOUT
+from services.stock import calculate_ma, _sync_post
 
-# 2026-07-02 C-5: _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
+# 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 
 # ========== AI 配置（兼容 DeepSeek / Agnes AI 等 OpenAI 格式接口） ==========
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
@@ -464,7 +464,6 @@ async def _call_deepseek_api(prompt: str) -> str:
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=400, detail="未配置AI API Key，请在设置中配置")
 
-    client = get_http_client()
     # 兼容 baseUrl 末尾已含 /v1 /v3 等版本路径的情况，避免拼出 /v1/v1/chat/completions
     base = DEEPSEEK_BASE_URL.rstrip('/')
     if base.endswith(('/v1', '/v2', '/v3', '/v4')):
@@ -486,21 +485,29 @@ async def _call_deepseek_api(prompt: str) -> str:
         "response_format": {"type": "json_object"}
     }
 
+    # -fix: 改用 requests 同步 POST + asyncio.to_thread（去 httpx 依赖，规避断连问题）
+    def _do_post():
+        return _sync_post(url, payload, headers=headers, timeout=HTTP_TIMEOUT)
+
     try:
-        response = await client.post(url, headers=headers, json=payload, timeout=30.0)
+        response = await asyncio.to_thread(_do_post)
         response.raise_for_status()
         result = response.json()
         content = result['choices'][0]['message']['content']
         return content
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="AI诊断超时，请稍后重试")
-    except httpx.HTTPStatusError as e:
-        detail = f"AI API错误: {e.response.status_code}"
-        try:
-            err_body = e.response.json()
-            detail = f"AI API错误: {err_body.get('error', {}).get('message', str(e.response.status_code))}"
-        except:
-            pass
-        raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI诊断失败: {str(e)}")
+        # 精确区分：超时 / HTTP 状态码错误 / 其他
+        err_str = str(e) or repr(e)
+        # 1. 超时（requests.Timeout 或错误信息含 timeout/timed out）
+        if isinstance(e, requests.Timeout) or 'timeout' in err_str.lower() or 'timed out' in err_str.lower():
+            raise HTTPException(status_code=504, detail=f"AI诊断超时，请稍后重试: {err_str}")
+        # 2. HTTP 状态码错误（requests.HTTPError 带 response 属性）
+        if isinstance(e, requests.HTTPError) and hasattr(e, 'response') and e.response is not None:
+            status = getattr(e.response, 'status_code', 'unknown')
+            try:
+                err_body = e.response.json()
+                detail = f"AI API错误: {err_body.get('error', {}).get('message', status)}"
+            except Exception:
+                detail = f"AI API错误: {status}"
+            raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=500, detail=f"AI诊断失败: {err_str}")

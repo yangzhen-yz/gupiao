@@ -90,7 +90,7 @@ def _reload_config():
 
 
 from db.database import init_db, save_hot_search_ranking, load_trend_scan_results
-from services.stock import get_http_client, fetch_eastmoney_hot_list
+from services.stock import fetch_eastmoney_hot_list
 from services.trend import scan_trend_task
 from services.ai import load_ai_config
 
@@ -128,15 +128,10 @@ async def lifespan(app: FastAPI):
                 asyncio.create_task(scan_trend_task(force=True))
     except Exception as error:
         print(f'[初始化] 预加载趋势数据失败: {str(error)}')
-    get_http_client()
-    print('[初始化] HTTP连接池已创建')
+    # -fix: 全局改用 requests + asyncio.to_thread，不再需要 httpx 连接池
     scheduler_thread = threading.Thread(target=lambda: _lazy_start_scheduler(), daemon=True)
     scheduler_thread.start()
     yield
-    import services.stock as _s
-    if _s.http_client and not _s.http_client.is_closed:
-        await _s.http_client.aclose()
-        print('[关闭] HTTP连接池已关闭')
 
 app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票行情、K线图、趋势发现", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])

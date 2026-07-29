@@ -7,6 +7,8 @@ from db.database import get_db_conn, load_daily_recommendations, save_daily_reco
 from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy import calc_stock_score_v2, apply_industry_neutralization
 from services.utils import to_float as _to_float
+from services.valuation import get_valuation_batch
+from services.risk_control import calc_risk_control
 
 
 async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
@@ -24,26 +26,29 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
     """
     if not codes:
         return {}
-    
+
     # 构建 secids: 1.600519 (沪), 0.000858 (深)
     secids = []
     for c in codes:
         code = c[2:]
         market = '1' if c.startswith('sh') else '0'
         secids.append(f"{market}.{code}")
-    
+
     _HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': '*/*',
         'Referer': 'https://quote.eastmoney.com/',
     }
 
-    def _fetch_targeted():
+    # 2026-07-08 修复：分批避免 414，100/批安全（<2KB URL），并发执行
+    _BATCH_SIZE = 100
+
+    def _fetch_batch(batch_secids: List[str]) -> List[Dict]:
         # ulist.get 支持批量获取指定 secids
         params = {
-            'pi': 0, 'pz': len(secids), 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
+            'pi': 0, 'pz': len(batch_secids), 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
             'fields': 'f12,f13,f62,f21,f100',
-            'secids': ','.join(secids)
+            'secids': ','.join(batch_secids)
         }
         # 使用 EASTMONEY_HOT_LIST_API 的基础域名，但接口路径不同
         # 实际地址示例: https://push2.eastmoney.com/api/qt/ulist/get
@@ -53,11 +58,23 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
         data = r.json()
         return data.get('data', {}).get('diff', []) or []
 
-    # 2026-07-06 C-5: _to_float 已合并到 services.utils.to_float（顶部 import 别名 _to_float）
+    # 2026-07-06 : _to_float 已合并到 services.utils.to_float（顶部 import 别名 _to_float）
     # 此处原局部函数定义已删除
 
     try:
-        items = await asyncio.to_thread(_fetch_targeted)
+        # 分批（100/批），每批并行执行
+        batches = [secids[i:i + _BATCH_SIZE] for i in range(0, len(secids), _BATCH_SIZE)]
+        batch_results = await asyncio.gather(
+            *(asyncio.to_thread(_fetch_batch, b) for b in batches),
+            return_exceptions=True
+        )
+        # 合并所有批次的 diff 列表
+        items: List[Dict] = []
+        for r in batch_results:
+            if isinstance(r, Exception) or not r:
+                continue
+            items.extend(r)
+
         found: Dict[str, Dict] = {}
         for item in items:
             code = item.get('f12', '')
@@ -74,7 +91,7 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
                 'circ_mv': circ_mv,
                 'industry': industry,
             }
-        print(f'[资金流向] 靶向获取 {len(found)}/{len(codes)} 只股票数据')
+        print(f'[资金流向] 靶向获取 {len(found)}/{len(codes)} 只股票数据 (分 {len(batches)} 批)')
         return found
     except Exception as e:
         print(f'[资金流向] 靶向获取失败: {e}')
@@ -269,26 +286,69 @@ async def auto_generate_recommendations_task():
             print('[智能推荐] 未获取到任何股票行情数据')
             return
 
-        # ===== 4. 混合评分（P0: 50%日内 + 50%趋势 + P1-1 主力资金因子） =====
+        # ===== 4. 混合评分（P0: 50%日内 + 50%趋势 + 主力资金因子） =====
         concept_tags_raw = load_stock_concept_tags()
         concept_tags = {k.lower(): v for k, v in concept_tags_raw.items()}  # 统一小写
-        # P1-1: 批量预取主力资金流向，注入第9因子
+        # : 批量预取主力资金流向，注入第9因子
         fund_flow_map = {}
         try:
             fund_flow_map = await fetch_batch_fund_flow([s.get('symbol', '') for s in all_results])
         except Exception as e:
             print(f'[智能推荐] 资金流向预取失败（降级为无数据）: {e}')
+        # : 批量预取股东人数（从 DB 缓存，月度数据），注入第10因子
+        holder_map = {}
+        try:
+            from services.shareholder import get_holder_num_batch
+            holder_map = await asyncio.to_thread(get_holder_num_batch,
+                                                  [s.get('symbol', '') for s in all_results])
+        except Exception as e:
+            print(f'[智能推荐] 股东人数预取失败（降级为无数据）: {e}')
+        # : P1a/P1b 批量预取基本面质量 + 聪明钱(龙虎榜)，注入第12/13因子
+        fund_map = {}
+        sm_map = {}
+        try:
+            from services.fundamental import get_fundamental_batch
+            fund_map = await asyncio.to_thread(get_fundamental_batch,
+                                               [s.get('symbol', '') for s in all_results])
+        except Exception as e:
+            print(f'[智能推荐] 基本面预取失败（降级为无数据）: {e}')
+        try:
+            from services.smartmoney import get_dragon_tiger_symbol_map
+            sm_map = await asyncio.to_thread(get_dragon_tiger_symbol_map)
+        except Exception as e:
+            print(f'[智能推荐] 聪明钱预取失败（降级为无数据）: {e}')
+        # : P2c 批量预取估值分位（PE/PB 全市场百分位），注入风控过滤
+        val_map = {}
+        try:
+            val_map = await asyncio.to_thread(get_valuation_batch,
+                                              [s.get('symbol', '') for s in all_results])
+        except Exception as e:
+            print(f'[智能推荐] 估值分位预取失败（降级为无数据）: {e}')
         for stock in all_results:
             sym = stock.get('symbol', '').lower()
             trend = trend_map.get(sym)  # 趋势扫描已有的结果
             ff = fund_flow_map.get(sym)
+            hd = holder_map.get(sym)
+            fd = fund_map.get(sym)
+            sm = sm_map.get(sym)
+            val = val_map.get(sym)
+            sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
+                       'appearances': (sm or {}).get('appearances', 0)} if sm else None
             stock['score'] = calc_stock_score_v2(stock, market_change=market_change,
-                                                 trend_result=trend, fund_flow_data=ff)
+                                                 trend_result=trend, fund_flow_data=ff,
+                                                 holder_data=hd,
+                                                 fundamental_data=fd, smart_money_data=sm_data)
+            # P2a/P2c: 风控止损 + 估值分位（纯函数，无额外 IO）
+            _holder_ratio = (hd or {}).get('total_num_ratio')
+            stock['valuation'] = val
+            stock['riskControl'] = calc_risk_control(
+                stock.get('price', 0), score_result=stock['score'],
+                stock=stock, valuation=val, smart_money=sm_data, holder_ratio=_holder_ratio)
             # 预取概念标签用于行业分散
             tags = concept_tags.get(sym)
             stock['primary_tag'] = tags[0] if tags else '其他'
 
-        # P3-2 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total（与 routes 路径对齐）
+        # 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total（与 routes 路径对齐）
         if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED:
             industry_map = {sym: (ff or {}).get('industry', '') for sym, ff in fund_flow_map.items()}
             apply_industry_neutralization(all_results, industry_map)
@@ -303,10 +363,22 @@ async def auto_generate_recommendations_task():
         MIN_RECOMMEND_SCORE = 60
         above_threshold = [s for s in all_results if s['score']['total'] >= MIN_RECOMMEND_SCORE]
 
+        # P2c: 估值分位过滤 —— 极端高估(PE&PB 百分位双高)且非强多(>=80)的票不参与精选推荐
+        candidates = []
+        skipped_overvalued = 0
+        for s in above_threshold:
+            val = s.get('valuation')
+            if val and val.get('overvalued') and s['score']['total'] < 80:
+                skipped_overvalued += 1
+                continue
+            candidates.append(s)
+        if skipped_overvalued:
+            print(f'[智能推荐] 估值分位过滤：跳过 {skipped_overvalued} 只极端高估股')
+
         # 行业分散：每种概念取最高分的一只，最多3只
         top3 = []
         seen_tags = set()
-        for s in above_threshold:
+        for s in candidates:
             tag = s.get('primary_tag', '其他')
             if tag not in seen_tags:
                 top3.append(s)
@@ -316,7 +388,7 @@ async def auto_generate_recommendations_task():
 
         # 如果行业分散后不足3只，从剩余中按分数补足（允许同概念）
         if len(top3) < 3:
-            remaining = [s for s in above_threshold if s not in top3]
+            remaining = [s for s in candidates if s not in top3]
             top3.extend(remaining[:3 - len(top3)])
 
         if not top3:
@@ -341,6 +413,8 @@ async def auto_generate_recommendations_task():
                 'changePercent': r.get('changePercent', 0),
                 'score': r['score']['total'],
                 'buySellPoints': bsp,
+                'valuation': r.get('valuation'),
+                'riskControl': r.get('riskControl'),
                 'reason': reason,
             })
 

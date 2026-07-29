@@ -1,4 +1,4 @@
-"""trend_backtest.py - P4-1 趋势评分回测验证闭环（2026-07-01）
+"""trend_backtest.py - 趋势评分回测验证闭环（2026-07-01）
 
 让趋势评分系统能"回头看自己"：
 1. 每次趋势扫描入选的趋势股作为"预测记录"落库（在 trend.py 中调用 save_trend_backtest_records）
@@ -17,7 +17,7 @@ from app.config import (SCAN_KLINE_TIMEOUT, TREND_BACKTEST_PERIODS,
 from db.database import (load_trend_backtest_records_pending_verification,
                          load_trend_backtest_records, update_trend_backtest_verification,
                          upsert_trend_backtest_report)
-from services.stock import get_kline_data, get_http_client
+from services.stock import get_kline_data
 
 
 def _is_weekend(date_str: str) -> bool:
@@ -74,7 +74,7 @@ def _calc_n_day_change(kline: List[List], predict_date: str, n: int) -> Optional
         return None
 
 
-async def _fetch_kline_batch(symbols: List[str], client=None) -> Dict[str, Optional[List[List]]]:
+async def _fetch_kline_batch(symbols: List[str]) -> Dict[str, Optional[List[List]]]:
     """批量并发拉取 K 线数据
 
     复用 trend.py 的 Semaphore + wait_for + gather 模式。
@@ -83,7 +83,6 @@ async def _fetch_kline_batch(symbols: List[str], client=None) -> Dict[str, Optio
     if not symbols:
         return {}
 
-    cl = client or get_http_client()
     sem = asyncio.Semaphore(TREND_BACKTEST_KLINE_CONCURRENCY)
     result: Dict[str, Optional[List[List]]] = {}
 
@@ -91,7 +90,7 @@ async def _fetch_kline_batch(symbols: List[str], client=None) -> Dict[str, Optio
         async with sem:
             try:
                 kline = await asyncio.wait_for(
-                    get_kline_data(symbol, cl), timeout=SCAN_KLINE_TIMEOUT
+                    get_kline_data(symbol), timeout=SCAN_KLINE_TIMEOUT
                 )
                 result[symbol] = kline
             except Exception as e:
@@ -140,7 +139,7 @@ async def _generate_trend_backtest_report(predict_date: str) -> Dict:
 
 
 async def backtest_trend_predictions() -> Dict:
-    """P4-1 趋势回测主入口
+    """趋势回测主入口
 
     流程：
     1. 周末跳过（非交易日不回测）

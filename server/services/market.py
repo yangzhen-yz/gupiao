@@ -1,10 +1,32 @@
 """market.py - split from main.py"""
-import asyncio, re
+import asyncio, re, json, os
 from typing import List, Dict, Optional
 from datetime import date, datetime
-from app.config import INDEX_SYMBOLS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, TENCENT_QUOTE_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
+from app.config import INDEX_SYMBOLS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, TENCENT_QUOTE_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, MARKET_ALERT_RISK_THRESHOLD
 from db.database import get_db_conn, load_hot_search_ranking, load_hot_stock_buttons, load_user_scan_pool, load_stock_basic_info
-from services.stock import get_http_client, fetch_with_retry, parse_tencent_batch_data
+from services.stock import fetch_with_retry, parse_tencent_batch_data
+
+# ========== 大盘预警持久化 ==========
+_ALERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'market_alert.json')
+
+def save_market_alert(alert_data: Dict):
+    """保存最新大盘预警到文件（供前端轮询）"""
+    try:
+        alert_data['savedAt'] = datetime.now().isoformat()
+        with open(_ALERT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(alert_data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f'[大盘预警] 保存失败: {e}')
+
+def load_market_alert() -> Optional[Dict]:
+    """读取最新大盘预警"""
+    try:
+        if not os.path.exists(_ALERT_FILE):
+            return None
+        with open(_ALERT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 async def get_market_index(index_symbol: str) -> Optional[Dict]:
     """获取单个大盘指数数据"""
@@ -182,9 +204,9 @@ async def predict_market_risk() -> Dict:
         stocks = [s['symbol'] for s in hot_search_ranking_stocks]
     
     # 分批获取实时数据（最多取500只代表性股票）
-    # 性能优化（2026-07-02）：batch 20→100 + asyncio.gather 并发 + 复用 get_http_client
+    # 性能优化（2026-07-02）：batch 20→100 + asyncio.gather 并发（每批 100 只）
     # 旧实现：500只/20=25 批串行 await + 新建 httpx.AsyncClient，5-12s
-    # 新实现：500只/100=5 批 gather 并发 + 复用全局 client，1-2s
+    # 新实现：500只/100=5 批 gather 并发 + requests 同步，1-2s
     all_symbols = stocks[:500]
     batch_size = 100
     all_data = []
@@ -513,3 +535,28 @@ async def predict_market_risk() -> Dict:
     # 写入缓存
     _market_predict_cache[today_str] = (now_ts, result)
     return result
+
+
+async def run_scheduled_market_alert():
+    """定时任务：自动扫描大盘风险并保存预警（供前端轮询推送）"""
+    try:
+        print('[大盘预警] 定时扫描开始...')
+        result = await predict_market_risk()
+        risk_score = result.get('riskScore', 0)
+        predict_status = result.get('predictStatus', 'safe')
+
+        # 风险评分 >= 阈值时保存预警
+        if risk_score >= MARKET_ALERT_RISK_THRESHOLD and predict_status != 'safe':
+            save_market_alert({
+                'date': date.today().isoformat(),
+                'riskScore': risk_score,
+                'predictStatus': predict_status,
+                'prediction': result.get('prediction', {}),
+                'signals': result.get('signals', {}),
+                'details': result.get('details', {}),
+            })
+            print(f'[大盘预警] 风险评分 {risk_score} >= {MARKET_ALERT_RISK_THRESHOLD}，已保存预警')
+        else:
+            print(f'[大盘预警] 风险评分 {risk_score} < {MARKET_ALERT_RISK_THRESHOLD}，暂无预警')
+    except Exception as e:
+        print(f'[大盘预警] 定时扫描失败: {e}')

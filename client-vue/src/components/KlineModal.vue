@@ -127,7 +127,11 @@ function scheduleRefresh() {
   stopRefresh()
   const tick = async () => {
     if (props.symbol) await fetchData(props.symbol, klineType.value)
-    refreshTimer = setTimeout(tick, isTradingTime() ? 5000 : getNextRefreshDelay())
+    // 2026-07-20 A3：分时图实时变化 → 5秒；日K历史一天不变 → 15秒（后端已做 SQLite 缓存，历史不必高频重拉）
+    const interval = klineType.value === 'minute'
+      ? (isTradingTime() ? 5000 : getNextRefreshDelay())
+      : (isTradingTime() ? 15000 : getNextRefreshDelay())
+    refreshTimer = setTimeout(tick, interval)
   }
   if (isTradingTime()) tick()
 }

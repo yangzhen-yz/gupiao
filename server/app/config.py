@@ -23,10 +23,30 @@ HOT_SEARCH_TOP_N = 500  # 热搜榜最大显示数量
 HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS = 60  # 热搜榜快照清理天数
 
 
+# ========== 资金流向 Tab 配置（2026-07-16 新增） ==========
+FUND_FLOW_STOCK_TOP_N = 50          # 个股主力净流入/净流出排名各取前 N 只
+FUND_FLOW_SECTOR_TOP_N = 30         # 板块（行业/概念）净流入/净流出排名各取前 N 个（≥30 以支撑前端每页 10 条翻页）
+FUND_FLOW_HIDDEN_CHANGE_THRESHOLD = 3.0   # “非热点但上涨不错”的最低涨幅阈值（%）
+FUND_FLOW_HIDDEN_HOT_TOP_N = 30     # 排除热搜榜前 N 名（视为“近期热点”）
+FUND_FLOW_HIDDEN_TOP_N = 50         # “非热点上涨股”最多返回 N 只
+FUND_FLOW_CACHE_TTL = 20            # 资金流向汇总接口内存缓存有效期（秒）
+
+
 # ========== 扫描配置 ==========
 SCAN_CONCURRENCY = 25  # 扫描并发数
 SCAN_KLINE_TIMEOUT = 12.0  # 扫描K线超时时间
 SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
+
+# ========== 股票筛选 Tab 过滤配置（2026-07-08）==========
+# 第二个 Tab "股票筛选"（/api/hot-stocks-scan）的可选过滤模式
+# 用户在前端可切换：all(全部) / bull_only(仅看涨) / bull_and_hold(观望以上) / min_score(自定义分)
+# 注意：当前后端默认仍返回全量，前端按此配置做客户端过滤；如需服务端过滤可将 FILTER_MODE 设为 'all' 之外的任意值并改 hot-stocks-scan 路由
+TAB_SCAN_FILTER_MODES = ['all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
+TAB_SCAN_DEFAULT_MODE = 'bull_and_hold'  # 默认模式：全量展示（不隐藏任何股票）
+TAB_SCAN_BULL_MIN_SCORE = 70  # "看涨"区间的最低分（≥ 此值为看涨）
+TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌）
+# 区间划分：score < BEAR_MAX(40) 为看跌，BEAR_MAX(40) ≤ score < BULL_MIN(70) 为观望，score ≥ BULL_MIN(70) 为看涨
+# "观望以上" 指 score ≥ BULL_MIN_SCORE，仅看涨也是 score ≥ BULL_MIN_SCORE
 
 
 # ========== 趋势发现配置（中短线波段评分，满分 100 分） ==========
@@ -48,7 +68,7 @@ TREND_D1_TREND_BARE = 8   # 近3日反复穿插MA20但现价站稳
 TREND_D1_DIVERGENCE_PENALTY_TIERS = [(15, -10), (10, -6), (5, -3)]  # [(乖离%≥, 扣分)], 当前价偏离MA20越远追高风险越大
 
 # 维度 2：短期资金异动（30 分，多档制；连板高度分层 + 连阳数取高分）
-# 2026-06-30 P0-2 升级：业界龙头战法核心是"龙一溢价 > 龙二 > 龙三"，
+# 2026-06-30 升级：业界龙头战法核心是"龙一溢价 > 龙二 > 龙三"，
 # 用连板高度（最大连续涨停数）替代单纯的涨停次数，识别题材内的龙头位置
 TREND_D2_LIMIT_UP_TIERS = [(3, 30), (2, 20), (1, 10)]  # [(≥涨停次数, 得分)] — 旧逻辑保留作 fallback
 TREND_D2_YANG_LINE_TIERS = [(6, 30), (4, 20), (3, 10)]  # [(≥连阳数, 得分)]
@@ -94,7 +114,7 @@ TREND_SIDEWAYS_BONUS = 3      # 低位横盘蓄力加分
 # 加分项（额外奖励，用于拉开分差 + 平衡低位分位）
 # 注意：基础分满分100 + 加分项最大 20 = 120，融合时再按比例归一化到 100，
 # 避免"基础分顶格+全触发加分"导致 6 只票都拿 100 分无法区分
-# 2026-07-02 B-2/B-4 优化：参考市面"稳步震荡上行 vs 加速拉升"区分
+# 2026-07-02 优化：参考市面"稳步震荡上行 vs 加速拉升"区分
 #   - 多头排列+低位 5→6（市面"中长期均线多头"权重 40%，应加强）
 #   - 连续阳线 3→4（稳步上行市面更推崇）
 #   - 新增稳步上行+3 / 加速拉升+1（市面"稳步上行趋势延续周期更长，加速拉升易深度调整"）
@@ -106,7 +126,7 @@ TREND_BONUS_STEADY_UPTREND = 3    # 稳步上行：近20日涨幅5%-15% + 阳线
 TREND_BONUS_ACCELERATING = 1      # 加速拉升：近5日涨幅≥15% + 量比≥2（警示透支风险，低加分）
 
 # 板块动量因子（环境修正：±5% 权重，叠加到总分）
-# 2026-06-30 P0-1 实现：基于个股概念标签(stock_concept_tags)的同题材平均涨幅做环境修正
+# 2026-06-30 实现：基于个股概念标签(stock_concept_tags)的同题材平均涨幅做环境修正
 # 数据源：扫描时统计每个概念标签下所有股票的平均涨幅，个股取其标签的平均涨幅作为 sector_change
 TREND_SECTOR_MOMENTUM_WEIGHT = 0.20  # 板块动量占整体评分的权重（保留，用于未来扩展）
 TREND_SECTOR_HOT_RANK_MIN = 5       # 板块排名前N视为热门板块
@@ -120,7 +140,7 @@ TREND_SECTOR_FACTOR_TIERS = [
 ]
 TREND_SECTOR_FACTOR_COLD = -0.05  # 题材平均涨幅 ≤ -3% → 冷门 -5%
 
-# ========== P2-2 量价6形态分类（2026-06-30）==========
+# ==========  量价6形态分类（2026-06-30）==========
 # 6种量价形态互斥，优先级：突破类 > 滞涨/背离类 > 回调类 > 横盘类
 # 作为修正系数叠加到总分（与板块动量同属乘性修正，各自独立计算）
 TREND_PATTERN_FACTOR = {
@@ -140,7 +160,7 @@ TREND_PATTERN_SHRINK_RATIO = 0.5             # 缩量阈值：日成交量 < 60�
 TREND_PATTERN_SIDEWAYS_AMPLITUDE = 5.0       # 横盘振幅 < 5%
 TREND_PATTERN_DIVERGENCE_VOLUME_EXPAND = 1.3 # 量价背离：20日均量放大超 30%
 
-# ========== P2-1 筹码结构修正（代理指标，2026-06-30）==========
+# ========== 筹码结构修正（代理指标，2026-06-30）==========
 # 用 MA60/MA120 成本压力位 + 换手率筹码松动度 + 主力净流入 + 量能稳定性CV 组合
 # 作为修正系数叠加到总分（与板块动量同属乘性修正，各自独立计算）
 TREND_CHIP_FACTOR_MAX = 0.08   # 筹码修正系数上限 +8%
@@ -162,7 +182,7 @@ TREND_CHIP_CV_STABLE = 0.02         # CV ≤ 0.3（量能稳定，筹码沉淀�
 TREND_CHIP_CV_VOLATILE = -0.02      # CV > 0.8（量能紊乱，筹码动荡）
 TREND_CHIP_CV_NORMAL = 0.0
 
-# ========== P3-1 动态阈值（市场状态 + 形态感知，2026-06-30）==========
+# ========== 动态阈值（市场状态 + 形态感知，2026-06-30）==========
 # 市场状态判定：大盘指数(sh000001) 现价 vs MA20 + 当日涨幅
 TREND_DYNAMIC_MARKET_BULL_CHANGE = 0.5    # 大盘 MA20 之上 + 当日涨幅≥0.5% → bull
 TREND_DYNAMIC_MARKET_BEAR_CHANGE = -0.5   # 大盘 MA20 之下 + 当日涨幅≤-0.5% → bear
@@ -195,7 +215,7 @@ TREND_DYNAMIC_DEFAULTS = {
     'DEDUCT_AMPLITUDE_FLAT': 10,
 }
 
-# ========== P3-2 行业中性化（2026-06-30）==========
+# ========== 行业中性化（2026-06-30）==========
 # 对 strategy_score(calc_stock_score_v2 输出) 按行业分位数做后处理调整，
 # 避免热门行业股票因整体高 volume_ratio/turnover/change 而集体虚高。
 # 作为共享 helper apply_industry_neutralization 在 routes/recommend/trend 三层调用。
@@ -218,6 +238,48 @@ TREND_ANNOUNCEMENT_CACHE_TTL = 3600  # 公告缓存秒数（1小时）
 USE_INTRADAY_BREAK_CHECK = True
 
 
+# ========== RPS 相对强度因子（P0，2026-07-16 新增）==========
+# 欧奈尔体系核心：RPS = 个股区间涨幅在全市场的百分位排名（0~100）。
+# RPS 90 表示强于 90% 的股票的同期表现，是"强势股/龙头"的量化标志。
+# 数据来源：东方财富 clist + k1/k2/k3=1（区间涨跌幅），一次请求拿全市场，本地算百分位。
+RPS_ENABLED = True
+RPS_PERIOD_DAYS = 120            # 主评分周期（欧奈尔常用 120 日），calc_stock_score_v2 默认用此周期
+RPS_PERIODS = [50, 120, 250]     # 多周期（前端展示/未来组合用），分别对应月/季/年相对强度
+RPS_CACHE_TTL = 3600             # RPS 全市场映射缓存（秒），盘前算一次即可，盘中复用
+RPS_MIN_SAMPLES = 300            # 全市场样本不足时跳过计算（避免误算 RPS）
+RPS_TOP_N = 100                  # /api/rps 强势股榜默认返回数量
+
+# ========== 基本面质量因子（P1a，2026-07-16 新增）==========
+# 数据源：东方财富 datacenter RPT_LICO_FN_CPD（核心财务指标，季度披露）
+# 取最新一期(ISNEW=1)：WEIGHTAVG_ROE(ROE%)+SJLTZ(归母净利润同比%)，每日18:05盘后更新
+FUNDAMENTAL_ENABLED = True
+FUNDAMENTAL_UPDATE_TIME = '18:05'  # 与股东人数(18:00)错开，避免并发拉取
+
+# ========== 聪明钱因子（P1b，2026-07-16 新增）==========
+# 龙虎榜净买入额 + 北向资金净流入，作为"聪明钱"个股/市场级信号
+SMART_MONEY_ENABLED = True
+SMART_MONEY_DRAGON_TIGER_DAYS = 5       # 龙虎榜聚合近 N 个交易日
+SMART_MONEY_NET_AMT_HIGH = 500_000_000   # 龙虎榜净买入 ≥5亿 → high（机构/游资重仓介入）
+SMART_MONEY_NET_AMT_MID = 100_000_000    # 龙虎榜净买入 ≥1亿 → mid（游资介入）
+SMART_MONEY_UPDATE_TIME = '17:30'        # 交易日后定时拉取龙虎榜+北向最新数据（盘后约17:30发布）
+
+# ========== 估值分位过滤（P2c，2026-07-16 新增）==========
+# 数据源：东方财富 clist（复用 fundflow._clist），字段 f9=PE(TTM)、f23=PB。
+# 全市场拉取后本地算 PE/PB 百分位（0~100，分位越高越贵），用于过滤极端高估股。
+VALUATION_ENABLED = True
+VALUATION_OVERVALUED_PE_PCT = 90   # PE 百分位 ≥ 此值视为偏高
+VALUATION_OVERVALUED_PB_PCT = 90   # PB 百分位 ≥ 此值视为偏高
+VALUATION_UPDATE_TIME = '18:10'    # 与基本面(18:05)错开，避免并发拉取
+
+# ========== 风控止损（P2a，2026-07-16 新增）==========
+# 止损幅度基于当日振幅(波动率代理)动态缩放，clamp 在 [STOP_LOSS_MIN, STOP_LOSS_MAX] 之间。
+RISK_CONTROL_STOP_LOSS_MIN = 0.04   # 最小止损幅度 4%（低波动股不会过于贴近）
+RISK_CONTROL_STOP_LOSS_MAX = 0.12   # 最大止损幅度 12%（高波动股防止过早被洗）
+RISK_CONTROL_STOP_LOSS_VOL_MULT = 1.5  # 止损幅度 = 当日振幅 × 此系数（波动率缩放）
+# 风险等级阈值（基于综合评分 + 估值/聪明钱/筹码信号综合判定）
+RISK_CONTROL_SCORE_HIGH_RISK = 55   # 评分 < 此值 → 高风险
+RISK_CONTROL_SCORE_MID_RISK = 65    # 评分 < 此值 → 中风险，否则低风险
+
 # ========== 策略综合评分配置 ==========
 STRATEGY_BULL_THRESHOLD = 60  # 策略评分上涨阈值
 STRATEGY_BEAR_THRESHOLD = 40  # 策略评分下跌阈值
@@ -231,14 +293,33 @@ STRATEGY_BACKTEST_HISTORY_DAYS = 30  # 策略回测历史天数阈值
 STRATEGY_SCORE_THRESHOLDS = {
     'outer_ratio': {'high': 55, 'mid': 50},  # 外盘比例：>55%为高，50-55%为中，<50%为低
     'volume_ratio': {'high': 1.5, 'mid': 1.0, 'low': 0.5},  # 量比：>1.5为高，1.0-1.5为中，0.5-1.0为正常，<0.5为低
-    'turnover_rate': {'high': [3, 10], 'mid': [1, 3], 'high_penalty': 10},  # 换手率：3-10%为高，1-3%为中，>10%时应用扣分
+    'turnover_rate': {'high': [3, 15], 'mid': [1, 3], 'high_penalty': 20},  # 换手率：3-15%为高，1-3%为中，>20%才扣分（原10%太严，活跃股普遍>10%）
     'change_percent': {'high': 5, 'mid': 2, 'low': 0, 'negative': -2},  # 涨跌幅：>5%为高，2-5%为中，0-2%为低，<0为负
     'weibi': {'high': 30, 'mid': 0, 'low': -30},  # 委比：>30为高，0-30为中，-30-0为低，<-30为负
     'avg_price_deviation': {'high': 1, 'mid': 0, 'low': -1},  # 均价偏离：>1%为高，-1-1%为中，<-1%为低
-    'amplitude': {'high': [2, 5], 'mid': [1, 2]},  # 振幅：2-5%为高，1-2%为中，<1%为低
-    # 2026-06-30 P1-1 新增：主力净流入占比（主力净流入/流通市值 ×100%）
+    'amplitude': {'high': [2, 8], 'mid': [1, 2]},  # 振幅：2-8%为高（原5%太严，涨停/急拉股普遍>5%），1-2%为中，<1%为低
+    # 2026-06-30 新增：主力净流入占比（主力净流入/流通市值 ×100%）
     # ≥3%为高（强力吸筹），1-3%为中，0-1%为低，<0为负（主力出逃）
     'main_capital_inflow': {'high': 3.0, 'mid': 1.0, 'low': 0.0, 'negative': -1.0},
+    # 2026-07-06 新增：筹码集中度（股东人数户数 + 环比变化率%）
+    # tiny_hold/small_hold/large_hold 为户数绝对值门槛；concentrate/dispersion 为环比%阈值
+    'holder_structure': {
+        'tiny_hold': 30000,          # 小盘筹码门槛（<3万户为小盘，易拉升）
+        'small_hold': 80000,         # 中小盘门槛
+        'large_hold': 200000,        # 大盘抛压门槛（>20万户抛压重）
+        'concentrate_ratio': -10.0,  # 筹码集中阈值（环比减少≥10%为主力吸筹）
+        'dispersion_ratio': 10.0,    # 散户化阈值（环比增加≥10%为散户涌入）
+        'stable_range': 5.0,         # 稳定区间（环比±5%内为筹码稳定）
+    },
+    # 2026-07-16 新增：RPS 相对强度（欧奈尔核心因子）
+    # RPS 百分位：≥90（强于90%个股，龙头候选）→ high；80-90 → mid；70-80 → low；50-70 → weak；<50 → 弱
+    'rps': {'high': 90, 'mid': 80, 'low': 70, 'weak': 50},
+    # 2026-07-16 新增：基本面质量（P1a）
+    # ROE%(加权净资产收益率) + 归母净利润同比%(SJLTZ)：双高=高质量，双低/亏损=低质量
+    'fundamental': {'roe_high': 15, 'roe_mid': 10, 'yoy_high': 30, 'yoy_mid': 15},
+    # 2026-07-16 新增：聪明钱（P1b，纯加分信号，无数据不给分）
+    # 龙虎榜净买入额(元)：≥5000万=high；≥1000万=mid；>0=low；≤0/无=none(0)
+    'smart_money': {'net_amt_high': 50_000_000, 'net_amt_mid': 10_000_000},
 }
 
 
@@ -248,13 +329,21 @@ STRATEGY_SCORE_VALUES = {
     'outer_ratio': {'high': 15, 'mid': 10, 'low': 5},  # 外盘比例得分
     'volume_ratio': {'high': 10, 'mid': 7, 'normal': 5, 'low': 2},  # 量比得分
     'turnover_rate': {'high': 10, 'mid': 7, 'normal': 5, 'low': 3},  # 换手率得分
-    'change_percent': {'high': 20, 'mid': 15, 'normal': 10, 'low': 5, 'negative': 0},  # 涨跌幅得分
+    'change_percent': {'high': 28, 'mid': 22, 'normal': 16, 'low': 8, 'negative': 0},  # 涨跌幅得分（2026-07-08 强化封板分：high=28/优质封板）
     'weibi': {'high': 10, 'mid': 7, 'low': 4, 'negative': 2},  # 委比得分
     'avg_price_deviation': {'high': 15, 'mid': 10, 'normal': 5, 'low': 2},  # 均价偏离得分
     'amplitude': {'high': 5, 'mid': 3, 'low': 2},  # 振幅得分
     'position': {'high': 10, 'mid': 5, 'low': 0},  # 仓位建议得分
-    # 2026-06-30 P1-1 新增：主力净流入因子（满分15，无数据时给中档7分避免拖累总分）
+    # 2026-06-30 新增：主力净流入因子（满分15，无数据时给中档7分避免拖累总分）
     'main_capital_inflow': {'high': 15, 'mid': 10, 'low': 7, 'negative': 2, 'no_data': 7},
+    # 2026-07-06 新增：筹码集中度因子（满分15，无数据时给中档8分避免拖累总分）
+    'holder_structure': {'high': 15, 'mid': 12, 'normal': 8, 'low': 5, 'negative': 2, 'no_data': 8},
+    # 2026-07-16 新增：RPS 相对强度因子（满分15，无数据时给中档7分避免拖累总分）
+    'rps': {'high': 15, 'mid': 10, 'low': 7, 'weak': 3, 'no_data': 7},
+    # 2026-07-16 新增：基本面质量因子（满分15，无数据时给中档8分避免拖累总分）
+    'fundamental': {'high': 15, 'mid': 11, 'low': 8, 'weak': 4, 'negative': 3, 'no_data': 8},
+    # 2026-07-16 新增：聪明钱因子（满分10，纯加分，无数据=0分不拖累也不虚高）
+    'smart_money': {'high': 10, 'mid': 6, 'low': 4, 'none': 0},
 }
 
 # ========== 策略委比验证配置 ==========
@@ -265,11 +354,39 @@ STRATEGY_WEBI_VERIFY = {
     'volume_ratio_low': 0.8, # 量比低于此值视为成交量不足，委比信号可能失真
 }
 
+# ========== 主力扫货识别配置（P1-4，2026-07-07）==========
+# 核心场景：急拉 + 负委比（卖盘堆积被吃光）+ 高外盘占比 = 主力扫货
+# 时间无关：上午/午后/尾盘急拉扫货均可命中，关键是组合特征而非发生时刻
+# 例：002384 东山精密 急拉6.79% / 委比-26.67% / 外盘55.7% / 量比1.17
+# 原逻辑：负委比给 low(4) 分，低量比给 normal(5) 分 → 总分被低估
+# 新逻辑：识别"急拉+负委比+高外盘"组合 → 委比给予 high(10) 分奖励
+STRATEGY_MAIN_FORCE_SWEEP = {
+    'change_percent_min': 5.0,    # 急拉阈值：涨幅≥5%
+    'weibi_negative_max': -10.0,  # 负委比阈值：委比≤-10%（卖盘显著堆积）
+    'outer_ratio_min': 52.0,      # 外盘占比阈值：≥52%（买盘主动吃单）
+    'volume_ratio_max': 1.5,      # 量比上限：≤1.5（剔除天量对倒，专注"温和量能扫货"）
+    'turnover_rate_min': 1.5,     # 换手率下限：≥1.5%（确保有真实成交，排除停牌/无量）
+    'weibi_bonus_score': 10,      # 命中时委比得分（=high）
+    'volume_ratio_bonus_score': 8, # 命中时量比得分（接近 high）
+}
+
+# ========== 主力控盘识别配置（P1-4，2026-07-07）==========
+# 核心场景：低量比 + 急拉 + 高换手 = 主力控盘锁仓拉升
+# 原逻辑：低量比给 normal(5) 分 → 控盘锁仓特征被低估
+# 新逻辑：识别"低量比+急拉+高换手"组合 → 量比给予 high(10) 分奖励
+STRATEGY_MAIN_FORCE_CONTROL = {
+    'change_percent_min': 4.0,    # 急拉阈值：涨幅≥4%
+    'volume_ratio_max': 1.0,      # 量比上限：≤1.0（量能温和）
+    'turnover_rate_min': 2.0,     # 换手率下限：≥2%（活跃但有控盘痕迹）
+    'outer_ratio_min': 55.0,      # 外盘占比阈值：≥55%（买盘主导）
+    'volume_ratio_bonus_score': 9, # 命中时量比得分（接近 high）
+}
+
 # ========== 市盈率过滤配置 ==========
 # pe_high: 市盈率高于此值视为高估，降低评分
 # pe_max: 市盈率超过此值视为异常，直接过滤
 STRATEGY_PE_FILTER = {
-    'pe_high': 8,
+    'pe_high': 10.5,  # 2026-07-08：从8提高到10.5，避免涨停股(9.8-10%)被仓位因子惩罚
     'pe_max': 700,
 }
 
@@ -280,7 +397,7 @@ STRATEGY_LABEL_THRESHOLDS = {
     'weak_bull': 60,    # 弱势看多：评分≥60，建议谨慎观察
 }
 
-# 默认策略评分权重配置（2026-07-02 B-1 优化：参考市面"中长期动量复合打分模型"调整）
+# 默认策略评分权重配置（2026-07-02  优化：参考市面"中长期动量复合打分模型"调整）
 # 市面经验：资金面(35%)+均线(40%)+斜率(25%)，对应本系统：
 #   资金面 = 主力净流入 + 外盘占比 + 委比
 #   龙头溢价 = 涨幅及龙头
@@ -295,6 +412,10 @@ DEFAULT_WEIGHTS = {
     'amplitude': 0.9,            # 振幅：高振幅既有机会也有风险，1.0→0.9
     'position': 1.0,             # 仓位建议：已含 PE+涨幅组合，保持
     'main_capital_inflow': 1.3,  # 主力净流入：市面强调"连续3日净流入+占流通市值≥0.5%"，1.0→1.3
+    'holder_structure': 1.2,     # 筹码集中度：股东人数筹码面，月度数据有滞后，1.0→1.2
+    'rps': 1.1,                  # RPS 相对强度：欧奈尔核心因子，强于90%个股给高分，1.0→1.1
+    'fundamental': 1.0,          # 基本面质量：ROE+净利润增速，季度数据，质量防护维度
+    'smart_money': 0.6,          # 聪明钱：龙虎榜净买+北向，纯加分信号（权重略低避免单一事件主导）
 }
 
 # ========== 大盘预警配置 ==========
@@ -306,48 +427,50 @@ DELISTING_KEYWORDS = ['ST', '*ST', 'SST', 'S*ST', 'NST', 'PT', '退', '退市', 
 
 # ========== 禁止股票关键词 ==========
 # 退市/ST 等风险词由独立的 DELISTING_KEYWORDS + has_delisting_risk() 处理。
+# 2026-07-08 精简：移除单字/泛义词（'酒'、'太平洋'、'光明'、'太平'、'华泰'、'前海'、'天安'），
+# 这些词会误伤大量无关股票。用更精确的关键词替代。
 FORBIDDEN_KEYWORDS = [
     # 金融行业
     '银行', '证券', '保险', '信托', '金控',
     # 保险公司（按名称直接列，避免中国人寿/平安/太保等被漏过）
-    '中国人寿', '平安', '太保', '太平洋', '新华保险', '人保', '财险', '寿险',
-    '中国人保', '中国平安', '中国太保', '中国太平', '中国人寿', '国寿',
-    '众安', '华泰', '天安', '前海', '华夏人寿', '泰康', '太平', '民生人寿',
-    
-    # 白酒消费
-    '酒',
-    
+    '中国人寿', '平安', '太保', '新华保险', '人保', '财险', '寿险',
+    '中国人保', '中国平安', '中国太保', '中国太平', '国寿',
+    '众安', '华夏人寿', '泰康', '民生人寿',
+
+    # 白酒/酒类消费（原'酒'单字会误伤"酒店"等无关股票，改为精确匹配）
+    '白酒', '啤酒', '红酒', '黄酒', '酒业', '酒股份', '茅台', '五粮液', '泸州', '汾酒', '洋河',
+
     # 家电行业
     '家电', '美的', '海尔', '格力',
-    
+
     # 房地产行业
-    '地产', '房产', '置业', '建设', '房地产', '城投', '万科', '保利', '绿地', '碧桂园', '恒大', '融创',
-    
+    '地产', '房产', '置业', '房地产', '城投', '万科', '保利', '绿地', '碧桂园', '恒大', '融创',
+
     # 铁路交通
     '铁路', '铁建', '中铁', '高铁',
-    
+
     # 铁路公路
     '公路', '高速', '路桥', '交建',
-    
+
     # 航运港口
     '航运', '港口', '水运', '轮船', '船舶',
-    
+
     # 航空板块
     '航空', '机场', '民航', '国航', '东航', '南航', '海航',
 
-    #物流
-    '物流', '运输', '交运', '快递',
-    
-    # 乳业食品
-    '乳业', '牛奶', '伊利', '蒙牛', '光明', '三元', '皇氏', '新乳业', '天润', '燕塘', '李子园',
-    
+    # 物流
+    '物流', '交运', '快递',
+
+    # 乳业食品（移除'光明'、'三元'等泛义词，保留明确乳业词）
+    '乳业', '牛奶', '伊利', '蒙牛', '新乳业',
+
     # 纺织板块
     '纺织', '服装', '服饰', '家纺', '面料', '化纤',
-    
+
     # 农林牧渔
     '农业', '林业', '牧业', '渔业', '农林', '牧渔', '养殖', '饲料', '种业', '化肥',
 
-    #传媒
+    # 传媒
     '游戏', '影视', '出版'
 ]
 
@@ -377,15 +500,23 @@ SCHEDULE_TREND_SCAN_INTERVAL_MIN = 30  # 扫描间隔（分钟）
 SCHEDULE_TREND_SCAN_START = '09:00'   # 扫描起始时间
 SCHEDULE_TREND_SCAN_END = '15:00'     # 扫描结束时间
 
-# P4-1 趋势评分回测验证闭环（2026-07-01）
+# 趋势评分回测验证闭环（2026-07-01）
 SCHEDULE_TREND_BACKTEST_TIME = '15:30'  # 趋势回测定时任务时间（收盘后触发）
+
+# 股东人数更新时间（每日收盘后拉取最新一期，避开交易高峰）
+SHAREHOLDER_UPDATE_TIME = '18:00'
 TREND_BACKTEST_PERIODS = [1, 3, 5]                  # 回测周期（天）
+
+# 大盘风险预警自动扫描（盘中多时段，覆盖开盘/上午/下午）
+# 9:35 = 开盘5分钟早期预警；10:00/10:30 = 上午检查；13:05 = 下午开盘；14:00 = 尾盘
+SCHEDULE_MARKET_ALERT_TIMES = ['09:35', '10:00', '10:30', '13:05', '14:00']
+MARKET_ALERT_RISK_THRESHOLD = 40  # 风险评分 >= 此值时触发预警推送
 TREND_BACKTEST_KLINE_CONCURRENCY = 5                # 批量拉 K 线并发度
 TREND_BACKTEST_MARKET_SYMBOL = 'sh000001'           # 大盘基准（上证指数）
 TREND_BACKTEST_SCORE_SEGMENTS = [(60, 70), (70, 80), (80, 101)]  # 分数段（左闭右开，80+ 用 101 兜顶）
 
 # ========== 数据查询限制 ==========
-QUERY_DAILY_RECOMMENDATIONS_LIMIT = 30  # 每日推荐股票数量限制
+QUERY_DAILY_RECOMMENDATIONS_LIMIT = 300  # 历史推荐记录保留天数（load 取最新 N 天 / save 截断到 N 天，均按天数语义）
 QUERY_TREND_RESULTS_LIMIT = 200  # 趋势结果数量限制
 QUERY_MARKET_REVIEWS_LIMIT = 30  # 市场评论数量限制
 
@@ -408,7 +539,7 @@ KLINE_DATA_LIMIT = 200  # K线数据数量限制
 KLINE_DISPLAY_MA_POINTS = 10  # 显示移动平均线点数
 
 # ========== 东方财富请求头（统一常量） ==========
-# 2026-07-02 C-5 优化：从 review.py/ai.py/routes.py 三处分散定义统一到此处
+# 2026-07-02 优化：从 review.py/ai.py/routes.py 三处分散定义统一到此处
 EASTMONEY_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',

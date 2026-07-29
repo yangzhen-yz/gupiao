@@ -26,19 +26,19 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD,
     TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN,
-    # P2-1 筹码结构修正
+    # 筹码结构修正
     TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN,
     TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN,
     TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL,
     TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL,
     TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL,
-    # P3-1 动态阈值
+    # 动态阈值
     TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE,
     TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS,
-    # P3-2 行业中性化
+    # 行业中性化
     STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED)
 from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry
-from services.stock import (get_http_client, has_delisting_risk, is_main_board, get_kline_data,
+from services.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)
 from services.strategy import calc_stock_score_v2, load_strategy_factor_weights, apply_industry_neutralization
@@ -47,24 +47,37 @@ from services.pattern import detect_volume_price_pattern
 _last_scan_result = None
 _last_scan_date = ''
 _last_scan_ts = 0.0
-# 2026-07-06 修复：模块级 asyncio.Lock / Semaphore 会绑定到 import 时的事件循环，
-# Uvicorn reload 后新进程的新循环会触发 "bound to a different event loop" 错误，
-# 导致 /api/scan-trend-stocks?force=true 返回 500。改为函数内懒初始化。
+# 2026-07-22 修复：跨事件循环问题
+# 早期修复（2026-07-06）只做了"懒初始化"，但全局缓存导致：
+#   - 第一次扫描在 loop A 创建 Lock/Semaphore
+#   - uvicorn reload / 测试 / asyncio.run 后产生 loop B
+#   - 重用 loop A 的实例 → RuntimeError: bound to a different event loop → 500
+# 修复：用 _bound_loop 记录创建时所在 loop；当前 loop 变化时重建实例
 _scan_trend_lock = None
+_scan_lock_bound_loop: Optional[asyncio.AbstractEventLoop] = None
+_scan_semaphore = None
+_scan_semaphore_bound_loop: Optional[asyncio.AbstractEventLoop] = None
 
 def _get_scan_lock() -> asyncio.Lock:
-    """获取趋势扫描锁（函数内懒初始化，绑定当前事件循环）"""
-    global _scan_trend_lock
-    if _scan_trend_lock is None:
+    """获取趋势扫描锁：跨 loop 安全（每次新 loop 都重建 Lock）"""
+    global _scan_trend_lock, _scan_lock_bound_loop
+    cur_loop = asyncio.get_running_loop()
+    if _scan_trend_lock is None or _scan_lock_bound_loop is not cur_loop:
         _scan_trend_lock = asyncio.Lock()
+        _scan_lock_bound_loop = cur_loop
     return _scan_trend_lock
 
 def get_scan_semaphore() -> asyncio.Semaphore:
-    """获取趋势扫描并发信号量（每次返回新实例，绑定当前事件循环）"""
-    return asyncio.Semaphore(SCAN_CONCURRENCY)
+    """获取趋势扫描并发信号量：跨 loop 安全（每次新 loop 都重建 Semaphore）"""
+    global _scan_semaphore, _scan_semaphore_bound_loop
+    cur_loop = asyncio.get_running_loop()
+    if _scan_semaphore is None or _scan_semaphore_bound_loop is not cur_loop:
+        _scan_semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+        _scan_semaphore_bound_loop = cur_loop
+    return _scan_semaphore
 
 def _ensure_today_date(data: Dict) -> Dict:
-    # 2026-07-06 C-5: 已合并到 services.utils.ensure_today_date，此处保留薄壳透传以最小化改动
+    # 2026-07-06 : 已合并到 services.utils.ensure_today_date，此处保留薄壳透传以最小化改动
     from services.utils import ensure_today_date
     return ensure_today_date(data)
 
@@ -77,7 +90,8 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 turnover_rate: float = 0.0,
                 main_inflow_ratio: Optional[float] = None,
                 market_regime: str = 'range',
-                pattern_info: Optional[Dict] = None) -> Dict:
+                pattern_info: Optional[Dict] = None,
+                intraday_change_pct: float = 0.0) -> Dict:
     """
     中短线波段趋势判断 V4.0
 
@@ -113,7 +127,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     n = len(kline_data)
     latest_idx = n - 1
     latest_close = closes[latest_idx]
-    cv = None  # P2-1: 量能稳定性CV，D3子维度3计算后覆盖（预初始化避免NameError）
+    cv = None  # : 量能稳定性CV，D3子维度3计算后覆盖（预初始化避免NameError）
 
     # 优先使用实时价（盘中校准）
     if USE_INTRADAY_BREAK_CHECK and realtime_price and realtime_price > 0:
@@ -161,7 +175,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
             'deducts': [], 'exclusions': exclusions
         }
 
-    # ========== P2-2 量价形态识别 + P3-1 动态阈值预计算（2026-06-30）==========
+    # ==========  量价形态识别 + 动态阈值预计算（2026-06-30）==========
     # 提前计算均量用于形态识别（D3 会重新计算相同值，不影响正确性）
     _pat_avg_vol_20 = sum(vols[max(0, n - 20):]) / min(20, n) if n > 0 else 0
     _pat_win60_start = max(0, n - 60)
@@ -174,7 +188,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     # ========== 计算额外均线（MA60、MA120 用于扣分/加分） ==========
     ma60 = calculate_ma(kline_data, 60)
     ma120 = calculate_ma(kline_data, 120)
-    # P2-1: 提前取 MA60/MA120 最新值，供筹码修正系数 _calc_chip_factor 引用
+    # : 提前取 MA60/MA120 最新值，供筹码修正系数 _calc_chip_factor 引用
     # （原 line 498 处的赋值已移至此处，ma60_down/ma120_down 在 line 335 用数组计算，不受影响）
     ma60_val = ma60[latest_idx] if latest_idx < len(ma60) and ma60[latest_idx] else None
     ma120_val = ma120[latest_idx] if latest_idx < len(ma120) and ma120[latest_idx] else None
@@ -233,7 +247,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     s_d1 = max(0, s_d1_trend + d1_divergence_penalty)
 
     # ========== 维度 2：短期资金异动（30 分，连板高度分层 + 连阳分取高） ==========
-    # P0-2 升级（2026-06-30）：业界龙头战法核心是"龙一溢价 > 龙二 > 龙三"，
+    # 升级（2026-06-30）：业界龙头战法核心是"龙一溢价 > 龙二 > 龙三"，
     # 用连板高度（最大连续涨停数）替代单纯涨停次数，识别题材内龙头位置
     # ③ 近 20 日涨停次数 + 最大连板数
     limit_up_20d = 0
@@ -438,7 +452,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         bonus_score += TREND_BONUS_POCKET_PIVOT
         bonuses.append(('口袋支点', TREND_BONUS_POCKET_PIVOT))
 
-    # ⑤ 稳步上行 vs 加速拉升（2026-07-02 B-4 新增，参考市面策略）
+    # ⑤ 稳步上行 vs 加速拉升（2026-07-02 新增，参考市面策略）
     # 市面经验："稳步震荡上行趋势延续周期更长，加速拉升易深度调整"
     # 稳步上行：近20日涨幅5%-15% + 阳线占比≥60% + 最大单日涨幅<5%
     # 加速拉升：近5日涨幅≥15% + 量比≥2（警示透支风险，低加分）
@@ -490,12 +504,12 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 deducts = [d for d in deducts if d[0] != k]  # 移除非最大扣分项
 
     # ========== 板块动量因子（环境加成/折价 ±5%） ==========
-    # P0-1 实现（2026-06-30）：基于个股概念标签的同题材平均涨幅做环境修正
+    # 实现（2026-06-30）：基于个股概念标签的同题材平均涨幅做环境修正
     # sector_change 由 scan_trend_scan_results 预计算并注入（基于 stock_concept_tags）
     # None=无数据不修正；≥3%热门+5%；≥1%偏热+3%；≤-3%冷门-5%；≤-1%偏冷-3%
     sector_factor = _calc_sector_factor(sector_change)
 
-    # ========== P2-1 筹码结构修正（代理指标，2026-06-30）==========
+    # ========== 筹码结构修正（代理指标，2026-06-30）==========
     # 用 MA60/MA120 成本压力位 + 换手率筹码松动度 + 主力净流入 + 量能稳定性CV 组合
     # 作为乘性修正系数叠加（与板块动量同族），钳制在 [-0.08, 0.08]
     chip_factor = _calc_chip_factor(check_price, ma60_val, ma120_val,
@@ -513,15 +527,27 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     # 加速拉升 +1 不会同时出现，故 max_bonus 不含 TREND_BONUS_ACCELERATING
     max_bonus = (TREND_BONUS_BULL_ALIGNMENT + TREND_BONUS_VOLUME_BREAKOUT +
                  TREND_BONUS_CONSECUTIVE_YANG + TREND_BONUS_POCKET_PIVOT +
-                 TREND_BONUS_STEADY_UPTREND + TREND_SIDEWAYS_BONUS)  # = 23（2026-07-02 B-2 调整后）
+                 TREND_BONUS_STEADY_UPTREND + TREND_SIDEWAYS_BONUS)  # = 23（2026-07-02  调整后）
     bonus_contrib = (bonus_score / max_bonus) * 5 if max_bonus > 0 else 0
     raw_score = base_score_capped + bonus_contrib  # 100 + (0~5) = 100~105
     raw_score = min(100, raw_score)  # 封顶
-    # P2-1/P2-2/P0-1 三修正系数叠加（封顶 TREND_TOTAL_FACTOR_CAP=0.15，防溢出）
+    # //三修正系数叠加（封顶 TREND_TOTAL_FACTOR_CAP=0.15，防溢出）
     # total = raw × (1 + min(0.15, sector_factor + chip_factor + pattern_factor))
     total_factor = min(TREND_TOTAL_FACTOR_CAP, sector_factor + chip_factor + pattern_factor)
     total_score = round(raw_score * (1 + total_factor), 1)
     total_score = min(100, max(0, total_score))
+
+    # ========== 日内动量加成（v5.4 新增）==========
+    # 日内强势股（涨幅≥5%）获得额外评分加成，避免反弹初期评分偏低被误杀
+    intraday_bonus = 0
+    abs_chg = abs(intraday_change_pct)
+    if abs_chg >= 9:
+        intraday_bonus = 10
+    elif abs_chg >= 7:
+        intraday_bonus = 8
+    elif abs_chg >= 5:
+        intraday_bonus = 5
+    total_score = min(100, total_score + intraday_bonus)
 
     # ========== 入选判断 ==========
     # 过滤规则 1：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制排除（原有逻辑保留）
@@ -539,12 +565,13 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                     'latestPrice': latest_close, 'checkPrice': check_price,
                 }
     
-    # 过滤规则 2：下跌趋势中的短暂反弹过滤（v5.3 增强）
+    # 过滤规则 2：下跌趋势中的短暂反弹过滤（v5.4 放宽）
     # 条件：① 中长期均线结构偏空（满足任意一项即视为偏空）：
     #          a. MA60 + MA120 双空头（5日斜率均向下）
     #          b. MA60 < MA120 死亡交叉未修复
     #          c. 现价 < MA120（股价尚未收复半年线，中长期趋势未逆转）
-    #        ② 现价距全量历史最高点回撤 > 20%
+    #        ② 现价距全量历史最高点回撤 > 30%（v5.4: 20%→30%，放宽）
+    #        ③ 日内涨幅 ≥ 7% 豁免（涨停/大涨股不适用反弹过滤）
     # → 即使近期反弹至 MA20 甚至 MA60 上方，中长期趋势仍偏空，
     #   属于"下跌中继反弹"而非趋势反转，强制排除
     # 
@@ -554,7 +581,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     #   实测 score=62 isUp=True，但该股距历史高点 3.54 回撤 29.4%，
     #   且现价 2.5 仍在 MA120(2.642) 之下，属于典型下跌中继反弹。
     # v5.3 新增条件 c：股价 < MA120 也是中长期偏空的有效信号。
-    # 注：ma60_val/ma120_val 已在 line 163-164 提前赋值（P2-1 筹码修正需要）
+    # 注：ma60_val/ma120_val 已在 line 163-164 提前赋值（筹码修正需要）
 
     ma_long_bearish = ma60_down and ma120_down
     if not ma_long_bearish:
@@ -569,11 +596,11 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         if ma120_val is not None and check_price < ma120_val:
             ma_long_bearish = True
 
-    if ma_long_bearish:
+    if ma_long_bearish and abs(intraday_change_pct) < 7.0:
         # 使用全量历史数据找最高点，而非仅限 60 日内
         all_time_high = max(highs) if highs else 0
         peak_drawdown = (all_time_high - check_price) / all_time_high * 100 if all_time_high > 0 else 0
-        if peak_drawdown > 20:
+        if peak_drawdown > 30:
             signal_desc = []
             if ma60_down and ma120_down:
                 signal_desc.append('双空头')
@@ -620,7 +647,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         # 维度 2
         'sD2': s_d2,
         'limitUpCount20d': limit_up_20d,
-        'maxConsecutiveBoards': max_consecutive_boards,  # P0-2: 最大连板数（龙头辨识）
+        'maxConsecutiveBoards': max_consecutive_boards,  # : 最大连板数（龙头辨识）
         'consecutiveYangCount': consecutive_yang_count,
         'has2ConsecutiveBoard': has_2_consecutive_board,
         # 维度 3
@@ -644,21 +671,23 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'latestClose': latest_close,
         'checkPrice': check_price,
         'isRealtime': is_realtime,
+        # 日内动量加成（v5.4）
+        'intradayBonus': intraday_bonus,
         # 展示用：连涨/连跌天数
         'consecutiveUpDays': consecutive_up_days,
         'consecutiveDownDays': consecutive_down_days,
         # 加分
         'bonusScore': bonus_score,
-        # 板块动量因子（P0-1）
+        # 板块动量因子（）
         'sectorChange': round(sector_change, 2) if sector_change is not None else None,
         'sectorFactor': round(sector_factor, 2),
-        # P2-1 筹码结构修正系数
+        # 筹码结构修正系数
         'chipFactor': round(chip_factor, 3),
-        # P2-2 量价形态
+        #  量价形态
         'pattern': pattern_result['pattern'],
         'patternDesc': pattern_result['desc'],
         'patternFactor': round(pattern_factor, 3),
-        # P3-1 动态阈值市场状态
+        # 动态阈值市场状态
         'marketRegime': market_regime,
         # 三修正系数叠加总值（封顶 0.15）
         'totalFactor': round(min(TREND_TOTAL_FACTOR_CAP, sector_factor + chip_factor + pattern_factor), 3),
@@ -680,7 +709,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
 
 def _count_max_consecutive_boards(closes: List[float], start: int, end: int) -> int:
     """区间内最大连续涨停数（连板高度）。
-    P0-2 新增（2026-06-30）：用于龙头辨识——5连板+=市场总龙头，3-4连板=板块龙头。
+    新增（2026-06-30）：用于龙头辨识——5连板+=市场总龙头，3-4连板=板块龙头。
     涨停判定：当日涨幅 ≥ TREND_LIMIT_UP_THRESHOLD（默认 9.8%）
     """
     n = end - start
@@ -908,7 +937,7 @@ def _check_pocket_pivot(opens: List[float], closes: List[float], highs: List[flo
 
 def _calc_sector_factor(sector_change: Optional[float]) -> float:
     """
-    计算板块动量修正系数（P0-1 实现，2026-06-30）
+    计算板块动量修正系数（实现，2026-06-30）
 
     基于个股所属题材/板块当日平均涨幅，对个股评分做环境修正：
     - 热门题材（≥3%）→ +5%
@@ -931,7 +960,7 @@ def _calc_sector_factor(sector_change: Optional[float]) -> float:
 
 
 def _classify_market_regime(market_change: float, index_kline: Optional[List[List]]) -> str:
-    """P3-1 大盘状态分类（2026-06-30）
+    """大盘状态分类（2026-06-30）
 
     结合大盘指数(sh000001) 现价 vs MA20 + 当日涨幅，判定 bull/bear/range：
     - bull: 大盘在 MA20 之上 且 当日涨幅 ≥ +0.5%
@@ -970,7 +999,7 @@ def _classify_market_regime(market_change: float, index_kline: Optional[List[Lis
 
 
 def _get_dynamic_thresholds(market_regime: str, pattern: str) -> Dict:
-    """P3-1 三级优先合并动态阈值（2026-06-30）
+    """三级优先合并动态阈值（2026-06-30）
 
     优先级：精确匹配(regime, pattern) > regime 默认 > 全局默认
     保证返回的 dict 一定含 6 个 key，供 is_up_trend 内 6 处引用：
@@ -989,7 +1018,7 @@ def _get_dynamic_thresholds(market_regime: str, pattern: str) -> Dict:
 def _calc_chip_factor(check_price: float, ma60_val: Optional[float], ma120_val: Optional[float],
                       turnover_rate: float, main_inflow_ratio: Optional[float],
                       cv: Optional[float]) -> float:
-    """P2-1 筹码结构修正系数（代理指标方案，2026-06-30）
+    """筹码结构修正系数（代理指标方案，2026-06-30）
 
     无真实 CYQ 筹码数据，用 4 个代理指标组合刻画筹码结构：
       子项1 成本压力位：现价 vs MA60/MA120（双线上方=无套牢盘 / 双线下方=双重套牢）
@@ -1399,8 +1428,7 @@ async def scan_trend_scan_results(force: bool = False):
                     print(f'[趋势扫描] 已排除用户股票池中 {removed} 只股票')
         except Exception as e:
             print(f'[趋势扫描] 排除用户股票池失败: {str(e)}')
-        
-        client = get_http_client()
+
         weights = load_strategy_factor_weights()
         
         # 提前获取大盘涨跌幅，传递给评分函数
@@ -1412,18 +1440,18 @@ async def scan_trend_scan_results(force: bool = False):
         except Exception as _e:
             print(f'[趋势扫描] 大盘涨跌幅获取失败，使用 0: {_e}')
 
-        # ===== P3-1 大盘状态预计算（2026-06-30，用于 is_up_trend 动态阈值）=====
+        # ===== 大盘状态预计算（2026-06-30，用于 is_up_trend 动态阈值）=====
         # 结合大盘现价 vs MA20 + 当日涨跌，判定 bull/bear/range
         # 传入 is_up_trend 后，D1乖离/D3放量滞涨/D4回撤等阈值会按状态动态调整
         market_regime = 'range'
         try:
-            idx_kline = await get_kline_data('sh000001', client)
+            idx_kline = await get_kline_data('sh000001')
             market_regime = _classify_market_regime(market_change, idx_kline)
         except Exception as e:
             print(f'[趋势扫描] 大盘状态分类失败（降级为range）: {e}')
         print(f'[趋势扫描] 大盘状态: {market_regime} (大盘涨跌{market_change:.2f}%)')
 
-        # ===== P0-1 板块动量预计算（2026-06-30）=====
+        # ===== 板块动量预计算（2026-06-30）=====
         # 基于个股概念标签(stock_concept_tags)的同题材平均涨幅，构建 symbol → sector_change 映射
         # 后续 is_up_trend 调用时注入，实现"热门题材+5%/冷门题材-5%"的环境修正
         sector_change_map: Dict[str, float] = {}
@@ -1437,7 +1465,7 @@ async def scan_trend_scan_results(force: bool = False):
 
                 async def _fetch_change_batch(_batch):
                     try:
-                        _raw = await fetch_with_retry(','.join(_batch), client)
+                        _raw = await fetch_with_retry(','.join(_batch))
                         return parse_tencent_batch_data(_raw)
                     except Exception:
                         return []
@@ -1474,7 +1502,7 @@ async def scan_trend_scan_results(force: bool = False):
         except Exception as e:
             print(f'[趋势扫描] 板块动量预计算失败（不影响扫描）: {e}')
 
-        # ===== P1-1 主力资金流向预取（2026-06-30）=====
+        # ===== 主力资金流向预取（2026-06-30）=====
         # 批量获取扫描池股票的主力净流入，注入 strategy_score 的第9因子
         # 局部 import 避免与 recommend.py 循环导入
         fund_flow_map: Dict[str, Dict] = {}
@@ -1484,13 +1512,37 @@ async def scan_trend_scan_results(force: bool = False):
         except Exception as e:
             print(f'[趋势扫描] 资金流向预取失败（不影响扫描）: {e}')
 
+        # ===== 股东人数筹码面预取（2026-07-06）=====
+        # 从 DB 缓存批量查最新一期股东人数，注入 strategy_score 的第10因子
+        # 月度数据无需实时拉取，DB 查询用 to_thread 包装避免阻塞
+        holder_map: Dict[str, Dict] = {}
+        try:
+            from services.shareholder import get_holder_num_batch
+            holder_map = await asyncio.to_thread(get_holder_num_batch, scan_pool) or {}
+        except Exception as e:
+            print(f'[趋势扫描] 股东人数预取失败（不影响扫描）: {e}')
+
+        # P1a/P1b: 基本面质量 + 聪明钱(龙虎榜)预取，注入第12/13因子
+        fund_map: Dict[str, Dict] = {}
+        sm_map: Dict[str, Dict] = {}
+        try:
+            from services.fundamental import get_fundamental_batch
+            fund_map = await asyncio.to_thread(get_fundamental_batch, scan_pool) or {}
+        except Exception as e:
+            print(f'[趋势扫描] 基本面预取失败（不影响扫描）: {e}')
+        try:
+            from services.smartmoney import get_dragon_tiger_symbol_map
+            sm_map = await asyncio.to_thread(get_dragon_tiger_symbol_map) or {}
+        except Exception as e:
+            print(f'[趋势扫描] 聪明钱预取失败（不影响扫描）: {e}')
+
         async def process_one_stock(symbol: str) -> Optional[Dict]:
             async with get_scan_semaphore():
                 try:
                     # 性能优化（2026-07-02）：get_kline_data 内部已拉实时行情校准最新 K 线
                     # 通过 return_realtime=True 复用 realtime_raw，避免二次 fetch_with_retry 冗余请求
                     kline, realtime_raw = await asyncio.wait_for(
-                        get_kline_data(symbol, client, return_realtime=True),
+                        get_kline_data(symbol, return_realtime=True),
                         timeout=SCAN_KLINE_TIMEOUT
                     )
                     if not kline:
@@ -1518,23 +1570,21 @@ async def scan_trend_scan_results(force: bool = False):
                     # 沪深主板标记（非主板改为扣 -5 分，不再直接排除）
                     _is_mainboard = is_main_board(symbol)
 
-                    # 并发拉取近 20 日公告用于利空检测（失败不阻塞，仅视为无利空）
-                    try:
-                        neg_ann = await asyncio.wait_for(has_negative_announcement(symbol), timeout=4)
-                    except Exception:
-                        neg_ann = {'hasNegative': False, 'hits': []}
-
                     # 市值（概算：从实时数据取，若不可用则为 None=不触发小微盘排除）
                     _market_cap = None
                     if realtime_data:
                         # 腾讯 API 返回的 marketCap 可能在某些字段中，取不到则留 None
                         _market_cap = realtime_data.get('marketCap')
 
-                    # 趋势判断（V3.0 综合评分）
+                    # 趋势判断（V3.0 综合评分）—— 先不加利空公告，做"廉价"技术面预筛
+                    # 性能优化（2026-07-20）：原逻辑在 is_up_trend 之前就并发拉每只公告，
+                    # 而 90%+ 的票会在 is_up_trend 内部因趋势不符/ST/小微盘被排除，
+                    # 公告请求白白浪费大量外部 IO。改为先跑技术面，只有趋势通过才查公告，
+                    # 利空公告命中则等价于原逻辑 isUp=False 直接排除。
                     trend_result = is_up_trend(
                         kline,
                         realtime_price=realtime_price,
-                        negative_announcement=neg_ann,
+                        negative_announcement=None,
                         stock_name=name,
                         market_cap=_market_cap,
                         is_mainboard=_is_mainboard,
@@ -1542,8 +1592,17 @@ async def scan_trend_scan_results(force: bool = False):
                         turnover_rate=realtime_data.get('turnoverRate', 0) if realtime_data else 0.0,
                         main_inflow_ratio=(fund_flow_map.get(symbol.lower(), {}) or {}).get('main_inflow_ratio'),
                         market_regime=market_regime,
+                        intraday_change_pct=realtime_data.get('changePercent', 0) if realtime_data else 0.0,
                     )
                     if not trend_result['isUp']:
+                        return None
+
+                    # 趋势技术面已通过，才拉取近 20 日公告做利空检测（失败不阻塞，仅视为无利空）
+                    try:
+                        neg_ann = await asyncio.wait_for(has_negative_announcement(symbol), timeout=4)
+                    except Exception:
+                        neg_ann = {'hasNegative': False, 'hits': []}
+                    if neg_ann and neg_ann.get('hasNegative'):
                         return None
 
                     if has_delisting_risk(name, symbol):
@@ -1551,11 +1610,19 @@ async def scan_trend_scan_results(force: bool = False):
 
                     strategy_score = None
                     if realtime_data:
-                        # 传入 market_change + fund_flow_data（P1-1），与 recommend/routes 路径对齐
+                        # 传入 market_change + fund_flow_data + holder_data + 基本面 + 聪明钱
                         ff = fund_flow_map.get(symbol.lower())
+                        hd = holder_map.get(symbol.lower())
+                        fd = fund_map.get(symbol.lower())
+                        sm = sm_map.get(symbol.lower())
+                        sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
+                                   'appearances': (sm or {}).get('appearances', 0)} if sm else None
                         strategy_score = calc_stock_score_v2(realtime_data, weights,
                                                              market_change=market_change,
-                                                             fund_flow_data=ff)
+                                                             fund_flow_data=ff,
+                                                             holder_data=hd,
+                                                             fundamental_data=fd,
+                                                             smart_money_data=sm_data)
 
                     return {
                         'symbol': symbol,
@@ -1573,13 +1640,18 @@ async def scan_trend_scan_results(force: bool = False):
                         'realtimeData': realtime_data
                     }
                 except Exception as e:
+                    # 2026-07-14 修复：原本 return None 静默吞掉所有异常，导致 /api/scan-trend-stocks 500 时无法定位是哪只股票
+                    # 现在打印 traceback + symbol，方便排查
+                    import traceback as _tb
+                    print(f'[趋势扫描] {symbol} 扫描失败（已跳过）: {type(e).__name__}: {e}')
+                    print(f'[趋势扫描] {symbol} traceback:\n{_tb.format_exc()}')
                     return None
         
         try:
             tasks = [process_one_stock(s) for s in scan_pool]
             results = await asyncio.gather(*tasks)
 
-            # P3-2 行业中性化：对 strategy_score 做后处理（三层对齐 routes/recommend/trend）
+            # 行业中性化：对 strategy_score 做后处理（三层对齐 routes/recommend/trend）
             # 注意：trend 列表按 trend_score 排序，此处仅调整 strategyScore 字段，不改变趋势入选/排序
             # helper 原地修改 r['strategyScore'] dict（dict 引用共享），industry_map 复用已预取的 fund_flow_map
             if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED and fund_flow_map:
@@ -1592,8 +1664,20 @@ async def scan_trend_scan_results(force: bool = False):
                 except Exception as e:
                     print(f'[趋势扫描] 行业映射持久化失败（不影响扫描）: {e}')
 
-            trend_scan_results = [r for r in results if r is not None and r['score'] >= TREND_MIN_SCORE]
-            
+            # 2026-07-14 修复：防御性过滤，确保每条 result 都是带 'score' 字段的 dict
+            # 原来 `r is not None and r['score'] >= ...` 当 r 为非 dict（如 str/list）时会 KeyError → 500
+            trend_scan_results = []
+            for r in results:
+                if not isinstance(r, dict):
+                    if r is not None:
+                        print(f'[趋势扫描] 异常 result（非 dict）已跳过: {type(r).__name__}: {r}')
+                    continue
+                if 'score' not in r:
+                    print(f'[趋势扫描] 异常 result（缺 score 字段）已跳过: {r.get("symbol", "?")}')
+                    continue
+                if r['score'] >= TREND_MIN_SCORE:
+                    trend_scan_results.append(r)
+
             trend_scan_results.sort(key=lambda x: x['score'], reverse=True)
             
             # 保存策略预测记录 (复用上面已获取的 market_change)

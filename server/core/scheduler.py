@@ -2,7 +2,7 @@
 import asyncio, schedule, threading, time
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME)
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME)
 
 from services.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
@@ -11,6 +11,11 @@ from services.trend_backtest import backtest_trend_predictions
 from services.review import generate_daily_review
 from services.strategy import backtest_yesterday_predictions
 from services.recommend import auto_generate_recommendations_task
+from services.shareholder import update_holder_num_task
+from services.fundamental import update_fundamental_task
+from services.valuation import update_valuation_task
+from services.market import run_scheduled_market_alert
+from services.smartmoney import refresh_smart_money_task
 
 
 def _generate_interval_times(start_hhmm: str, end_hhmm: str, interval_min: int) -> list:
@@ -55,7 +60,10 @@ async def backtest_task():
         elif 'message' in result:
             print(f'[定时任务] {result["message"]}')
         else:
-            print(f'[定时任务] 回测完成: 准确率{result["accuracy"]}%, 看涨准确率{result["bull_accuracy"]}%, 看跌准确率{result["bear_accuracy"]}%')
+            # 2026-07-14 修复：使用 .get() 兜底，避免 KeyError（之前 result['bear_accuracy'] KeyError）
+            print(f'[定时任务] 回测完成: 准确率{result.get("accuracy", 0)}%, '
+                  f'看涨准确率{result.get("bull_accuracy", 0)}%, '
+                  f'看跌准确率{result.get("bear_accuracy", 0)}%')
             if result.get('weight_adjustments'):
                 for adj in result['weight_adjustments']:
                     if adj['action'] != 'keep':
@@ -85,6 +93,21 @@ def run_scheduler():
     def job_generate_recommendations():
         asyncio.run(auto_generate_recommendations_task())
 
+    def job_update_holder_num():
+        asyncio.run(update_holder_num_task())
+
+    def job_update_fundamental():
+        asyncio.run(update_fundamental_task())
+
+    def job_update_valuation():
+        asyncio.run(update_valuation_task())
+
+    def job_market_alert():
+        asyncio.run(run_scheduled_market_alert())
+
+    def job_update_smart_money():
+        asyncio.run(refresh_smart_money_task())
+
     # 原有的定时任务
     schedule.every().day.at(SCHEDULE_UPDATE_HOT_SEARCH_TIMES[0]).do(job_update_hot_search_ranking)
     schedule.every().day.at(SCHEDULE_UPDATE_HOT_SEARCH_TIMES[1]).do(job_update_hot_search_ranking)
@@ -111,15 +134,35 @@ def run_scheduler():
     # 新增：每天自动生成智能推荐股票
     for t in SCHEDULE_RECOMMENDATION_TIMES:
         schedule.every().day.at(t).do(job_generate_recommendations)
-    
+
+    # : 每天 18:00 更新股东人数筹码面数据（月度披露，每日刷新最新一期）
+    schedule.every().day.at(SHAREHOLDER_UPDATE_TIME).do(job_update_holder_num)
+
+    # : 每天 18:05 更新基本面质量数据（季度披露，每日刷新最新一期 ROE/净利润同比）
+    schedule.every().day.at(FUNDAMENTAL_UPDATE_TIME).do(job_update_fundamental)
+
+    # : 每天 18:10 更新估值分位数据（PE/PB 全市场百分位，每日盘后刷新）
+    schedule.every().day.at(VALUATION_UPDATE_TIME).do(job_update_valuation)
+
+    # 大盘风险预警：盘中多时段自动扫描，风险评分>=40 时保存预警供前端推送
+    for t in SCHEDULE_MARKET_ALERT_TIMES:
+        schedule.every().day.at(t).do(job_market_alert)
+
+    # 交易日后定时拉取最新龙虎榜+北向资金数据，前端无需手动刷新
+    schedule.every().day.at(SMART_MONEY_UPDATE_TIME).do(job_update_smart_money)
+
     print('[定时任务] 已设置定时任务：')
     print(f'[定时任务]   - {SCHEDULE_UPDATE_HOT_SEARCH_TIMES[0]}/{SCHEDULE_UPDATE_HOT_SEARCH_TIMES[1]}: 更新热搜榜')
     print(f'[定时任务]   - {",".join(trend_scan_times)} (每{SCHEDULE_TREND_SCAN_INTERVAL_MIN}分钟): 自动扫描趋势股')
     print(f'[定时任务]   - {SCHEDULE_MA10_CHECK_TIME}: 检查10日线并删除跌破股票')
     print(f'[定时任务]   - {SCHEDULE_DAILY_REVIEW_TIME}: 自动生成每日收评')
     print(f'[定时任务]   - {SCHEDULE_BACKTEST_TIME}: 回测验证昨日预测并调整策略权重')
-    print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: P4-1 趋势评分回测验证（1/3/5日跑赢大盘胜率）')
+    print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: 趋势评分回测验证（1/3/5日跑赢大盘胜率）')
     print(f'[定时任务]   - {"/".join(SCHEDULE_RECOMMENDATION_TIMES)}: 自动生成智能推荐股票')
+    print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据')
+    print(f'[定时任务]   - {VALUATION_UPDATE_TIME}: 更新估值分位数据（PE/PB 百分位）')
+    print(f'[定时任务]   - {",".join(SCHEDULE_MARKET_ALERT_TIMES)}: 大盘风险预警自动扫描')
+    print(f'[定时任务]   - {SMART_MONEY_UPDATE_TIME}: 刷新龙虎榜+北向资金数据（仅交易日）')
     
     while True:
         schedule.run_pending()

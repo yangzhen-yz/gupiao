@@ -1,14 +1,16 @@
 """services.stock.py - split from main.py"""
-import httpx, json, re, asyncio, requests, time
+import json, re, asyncio, requests, time
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date, timedelta
-from app.config import TENCENT_QUOTE_API, TENCENT_KLINE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, HTTP_MAX_CONNECTIONS, HTTP_KEEPALIVE_CONNECTIONS, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, KLINE_START_DATE, KLINE_DATA_LIMIT, HOT_SEARCH_TOP_N, INDEX_SYMBOLS, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS
+from app.config import TENCENT_QUOTE_API, TENCENT_KLINE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, KLINE_START_DATE, KLINE_DATA_LIMIT, HOT_SEARCH_TOP_N, INDEX_SYMBOLS, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS
 from db.database import load_stock_basic_info, save_stock_basic_info, load_hot_search_ranking, load_stock_concept_tags
 
 _stock_basic_info_cache = None
 _hot_search_ranking_cache = None
 _announcement_cache: Dict[str, Tuple[float, Dict]] = {}  # symbol -> (ts, result)
-http_client = None
+_analysis_cache: Dict[str, Tuple[float, Dict]] = {}  # symbol -> (ts, result), TTL=3s for 2s polling
+# 2026-07-08 优化：行情 API 10 秒缓存（symbol -> (ts, raw_data)），避免重复 RTT
+_realtime_cache: Dict[str, Tuple[float, str]] = {}
 
 # 利空公告关键词（出现任一即判定为"重大利空 / 减持 / 立案"）
 NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
@@ -24,7 +26,9 @@ NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
 ]
 
 TENCENT_API = TENCENT_QUOTE_API
-MAX_RETRIES = 3
+MAX_RETRIES = 2  # 2026-07-08 优化：3→2，腾讯偶尔超时1次重试足够，避免 3 RTT=1.5s
+RETRY_BACKOFF_BASE = 0.1  # 2026-07-08 优化：0.5→0.1，减少无效等待
+REALTIME_CACHE_TTL = 5  # 2026-07-08 优化：单只行情 5 秒缓存（腾讯 1-3 秒内数据变化小）
 
 _DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -34,18 +38,32 @@ _DEFAULT_HEADERS = {
     'Referer': 'https://quote.eastmoney.com/',
 }
 
+# 2026-07-08 优化：全局 requests.Session 复用 TCP 连接（keep-alive）
+# 避免每次请求都新建 TCP + TLS 握手（~100-200ms 开销）
+# 注意：必须在 _DEFAULT_HEADERS 定义之后初始化
+_REALTIME_SESSION = requests.Session()
+_REALTIME_SESSION.headers.update(_DEFAULT_HEADERS)
 
-def get_http_client() -> httpx.AsyncClient:
-    global http_client
-    if http_client is None or http_client.is_closed:
-        http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT),
-            limits=httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_KEEPALIVE_CONNECTIONS),
-            http2=False,
-            follow_redirects=True,
-            headers=_DEFAULT_HEADERS,
-        )
-    return http_client
+
+# ========== 同步 HTTP 调用辅助（替代原 httpx.AsyncClient）==========
+# 遵循 project_memory 硬约束：HTTP 请求到 Eastmoney/腾讯等服务必须用 requests 同步客户端
+# 包装 with asyncio.to_thread，避免 httpx "Server disconnected" 错误。
+def _sync_get(url: str, headers: Optional[Dict] = None, timeout: Optional[Tuple[float, float]] = None) -> requests.Response:
+    """同步 GET。timeout=(connect, read)，默认 (HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT)。
+    headers 会与 _DEFAULT_HEADERS 合并（调用方覆盖默认），避免丢失 User-Agent/Referer。
+    """
+    merged = {**_DEFAULT_HEADERS, **(headers or {})}
+    return requests.get(url, headers=merged,
+                        timeout=timeout or (HTTP_CONNECT_TIMEOUT, HTTP_TIMEOUT))
+
+def _sync_post(url: str, json_body: Dict, headers: Optional[Dict] = None,
+               timeout: float = 30.0) -> requests.Response:
+    """同步 POST JSON（AI/DeepSeek 等接口用）。
+    headers 会与 _DEFAULT_HEADERS 合并（调用方覆盖默认）。
+    """
+    merged = {**_DEFAULT_HEADERS, **(headers or {})}
+    return requests.post(url, json=json_body, headers=merged, timeout=timeout)
+
 
 def get_cached_stock_name(symbol: str) -> Optional[str]:
     global _stock_basic_info_cache, _hot_search_ranking_cache
@@ -89,39 +107,58 @@ def is_main_board(symbol: str) -> bool:
         return True
     # 其他（创业板、科创板、北交所等）→ 不是主板
     return False
-async def fetch_with_retry(symbols: str, client: Optional[httpx.AsyncClient] = None) -> str:
+async def fetch_with_retry(symbols: str) -> str:
+    """-fix: httpx.AsyncClient 在生产环境会触发 "Server disconnected without sending a response"
+    错误（参考 project_memory.md 硬约束），改用 requests 同步客户端 + asyncio.to_thread 包装。
+
+    2026-07-08 优化：
+    1. 全局 _REALTIME_SESSION 复用 keep-alive TCP 连接
+    2. MAX_RETRIES 3→2 + 退避 0.5→0.1
+    3. 新增 _realtime_cache（10 秒 TTL），同 symbol 重复请求 < 5ms
+    """
+    symbols_lower = symbols.lower()
+    # 2026-07-08 优化：5 秒内同 symbol 直接返回缓存
+    now = time.time()
+    cached = _realtime_cache.get(symbols_lower)
+    if cached and (now - cached[0]) < REALTIME_CACHE_TTL:
+        return cached[1]
+
     url = TENCENT_API + symbols
-    last_err = None
-    cl = client or get_http_client()
-    
+    last_err: Optional[Exception] = None
+
+    def _sync_fetch() -> str:
+        # 2026-07-08 优化：用 _REALTIME_SESSION 复用 keep-alive（无 keep-alive 时自动新建，不影响正确性）
+        resp = _REALTIME_SESSION.get(url, timeout=(2, 3))  # (connect, read)
+        resp.raise_for_status()
+        raw = resp.content
+        if len(raw) < 10:
+            raise Exception('返回数据过短')
+        try:
+            data = raw.decode('gbk')
+        except Exception:
+            data = raw.decode('utf-8', errors='ignore')
+        if '=' not in data or '="\n' in data:
+            raise Exception('API返回数据为空')
+        return data
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = await cl.get(url, headers={'Accept-Encoding': 'gzip'})
-            response.raise_for_status()
-            
-            raw = response.content
-            if len(raw) < 10:
-                raise Exception('返回数据过短')
-            
-            try:
-                data = raw.decode('gbk')
-            except:
-                data = raw.decode('utf-8', errors='ignore')
-            
-            if '=' not in data or '="\n' in data:
-                raise Exception('API返回数据为空')
-            
+            data = await asyncio.to_thread(_sync_fetch)
+            # 2026-07-08 优化：写入缓存（10 秒 TTL）
+            _realtime_cache[symbols_lower] = (time.time(), data)
             return data
         except Exception as err:
             last_err = err
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.5 * attempt)
-    
-    raise last_err
+                await asyncio.sleep(RETRY_BACKOFF_BASE * attempt)
 
-async def fetch_stock_data(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Optional[Dict]:
+    # 兜底：str(err) 为空时用 repr，否则 detail 看不到错误
+    err_msg = str(last_err) or (repr(last_err) if last_err else '未知错误')
+    raise Exception(f'fetch_with_retry 失败（已重试{MAX_RETRIES}次）: {err_msg}')
+
+async def fetch_stock_data(symbol: str) -> Optional[Dict]:
     try:
-        raw_data = await fetch_with_retry(symbol, client)
+        raw_data = await fetch_with_retry(symbol)
         parsed_list = parse_tencent_batch_data(raw_data)
         if parsed_list and len(parsed_list) > 0:
             return {'raw': raw_data, 'parsed': parsed_list[0]}
@@ -150,8 +187,10 @@ async def fetch_eastmoney_hot_list():
                 'Origin': 'https://quote.eastmoney.com',
             }
             all_stocks = []
-            # 一次最多 100，分多页取（按涨幅倒序）
-            for pn in (1, 2, 3):
+            # 2026-07-08 修复：从硬编码3页(300只)改为根据 HOT_SEARCH_TOP_N 动态计算页数
+            # 原代码 for pn in (1, 2, 3) 最多只取300只，与 HOT_SEARCH_TOP_N=500 不一致
+            total_pages = (HOT_SEARCH_TOP_N + 99) // 100  # 向上取整：500→5页
+            for pn in range(1, total_pages + 1):
                 params = {
                     'pn': pn, 'pz': 100, 'po': 1, 'np': 1, 'fltt': 1, 'invt': 2, 'fid': 'f3',
                     'fs': 'm:0+t:2,m:1+t:2',
@@ -194,17 +233,27 @@ async def fetch_eastmoney_hot_list():
             if is_shanghai_main or is_shenzhen_main:
                 if not is_forbidden_stock(name):
                     # 东方财富 f2/f3/f4 字段都是"放大 100 倍"的值（f2 单位是"分"，f3/f4 单位是"%"*100）
-                    raw_price = stock.get('f2', 0) or 0
-                    raw_change_pct = stock.get('f3', 0) or 0
-                    raw_change = stock.get('f4', 0) or 0
+                    # 2026-07-08 修复：东方财富某些字段会返回 '-'（停牌/无成交），float('-') 会抛 ValueError
+                    # 用 _to_float 兜底：'-'/None/'' → 0，避免 1000+ 只股票拉取中断
+                    def _to_float(v, default=0):
+                        if v is None or v == '' or v == '-':
+                            return default
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            return default
+
+                    raw_price = _to_float(stock.get('f2'), 0)
+                    raw_change_pct = _to_float(stock.get('f3'), 0)
+                    raw_change = _to_float(stock.get('f4'), 0)
                     result.append({
                         'symbol': market + code,
                         'code': code,
                         'name': name,
                         'market': market,
-                        'price': round(float(raw_price) / 100, 2) if raw_price else 0,
-                        'changePercent': round(float(raw_change_pct) / 100, 2) if raw_change_pct else 0,
-                        'change': round(float(raw_change) / 100, 2) if raw_change else 0,
+                        'price': round(raw_price / 100, 2),
+                        'changePercent': round(raw_change_pct / 100, 2),
+                        'change': round(raw_change / 100, 2),
                         'hotRank': idx + 1
                     })
         
@@ -295,8 +344,11 @@ async def get_stock_name(symbol: str) -> Optional[str]:
         pass
     return symbol
 
-async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None, return_realtime: bool = False):
-    """获取股票K线数据
+async def get_kline_data(symbol: str, return_realtime: bool = False):
+    """获取股票K线数据（-fix: 改用 requests + asyncio.to_thread，去 httpx）
+
+    性能优化（2026-07-20 A1）：日线历史按交易日缓存到 SQLite（kline_cache），
+    当天只拉一次腾讯；实时行情复用 _realtime_cache（5 秒 TTL），避免每次重拉全量历史。
 
     Args:
         return_realtime: 若为 True，返回 (kline, realtime_raw) 元组，
@@ -305,26 +357,35 @@ async def get_kline_data(symbol: str, client: Optional[httpx.AsyncClient] = None
     today = date.today().isoformat()
     start_date = KLINE_START_DATE
     url = f'{TENCENT_KLINE_API}?param={symbol},day,{start_date},{today},{KLINE_DATA_LIMIT},qfq'
-    cl = client or get_http_client()
+
+    # 2026-07-20 A1：优先读 SQLite 缓存（当天已拉过则直接命中，省一次腾讯请求）
+    from db.database import load_kline_cache, save_kline_cache
+    cached_kline = load_kline_cache(symbol, today)
+    kline = cached_kline if cached_kline else []
 
     try:
-        kline = []
-
-        try:
-            response = await cl.get(url)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('data') and data['data'].get(symbol):
-                kline = data['data'][symbol].get('qfqday', []) or data['data'][symbol].get('day', [])
-        except Exception as e:
-            print(f'[K线API请求] {str(e)}')
+        if not kline:
+            try:
+                def _fetch_kline():
+                    resp = _sync_get(url)
+                    resp.raise_for_status()
+                    return resp.json()
+                data = await asyncio.to_thread(_fetch_kline)
+                if data.get('data') and data['data'].get(symbol):
+                    kline = data['data'][symbol].get('qfqday', []) or data['data'][symbol].get('day', [])
+                    # 成功拉到足量数据才写缓存，避免脏数据污染
+                    if kline and len(kline) >= 30:
+                        save_kline_cache(symbol, today, kline)
+            except Exception as e:
+                print(f'[K线API请求] {str(e)}')
 
         if not kline or len(kline) < 30:
             return (None, None) if return_realtime else None
 
         realtime_raw = None
         try:
-            realtime_raw = await fetch_with_retry(symbol, cl)
+            # 2026-07-20 A1：复用实时行情缓存（_realtime_cache 5秒 TTL），避免重复 RTT
+            realtime_raw = await fetch_with_retry(symbol)
             if realtime_raw:
                 fields = parse_realtime_fields(realtime_raw)
                 if fields and fields['price']:

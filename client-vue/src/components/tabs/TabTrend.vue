@@ -4,6 +4,92 @@
       <div class="toggle-section"><span class="toggle-label">📊 自动刷新中</span></div>
       <div class="last-update">{{ lastScan }}</div>
     </div>
+
+    <!-- 市场温度计：每日趋势扫描数量历史 -->
+    <div v-if="trendHistoryCounts.length > 0" class="thermometer-section">
+      <!-- 顶部状态栏 -->
+      <div class="thermometer-header" @click="showThermometer = !showThermometer">
+        <div class="therm-left">
+          <svg class="therm-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg>
+          <span class="therm-title">市场温度计</span>
+        </div>
+        <div class="therm-status-group" v-if="thermometerStatus">
+          <span class="therm-status-pill" :class="'level-' + thermometerStatus.level">
+            {{ thermometerStatus.label }}
+          </span>
+          <span class="therm-hint-text">{{ thermometerStatus.hint }}</span>
+        </div>
+        <div class="therm-trend-badge" :class="thermometerTrend?.direction" v-if="thermometerTrend">
+          <span class="trend-dir">{{ thermometerTrend.direction === 'up' ? '↑' : thermometerTrend.direction === 'down' ? '↓' : '—' }}</span>
+          <span>较上日 <strong>{{ thermometerTrend.diff > 0 ? '+' : '' }}{{ thermometerTrend.diff }}</strong> 只</span>
+          <span class="trend-pct">({{ thermometerTrend.pct > 0 ? '+' : '' }}{{ thermometerTrend.pct.toFixed(0) }}%)</span>
+        </div>
+        <span class="therm-toggle">{{ showThermometer ? '收起' : '展开' }}
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" :style="{ transform: showThermometer ? 'rotate(180deg)' : '', transition: 'transform 0.2s' }"/></svg>
+        </span>
+      </div>
+
+      <!-- 展开内容 -->
+      <div v-show="showThermometer" class="therm-body">
+        <!-- 迷你柱状图：当前页符合数趋势 -->
+        <div class="therm-spark-row">
+          <div class="spark-label">近{{ pagedTrendHistoryCounts.length }}个交易日</div>
+          <div class="spark-bars">
+            <div v-for="(item, idx) in pagedTrendHistoryCounts.slice().reverse()" :key="item.date"
+                 class="spark-bar-wrap" :title="`${item.date}: ${item.result_count}只`">
+              <div class="spark-bar" :class="getThermResultClass(item.result_count)"
+                   :style="{ height: sparkBarHeight(item.result_count) + '%' }"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 数据表格 -->
+        <div class="therm-table-wrap">
+          <div class="therm-table">
+            <div class="therm-row therm-head">
+              <span class="col-date">日期</span>
+              <span class="col-num">扫描</span>
+              <span class="col-result">符合</span>
+              <span class="col-avg">均分</span>
+              <span class="col-high">80+</span>
+              <span class="col-delta">变化</span>
+            </div>
+            <div v-for="(item, idx) in pagedTrendHistoryCounts" :key="item.date"
+                 class="therm-row" :class="{ 'row-latest': idx === 0 }">
+              <span class="col-date" :class="{ 'date-latest': idx === 0 }">{{ item.date.slice(5) }}</span>
+              <span class="col-num">{{ item.scanned }}</span>
+              <span class="col-result" :class="getThermResultClass(item.result_count)">
+                <strong>{{ item.result_count }}</strong>
+              </span>
+              <span class="col-avg">{{ item.avg_score }}</span>
+              <span class="col-high">{{ item.count_80plus }}</span>
+              <span class="col-delta">
+                <template v-if="idx < pagedTrendHistoryCounts.length - 1">
+                  <span class="delta-val" :class="getTrendArrowClass(item.result_count, pagedTrendHistoryCounts[idx + 1].result_count)">
+                    {{ getTrendArrow(item.result_count, pagedTrendHistoryCounts[idx + 1].result_count) }}
+                  </span>
+                </template>
+                <span v-else class="delta-flat">—</span>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 分页：默认近21个交易日，超出翻页 -->
+        <div v-if="thermTotalPages > 1" class="history-pagination" style="margin-top: 0.6rem;">
+          <button class="page-btn" :disabled="thermPage <= 1" @click="thermPage--">上一页</button>
+          <span class="page-info">第 {{ thermPage }} / {{ thermTotalPages }} 页</span>
+          <button class="page-btn" :disabled="thermPage >= thermTotalPages" @click="thermPage++">下一页</button>
+        </div>
+
+        <!-- 图例 -->
+        <div class="therm-legends">
+          <span class="leg-item"><i class="leg-dot frozen"></i>&le;{{ THERMOMETER.FROZEN }} 冰点 · 减仓</span>
+          <span class="leg-item"><i class="leg-dot cold"></i>{{ THERMOMETER.FROZEN+1 }}~{{ THERMOMETER.COLD }} 偏冷 · 谨慎</span>
+          <span class="leg-item"><i class="leg-dot normal"></i>>{{ THERMOMETER.COLD }} 正常/活跃</span>
+        </div>
+      </div>
+    </div>
     <div class="trend-section">
       <div class="section-header">
         <div class="section-subtitle-small">发现的趋势股票</div>
@@ -254,11 +340,48 @@ const addInput = ref('')
 const autoAddThreshold = ref(80)
 const lastAutoAdded = ref([])
 
-// P4-1 趋势回测相关
+// 趋势回测相关
 const latestBacktest = ref(null)
 const backtestHistory = ref([])
 const showBacktestHistory = ref(false)
 const backtestRecordsMap = ref({})  // { symbol: { isCorrect1d, isCorrect3d, isCorrect5d } }
+
+// 市场温度计：每日趋势扫描数量历史
+const trendHistoryCounts = ref([])
+const showThermometer = ref(false)
+const THERM_PAGE_SIZE = 21
+const thermPage = ref(1)
+const thermTotalPages = computed(() => Math.max(1, Math.ceil(trendHistoryCounts.value.length / THERM_PAGE_SIZE)))
+const pagedTrendHistoryCounts = computed(() => {
+  const start = (thermPage.value - 1) * THERM_PAGE_SIZE
+  return trendHistoryCounts.value.slice(start, start + THERM_PAGE_SIZE)
+})
+
+// 温度等级判定
+const THERMOMETER = {
+  FROZEN: 8,    // ≤8只：冰点，强烈建议减仓
+  COLD: 15,     // ≤15只：偏冷，谨慎
+  NORMAL_LOW: 20, // ≤20只：正常偏低
+}
+const thermometerStatus = computed(() => {
+  if (trendHistoryCounts.value.length === 0) return null
+  const latest = trendHistoryCounts.value[0]
+  const count = latest.result_count
+  if (count <= THERMOMETER.FROZEN) return { level: 'frozen', label: '冰点', icon: '⚠️', hint: '市场极冷，建议减仓/观望', color: '#dc2626' }
+  if (count <= THERMOMETER.COLD) return { level: 'cold', label: '偏冷', icon: '🥶', hint: '市场偏冷，控制仓位', color: '#f59e0b' }
+  if (count <= THERMOMETER.NORMAL_LOW) return { level: 'normal-low', label: '温和', icon: '🟢', hint: '市场温和，正常操作', color: '#16a34a' }
+  return { level: 'warm', label: '活跃', icon: '🔥', hint: '市场活跃，可适当加仓', color: '#059669' }
+})
+
+// 趋势变化（对比上一交易日）
+const thermometerTrend = computed(() => {
+  if (trendHistoryCounts.value.length < 2) return null
+  const curr = trendHistoryCounts.value[0].result_count
+  const prev = trendHistoryCounts.value[1].result_count
+  const diff = curr - prev
+  const pct = prev > 0 ? ((curr - prev) / prev * 100) : 0
+  return { diff, pct, direction: diff > 0 ? 'up' : diff < 0 ? 'down' : 'flat' }
+})
 
 // 股票池排序
 const poolSortBy = ref(null)       // 'price' | 'consecutive' | null
@@ -294,7 +417,7 @@ const sortedPoolStocks = computed(() => {
   })
 })
 
-const TREND_PAGE_SIZE = 15
+const TREND_PAGE_SIZE = 10
 const trendPage = ref(1)
 const trendTotalPages = computed(() => Math.ceil(filteredTrendStocks.value.length / TREND_PAGE_SIZE))
 const pagedTrendStocks = computed(() => {
@@ -364,13 +487,20 @@ async function loadTrendStocks() {
       if (typeof result.data.autoAddThreshold === 'number') {
         autoAddThreshold.value = result.data.autoAddThreshold
       }
-      // 旧数据无 consecutiveUpDays 字段 → 自动触发一次重新扫描刷新数据
-      const needRescan = trendStocks.value.length > 0 &&
-        trendStocks.value.every(s => !s.details || typeof s.details.consecutiveUpDays === 'undefined')
-      if (needRescan && !_autoRescanTriggered) {
-        _autoRescanTriggered = true
-        console.log('[TabTrend] 检测到旧数据（无连涨天数），自动触发一次重新扫描...')
-        scanTrendStocks().catch(() => { _autoRescanTriggered = false })
+      // 检查是否需要自动重新扫描
+      if (!_autoRescanTriggered) {
+        const today = new Date().toISOString().slice(0, 10)
+        const scanDate = result.data.scanDate || ''
+        // 条件1: 最新扫描日期不是今天 → 数据过期，自动重扫
+        // 条件2: 旧数据无 consecutiveUpDays 字段 → 格式过旧，自动重扫
+        const isStale = scanDate && scanDate !== today
+        const isOldFormat = trendStocks.value.length > 0 &&
+          trendStocks.value.every(s => !s.details || typeof s.details.consecutiveUpDays === 'undefined')
+        if (isStale || isOldFormat) {
+          _autoRescanTriggered = true
+          console.log(`[TabTrend] 数据过期（扫描日期=${scanDate}，今天=${today}），自动触发重新扫描...`)
+          scanTrendStocks().catch(() => { _autoRescanTriggered = false })
+        }
       }
     }
   } catch (e) { console.error('加载趋势数据失败:', e) }
@@ -393,6 +523,8 @@ async function scanTrendStocks() {
         showNotification(`已自动加入 ${lastAutoAdded.value.length} 只≥${autoAddThreshold.value}分股票到股票池`)
       }
       lastScan.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      // 扫描完成后刷新温度计历史数据
+      loadTrendHistoryCounts()
     }
   } catch (e) { showNotification('趋势扫描失败') }
 }
@@ -472,7 +604,7 @@ function scheduleTrendRefresh() {
   tick()
 }
 
-// ========== P4-1 趋势回测相关方法 ==========
+// ========== 趋势回测相关方法 ==========
 async function loadLatestBacktest() {
   try {
     const result = await apiFetch('/api/trend/backtest-latest')
@@ -533,6 +665,17 @@ function toggleBacktestHistory() {
   showBacktestHistory.value = !showBacktestHistory.value
 }
 
+// ========== 市场温度计 ==========
+async function loadTrendHistoryCounts() {
+  try {
+    const result = await apiFetch('/api/trend/history-counts?days=90')
+    if (result.success && result.data) {
+      trendHistoryCounts.value = result.data
+      thermPage.value = 1
+    }
+  } catch (e) { console.warn('加载趋势历史统计失败', e) }
+}
+
 function getWinRateClass(rate) {
   if (rate >= 0.6) return 'win-rate-high'
   if (rate >= 0.5) return 'win-rate-mid'
@@ -548,6 +691,37 @@ function getStockBacktestTag(stock) {
     : { text: '昨测✗', cls: 'tag-wrong' }
 }
 
+// 温度计辅助
+function getThermResultClass(count) {
+  if (count <= THERMOMETER.FROZEN) return 'result-frozen'
+  if (count <= THERMOMETER.COLD) return 'result-cold'
+  return 'result-normal'
+}
+function getTrendArrow(curr, prev) {
+  const d = curr - prev
+  if (d > 0) return `↑${d}`
+  if (d < 0) return `↓${Math.abs(d)}`
+  return '—'
+}
+function getTrendArrowClass(curr, prev) {
+  const d = curr - prev
+  if (d > 3) return 'up-strong'
+  if (d > 0) return 'up'
+  if (d < -3) return 'down-strong'
+  if (d < 0) return 'down'
+  return 'flat'
+}
+// 迷你柱状图高度（百分比，基于当前页）
+const sparkMaxCount = computed(() => {
+  if (!pagedTrendHistoryCounts.value.length) return 40
+  return Math.max(40, ...pagedTrendHistoryCounts.value.map(i => i.result_count))
+})
+function sparkBarHeight(count) {
+  const max = sparkMaxCount.value
+  if (max <= 0) return 8
+  return Math.max(8, (count / max) * 100)
+}
+
 onMounted(async () => {
   // 性能优化（2026-07-02）：三个串行 await 改 Promise.all，首屏 = max(三者) 而非 sum
   await Promise.all([loadStockMap(), loadPoolWithIndicators(), loadTrendStocks()])
@@ -556,9 +730,258 @@ onMounted(async () => {
   loadLatestBacktest()
   loadBacktestHistory()
   loadYesterdayBacktestRecords()
+  loadTrendHistoryCounts()
 })
 
 onUnmounted(() => {
   if (trendTimer) clearTimeout(trendTimer)
 })
 </script>
+
+<style scoped>
+/* ========== 市场温度计（Redesigned 2026-07-08） ========== */
+.thermometer-section {
+  background: #fff;
+  border: 0.5px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 1rem;
+  overflow: hidden;
+}
+
+/* ---- 头部状态栏 ---- */
+.thermometer-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1.1rem;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease;
+  flex-wrap: wrap;
+}
+.thermometer-header:hover { background: #fafbfc; }
+
+.therm-left {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.therm-icon {
+  width: 18px; height: 18px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+.therm-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #334155;
+  letter-spacing: -0.01em;
+}
+
+.therm-status-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.therm-status-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+.therm-status-pill.level-frozen  { background: #fef2f2; color: #dc2626; }
+.therm-status-pill.level-cold    { background: #fffbeb; color: #d97706; }
+.therm-status-pill.level-normal-low { background: #f0fdf4; color: #16a34a; }
+.therm-status-pill.level-warm    { background: #ecfdf5; color: #059669; }
+.therm-hint-text {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.therm-trend-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: #64748b;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #f8fafc;
+  margin-left: auto;
+}
+.therm-trend-badge.up     { color: #16a34a; }
+.therm-trend-badge.down   { color: #dc2626; }
+.therm-trend-badge.flat   { color: #94a3b8; }
+.trend-dir {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+.therm-trend-badge strong {
+  font-weight: 700;
+}
+.trend-pct {
+  font-size: 0.73rem;
+  color: #94a3b8;
+  margin-left: 1px;
+}
+
+.therm-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.76rem;
+  color: #94a3b8;
+  margin-left: 0.25rem;
+  transition: color 0.15s;
+}
+.thermometer-header:hover .therm-toggle { color: #64748b; }
+
+/* ---- 展开内容 ---- */
+.therm-body {
+  padding: 0 1.1rem 0.9rem;
+  border-top: 0.5px solid #eef2f6;
+}
+
+/* 迷你柱状图 */
+.therm-spark-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 1rem;
+  padding: 0.85rem 0 0.55rem;
+  border-bottom: 0.5px solid #f1f5f9;
+}
+.spark-label {
+  font-size: 0.76rem;
+  color: #94a3b8;
+  white-space: nowrap;
+  padding-bottom: 2px;
+}
+.spark-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  flex: 1;
+  height: 40px;
+}
+.spark-bar-wrap {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  min-width: 0;
+}
+.spark-bar {
+  width: 100%;
+  border-radius: 2px 2px 0 0;
+  min-height: 3px;
+  transition: opacity 0.15s;
+  opacity: 0.75;
+}
+.spark-bar-wrap:hover .spark-bar { opacity: 1; }
+.spark-bar.result-frozen  { background: #fecaca; }
+.spark-bar.result-cold    { background: #fde68a; }
+.spark-bar.result-normal { background: #bbf7d0; }
+
+/* ---- 数据表格 ---- */
+.therm-table-wrap {
+  margin-top: 0.5rem;
+}
+.therm-table {
+  width: 100%;
+}
+.therm-row {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  align-items: center;
+  justify-items: center;
+  padding: 0.42rem 0.6rem;
+  font-size: 0.88rem;
+  transition: background 0.12s;
+  border-bottom: 0.5px solid #f4f6f8;
+}
+.therm-row:last-child { border-bottom: none; }
+.therm-row:hover:not(.therm-head) { background: #fafbfc; }
+
+/* 表头 */
+.therm-head {
+  font-weight: 500;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  background: #fbfcfd;
+  border-bottom: 0.5px solid #eef2f6;
+  letter-spacing: 0.02em;
+}
+.therm-head:hover { background: #fbfcfd; }
+
+/* 最新行高亮 */
+.row-latest {
+  position: relative;
+  background: linear-gradient(90deg, #fefce8 0%, rgba(254,252,232,0) 60%);
+  font-weight: 500;
+}
+.row-latest::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: #f59e0b;
+  border-radius: 0 2px 2px 0;
+}
+
+/* 列 */
+.col-date { color: #64748b; font-variant-numeric: tabular-nums; justify-self: start; padding-left: 0.3rem; }
+.col-date.date-latest { color: #d97706; font-weight: 700; }
+.col-num { color: #94a3b8; font-variant-numeric: tabular-nums; font-size: 0.84rem; }
+.col-result { font-weight: 700; font-family: 'SF Mono', Consolas, 'Cascadia Code', monospace; font-variant-numeric: tabular-nums; }
+.col-result.result-frozen { color: #dc2626; }
+.col-result.result-cold { color: #d97706; }
+.col-result.result-normal { color: #16a34a; }
+.col-avg { color: #94a3b8; font-variant-numeric: tabular-nums; font-size: 0.86rem; }
+.col-high { color: #94a3b8; font-variant-numeric: tabular-nums; font-size: 0.84rem; }
+.col-delta { }
+
+/* 变化箭头 */
+.delta-val {
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.delta-val.up-strong { color: #166534; background: #f0fdf4; }
+.delta-val.up        { color: #15803d; }
+.delta-val.down-strong { color: #991b1b; background: #fef2f2; }
+.delta-val.down      { color: #c2410c; }
+.delta-flat          { color: #cbd5e1; font-size: 0.78rem; }
+
+/* 图例 */
+.therm-legends {
+  display: flex;
+  gap: 1.1rem;
+  margin-top: 0.55rem;
+  padding-top: 0.5rem;
+  border-top: 0.5px dashed #eef2f6;
+  font-size: 0.74rem;
+  color: #94a3b8;
+  flex-wrap: wrap;
+}
+.leg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.leg-dot {
+  width: 7px; height: 7px;
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.leg-dot.frozen  { background: #fca5a5; }
+.leg-dot.cold    { background: #fcd34d; }
+.leg-dot.normal  { background: #86efac; }
+</style>

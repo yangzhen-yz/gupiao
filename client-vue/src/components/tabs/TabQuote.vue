@@ -292,17 +292,18 @@ async function fetchStockQuote(symbol, silent = false) {
     error.value = ''
   }
   try {
-    // 并行：1) 拉行情原始数据  2) 拉9因子评分（修复评分始终为 0）
-    const [quoteResp, analysisResp] = await Promise.all([
-      fetch(`/api/stock/${formatted}`).then(r => r.text()),
-      fetch(`/api/stock/${formatted}/analysis`).then(r => r.json()).catch(() => null),
-    ])
-    const parsed = parseTencentData(quoteResp)
+    // 2026-07-08 性能优化：合并行情+评分为单一接口，从 2 个并行请求 → 1 个请求
+    const resp = await fetch(`/api/stock/${formatted}/full`).then(r => r.json())
+    if (!resp || !resp.success) {
+      throw new Error(resp?.detail || '数据获取失败')
+    }
+    const { raw, score, label, predictDirection, details } = resp.data
+    const parsed = parseTencentData(raw)
     // 注入后端 score（后端 calc_stock_score_v2 是权威评分源）
-    if (parsed && analysisResp && analysisResp.success) {
-      parsed.score = analysisResp.data.score
-      parsed.scoreDetails = analysisResp.data.details || []
-      parsed.label = analysisResp.data.label
+    if (parsed) {
+      parsed.score = score
+      parsed.scoreDetails = details || []
+      parsed.label = label
     }
     if (parsed) {
       if (silent && quoteData.value && quoteData.value.symbol === parsed.symbol) {
@@ -364,7 +365,7 @@ function scheduleRefresh() {
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
   const tick = async () => {
     if (currentSymbol.value) await fetchStockQuote(currentSymbol.value, true)
-    autoRefreshTimer = setTimeout(tick, isTradingTime() ? 3000 : getNextRefreshDelay())
+    autoRefreshTimer = setTimeout(tick, isTradingTime() ? 2000 : getNextRefreshDelay())
   }
   tick()
 }

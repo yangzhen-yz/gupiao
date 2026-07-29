@@ -2,33 +2,42 @@
   <div class="main-container">
     <!-- 大盘指数栏 -->
     <IndexBar />
-    <!-- Tab 导航 -->
-    <div class="tab-nav">
-      <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        :class="['tab-btn', { active: activeTab === tab.id }]"
-        @click="activeTab = tab.id"
-      >{{ tab.label }}</button>
-    </div>
-    <!-- Tab 内容 -->
-    <div :class="['tab-content', { active: activeTab === 'tab-quote' }]" v-show="activeTab === 'tab-quote'">
-      <TabQuote ref="tabQuoteRef" @open-kline="openKline" @open-ai-diag="openAiDiag" />
-    </div>
-    <div :class="['tab-content', { active: activeTab === 'tab-scan' }]" v-show="activeTab === 'tab-scan'">
-      <TabScan />
-    </div>
-    <div :class="['tab-content', { active: activeTab === 'tab-trend' }]" v-show="activeTab === 'tab-trend'">
-      <TabTrend @open-kline="openKline" />
-    </div>
-    <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'">
-      <TabRecommend />
-    </div>
-    <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'">
-      <TabReview @open-kline="openKline" />
-    </div>
-    <div :class="['tab-content', { active: activeTab === 'tab-strategy' }]" v-show="activeTab === 'tab-strategy'">
-      <TabStrategy />
+    <!-- 顶部功能标签栏（交易终端风格） -->
+    <div class="app-body">
+      <nav class="tab-bar">
+        <button
+          v-for="tab in tabs"
+          :key="tab.id"
+          :class="['tab-bar-item', { active: activeTab === tab.id }]"
+          @click="activeTab = tab.id"
+        >{{ tab.label }}</button>
+      </nav>
+      <div class="app-main">
+        <div :class="['tab-content', { active: activeTab === 'tab-quote' }]" v-show="activeTab === 'tab-quote'">
+          <TabQuote ref="tabQuoteRef" @open-kline="openKline" @open-ai-diag="openAiDiag" />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-scan' }]" v-show="activeTab === 'tab-scan'">
+          <TabScan />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-trend' }]" v-show="activeTab === 'tab-trend'">
+          <TabTrend @open-kline="openKline" />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'">
+          <TabRecommend />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-flow' }]" v-show="activeTab === 'tab-flow'">
+          <TabFlow />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'">
+          <TabReview @open-kline="openKline" />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-backtest' }]" v-show="activeTab === 'tab-backtest'">
+          <TabBacktest />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-strategy' }]" v-show="activeTab === 'tab-strategy'">
+          <TabStrategy @open-kline="openKline" />
+        </div>
+      </div>
     </div>
     <!-- K线弹窗 -->
     <KlineModal :visible="klineVisible" :symbol="klineSymbol" @close="klineVisible = false" />
@@ -45,8 +54,8 @@
 </template>
 
 <script setup>
-import { ref, provide, nextTick } from 'vue'
-import { useNotification } from './utils/helpers'
+import { ref, provide, nextTick, onMounted, onUnmounted } from 'vue'
+import { useNotification, isTradingTime, apiFetch } from './utils/helpers'
 import IndexBar from './components/IndexBar.vue'
 import TabQuote from './components/tabs/TabQuote.vue'
 import TabScan from './components/tabs/TabScan.vue'
@@ -54,6 +63,8 @@ import TabTrend from './components/tabs/TabTrend.vue'
 import TabRecommend from './components/tabs/TabRecommend.vue'
 import TabReview from './components/tabs/TabReview.vue'
 import TabStrategy from './components/tabs/TabStrategy.vue'
+import TabFlow from './components/tabs/TabFlow.vue'
+import TabBacktest from './components/tabs/TabBacktest.vue'
 import KlineModal from './components/KlineModal.vue'
 import AiDiagModal from './components/AiDiagModal.vue'
 
@@ -74,6 +85,36 @@ function navigateToQuote(symbol) {
   })
 }
 provide('navigateToQuote', navigateToQuote)
+
+// ========== 大盘风险预警轮询 ==========
+const _lastAlertDate = ref('')
+let _alertTimer = null
+
+async function _checkMarketAlert() {
+  if (!isTradingTime()) return
+  try {
+    const result = await apiFetch('/api/market-alert')
+    if (!result.success || !result.data) return
+    const alert = result.data
+    // 同一天只推送一次
+    if (alert.date === _lastAlertDate.value) return
+    if (alert.riskScore >= 40) {
+      _lastAlertDate.value = alert.date
+      const pred = alert.prediction || {}
+      const type = alert.riskScore >= 60 ? 'error' : 'warning'
+      const msg = `${pred.title || '大盘风险预警'} (风险评分${alert.riskScore}) ${pred.action || ''}`
+      showNotification(msg, type, 8000)
+    }
+  } catch (e) { /* 静默失败 */ }
+}
+
+onMounted(() => {
+  _checkMarketAlert()
+  _alertTimer = setInterval(_checkMarketAlert, 60000)
+})
+onUnmounted(() => {
+  if (_alertTimer) clearInterval(_alertTimer)
+})
 
 // K线弹窗
 const klineVisible = ref(false)
@@ -96,7 +137,9 @@ const tabs = [
   { id: 'tab-scan', label: '股票筛选' },
   { id: 'tab-trend', label: '趋势发现' },
   { id: 'tab-recommend', label: '智能推荐' },
+  { id: 'tab-flow', label: '资金流向' },
   { id: 'tab-review', label: '每日收评' },
+  { id: 'tab-backtest', label: '策略回测' },
   { id: 'tab-strategy', label: '策略优化' },
 ]
 </script>

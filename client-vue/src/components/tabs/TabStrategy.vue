@@ -95,6 +95,98 @@
       </div>
     </div>
 
+    <!-- RPS 相对强度强势股榜（P0，2026-07-16） -->
+    <div class="rps-table" style="margin-bottom:24px;">
+      <div class="section-subtitle-small" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
+        <span>RPS 相对强度强势股榜（{{ rpsPeriod }}日）</span>
+        <button class="btn-secondary" style="padding:4px 12px;font-size:0.76rem;" @click="refreshRps" :disabled="rpsRefreshing">{{ rpsRefreshing ? '计算中...' : '刷新预计算' }}</button>
+      </div>
+      <div v-if="rpsError" class="empty-state" style="padding:1.5rem;">{{ rpsError }}（点击"刷新预计算"触发全市场计算，约 30 秒）</div>
+      <div v-else-if="rpsList.length" class="stock-table">
+        <div class="stock-table-header">
+          <span class="sortable" :class="{ active: rpsSortKey==='name', desc: rpsSortKey==='name' && rpsSortDesc }" @click.stop="sortRps('name')">名称</span>
+          <span class="sortable" :class="{ active: rpsSortKey==='rps', desc: rpsSortKey==='rps' && rpsSortDesc }" @click.stop="sortRps('rps')">RPS</span>
+          <span class="sortable" :class="{ active: rpsSortKey==='intervalChange', desc: rpsSortKey==='intervalChange' && rpsSortDesc }" @click.stop="sortRps('intervalChange')">区间涨幅</span>
+          <span class="sortable" :class="{ active: rpsSortKey==='pullback_1m', desc: rpsSortKey==='pullback_1m' && rpsSortDesc }" @click.stop="sortRps('pullback_1m')">近1月回调</span>
+          <span>K线</span>
+        </div>
+        <div v-for="s in pagedRpsList" :key="s.symbol" class="stock-table-row clickable" @click="goToQuoteRps(s.symbol)">
+          <span class="name">{{ s.name }}<br><small style="color:var(--text-tertiary);">{{ s.symbol.toUpperCase() }}</small></span>
+          <span :style="{ fontWeight:700, color: s.rps>=90?'var(--accent-danger)':s.rps>=70?'var(--accent-warning)':'var(--text-secondary)' }">{{ s.rps.toFixed(0) }}</span>
+          <span :style="{ color: s.intervalChange>=0?'var(--accent-danger)':'var(--accent-success)', fontWeight:600 }">{{ s.intervalChange>=0?'+':'' }}{{ s.intervalChange.toFixed(2) }}%</span>
+          <span :style="{ color: (s.pullback_1m==null?0:s.pullback_1m)>=0?'var(--accent-danger)':'var(--accent-success)', fontWeight:600 }">
+            {{ s.pullback_1m == null ? '—' : (s.pullback_1m>=0?'+':'') + s.pullback_1m.toFixed(2) + '%' }}
+          </span>
+          <span>
+            <button class="rps-kline-btn" @click.stop="emit('open-kline', s.symbol)" title="查看K线">K线</button>
+          </span>
+        </div>
+      </div>
+      <div v-if="rpsList.length && rpsTotalPages > 1" class="history-pagination">
+        <button class="page-btn" :disabled="rpsPage <= 1" @click="rpsPage--">上一页</button>
+        <span class="page-info">第 {{ rpsPage }} / {{ rpsTotalPages }} 页</span>
+        <button class="page-btn" :disabled="rpsPage >= rpsTotalPages" @click="rpsPage++">下一页</button>
+      </div>
+      <div v-else class="empty-state" style="padding:1.5rem;">
+        <div class="loading-spinner" style="margin:0 auto 0.5rem;" v-if="rpsLoading"></div>
+        <span>{{ rpsLoading ? '加载中...' : '暂无 RPS 数据，点击"刷新预计算"' }}</span>
+      </div>
+    </div>
+
+    <!-- 聪明钱信号（P1b，2026-07-16） -->
+    <div class="smart-money" style="margin-bottom:24px;">
+      <div class="section-subtitle-small" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span>聪明钱信号（龙虎榜 + 北向资金）</span>
+        <button class="btn-secondary" style="padding:4px 12px;font-size:0.76rem;" @click="loadSmartMoney(true)" :disabled="smLoading">{{ smLoading ? '刷新中...' : '刷新' }}</button>
+        <span style="font-size:0.72rem;color:var(--text-tertiary);">龙虎榜统计周期为近5日</span>
+        <span v-if="dragonTigerLatestDate" style="font-size:0.72rem;color:var(--text-tertiary);margin-left:auto;">数据日期：{{ dragonTigerLatestDate }}</span>
+      </div>
+
+      <!-- 北向资金（市场级情绪） -->
+      <div v-if="northbound" class="strategy-card" style="margin-bottom:12px;"
+           :style="{ borderLeft: `3px solid ${northbound.sentiment==='bullish'?'var(--accent-danger)':northbound.sentiment==='bearish'?'var(--accent-success)':'var(--accent-info)'}` }">
+        <div class="strategy-card-header">
+          <span class="strategy-card-title">北向资金（沪深股通）</span>
+          <span :style="{ fontWeight:700, color: northbound.sentiment==='bullish'?'var(--accent-danger)':northbound.sentiment==='bearish'?'var(--accent-success)':'var(--accent-info)' }">
+            {{ northbound.sentiment==='bullish'?'净流入 · 偏多':northbound.sentiment==='bearish'?'净流出 · 偏空':'中性' }}
+          </span>
+        </div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:0.85rem;margin-top:4px;">
+          <span>当日沪股通: <b :style="{ color: northbound.sh_net>=0?'var(--accent-danger)':'var(--accent-success)' }">{{ fmtWan(northbound.sh_net) }}</b></span>
+          <span>当日深股通: <b :style="{ color: northbound.sz_net>=0?'var(--accent-danger)':'var(--accent-success)' }">{{ fmtWan(northbound.sz_net) }}</b></span>
+          <span>当日合计: <b :style="{ color: northbound.total>=0?'var(--accent-danger)':'var(--accent-success)' }">{{ fmtWan(northbound.total) }}</b></span>
+          <span style="color:var(--text-tertiary)">近1月 沪 {{ fmtWan(northbound.month_sh) }} · 深 {{ fmtWan(northbound.month_sz) }}</span>
+        </div>
+        <div style="font-size:0.72rem;color:var(--text-tertiary);margin-top:6px;">数据日期: {{ northbound.date || '—' }} ｜ 更新: {{ northbound.updated }}</div>
+      </div>
+
+      <!-- 龙虎榜净买入榜（个股级聪明钱） -->
+      <div v-if="dragonTigerError" class="empty-state" style="padding:1.5rem;">{{ dragonTigerError }}</div>
+      <div v-else-if="dragonTigerList.length" class="stock-table smart-money-table">
+        <div class="stock-table-header">
+          <span class="sortable" :class="{ active: dragonSortKey==='name', desc: dragonSortKey==='name' && dragonSortDesc }" @click.stop="sortDragon('name')">名称</span>
+          <span class="sortable" :class="{ active: dragonSortKey==='net_amt', desc: dragonSortKey==='net_amt' && dragonSortDesc }" @click.stop="sortDragon('net_amt')">龙虎榜净买入</span>
+          <span class="sortable" :class="{ active: dragonSortKey==='appearances', desc: dragonSortKey==='appearances' && dragonSortDesc }" @click.stop="sortDragon('appearances')">近5日上榜次数</span>
+          <span class="sortable" :class="{ active: dragonSortKey==='max_change', desc: dragonSortKey==='max_change' && dragonSortDesc }" @click.stop="sortDragon('max_change')">期间涨幅</span>
+        </div>
+        <div v-for="s in pagedDragonTigerList" :key="s.symbol" class="stock-table-row clickable" @click="goToQuoteRps(s.symbol)">
+          <span class="name">{{ s.name }}<br><small style="color:var(--text-tertiary);">{{ s.symbol.toUpperCase() }}</small></span>
+          <span :style="{ fontWeight:700, color: s.net_amt>=5e8?'var(--accent-danger)':s.net_amt>=1e8?'var(--accent-warning)':'var(--text-secondary)' }">{{ fmtYuan(s.net_amt) }}</span>
+          <span>{{ s.appearances }} 次</span>
+          <span :style="{ color: s.max_change>=0?'var(--accent-danger)':'var(--accent-success)', fontWeight:600 }">{{ s.max_change>=0?'+':'' }}{{ s.max_change.toFixed(1) }}%</span>
+        </div>
+      </div>
+      <div v-if="dragonTigerList.length && dragonTigerTotalPages > 1" class="history-pagination">
+        <button class="page-btn" :disabled="dragonTigerPage <= 1" @click="dragonTigerPage--">上一页</button>
+        <span class="page-info">第 {{ dragonTigerPage }} / {{ dragonTigerTotalPages }} 页</span>
+        <button class="page-btn" :disabled="dragonTigerPage >= dragonTigerTotalPages" @click="dragonTigerPage++">下一页</button>
+      </div>
+      <div v-else class="empty-state" style="padding:1.5rem;">
+        <div class="loading-spinner" style="margin:0 auto 0.5rem;" v-if="smLoading"></div>
+        <span>{{ smLoading ? '加载中...' : '暂无龙虎榜数据' }}</span>
+      </div>
+    </div>
+
     <!-- 回测历史 -->
     <div style="margin-bottom:24px;">
       <div class="section-subtitle-small" style="margin-bottom:12px;">回测报告</div>
@@ -176,6 +268,8 @@ import { ref, computed, onMounted, inject } from 'vue'
 import { apiFetch } from '../../utils/helpers'
 
 const showNotification = inject('showNotification')
+const navigateToQuote = inject('navigateToQuote')
+const emit = defineEmits(['open-kline'])
 const weights = ref([])
 const backtestHistory = ref([])
 const predictions = ref([])
@@ -184,6 +278,50 @@ const marketPredict = ref(null)
 const marketPredictLoading = ref(false)
 const marketCrash = ref(null)
 const marketPredictExpanded = ref(true)
+
+// RPS 相对强度强势股榜（P0，2026-07-16）
+const rpsList = ref([])
+const rpsLoading = ref(false)
+const rpsRefreshing = ref(false)
+const rpsError = ref('')
+const rpsPeriod = ref(120)
+
+const RPS_PAGE_SIZE = 10
+const rpsPage = ref(1)
+const rpsSortKey = ref('rps')
+const rpsSortDesc = ref(true)
+
+function sortRps(key) {
+  if (rpsSortKey.value === key) {
+    rpsSortDesc.value = !rpsSortDesc.value
+  } else {
+    rpsSortKey.value = key
+    rpsSortDesc.value = true
+  }
+  rpsPage.value = 1
+}
+
+const sortedRpsList = computed(() => {
+  const key = rpsSortKey.value
+  return [...rpsList.value].sort((a, b) => {
+    if (key === 'name') {
+      const va = a.name || a.symbol || ''
+      const vb = b.name || b.symbol || ''
+      return rpsSortDesc.value ? vb.localeCompare(va, 'zh-CN') : va.localeCompare(vb, 'zh-CN')
+    }
+    let va = a[key]
+    let vb = b[key]
+    if (va == null) va = -Infinity
+    if (vb == null) vb = -Infinity
+    return rpsSortDesc.value ? vb - va : va - vb
+  })
+})
+
+const rpsTotalPages = computed(() => Math.ceil(sortedRpsList.value.length / RPS_PAGE_SIZE))
+const pagedRpsList = computed(() => {
+  const start = (rpsPage.value - 1) * RPS_PAGE_SIZE
+  return sortedRpsList.value.slice(start, start + RPS_PAGE_SIZE)
+})
 
 const PREDICTION_PAGE_SIZE = 5
 const predictionPage = ref(1)
@@ -304,10 +442,167 @@ async function resetWeights() {
   } catch (e) { showNotification('重置失败') }
 }
 
+async function loadRps() {
+  rpsLoading.value = true
+  rpsError.value = ''
+  try {
+    const r = await apiFetch(`/api/rps?period_days=${rpsPeriod.value}&top_n=50`)
+    if (r.success && r.data) {
+      if (r.data.error) rpsError.value = r.data.error
+      rpsList.value = r.data.stocks || []
+      rpsPage.value = 1
+    }
+  } catch (e) {
+    rpsError.value = '加载 RPS 失败'
+  } finally {
+    rpsLoading.value = false
+  }
+}
+
+async function refreshRps() {
+  rpsRefreshing.value = true
+  try {
+    const r = await apiFetch('/api/rps/refresh?period_days=' + rpsPeriod.value, { method: 'POST' })
+    if (r.success) {
+      showNotification('RPS 预计算已在后台启动，约 30 秒后自动刷新')
+      setTimeout(loadRps, 35000)
+    } else {
+      showNotification('触发失败')
+    }
+  } catch (e) {
+    showNotification('触发失败')
+  } finally {
+    rpsRefreshing.value = false
+  }
+}
+
+function goToQuoteRps(symbol) {
+  if (navigateToQuote) navigateToQuote(symbol)
+}
+
+// 聪明钱信号（P1b，2026-07-16）
+const dragonTigerList = ref([])
+const dragonTigerError = ref('')
+const dragonTigerLatestDate = ref('')
+const northbound = ref(null)
+const smLoading = ref(false)
+
+const DRAGON_TIGER_PAGE_SIZE = 10
+const dragonTigerPage = ref(1)
+const dragonSortKey = ref('net_amt')
+const dragonSortDesc = ref(true)
+
+function sortDragon(key) {
+  if (dragonSortKey.value === key) {
+    dragonSortDesc.value = !dragonSortDesc.value
+  } else {
+    dragonSortKey.value = key
+    dragonSortDesc.value = true
+  }
+  dragonTigerPage.value = 1
+}
+
+const sortedDragonTigerList = computed(() => {
+  const key = dragonSortKey.value
+  return [...dragonTigerList.value].sort((a, b) => {
+    if (key === 'name') {
+      const va = a.name || a.symbol || ''
+      const vb = b.name || b.symbol || ''
+      return dragonSortDesc.value ? vb.localeCompare(va, 'zh-CN') : va.localeCompare(vb, 'zh-CN')
+    }
+    let va = a[key]
+    let vb = b[key]
+    if (va == null) va = -Infinity
+    if (vb == null) vb = -Infinity
+    return dragonSortDesc.value ? vb - va : va - vb
+  })
+})
+
+const dragonTigerTotalPages = computed(() => Math.ceil(sortedDragonTigerList.value.length / DRAGON_TIGER_PAGE_SIZE))
+const pagedDragonTigerList = computed(() => {
+  const start = (dragonTigerPage.value - 1) * DRAGON_TIGER_PAGE_SIZE
+  return sortedDragonTigerList.value.slice(start, start + DRAGON_TIGER_PAGE_SIZE)
+})
+
+function fmtYuan(v) {
+  if (v === null || v === undefined) return '—'
+  const yi = v / 1e8
+  return (yi >= 0 ? '' : '-') + Math.abs(yi).toFixed(2) + '亿'
+}
+function fmtWan(v) {
+  if (v === null || v === undefined) return '—'
+  const wan = v  // 北向接口单位为万元
+  if (Math.abs(wan) >= 1e4) return (wan >= 0 ? '' : '-') + (Math.abs(wan) / 1e4).toFixed(2) + '亿'
+  return (wan >= 0 ? '' : '-') + Math.abs(wan).toFixed(0) + '万'
+}
+
+async function loadSmartMoney(force = false) {
+  smLoading.value = true
+  try {
+    const [dt, nb] = await Promise.all([
+      apiFetch(`/api/dragon-tiger?days=5&top_n=20&force=${force ? 1 : 0}`),
+      apiFetch(`/api/northbound?force=${force ? 1 : 0}`)
+    ])
+    if (dt.success && dt.data) {
+      if (dt.data.error) dragonTigerError.value = dt.data.error
+      dragonTigerList.value = dt.data.stocks || []
+      dragonTigerLatestDate.value = dt.data.latestTradeDate || ''
+      dragonTigerPage.value = 1
+    }
+    if (nb.success && nb.data) northbound.value = nb.data
+  } catch (e) {
+    dragonTigerError.value = '加载聪明钱数据失败'
+  } finally {
+    smLoading.value = false
+  }
+}
+
 onMounted(() => {
   loadWeights()
   loadBacktestHistory()
   loadPredictionRecords()
   loadMarketPredict()
+  loadRps()
+  loadSmartMoney()
 })
 </script>
+
+<style scoped>
+.smart-money-table .stock-table-header,
+.smart-money-table .stock-table-row {
+  grid-template-columns: 2fr 1.2fr 0.8fr 0.8fr;
+}
+.rps-table .stock-table-header .sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.2s;
+}
+.rps-table .stock-table-header .sortable::after {
+  content: ' ⇅';
+  font-size: 0.72em;
+  color: var(--text-tertiary);
+  opacity: 0.5;
+}
+.rps-table .stock-table-header .sortable.active {
+  color: var(--accent-primary);
+  font-weight: 700;
+}
+.rps-table .stock-table-header .sortable.active::after {
+  content: ' ↓';
+  opacity: 1;
+}
+.rps-table .stock-table-header .sortable.active.desc::after {
+  content: ' ↑';
+}
+@media (max-width: 640px) {
+  .smart-money-table .stock-table-header,
+  .smart-money-table .stock-table-row {
+    grid-template-columns: 1.6fr 1.2fr 0.7fr;
+  }
+  /* 窄屏隐藏"期间涨幅"列 */
+  .smart-money-table .stock-table-header span:nth-child(4),
+  .smart-money-table .stock-table-row span:nth-child(4) {
+    display: none;
+  }
+}
+</style>

@@ -1,11 +1,11 @@
 """review.py - split from main.py"""
-import json, httpx, asyncio, requests as _requests
+import json, asyncio, requests as _requests
 from typing import List, Dict
 from datetime import date, datetime, timedelta
 from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOP_SECTORS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, INDEX_SYMBOLS, TENCENT_QUOTE_API, MARKET_CRASH_THRESHOLD, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, EASTMONEY_HEADERS
-# 2026-07-02 C-5: _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
+# 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 from db.database import get_db_conn, save_daily_market_reviews, load_daily_recommendations, load_trend_scan_results
-from services.stock import get_http_client, fetch_stock_data
+from services.stock import fetch_stock_data
 
 async def generate_daily_review() -> Dict:
     try:

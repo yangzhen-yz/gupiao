@@ -9,9 +9,10 @@ SQLITE_DB_PATH = SQLITE_DB_PATH
 
 def get_db_conn():
     """获取 SQLite 数据库连接"""
-    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -89,7 +90,7 @@ def init_db():
                 is_correct INTEGER DEFAULT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(predict_date, symbol))''')
-        # 索引（2026-07-06 A-P3-1）：strategy_predict_records 按日期查询 + 未验证筛选是高频路径
+        # 索引（2026-07-06 A-）：strategy_predict_records 按日期查询 + 未验证筛选是高频路径
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_date ON strategy_predict_records(predict_date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_verified ON strategy_predict_records(verified)')
         # 策略权重表（动态调整的评分权重）
@@ -184,7 +185,7 @@ def init_db():
                 symbol TEXT NOT NULL UNIQUE,
                 tags_json TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
-        # P4-1 趋势回测记录表（三周期字段并存于同一行，补验时只 UPDATE 对应周期）
+        # 趋势回测记录表（三周期字段并存于同一行，补验时只 UPDATE 对应周期）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trend_backtest_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,12 +217,12 @@ def init_db():
                 verified_at_5d TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(predict_date, symbol))''')
-        # 索引（2026-07-06 A-P3-1）：trend_backtest_records 回测验证按 verified_1d/3d/5d 筛选未验证记录是高频路径
+        # 索引（2026-07-06 A-）：trend_backtest_records 回测验证按 verified_1d/3d/5d 筛选未验证记录是高频路径
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_1d ON trend_backtest_records(verified_1d)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_3d ON trend_backtest_records(verified_3d)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_5d ON trend_backtest_records(verified_5d)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_predict_date ON trend_backtest_records(predict_date)')
-        # P4-1 趋势回测聚合报告表（按 predict_date 聚合，三周期统计字段并存）
+        # 趋势回测聚合报告表（按 predict_date 聚合，三周期统计字段并存）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trend_backtest_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,11 +260,65 @@ def init_db():
             cursor.execute('ALTER TABLE trend_scan_results DROP COLUMN hot_rank')
         except Exception:
             pass
-        # P3-2 行业中性化：stock_basic_info 表增加 industry 列
+        # 行业中性化：stock_basic_info 表增加 industry 列
         try:
             cursor.execute('ALTER TABLE stock_basic_info ADD COLUMN industry TEXT DEFAULT ""')
         except Exception:
             pass  # 列已存在
+        # 回测因子补全：strategy_predict_records 表增加 position/main_capital_inflow/holder_structure 列
+        # 原表只有 7 个旧因子字段，导致 _adjust_weights 跳过这 3 个因子，sample_count 永远为 0
+        for _col, _type in [('position', 'REAL DEFAULT 0'),
+                             ('main_capital_inflow', 'REAL DEFAULT 0'),
+                             ('holder_structure', 'REAL DEFAULT 0')]:
+            try:
+                cursor.execute(f'ALTER TABLE strategy_predict_records ADD COLUMN {_col} {_type}')
+            except Exception:
+                pass  # 列已存在
+        # 股东人数筹码面数据表（2026-07-06）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stock_holder_num (
+                symbol TEXT NOT NULL,           -- 小写带前缀 sh600519
+                end_date TEXT NOT NULL,         -- 截止日期 YYYY-MM-DD（月末）
+                holder_total_num INTEGER,       -- 股东总户数
+                num_change INTEGER,             -- 环比增减数
+                total_num_ratio REAL,           -- 环比变化率%
+                avg_free_shares REAL,           -- 户均流通股
+                avg_hold_amt REAL,              -- 户均持股市值
+                notice_date TEXT,               -- 公告日期
+                updated_at TEXT,                -- 更新时间
+                PRIMARY KEY (symbol, end_date))''')
+        # 基本面质量数据表（2026-07-16 P1a：ROE + 净利润同比，季度披露）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stock_fundamental (
+                symbol TEXT NOT NULL,            -- 小写带前缀 sh600519
+                report_date TEXT,                -- 报告期 YYYY-MM-DD
+                roe REAL,                        -- 加权平均净资产收益率(%)
+                net_profit_yoy REAL,             -- 归母净利润同比增长率(%)
+                eps REAL,                        -- 基本每股收益
+                updated_at TEXT,                 -- 更新时间
+                PRIMARY KEY (symbol))''')
+        # 估值分位数据表（2026-07-16 P2c：PE/PB 百分位，每日盘后更新）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stock_valuation (
+                symbol TEXT NOT NULL,            -- 小写带前缀 sh600519
+                pe REAL,                         -- 市盈率(TTM)
+                pb REAL,                         -- 市净率
+                pe_pct REAL,                     -- PE 全市场百分位(0~100，越高越贵)
+                pb_pct REAL,                     -- PB 全市场百分位(0~100，越高越贵)
+                updated_at TEXT,                 -- 更新时间
+                PRIMARY KEY (symbol))''')
+        # K线历史缓存表（2026-07-20 性能优化 A1：日线历史按交易日缓存，当天只拉一次腾讯）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS kline_cache (
+                symbol TEXT NOT NULL,            -- 小写带前缀 sh600519
+                trade_date TEXT NOT NULL,        -- 缓存对应的交易日 YYYY-MM-DD
+                kline_json TEXT NOT NULL,         -- 该交易日收盘后的日线历史 JSON
+                updated_at TEXT,                  -- 更新时间
+                PRIMARY KEY (symbol, trade_date))''')
+        # 索引（2026-07-20 性能优化 A4）：基本面/估值按 symbol 高频点查
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_symbol ON stock_fundamental(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_kline_cache_symbol ON kline_cache(symbol)')
         conn.commit()
         print('[数据库] 表初始化完成')
     except Exception as e:
@@ -276,7 +331,23 @@ def load_daily_recommendations() -> List[Dict]:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute(f'SELECT * FROM daily_recommendations ORDER BY rec_date DESC, sort_order ASC LIMIT {QUERY_DAILY_RECOMMENDATIONS_LIMIT}')
+        # QUERY_DAILY_RECOMMENDATIONS_LIMIT 限制的是「天数」而非「行数」
+        # daily_recommendations 表每只股票一行（每天 3 只 = 3 行），
+        # 若直接 LIMIT 30 行只能读出 10 天，与 save 的 [:30]（按天数）语义不一致。
+        # 改为：先取最新 N 天的日期，再查这些天的所有股票行。
+        cursor.execute(
+            'SELECT DISTINCT rec_date FROM daily_recommendations ORDER BY rec_date DESC LIMIT ?',
+            (QUERY_DAILY_RECOMMENDATIONS_LIMIT,)
+        )
+        recent_dates = [row['rec_date'] for row in cursor.fetchall()]
+        if not recent_dates:
+            conn.close()
+            return []
+        placeholders = ','.join('?' * len(recent_dates))
+        cursor.execute(
+            f'SELECT * FROM daily_recommendations WHERE rec_date IN ({placeholders}) ORDER BY rec_date DESC, sort_order ASC',
+            recent_dates
+        )
         rows = cursor.fetchall()
         conn.close()
 
@@ -369,6 +440,9 @@ def load_trend_scan_results() -> Dict:
         for row in rows:
             if row['scan_date'] != first_row['scan_date']:
                 continue
+            # 跳过占位行（0只扫描结果的元数据行）
+            if row['symbol'] == '__SCAN_EMPTY__':
+                continue
             stocks.append({
                 'symbol': row['symbol'],
                 'name': row['name'],
@@ -394,6 +468,7 @@ def load_trend_scan_results() -> Dict:
         return {'date': '', 'stocks': []}
 
 def save_trend_scan_results(data: Dict) -> bool:
+    conn = None
     try:
         scan_date = data.get('date', date.today().isoformat())
         stocks = data.get('stocks', [])
@@ -423,17 +498,29 @@ def save_trend_scan_results(data: Dict) -> bool:
                 source,
                 scan_time
             ))
+        # 当扫描结果为0只时，仍插入一条占位行保留扫描元数据（total_scanned/scan_time等）
+        # 占位行 symbol='__SCAN_EMPTY__'，history-counts 查询会排除它不计入符合数
+        if not stocks:
+            cursor.execute('''
+                INSERT INTO trend_scan_results (scan_date, symbol, name, score, details_json, latest_price, ma5_json, ma10_json, ma20_json, recent5_json, total_scanned, source, scan_time)
+                VALUES (?, '__SCAN_EMPTY__', '', 0, '{}', 0, '[]', '[]', '[]', '[]', ?, ?, ?)
+            ''', (scan_date, total_scanned, source, scan_time))
         conn.commit()
-        conn.close()
         return True
     except Exception as error:
         print(f'保存趋势股票失败: {str(error)}')
         return False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
-# ========== P4-1 趋势回测函数（2026-07-01）==========
+# ========== 趋势回测函数（2026-07-01）==========
 def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
-    """P4-1 保存趋势回测预测记录（每次趋势扫描后调用）
+    """保存趋势回测预测记录（每次趋势扫描后调用）
 
     Args:
         predict_date: 预测日期（即趋势扫描日期）
@@ -472,7 +559,7 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
 
 
 def load_trend_backtest_records(predict_date: str = None, symbol: str = None, limit: int = 100) -> List[Dict]:
-    """P4-1 加载趋势回测明细记录（支持按 predict_date / symbol 过滤）"""
+    """加载趋势回测明细记录（支持按 predict_date / symbol 过滤）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
@@ -499,7 +586,7 @@ def load_trend_backtest_records(predict_date: str = None, symbol: str = None, li
 
 
 def load_trend_backtest_records_pending_verification() -> List[Dict]:
-    """P4-1 加载所有未完全验证的记录（verified_1d=0 OR verified_3d=0 OR verified_5d=0）
+    """加载所有未完全验证的记录（verified_1d=0 OR verified_3d=0 OR verified_5d=0）
 
     返回所有待补验的记录，按 predict_date 分组由调用方处理。
     """
@@ -522,7 +609,7 @@ def load_trend_backtest_records_pending_verification() -> List[Dict]:
 def update_trend_backtest_verification(predict_date: str, symbol: str, period: str,
                                        actual_change: float, market_change: float,
                                        is_correct: bool) -> bool:
-    """P4-1 补验单条记录的指定周期
+    """补验单条记录的指定周期
 
     Args:
         period: '1d' / '3d' / '5d'
@@ -554,7 +641,7 @@ def update_trend_backtest_verification(predict_date: str, symbol: str, period: s
 
 def upsert_trend_backtest_report(predict_date: str, total_count: int,
                                  period_stats: Dict, score_segment_stats: Dict) -> bool:
-    """P4-1 UPSERT 趋势回测聚合报告
+    """UPSERT 趋势回测聚合报告
 
     Args:
         predict_date: 预测日期
@@ -613,7 +700,7 @@ def upsert_trend_backtest_report(predict_date: str, total_count: int,
 
 
 def load_trend_backtest_reports(limit: int = 30) -> List[Dict]:
-    """P4-1 加载历史回测报告列表（按 predict_date DESC）"""
+    """加载历史回测报告列表（按 predict_date DESC）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
@@ -629,7 +716,7 @@ def load_trend_backtest_reports(limit: int = 30) -> List[Dict]:
 
 
 def load_latest_trend_backtest_report() -> Dict:
-    """P4-1 加载最新一条回测报告（前端徽章用）"""
+    """加载最新一条回测报告（前端徽章用）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
@@ -673,7 +760,7 @@ def save_stock_basic_info(stock_basic_info: Dict) -> bool:
         return False
 
 def save_stock_industry(industry_map: Dict[str, str]) -> bool:
-    """P3-2 批量更新 symbol → industry（增量更新，不删除已有名称）（2026-06-30）"""
+    """批量更新 symbol → industry（增量更新，不删除已有名称）（2026-06-30）"""
     if not industry_map:
         return False
     try:
@@ -717,8 +804,191 @@ FACTOR_DESCRIPTIONS = {
     'avg_price_deviation': '均价偏离',
     'amplitude': '振幅',
     'position': '位置评估',
-    'main_capital_inflow': '主力净流入',  # P1-1（2026-06-30）：第 9 因子，配套展示中文
+    'main_capital_inflow': '主力净流入',  # （2026-06-30）：第 9 因子，配套展示中文
+    'holder_structure': '筹码集中度',  # （2026-07-06）：第 10 因子，股东人数筹码面
+    'rps': 'RPS相对强度',  # （2026-07-16）：第 11 因子，欧奈尔相对强度
+    'fundamental': '基本面质量',  # （2026-07-16 P1a）：第 12 因子，ROE+净利润增速
+    'smart_money': '聪明钱',  # （2026-07-16 P1b）：第 13 因子，龙虎榜净买+北向
 }
+
+def save_holder_num_batch(records: List[Dict]) -> bool:
+    """批量保存股东人数数据（UPSERT 语义，2026-07-06）
+
+    Args:
+        records: [{'symbol', 'end_date', 'holder_total_num', 'num_change',
+                   'total_num_ratio', 'avg_free_shares', 'avg_hold_amt',
+                   'notice_date', 'updated_at'}]
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for r in records:
+            cursor.execute('''INSERT OR REPLACE INTO stock_holder_num
+                (symbol, end_date, holder_total_num, num_change, total_num_ratio,
+                 avg_free_shares, avg_hold_amt, notice_date, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (r.get('symbol', ''), r.get('end_date', ''),
+                 r.get('holder_total_num'), r.get('num_change'),
+                 r.get('total_num_ratio'), r.get('avg_free_shares'),
+                 r.get('avg_hold_amt'), r.get('notice_date'),
+                 r.get('updated_at', '')))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as _e:
+        print(f'[数据库] 保存股东人数数据失败: {_e}')
+        return False
+
+
+def load_holder_num_batch(symbols: List[str]) -> Dict[str, Dict]:
+    """批量查询每只股票最新一期股东人数（2026-07-06）
+
+    Args:
+        symbols: 股票代码列表（小写带前缀 sh600519）
+    Returns:
+        {symbol: {holder_total_num, num_change, total_num_ratio,
+                  avg_free_shares, avg_hold_amt, end_date}}
+    """
+    if not symbols:
+        return {}
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(symbols))
+        # 子查询取每只股票最新一期 end_date
+        cursor.execute(f'''SELECT symbol, end_date, holder_total_num, num_change,
+            total_num_ratio, avg_free_shares, avg_hold_amt
+            FROM stock_holder_num
+            WHERE symbol IN ({placeholders})
+            AND end_date = (
+                SELECT MAX(end_date) FROM stock_holder_num h2
+                WHERE h2.symbol = stock_holder_num.symbol)''', symbols)
+        rows = cursor.fetchall()
+        conn.close()
+        result = {}
+        for row in rows:
+            result[row['symbol']] = {
+                'holder_total_num': row['holder_total_num'],
+                'num_change': row['num_change'],
+                'total_num_ratio': row['total_num_ratio'],
+                'avg_free_shares': row['avg_free_shares'],
+                'avg_hold_amt': row['avg_hold_amt'],
+                'end_date': row['end_date'],
+            }
+        return result
+    except Exception as _e:
+        print(f'[数据库] 查询股东人数数据失败: {_e}')
+        return {}
+
+
+def save_fundamental_batch(records: List[Dict]) -> bool:
+    """批量保存基本面质量数据（UPSERT 语义，2026-07-16 P1a）
+
+    Args:
+        records: [{'symbol', 'report_date', 'roe', 'net_profit_yoy', 'eps', 'updated_at'}]
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for r in records:
+            cursor.execute('''INSERT OR REPLACE INTO stock_fundamental
+                (symbol, report_date, roe, net_profit_yoy, eps, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)''',
+                (r.get('symbol', ''), r.get('report_date', ''),
+                 r.get('roe'), r.get('net_profit_yoy'), r.get('eps'),
+                 r.get('updated_at', '')))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as _e:
+        print(f'[数据库] 保存基本面数据失败: {_e}')
+        return False
+
+
+def load_fundamental_batch(symbols: List[str]) -> Dict[str, Dict]:
+    """批量查询每只股票最新基本面质量数据（2026-07-16 P1a）
+
+    Args:
+        symbols: 股票代码列表（小写带前缀 sh600519）
+    Returns:
+        {symbol: {report_date, roe, net_profit_yoy, eps}}
+    """
+    if not symbols:
+        return {}
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(symbols))
+        cursor.execute(f'''SELECT symbol, report_date, roe, net_profit_yoy, eps
+            FROM stock_fundamental WHERE symbol IN ({placeholders})''', symbols)
+        rows = cursor.fetchall()
+        conn.close()
+        result = {}
+        for row in rows:
+            result[row['symbol']] = {
+                'report_date': row['report_date'],
+                'roe': row['roe'],
+                'net_profit_yoy': row['net_profit_yoy'],
+                'eps': row['eps'],
+            }
+        return result
+    except Exception as _e:
+        print(f'[数据库] 查询基本面数据失败: {_e}')
+        return {}
+
+
+def save_valuation_batch(records: List[Dict]) -> int:
+    """批量保存估值分位数据（UPSERT 语义，2026-07-16 P2c）
+
+    Args:
+        records: [{'symbol', 'pe', 'pb', 'pe_pct', 'pb_pct', 'updated_at'}]
+    Returns:
+        成功保存的条数
+    """
+    if not records:
+        return 0
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for r in records:
+            cursor.execute('''INSERT OR REPLACE INTO stock_valuation
+                (symbol, pe, pb, pe_pct, pb_pct, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)''',
+                (r.get('symbol', ''), r.get('pe'), r.get('pb'),
+                 r.get('pe_pct'), r.get('pb_pct'), r.get('updated_at', '')))
+        conn.commit()
+        n = len(records)
+        conn.close()
+        return n
+    except Exception as _e:
+        print(f'[数据库] 保存估值数据失败: {_e}')
+        return 0
+
+
+def load_valuation_batch(symbols: List[str]) -> List[Dict]:
+    """批量查询每只股票估值分位（2026-07-16 P2c）
+
+    Args:
+        symbols: 股票代码列表（小写带前缀 sh600519）
+    Returns:
+        [{'symbol', 'pe', 'pb', 'pe_pct', 'pb_pct'}]
+    """
+    if not symbols:
+        return []
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(symbols))
+        cursor.execute(f'''SELECT symbol, pe, pb, pe_pct, pb_pct
+            FROM stock_valuation WHERE symbol IN ({placeholders})''', symbols)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as _e:
+        print(f'[数据库] 查询估值数据失败: {_e}')
+        return []
+
+
 def load_strategy_factor_weights() -> Dict:
     """加载动态权重，如果数据库无数据则返回默认权重"""
     try:
@@ -794,13 +1064,16 @@ def save_predictions(predictions: List[Dict]) -> bool:
                 '''INSERT OR REPLACE INTO strategy_predict_records
                    (predict_date, symbol, name, score, label, predict_direction,
                     outer_ratio, volume_ratio, turnover_rate, change_percent,
-                    weibi, avg_price_deviation, amplitude, market_change)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    weibi, avg_price_deviation, amplitude, market_change,
+                    position, main_capital_inflow, holder_structure)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (p['predict_date'], p['symbol'], p['name'], p['score'], p['label'],
                  p['predict_direction'], p.get('outer_ratio', 0), p.get('volume_ratio', 0),
                  p.get('turnover_rate', 0), p.get('change_percent', 0),
                  p.get('weibi', 0), p.get('avg_price_deviation', 0),
-                 p.get('amplitude', 0), p.get('market_change', 0))
+                 p.get('amplitude', 0), p.get('market_change', 0),
+                 p.get('position', 0), p.get('main_capital_inflow', 0),
+                 p.get('holder_structure', 0))
             )
         conn.commit()
         conn.close()
@@ -1099,6 +1372,59 @@ def remove_stock_tag(symbol: str, tag: str) -> List[str]:
     
     save_stock_concept_tags(tags)
     return tags.get(symbol_lower, [])
+# ========== K线历史缓存（2026-07-20 性能优化 A1）==========
+def load_kline_cache(symbol: str, trade_date: str) -> List:
+    """加载某股票指定交易日的日线历史缓存
+
+    Args:
+        symbol: 小写带前缀 sh600519
+        trade_date: 交易日 YYYY-MM-DD
+    Returns:
+        成功返回日线列表（同 get_kline_data 的 qfqday 结构），未命中返回 None
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT kline_json FROM kline_cache WHERE symbol = ? AND trade_date = ?',
+            (symbol, trade_date))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row['kline_json']:
+            return json.loads(row['kline_json'])
+        return None
+    except Exception as _e:
+        print(f'[数据库] 加载K线缓存失败: {_e}')
+        return None
+
+
+def save_kline_cache(symbol: str, trade_date: str, kline: List, updated_at: str = '') -> bool:
+    """保存某股票指定交易日的日线历史缓存（UPSERT 语义）
+
+    Args:
+        symbol: 小写带前缀 sh600519
+        trade_date: 交易日 YYYY-MM-DD
+        kline: 日线列表
+    """
+    if not kline:
+        return False
+    try:
+        from datetime import datetime
+        updated_at = updated_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT OR REPLACE INTO kline_cache
+            (symbol, trade_date, kline_json, updated_at)
+            VALUES (?, ?, ?, ?)''',
+            (symbol, trade_date, json.dumps(kline, ensure_ascii=False), updated_at))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as _e:
+        print(f'[数据库] 保存K线缓存失败: {_e}')
+        return False
+
+
 def load_hot_search_ranking() -> Dict:
     try:
         conn = get_db_conn()

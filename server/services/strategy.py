@@ -2,14 +2,14 @@
 import asyncio
 from typing import List, Dict, Optional
 from datetime import date, timedelta
-from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD
+from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD
 from db.database import get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions
-from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
+from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data, get_kline_data
 from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
 
 def _score_main_inflow(main_inflow_ratio: Optional[float]) -> float:
-    """P1-1 主力净流入因子评分（2026-06-30）
+    """主力净流入因子评分（2026-06-30）
 
     基于主力净流入/流通市值占比(%)评分：
     - ≥3%（强力吸筹）→ 15 分
@@ -36,10 +36,149 @@ def _score_main_inflow(main_inflow_ratio: Optional[float]) -> float:
     return vals['negative']
 
 
+def _score_holder_structure(holder_num: Optional[int], ratio: Optional[float]) -> float:
+    """筹码集中度因子评分（2026-07-06，第 10 因子）
+
+    基于股东人数绝对值 + 环比变化率(%)评分：
+    - 户数少 + 环比减少 → 筹码集中，主力吸筹，看涨
+    - 户数多 → 抛压重，难拉升
+    - 环比增加 → 散户化，看跌
+
+    判断优先级：无数据 → 散户化(≥+10%) → 抛压重(>20万) → 户数+环比组合分档
+    与外盘占比、主力净流入形成筹码层防护：避免"散户扎堆+筹码分散"的票被高分推荐。
+    """
+    vals = STRATEGY_SCORE_VALUES['holder_structure']
+    if holder_num is None or ratio is None:
+        return vals['no_data']
+
+    thr = STRATEGY_SCORE_THRESHOLDS['holder_structure']
+
+    # 1. 散户化强烈信号（环比增加≥10%，不论户数，最优先）
+    if ratio >= thr['dispersion_ratio']:
+        return vals['negative']  # 2
+
+    # 2. 大盘抛压重（户数>20万）：结合环比再细分
+    if holder_num > thr['large_hold']:
+        if ratio > 0:  # 大盘 + 散户化（0~10%）
+            return vals['negative']  # 2
+        return vals['low']  # 5：大盘但筹码趋稳/集中
+
+    # 3. 小盘高度集中（户数<3万 且 环比减少≥10%）
+    if holder_num < thr['tiny_hold'] and ratio <= thr['concentrate_ratio']:
+        return vals['high']  # 15
+
+    # 4. 小盘筹码趋集中（户数<3万 且 环比减少）
+    if holder_num < thr['tiny_hold'] and ratio < 0:
+        return vals['mid']  # 12
+
+    # 5. 中小盘筹码集中（户数 3-8万 且 环比减少≥5%）
+    if holder_num < thr['small_hold'] and ratio <= -thr['stable_range']:
+        return vals['mid']  # 12
+
+    # 6. 筹码稳定（户数<8万 且 环比±5%内）
+    if holder_num < thr['small_hold'] and abs(ratio) <= thr['stable_range']:
+        return vals['normal']  # 8
+
+    # 7. 中大盘散户化（户数 8-20万 且 环比增加）
+    if holder_num <= thr['large_hold'] and ratio > 0:
+        return vals['low']  # 5
+
+    # 8. 默认中性
+        return vals['normal']  # 8
+
+
+def _score_rps(rps: Optional[float]) -> float:
+    """RPS 相对强度因子评分（2026-07-16 新增，欧奈尔核心因子）
+
+    基于个股区间涨幅在全市场的百分位排名(0~100)：
+    - ≥90（强于90%个股，龙头候选）→ 15 分（high）
+    - ≥80 → 10 分（mid）
+    - ≥70 → 7 分（low）
+    - ≥50 → 3 分（weak，中位附近）
+    - <50 → 0 分（弱势，RPS 不及一半股票，明确低配）
+    - None（无数据）→ 7 分（no_data 中档，避免无数据股票总分被拖累）
+
+    与涨幅因子(change_percent)区别：change_percent 是"当日/短期涨幅"，
+    RPS 是"相对全市场的区间强度排名"，是趋势市选龙头的关键维度。
+    """
+    vals = STRATEGY_SCORE_VALUES['rps']
+    if rps is None:
+        return vals['no_data']
+    thr = STRATEGY_SCORE_THRESHOLDS['rps']
+    if rps >= thr['high']:
+        return vals['high']
+    if rps >= thr['mid']:
+        return vals['mid']
+    if rps >= thr['low']:
+        return vals['low']
+    if rps >= thr['weak']:
+        return vals['weak']
+    return 0  # <50 偏弱，明确低配（不拖累也无虚高）
+
+
+def _score_fundamental(roe: Optional[float], yoy: Optional[float]) -> float:
+    """基本面质量因子评分（2026-07-16 P1a）
+
+    基于 ROE(加权净资产收益率%) + 归母净利润同比%(SJLTZ)：
+    - ROE≥15% 且 净利同比≥30% → 15 分（high，高质量成长）
+    - ROE≥10% 且 净利同比≥15% → 11 分（mid，稳健优质）
+    - ROE≥5% 且 净利同比≥0% → 8 分（low，及格）
+    - ROE 在 0~5% 或 净利同比 -20%~0% → 4 分（weak，平庸/放缓）
+    - ROE<0（亏损）或 净利同比<-20%（大幅下滑）→ 3 分（negative，质量差）
+    - None（无数据）→ 8 分（no_data 中档，避免无数据股票总分被拖累）
+
+    与主力净流入、筹码集中度形成"质量防护"：避免垃圾股仅靠资金面被高分推荐。
+    """
+    vals = STRATEGY_SCORE_VALUES['fundamental']
+    if roe is None or yoy is None:
+        return vals['no_data']
+    thr = STRATEGY_SCORE_THRESHOLDS['fundamental']
+    if roe < 0:
+        return vals['negative']  # 亏损
+    if yoy < -20:
+        return vals['negative']  # 盈利大幅下滑
+    if roe >= thr['roe_high'] and yoy >= thr['yoy_high']:
+        return vals['high']
+    if roe >= thr['roe_mid'] and yoy >= thr['yoy_mid']:
+        return vals['mid']
+    if roe >= 5 and yoy >= 0:
+        return vals['low']
+    return vals['weak']
+
+
+def _score_smart_money(info: Optional[Dict]) -> float:
+    """聪明钱因子评分（2026-07-16 P1b，纯加分信号）
+
+    info: {'on_board': bool, 'net_amt': float(龙虎榜净买入元), 'appearances': int}
+    - 上榜且净买入 ≥5000万 → 10 分（high，机构/游资强力介入）
+    - 上榜且净买入 ≥1000万 → 6 分（mid，游资介入）
+    - 上榜且净买入 >0 → 4 分（low，有资金关注）
+    - 未上榜/净卖出 → 0 分（none，纯加分不扣分，无信号不虚高）
+
+    设计核心：这是"Bonus"因子，无数据时给 0 而非中档分，避免拖累普通股票。
+    """
+    vals = STRATEGY_SCORE_VALUES['smart_money']
+    if not info or not info.get('on_board'):
+        return vals['none']
+    net = float(info.get('net_amt') or 0)
+    thr = STRATEGY_SCORE_THRESHOLDS['smart_money']
+    if net >= thr['net_amt_high']:
+        return vals['high']
+    if net >= thr['net_amt_mid']:
+        return vals['mid']
+    if net > 0:
+        return vals['low']
+    return vals['none']
+
+
 def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float = 0.0,
                         trend_result: Dict = None,
-                        fund_flow_data: Optional[Dict] = None) -> Dict:
-    """使用动态权重的评分函数 V2 (V4.1 融合趋势评分 + P1-1 新增主力净流入因子)
+                        fund_flow_data: Optional[Dict] = None,
+                        holder_data: Optional[Dict] = None,
+                        rps_data: Optional[Dict] = None,
+                        fundamental_data: Optional[Dict] = None,
+                        smart_money_data: Optional[Dict] = None) -> Dict:
+    """使用动态权重的评分函数 V2 (V4.1 融合趋势评分 + 新增主力净流入因子)
 
     Args:
         data: 股票特征数据（实时行情/日内因子）
@@ -47,10 +186,14 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         market_change: 大盘涨跌幅，用于根据市场环境动态调整评分阈值
         trend_result: 趋势评分结果（来自 is_up_trend），包含 score(0-100) 等字段。
                       提供后，最终评分 = 50% 日内因子 + 50% 趋势因子
-        fund_flow_data: 主力资金流向数据（P1-1 新增），格式：
+        fund_flow_data: 主力资金流向数据（新增），格式：
                         {'main_net_inflow': float(元), 'main_inflow_ratio': float(%),
                          'circ_mv': float(元)}
                         提供后，新增第9因子 main_capital_inflow 参与评分
+        holder_data: 股东人数筹码面数据（新增），格式：
+                     {'holder_total_num': int, 'total_num_ratio': float(%),
+                      'avg_free_shares': float, 'avg_hold_amt': float, 'end_date': str}
+                     提供后，新增第10因子 holder_structure 参与评分（月度数据，从 DB 缓存读取）
     """
     if weights is None:
         weights = load_strategy_factor_weights()
@@ -67,7 +210,7 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     amplitude = data.get('amplitude', 0)
     pe = data.get('pe', 0)
 
-    # P1-1 主力净流入占比（%）— 无数据时为 None，评分时给 no_data 中档分
+    # 主力净流入占比（%）— 无数据时为 None，评分时给 no_data 中档分
     main_inflow_ratio = None
     if fund_flow_data:
         # 优先用已计算好的占比，否则用 main_net_inflow / circ_mv 现算
@@ -78,18 +221,72 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
             if mv > 0:
                 main_inflow_ratio = float(fund_flow_data['main_net_inflow']) / mv * 100
 
+    # 股东人数筹码面（户数 + 环比变化率%）— 无数据时给 no_data 中档分
+    holder_num = None
+    holder_ratio = None
+    if holder_data:
+        if holder_data.get('holder_total_num') is not None:
+            holder_num = int(holder_data['holder_total_num'])
+        if holder_data.get('total_num_ratio') is not None:
+            holder_ratio = float(holder_data['total_num_ratio'])
+
+    # RPS 相对强度（2026-07-16 新增）：个股 RPS 百分位(0~100)，无数据给 no_data 中档分
+    rps_value = None
+    if rps_data:
+        if rps_data.get('rps') is not None:
+            try:
+                rps_value = float(rps_data['rps'])
+            except (TypeError, ValueError):
+                rps_value = None
+
+    # 基本面质量（2026-07-16 P1a）：ROE(%) + 归母净利润同比(%)，无数据给 no_data 中档分
+    fund_roe = None
+    fund_yoy = None
+    if fundamental_data:
+        if fundamental_data.get('roe') is not None:
+            try:
+                fund_roe = float(fundamental_data['roe'])
+            except (TypeError, ValueError):
+                fund_roe = None
+        if fundamental_data.get('net_profit_yoy') is not None:
+            try:
+                fund_yoy = float(fundamental_data['net_profit_yoy'])
+            except (TypeError, ValueError):
+                fund_yoy = None
+
+    # 聪明钱（2026-07-16 P1b）：龙虎榜净买入等，无信号给 none(0 分，纯加分不拖累)
+    sm_info = None
+    if smart_money_data:
+        sm_info = {
+            'on_board': bool(smart_money_data.get('on_board', False)),
+            'net_amt': float(smart_money_data.get('net_amt') or 0),
+            'appearances': int(smart_money_data.get('appearances') or 0),
+        }
+
     # 基础得分（与原逻辑一致）
     base_scores = {
         'outer_ratio': STRATEGY_SCORE_VALUES['outer_ratio']['high'] if outer_ratio >= STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high'] else STRATEGY_SCORE_VALUES['outer_ratio']['mid'] if outer_ratio >= STRATEGY_SCORE_THRESHOLDS['outer_ratio']['mid'] else STRATEGY_SCORE_VALUES['outer_ratio']['low'],
         'volume_ratio': STRATEGY_SCORE_VALUES['volume_ratio']['high'] if volume_ratio >= STRATEGY_SCORE_THRESHOLDS['volume_ratio']['high'] else STRATEGY_SCORE_VALUES['volume_ratio']['mid'] if volume_ratio >= STRATEGY_SCORE_THRESHOLDS['volume_ratio']['mid'] else STRATEGY_SCORE_VALUES['volume_ratio']['normal'] if volume_ratio >= STRATEGY_SCORE_THRESHOLDS['volume_ratio']['low'] else STRATEGY_SCORE_VALUES['volume_ratio']['low'],
         'turnover_rate': STRATEGY_SCORE_VALUES['turnover_rate']['high'] if (STRATEGY_SCORE_THRESHOLDS['turnover_rate']['high'][0] <= turnover_rate <= STRATEGY_SCORE_THRESHOLDS['turnover_rate']['high'][1]) else STRATEGY_SCORE_VALUES['turnover_rate']['mid'] if (STRATEGY_SCORE_THRESHOLDS['turnover_rate']['mid'][0] <= turnover_rate < STRATEGY_SCORE_THRESHOLDS['turnover_rate']['mid'][1]) else STRATEGY_SCORE_VALUES['turnover_rate']['normal'] if turnover_rate > STRATEGY_SCORE_THRESHOLDS['turnover_rate']['high_penalty'] else STRATEGY_SCORE_VALUES['turnover_rate']['low'],
         'change_percent': STRATEGY_SCORE_VALUES['change_percent']['high'] if change_percent > STRATEGY_SCORE_THRESHOLDS['change_percent']['high'] else STRATEGY_SCORE_VALUES['change_percent']['mid'] if change_percent > STRATEGY_SCORE_THRESHOLDS['change_percent']['mid'] else STRATEGY_SCORE_VALUES['change_percent']['normal'] if change_percent > STRATEGY_SCORE_THRESHOLDS['change_percent']['low'] else STRATEGY_SCORE_VALUES['change_percent']['negative'] if change_percent > STRATEGY_SCORE_THRESHOLDS['change_percent']['negative'] else 0,
-        'weibi': STRATEGY_SCORE_VALUES['weibi']['high'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['high'] else STRATEGY_SCORE_VALUES['weibi']['mid'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['mid'] else STRATEGY_SCORE_VALUES['weibi']['low'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['low'] else STRATEGY_SCORE_VALUES['weibi']['negative'],
+        'weibi': STRATEGY_SCORE_VALUES['weibi']['high'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['high'] else STRATEGY_SCORE_VALUES['weibi']['mid'] if weibi >= STRATEGY_SCORE_THRESHOLDS['weibi']['mid'] else STRATEGY_SCORE_VALUES['weibi']['low'] if weibi > STRATEGY_SCORE_THRESHOLDS['weibi']['low'] else STRATEGY_SCORE_VALUES['weibi']['negative'],
         'avg_price_deviation': STRATEGY_SCORE_VALUES['avg_price_deviation']['high'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['high'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['mid'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['mid'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['normal'] if avg_price_deviation > STRATEGY_SCORE_THRESHOLDS['avg_price_deviation']['low'] else STRATEGY_SCORE_VALUES['avg_price_deviation']['low'],
         'amplitude': STRATEGY_SCORE_VALUES['amplitude']['high'] if (STRATEGY_SCORE_THRESHOLDS['amplitude']['high'][0] < amplitude <= STRATEGY_SCORE_THRESHOLDS['amplitude']['high'][1]) else STRATEGY_SCORE_VALUES['amplitude']['mid'] if (STRATEGY_SCORE_THRESHOLDS['amplitude']['mid'][0] < amplitude <= STRATEGY_SCORE_THRESHOLDS['amplitude']['mid'][1]) else STRATEGY_SCORE_VALUES['amplitude']['low'],
-        # P1-1 主力净流入因子（2026-06-30）：无数据给 no_data 中档分，避免拖累总分
+        # 主力净流入因子（2026-06-30）：无数据给 no_data 中档分，避免拖累总分
         'main_capital_inflow': _score_main_inflow(main_inflow_ratio),
+        # 股东人数筹码面因子（2026-07-06）：无数据给 no_data 中档分
+        'holder_structure': _score_holder_structure(holder_num, holder_ratio),
+        # RPS 相对强度因子（2026-07-16 新增）：无数据给 no_data 中档分
+        'rps': _score_rps(rps_value),
+        # 基本面质量因子（2026-07-16 P1a）：无数据给 no_data 中档分
+        'fundamental': _score_fundamental(fund_roe, fund_yoy),
+        # 聪明钱因子（2026-07-16 P1b）：纯加分，无信号给 none(0 分)
+        'smart_money': _score_smart_money(sm_info),
     }
+    # 2026-07-08 修复：涨停股振幅豁免。涨停股振幅必然>8%（开盘价~昨收→涨停价振幅10%），
+    # 当前会被 amplitude > 8 扣到 low=2分，不合理。涨停时振幅≥5%按 high=5 给分。
+    if change_percent >= TREND_LIMIT_UP_THRESHOLD and amplitude >= 5:
+        base_scores['amplitude'] = STRATEGY_SCORE_VALUES['amplitude']['high']
     if weibi > STRATEGY_WEBI_VERIFY['weibi_high'] and change_percent < 0:
         base_scores['weibi'] = 3
     elif weibi > STRATEGY_WEBI_VERIFY['weibi_high'] and change_percent < STRATEGY_SCORE_THRESHOLDS['change_percent']['negative']:
@@ -128,29 +325,32 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         # vol ≤ 5x 或 outer ≥ 48%：正常涨停交易特征，不罚
     else:
         # --- 非涨停股：保持原有规则 ---
+        # 2026-07-08 优化：放量惩罚阈值从1.5提高到2.0，避免正常活跃交易(1.0-2.0)被误判为对倒
         if outer_ratio < 50 and volume_ratio > 3:
             base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
             base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
-        if volume_ratio > 1.5 and outer_ratio < 55:
+        if volume_ratio > 2.0 and outer_ratio < 55:
             base_scores['volume_ratio'] = max(0, base_scores['volume_ratio'] - 5)
             base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
         
     # 2026-06-11 策略优化建议：不再盲目惩罚涨幅，而是区分"强势启动"与"力竭赶顶"
     # 2026-06-11 策略优化建议：拥抱强势龙头股。涨停不代表风险，往往代表次日的高溢价。
-    # P1-2 涨停质量增强（2026-06-30）：用委比+换手+量比组合代理封板质量
+    # 涨停质量增强（2026-06-30）：用委比+换手+量比组合代理封板质量
     # 业界共识：封板质量是次日溢价的关键——强力封板次日高开概率高，烂板次日低开概率高
     # 分档：强力封板25 / 优质封板22 / 普通封板18 / 弱封板14 / 烂板8
+    # 2026-07-14 修复：收盘后委比数据常归0或失真，涨停股不能简单判为烂板
+    # 涨停本身是强势信号，需结合量能判断封板质量
     if change_percent > 9.5:
         if weibi > 95 and 2 <= turnover_rate <= 8 and volume_ratio < 3:
-            base_scores['change_percent'] = 25  # 强力封板（一字/秒板，委比极高压单小，次日高溢价）
+            base_scores['change_percent'] = STRATEGY_SCORE_VALUES['change_percent']['high']  # 强力封板（28分：一字/秒板委比极高压单小，次日高溢价）
         elif weibi > 80 and 2 <= turnover_rate <= 15:
-            base_scores['change_percent'] = 22  # 优质封板（原"龙头股高分"逻辑保留）
+            base_scores['change_percent'] = 25  # 优质封板（2026-07-08 22→25：真强势封板次日高溢价）
         elif weibi > 50 and turnover_rate <= 20:
-            base_scores['change_percent'] = 18  # 普通封板（封单一般，有换手但未爆量）
-        elif weibi > 0:
-            base_scores['change_percent'] = 14  # 弱封板（封单被砸过，委比偏低）
+            base_scores['change_percent'] = 20  # 普通封板（2026-07-08 18→20：封单一般，有换手但未爆量）
+        elif weibi >= 0:
+            base_scores['change_percent'] = 18  # 收盘委比归0或弱封板，仍给基础涨停分（2026-07-14 15→18）
         else:
-            base_scores['change_percent'] = 8   # 烂板/开板（委比为负，封单被砸开）
+            base_scores['change_percent'] = 12  # 烂板/开板（委比为负，封单被砸开；2026-07-14 8→12）
     elif change_percent > 7.0:
         if volume_ratio < 2.5:
             base_scores['change_percent'] = 18
@@ -166,6 +366,31 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     else:
         pass
 
+    # ====== 2026-07-14 修复：涨停股反转惩罚不应因收盘委比归0而误触发 ======
+    # 只有真实负委比或天量（量比>8）/低外盘才视为弱封板/烂板，需要额外惩罚
+    if change_percent > 9.5:
+        weak_board = (weibi < 0) or (volume_ratio > 8) or (outer_ratio < 45)
+        if weak_board:
+            if market_change < -0.5:
+                # 大盘显著下跌：涨停股次日反转风险极高，重罚
+                reversal_penalty = 10
+            elif market_change < 0:
+                # 大盘微跌：中等反转风险
+                reversal_penalty = 6
+            elif market_change < 0.3:
+                # 大盘平盘：轻度反转风险
+                reversal_penalty = 3
+            else:
+                # 大盘上涨：涨停股可能延续强势，不罚
+                reversal_penalty = 0
+            # 真烂板（委比为负且天量）额外加重惩罚
+            if weibi < 0 and volume_ratio > 5:
+                reversal_penalty += 3
+            base_scores['change_percent'] = max(0, base_scores['change_percent'] - reversal_penalty)
+        else:
+            # 非弱封板：收盘委比归0或温和量能，保留基础涨停分，避免被反转惩罚直接抹零
+            base_scores['change_percent'] = max(15, base_scores['change_percent'])
+
     # 2026-06-11 策略优化建议：大盘上涨时的优选策略
     # 当大盘上涨（market_change > 0）时，优先选择“外盘占比 > 60% 且 量比 < 1.5”的股票（缩量稳步上涨，非对倒放量）。
     if market_change > 0 and outer_ratio > 60 and volume_ratio < 1.5:
@@ -174,11 +399,36 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
 
     # 2026-06-11 策略优化建议：虚假封单过滤 (委比 100% 陷阱)
     # 误判样本如旭光电子、昊华科技在委比 100% 时实际下跌，说明封单可能是诱多虚假单。
-    if weibi > 99:
+    # 2026-07-08 修复：涨停股豁免此规则——涨停+100%委比恰恰是真强势封板的特征，
+    # 不应触发诱多过滤。涨停股已经在 line 185-195 用更严格的"天量开板/封板质量"判定出货嫌疑。
+    if weibi > 99 and not is_limit_up:
         # 如果委比接近 100% 但外盘占比并未同步处于高位（>60%），则该委比可信度极低。
         if outer_ratio < 60:
             base_scores['weibi'] = 0
             base_scores['outer_ratio'] = max(0, base_scores['outer_ratio'] - 5)
+
+    # ====== P1-4 主力扫货识别（2026-07-07）======
+    # 核心场景：急拉 + 负委比（卖盘被吃光）+ 高外盘 + 温和量能 = 主力扫货
+    # 时间无关：上午/午后/尾盘急拉扫货均可命中，关键是组合特征而非发生时刻
+    # 例：002384 东山精密 急拉6.79% / 委比-26.67% / 外盘55.7% / 量比1.17 / 换手4.9%
+    # 原逻辑仅按委比阈值给 4 分（low），完全漏掉"主力吃光卖盘"的强看涨信号
+    if (change_percent >= STRATEGY_MAIN_FORCE_SWEEP['change_percent_min']
+        and weibi <= STRATEGY_MAIN_FORCE_SWEEP['weibi_negative_max']
+        and outer_ratio >= STRATEGY_MAIN_FORCE_SWEEP['outer_ratio_min']
+        and volume_ratio <= STRATEGY_MAIN_FORCE_SWEEP['volume_ratio_max']
+        and turnover_rate >= STRATEGY_MAIN_FORCE_SWEEP['turnover_rate_min']):
+        base_scores['weibi'] = max(base_scores['weibi'], STRATEGY_MAIN_FORCE_SWEEP['weibi_bonus_score'])
+        base_scores['volume_ratio'] = max(base_scores['volume_ratio'], STRATEGY_MAIN_FORCE_SWEEP['volume_ratio_bonus_score'])
+
+    # ====== P1-4 主力控盘识别（2026-07-07）======
+    # 核心场景：低量比 + 急拉 + 高换手 + 高外盘 = 主力控盘锁仓拉升
+    # 时间无关：任何时段的控盘锁仓拉升均可命中
+    # 低量比不代表弱势，可能是主力高度控盘后用少量资金快速拉升
+    if (change_percent >= STRATEGY_MAIN_FORCE_CONTROL['change_percent_min']
+        and volume_ratio <= STRATEGY_MAIN_FORCE_CONTROL['volume_ratio_max']
+        and turnover_rate >= STRATEGY_MAIN_FORCE_CONTROL['turnover_rate_min']
+        and outer_ratio >= STRATEGY_MAIN_FORCE_CONTROL['outer_ratio_min']):
+        base_scores['volume_ratio'] = max(base_scores['volume_ratio'], STRATEGY_MAIN_FORCE_CONTROL['volume_ratio_bonus_score'])
 
     cp = abs(change_percent)
     if cp > STRATEGY_PE_FILTER['pe_high'] or (pe > 0 and pe > STRATEGY_PE_FILTER['pe_max']):
@@ -195,15 +445,16 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         total += base_score * w
 
     # 归一化到100分（动态计算各因子满分总和，支持因子扩展）
-    # P1-1：从 8 因子扩展到 9 因子（新增 main_capital_inflow），硬编码改为动态计算
+    # ：从 8 因子扩展到 9 因子（新增 main_capital_inflow），硬编码改为动态计算
+    # 2026-07-08 修复：归一化公式从 sum(max)*avg(w) 改为正确的 sum(max[f]*w[f])
+    # 原公式当高权重因子满分值低时会高估 max_possible，导致所有评分被系统性压低
     def _factor_max(f: str) -> float:
         """从 STRATEGY_SCORE_VALUES 提取该因子的最大档位分值"""
         vals = STRATEGY_SCORE_VALUES.get(f, {})
         # 过滤掉非数值的 key（如 'no_data'）后取最大
         numeric_vals = [v for v in vals.values() if isinstance(v, (int, float))]
         return max(numeric_vals) if numeric_vals else 0
-    max_possible = sum(_factor_max(f) for f in base_scores) * \
-                   sum(weights.get(f, {}).get('weight', 1.0) for f in base_scores) / len(base_scores)
+    max_possible = sum(_factor_max(f) * weights.get(f, {}).get('weight', 1.0) for f in base_scores)
     if max_possible > 0:
         total = round(total / max_possible * 100)
     total = min(100, max(0, total))
@@ -216,11 +467,13 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     label_bull_threshold = STRATEGY_LABEL_THRESHOLDS['bull']
     
     if market_change < 0:
-        # 大盘下跌时，提高看涨门槛（更难被判定为看涨）
-        penalty = min(10, abs(int(market_change * 5))) # 跌幅越大，门槛提高越多，最多提高10分
+        # 2026-07-14 修复：降低大盘下跌惩罚，避免涨停股等强势信号被误标为观望
+        # 原公式 min(25, |change*15|) 过于严苛，导致收盘后强势票被系统性压低
+        # 新公式：只影响方向预测阈值，标签阈值保持固定，保证用户看到稳定的信号强度
+        penalty = min(15, int(abs(market_change) * 8))
         bull_threshold += penalty
-        strong_bull_threshold += penalty
-        label_bull_threshold += penalty
+        # 标签阈值保持固定（≥70 偏多看涨 / ≥80 强烈看涨），不再随大盘下跌而上调
+        # strong_bull_threshold 和 label_bull_threshold 不再 += penalty
 
     if total >= strong_bull_threshold:
         label = '强烈看涨'
@@ -268,13 +521,17 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
             'weibi': weibi,
             'avg_price_deviation': avg_price_deviation,
             'amplitude': amplitude,
-            'main_capital_inflow': main_inflow_ratio,  # P1-1: 主力净流入占比(%)，None=无数据
+            'main_capital_inflow': main_inflow_ratio,  # : 主力净流入占比(%)，None=无数据
+            'holder_structure': {'holder_num': holder_num, 'ratio': holder_ratio},  # : 股东人数+环比%，None=无数据
+            'rps': rps_value,  # : RPS 相对强度百分位(0~100)，None=无数据
+            'fundamental': {'roe': fund_roe, 'net_profit_yoy': fund_yoy},  # : ROE% + 净利同比%，None=无数据
+            'smart_money': sm_info,  # : 聪明钱 {on_board,net_amt,appearances}，None=无信号
         }
     }
 
 
 def apply_industry_neutralization(stocks: List[Dict], industry_map: Dict[str, str]) -> None:
-    """P3-2 行业中性化：按行业分位数调整 strategy_score.total（原地修改，2026-06-30）
+    """行业中性化：按行业分位数调整 strategy_score.total（原地修改，2026-06-30）
 
     对 calc_stock_score_v2 输出的 total 做后处理，避免热门行业股票因整体高
     volume_ratio/turnover/change 而集体虚高。trend_score 已有 sector_factor 做环境修正，
@@ -343,6 +600,61 @@ def apply_industry_neutralization(stocks: List[Dict], industry_map: Dict[str, st
             m['score']['total'] = max(0, min(100, t + adj))
 
 
+async def _get_next_day_change_from_kline(symbol: str, pred_date: str) -> Optional[float]:
+    """从K线数据获取预测日次日的涨跌幅
+    
+    2026-07-08 修复：历史补验原来用 fetch_stock_data 获取今天的实时涨跌，
+    而非预测日次日的涨跌。改用 get_kline_data 从K线中找到预测日次日的收盘价，
+    计算正确的涨跌幅。
+    
+    Args:
+        symbol: 股票代码 (如 sh603380)
+        pred_date: 预测日期 (如 2026-07-04)
+    
+    Returns:
+        次日涨跌幅(%)，如无法获取返回 None
+    """
+    try:
+        kline = await get_kline_data(symbol.lower())
+        if not kline or len(kline) < 2:
+            return None
+        # 在K线中找到预测日的位置
+        for i, k in enumerate(kline):
+            if k[0] == pred_date:
+                if i + 1 < len(kline):
+                    pred_close = float(k[2])
+                    next_close = float(kline[i + 1][2])
+                    if pred_close > 0:
+                        return round((next_close - pred_close) / pred_close * 100, 2)
+                break  # 找到预测日但没有次日数据（可能是今天）
+        # 预测日不在K线中（可能是非交易日生成的预测），找最近的前一个交易日
+        pred_date_dt = None
+        from datetime import datetime as _dt
+        try:
+            pred_date_dt = _dt.strptime(pred_date, '%Y-%m-%d').date()
+        except Exception:
+            return None
+        best_idx = -1
+        for i, k in enumerate(kline):
+            try:
+                kline_date = _dt.strptime(k[0], '%Y-%m-%d').date()
+                if kline_date <= pred_date_dt:
+                    best_idx = i
+                else:
+                    break
+            except Exception:
+                continue
+        if best_idx >= 0 and best_idx + 1 < len(kline):
+            pred_close = float(kline[best_idx][2])
+            next_close = float(kline[best_idx + 1][2])
+            if pred_close > 0:
+                return round((next_close - pred_close) / pred_close * 100, 2)
+        return None
+    except Exception as e:
+        print(f'  [补验] K线获取失败 {symbol}: {e}')
+        return None
+
+
 async def backtest_yesterday_predictions() -> Dict:
     """回溯验证未验证的预测，计算准确率，调整权重
     
@@ -392,10 +704,11 @@ async def backtest_yesterday_predictions() -> Dict:
             old_preds = cursor.fetchall()
             for pred in old_preds:
                 try:
-                    stock_data = await fetch_stock_data(pred['symbol'])
-                    if not stock_data:
+                    # 2026-07-08 修复：用K线数据获取预测日次日的涨跌幅
+                    # 原代码用 fetch_stock_data 获取今天的实时涨跌，对历史预测完全错误
+                    actual_change = await _get_next_day_change_from_kline(pred['symbol'], ud)
+                    if actual_change is None:
                         continue
-                    actual_change = stock_data.get('parsed', {}).get('changePercent', 0)
                     actual_dir = 'bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'
                     is_correct = pred['predict_direction'] == actual_dir
                     cursor.execute(
@@ -445,11 +758,12 @@ async def backtest_yesterday_predictions() -> Dict:
                         else:
                             bear_misjudge.append(item)
                     # 调用分析函数生成误判分析
+                    # 2026-07-08 修复：用K线获取补验日次日的大盘涨跌，而非今天的实时数据
                     ud_market_change = 0.0
                     try:
-                        idx_data = await fetch_stock_data('sh000001')
-                        if idx_data:
-                            ud_market_change = idx_data.get('parsed', {}).get('changePercent', 0)
+                        idx_change = await _get_next_day_change_from_kline('sh000001', ud)
+                        if idx_change is not None:
+                            ud_market_change = idx_change
                     except Exception:
                         pass
                     weights_bk = load_strategy_factor_weights()
@@ -553,11 +867,17 @@ async def backtest_yesterday_predictions() -> Dict:
                 print(f'  [回测] 降级拉取完成，actual_change_map 填充 {len(actual_change_map)} 条')
 
         # 逐个验证（用 actual_change_map 替代 N+1 await）
+        # 2026-07-08 修复：accuracy 分母使用实际验证数(bull_total)而非全部预测数(total_count)
+        # 原代码 total_count = len(predictions) 包含行情拉取失败被 continue 跳过的记录
+        # 导致 accuracy 被系统性拉低
         correct_count = 0
-        total_count = len(predictions)
+        verified_count = 0  # 实际验证的预测数（替代 total_count 作为分母）
         bull_correct = 0
         bull_total = 0
         bull_misjudge = []
+        # 2026-07-14：补充 bear 计数（保持与原硬编码 0 一致 — 暂未按 predict_dir 分桶，避免改动既有 bull_accuracy 语义）
+        bear_correct = 0
+        bear_total = 0
 
         for pred in predictions:
             symbol = pred['symbol']
@@ -570,8 +890,9 @@ async def backtest_yesterday_predictions() -> Dict:
             else:
                 # 性能优化（2026-07-02）：从 actual_change_map 取值，不再 N+1 await
                 actual_change = actual_change_map.get(symbol.lower(), 0)
-                if actual_change == 0 and symbol.lower() not in actual_change_map:
-                    continue  # 拉取失败的跳过
+                # 2026-07-08 修复：停牌/零涨跌的股票也跳过（changePercent=0 几乎一定是数据异常）
+                if symbol.lower() not in actual_change_map or actual_change == 0:
+                    continue  # 拉取失败或停牌的跳过
 
                 actual_dir = 'bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'
                 is_correct = predict_dir == actual_dir
@@ -583,6 +904,7 @@ async def backtest_yesterday_predictions() -> Dict:
                     (actual_change, actual_dir, 1 if is_correct else 0, yesterday, symbol)
                 )
 
+            verified_count += 1
             if is_correct:
                 correct_count += 1
 
@@ -612,8 +934,11 @@ async def backtest_yesterday_predictions() -> Dict:
         misjudge_analysis = await _analyze_misjudgments(bull_misjudge, [], market_change, weights)
 
         # 计算准确率
-        accuracy = round(correct_count / total_count * 100, 2) if total_count > 0 else 0
+        # 2026-07-08 修复：分母使用 verified_count（实际验证数），不再使用 total_count（含跳过记录）
+        accuracy = round(correct_count / verified_count * 100, 2) if verified_count > 0 else 0
         bull_accuracy = round(bull_correct / bull_total * 100, 2) if bull_total > 0 else 0
+        # 2026-07-14 修复：补全 bear_accuracy 计算（之前硬编码 0，导致 scheduler 访问 result['bear_accuracy'] KeyError）
+        bear_accuracy = round(bear_correct / bear_total * 100, 2) if bear_total > 0 else 0
 
         # 保存回测报告
         import json
@@ -623,8 +948,8 @@ async def backtest_yesterday_predictions() -> Dict:
                 bull_accuracy, bear_accuracy, bull_misjudge_count, bear_misjudge_count,
                 misjudge_analysis, weight_adjustments)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-            (yesterday, market_change, total_count, correct_count, accuracy,
-             bull_accuracy, 0, len(bull_misjudge), 0,
+            (yesterday, market_change, verified_count, correct_count, accuracy,
+             bull_accuracy, bear_accuracy, len(bull_misjudge), len(bear_misjudge),
              json.dumps(misjudge_analysis, ensure_ascii=False),
              json.dumps(weight_adjustments, ensure_ascii=False))
         )
@@ -634,11 +959,13 @@ async def backtest_yesterday_predictions() -> Dict:
         return {
             'date': yesterday,
             'market_change': market_change,
-            'total': total_count,
+            'total': verified_count,
             'correct': correct_count,
             'accuracy': accuracy,
             'bull_accuracy': bull_accuracy,
+            'bear_accuracy': bear_accuracy,  # 2026-07-14 修复：补齐字段，scheduler 调度需要
             'bull_misjudge': bull_misjudge,
+            'bear_misjudge': bear_misjudge,  # 2026-07-14 修复：补齐字段，便于前端展示
             'misjudge_analysis': misjudge_analysis,
             'weight_adjustments': weight_adjustments,
         }
@@ -652,7 +979,8 @@ def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict
     adjustments = []
     
     db_columns = {'outer_ratio', 'volume_ratio', 'turnover_rate', 'change_percent',
-                  'weibi', 'avg_price_deviation', 'amplitude'}
+                  'weibi', 'avg_price_deviation', 'amplitude',
+                  'position', 'main_capital_inflow', 'holder_structure'}
 
     for factor_name in DEFAULT_WEIGHTS.keys():
         if factor_name not in db_columns:

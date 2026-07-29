@@ -44,7 +44,8 @@ function parseTencentData(raw) {
 }
 
 async function loadIndexBar() {
-  for (const idx of indexes.value) {
+  // 2026-07-08 性能优化：3 个大盘指数并行请求（原串行 3 RTT → 1 RTT）
+  await Promise.all(indexes.value.map(async (idx) => {
     try {
       const resp = await fetch(`/api/stock/${idx.code}`)
       const raw = await resp.text()
@@ -55,7 +56,7 @@ async function loadIndexBar() {
         idx.changeText = `${parsed.changePct >= 0 ? '+' : ''}${parsed.changePct.toFixed(2)}%`
       }
     } catch (e) { /* silent */ }
-  }
+  }))
 }
 
 function scheduleRefresh() {
