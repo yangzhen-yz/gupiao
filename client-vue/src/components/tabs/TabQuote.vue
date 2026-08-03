@@ -42,7 +42,7 @@
         <div style="font-size:0.9rem;font-weight:500;color:var(--text-2);">正在加载数据...</div>
       </div>
       <div v-else-if="error" class="price-card" style="text-align:center;padding:2rem;">
-        <div style="font-size:1.1rem;color:var(--red);margin-bottom:0.5rem;">{{ error }}</div>
+        <div style="font-size:1.1rem;color:var(--accent-danger);margin-bottom:0.5rem;">{{ error }}</div>
         <button class="btn-primary" @click="fetchStockQuote(currentSymbol)">重试</button>
       </div>
       <template v-else-if="quoteData">
@@ -60,10 +60,10 @@
             </div>
           </div>
           <div style="display:flex;gap:0.5rem;margin-bottom:0.8rem;padding:0 0.25rem;">
-            <button class="btn-secondary" style="flex:1;display:flex;align-items:center;justify-content:center;gap:0.4rem;background:var(--blue-bg);color:var(--blue);border-color:var(--blue-border);" @click="$emit('open-kline', quoteData.symbol)">
+            <button class="btn-secondary" style="flex:1;display:flex;align-items:center;justify-content:center;gap:0.4rem;background:var(--accent-info-bg);color:var(--accent-info);border-color:var(--accent-info-border);" @click="$emit('open-kline', quoteData.symbol)">
               K线图
             </button>
-            <button class="btn-secondary" style="flex:1;display:flex;align-items:center;justify-content:center;gap:0.4rem;background:var(--orange-bg);color:var(--orange);border-color:var(--orange-border);" @click="startAiDiagnose(quoteData.symbol)">
+            <button class="btn-secondary" style="flex:1;display:flex;align-items:center;justify-content:center;gap:0.4rem;background:var(--accent-warning-bg);color:var(--accent-warning);border-color:var(--accent-warning-border);" @click="startAiDiagnose(quoteData.symbol)">
               AI诊断
             </button>
           </div>
@@ -85,10 +85,10 @@
                 <div class="grid-item"><div class="grid-label">成交量</div><div class="grid-value">{{ formatNumber(quoteData.volumeRaw) }}</div></div>
                 <div class="grid-item"><div class="grid-label">成交额</div><div class="grid-value">{{ formatNumber(quoteData.turnover * 10000) }}</div></div>
                 <div class="grid-item"><div class="grid-label">换手率</div><div class="grid-value">{{ (quoteData.turnoverRate || 0).toFixed(2) }}%</div></div>
-                <div class="grid-item"><div class="grid-label">量比</div><div class="grid-value" :style="{ color: quoteData.volumeRatio > 1.5 ? 'var(--red)' : quoteData.volumeRatio < 0.5 ? 'var(--green)' : 'var(--text)' }">{{ (quoteData.volumeRatio || 0).toFixed(2) }}</div></div>
+                <div class="grid-item"><div class="grid-label">量比</div><div class="grid-value" :style="{ color: quoteData.volumeRatio > 1.5 ? 'var(--accent-danger)' : quoteData.volumeRatio < 0.5 ? 'var(--accent-success)' : 'var(--text-primary)' }">{{ (quoteData.volumeRatio || 0).toFixed(2) }}</div></div>
                 <div class="grid-item"><div class="grid-label">市盈率</div><div class="grid-value">{{ quoteData.pe > 0 ? quoteData.pe.toFixed(2) : '亏损' }}</div></div>
                 <div class="grid-item"><div class="grid-label">振幅</div><div class="grid-value">{{ (quoteData.amplitude || 0).toFixed(2) }}%</div></div>
-                <div class="grid-item"><div class="grid-label">委比</div><div class="grid-value" :style="{ color: quoteData.weibi > 0 ? 'var(--red)' : 'var(--green)' }">{{ quoteData.weibi > 0 ? '+' : '' }}{{ (quoteData.weibi || 0).toFixed(2) }}%</div></div>
+                <div class="grid-item"><div class="grid-label">委比</div><div class="grid-value" :style="{ color: quoteData.weibi > 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">{{ quoteData.weibi > 0 ? '+' : '' }}{{ (quoteData.weibi || 0).toFixed(2) }}%</div></div>
                 <div class="grid-item"><div class="grid-label">均价</div><div class="grid-value">{{ (quoteData.avgPrice || 0).toFixed(2) }}</div></div>
                 <div class="grid-item"><div class="grid-label">买一</div><div class="grid-value">{{ quoteData.bid1 }}</div></div>
                 <div class="grid-item"><div class="grid-label">卖一</div><div class="grid-value">{{ quoteData.ask1 }}</div></div>
@@ -111,10 +111,10 @@
                   <div class="score-big" :style="{ color: scoreBarColor }">{{ scoreResult.score }}</div>
                   <div class="score-unit">
                     <div class="score-unit-text">分</div>
-                    <div class="score-tag" :style="{ color: scoreBarColor, background: scoreBarColor + '1a', borderColor: scoreBarColor + '55' }">{{ scoreLabel }}</div>
+                    <div class="score-tag" :style="{ color: scoreBarColor, background: `color-mix(in srgb, ${scoreBarColor} 10%, transparent)`, borderColor: `color-mix(in srgb, ${scoreBarColor} 33%, transparent)` }">{{ scoreLabel }}</div>
                   </div>
                 </div>
-                <div class="score-summary" :style="{ color: rating.color, background: rating.color + '1a', borderColor: rating.color + '55' }">{{ rating.label }}</div>
+                <div class="score-summary" :style="{ color: rating.color, background: `color-mix(in srgb, ${rating.color} 10%, transparent)`, borderColor: `color-mix(in srgb, ${rating.color} 33%, transparent)` }">{{ rating.label }}</div>
               </div>
               <div class="score-bar-track">
                 <div class="score-bar-fill" :style="{ width: scoreResult.score + '%', background: scoreBarColor }">
@@ -124,7 +124,7 @@
               <div class="score-details">
                 <div v-for="d in scoreResult.details" :key="d.label" class="score-detail-item">
                   <span>{{ d.label }}</span>
-                  <span :style="{ color: d.score >= d.max * 0.6 ? '#dc2626' : d.score >= d.max * 0.4 ? '#f59e0b' : '#16a34a' }">{{ d.score }}/{{ d.max }}</span>
+                  <span :style="{ color: d.score >= d.max * 0.6 ? 'var(--accent-danger)' : d.score >= d.max * 0.4 ? 'var(--accent-warning)' : 'var(--accent-success)' }">{{ d.score }}/{{ d.max }}</span>
                 </div>
               </div>
             </div>

@@ -62,7 +62,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
-import { apiFetch, isTradingTime, getNextRefreshDelay, formatNowTime } from '../../utils/helpers'
+import { apiFetch, isTradingTime, getNextRefreshDelay, formatNowTime, riskLabel, riskLevelClass } from '../../utils/helpers'
 import { getRating } from '../../utils/score'
 import { useStockData } from '../../composables/useStockData'
 
@@ -145,13 +145,6 @@ function goPage(p) {
 
 function goToQuote(symbol) {
   if (navigateToQuote) navigateToQuote(symbol)
-}
-
-function riskLabel(level) {
-  return { low: '低风险', mid: '中风险', high: '高风险' }[level] || '中风险'
-}
-function riskLevelClass(level) {
-  return { low: 'low', mid: 'mid', high: 'high' }[level] || 'mid'
 }
 
 async function startScan(silent = false) {

@@ -6,6 +6,7 @@ from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT
 # 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 from db.database import get_db_conn, save_daily_market_reviews, load_daily_recommendations, load_trend_scan_results
 from services.stock import fetch_stock_data
+from services.fundflow import _BROAD_CONCEPT_BLOCKLIST
 
 async def generate_daily_review() -> Dict:
     try:
@@ -64,8 +65,12 @@ async def generate_daily_review() -> Dict:
                 r = _requests.get(con_url, headers=_h, timeout=12)
                 con_json = r.json()
                 if con_json.get('data') and con_json['data'].get('diff'):
+                    _blocklist = _BROAD_CONCEPT_BLOCKLIST
                     for item in con_json['data']['diff']:
-                        con_list.append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'mainNetInflow': item.get('f62', 0), 'volume': item.get('f5', 0), 'amount': item.get('f6', 0), 'riseCount': item.get('f104', 0), 'fallCount': item.get('f105', 0)})
+                        _name = item.get('f14', '')
+                        if _name in _blocklist:
+                            continue
+                        con_list.append({'name': _name, 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'mainNetInflow': item.get('f62', 0), 'volume': item.get('f5', 0), 'amount': item.get('f6', 0), 'riseCount': item.get('f104', 0), 'fallCount': item.get('f105', 0)})
             except Exception as e:
                 print(f'[收评] 概念板块请求失败: {e}')
             return ind_list, con_list
@@ -247,6 +252,10 @@ async def generate_daily_review() -> Dict:
             'market': market_data,
             'industrySectors': industry_sectors[:20],
             'conceptSectors': concept_sectors[:20],
+            # 真实总数：涨停/跌停家数（前端 KPI 卡直接展示，不再依赖截取后的数组长度
+            'limitUpCount': len(limit_up_stocks),
+            'limitDownCount': len(limit_down_stocks),
+            # 数组只截前 20 只用于前端详情列表（避免 DB 存太多）
             'limitUpStocks': limit_up_stocks[:20],
             'limitDownStocks': limit_down_stocks[:20],
             'topGainers': top_gainers[:REVIEW_TOP_GAINERS_COUNT],

@@ -123,7 +123,7 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 
 | 优先级 | 数据源 | 说明 |
 |--------|--------|------|
-| 主要 | 东方财富热搜榜（`hot_search_daily_snapshot` 表） | 实时更新，前500只热门股票 |
+| 主要 | 东方财富热搜榜（`hot_search_daily_snapshot` 表） | 3 类榜单合并：真实人气榜前100 + 涨幅榜前100 + 成交额榜前400，去重后约 470~500 只沪深主板 |
 | 备用 | `HOT_STOCK_POOL` + `stock_basic_info` | 热搜榜为空时的本地股票池 |
 
 ### 2. 趋势股入选条件（中短线波段评分，V4.0）
@@ -375,7 +375,10 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | `TREND_EXCLUDE_MARKET_CAP_MIN` | 20 | 总市值<20亿直接剔除 |
 | `SCAN_CONCURRENCY` | 25 | 扫描并发数 |
 | `SCAN_CACHE_TTL` | 300 | 缓存有效期（秒） |
-| `HOT_SEARCH_TOP_N` | 500 | 热搜榜获取数量 |
+| `POPULARITY_RANK_TOP_N` | 100 | 真实人气榜获取数量（API 上限 100） |
+| `CHANGE_RANK_TOP_N` | 100 | 涨幅榜获取数量（沪深主板） |
+| `TURNOVER_RANK_TOP_N` | 400 | 成交额榜获取数量（沪深主板） |
+| `HOT_SEARCH_TOP_N` | 600 | 热搜榜合并后上限 |
 
 ### 8. 定时任务总览
 
@@ -587,6 +590,7 @@ const r = getRating(stock.score)   // { label, short, color }
 - 后端：Python + FastAPI（`server/app/main.py`）
   - 腾讯财经API：获取股票实时行情和K线数据
   - 东方财富API：获取热搜榜/板块数据，并通过 FastAPI 路由 `/eastmoney/*` 代理推送给前端（统一使用 `requests + asyncio.to_thread`，避免 `httpx.AsyncClient` 直连 `push2.eastmoney.com` 的 Server disconnected 问题）
+  - 人气榜API：`emappdata.eastmoney.com/stockrank/getAllCurrentList`（东方财富股吧真实人气榜，需 `httpx` 库 POST 访问，`requests` 会被服务器拒绝连接）
   - 字节方舟/豆包 API：AI 智能诊断（通过 `server/ai_config.json` 配置，OpenAI 兼容格式）
 - 数据库：SQLite（`server/gupiao.db`），使用 `sqlite3` 原生连接 + WAL 模式（定义在 `server/db/database.py`；已从 MySQL 迁移，迁移脚本 `migrate_mysql_to_sqlite.py`）
 - 存储：通过 `trend_scan_results` 表持久化，内存缓存加速访问
@@ -734,10 +738,11 @@ const r = getRating(stock.score)   // { label, short, color }
 
 > 阈值（`THERMOMETER_*`）在前端 `TabTrend.vue` 的 `THERMOMETER` 常量中调整；数据源完全复用现有 `trend_scan_results`，不新增定时任务。
 
-## 系统更新日志（2026-06 ~ 07）
+## 系统更新日志（2026-06 ~ 08）
 
 | 日期 | 模块 | 变更 |
 |------|------|------|
+| 2026-08-03 | 热搜榜 | **3 类榜单合并替代旧 f127 热度榜**：发现旧 `fid=f127` 并非东方财富APP真实人气榜（前10名零重叠），改用真实人气榜API `emappdata.eastmoney.com/stockrank/getAllCurrentList`（httpx POST，requests 被拒连）；热搜榜股票池由 3 类合并去重：① 真实人气榜前100（API上限100，含全市场，本地筛选沪深主板）→ ② 涨幅榜(fid=f3)前100 → ③ 成交额榜(fid=f6)前400；人气榜独有股票通过 push2 `ulist.np` 批量行情API补充名称/行情；`config.py` 新增 `POPULARITY_RANK_TOP_N`/`CHANGE_RANK_TOP_N`/`TURNOVER_RANK_TOP_N` 替代旧 `HOT_RANK_TOP_N`；合并后约470只沪深主板 |
 | 2026-07-18 | 聪明钱 | **交易日后自动拉取龙虎榜+北向数据**：`core/scheduler.py` 新增 17:30 定时任务（仅交易日执行），调用 `services/smartmoney.refresh_smart_money_task()` 强制跳过缓存拉取最新龙虎榜与北向资金，前端策略页无需手动刷新即可展示当日数据；`app/config.py` 新增 `SMART_MONEY_UPDATE_TIME` 配置 |
 | 2026-07-18 | 趋势发现 | **市场温度计分页优化**：`TabTrend.vue` 市场温度计默认每页展示近 21 个交易日（约一个月），超出部分翻页；前端请求 `history-counts?days=90` 保留更多历史，表格与迷你柱状图均按当前页 21 条渲染；新增翻页控件，柱状图高度基于当前页最大值动态缩放 |
 | 2026-07-18 | 聪明钱 | **龙虎榜自动对齐最近交易日**：`services/smartmoney.py` 缓存命中条件由"1小时TTL"升级为"数据日期==最近已收盘交易日"，新增 `_latest_settled_trade_date()`（交易日18:00后取当天、否则取上一交易日）；缓存非目标日即自动重拉，前端默认加载即可显示最新龙虎榜、无需手动刷新；定时任务改为每日（含周末）刷新到目标交易日 |

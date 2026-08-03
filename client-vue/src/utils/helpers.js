@@ -1,15 +1,19 @@
 import { ref, onUnmounted } from 'vue'
 
-// 判断是否为交易日
-const HOLIDAYS_2025 = [
-  '2025-01-01','2025-01-28','2025-01-29','2025-01-30','2025-01-31','2025-02-03','2025-02-04',
-  '2025-04-04','2025-05-01','2025-05-02','2025-05-05','2025-06-02',
-  '2025-10-01','2025-10-02','2025-10-03','2025-10-06','2025-10-07','2025-10-08',
+// 判断是否为交易日（2026年A股休市日历，来源：沪深北交易所公告）
+const HOLIDAYS_2026 = [
+  '2026-01-01','2026-01-02',                                    // 元旦
+  '2026-02-16','2026-02-17','2026-02-18','2026-02-19','2026-02-20','2026-02-23', // 春节
+  '2026-04-06',                                                  // 清明节
+  '2026-05-01','2026-05-04','2026-05-05',                        // 劳动节
+  '2026-06-19',                                                  // 端午节
+  '2026-09-25',                                                  // 中秋节
+  '2026-10-01','2026-10-02','2026-10-05','2026-10-06','2026-10-07', // 国庆节
 ]
 
 export function isHoliday(date = new Date()) {
   const y = date.getFullYear(), m = String(date.getMonth()+1).padStart(2,'0'), d = String(date.getDate()).padStart(2,'0')
-  return HOLIDAYS_2025.includes(`${y}-${m}-${d}`)
+  return HOLIDAYS_2026.includes(`${y}-${m}-${d}`)
 }
 
 export function isTradingTime() {
@@ -112,4 +116,13 @@ export async function apiFetch(url, options = {}) {
     console.error(`API请求失败: ${url}`, e)
     throw e
   }
+}
+
+// 风险等级标签与样式（TabRecommend / TabScan 共用）
+export function riskLabel(level) {
+  return { low: '低风险', mid: '中风险', high: '高风险' }[level] || '中风险'
+}
+
+export function riskLevelClass(level) {
+  return { low: 'low', mid: 'mid', high: 'high' }[level] || 'mid'
 }

@@ -11,12 +11,13 @@
 
 
 // 统一评级：标签 + 颜色（前后端共用同一份阈值，project_memory 硬约束）
+// color 使用 main.css 中定义的 CSS 变量，暗色模式自动联动
 export function getRating(score) {
-  if (score >= 80) return { label: '强烈看涨', short: '看涨', color: 'var(--red)' }
-  if (score >= 70) return { label: '建议关注', short: '看涨', color: 'var(--red)' }
-  if (score >= 55) return { label: '中性观望', short: '观望', color: 'var(--orange)' }
-  if (score >= 40) return { label: '谨慎回调', short: '回调', color: 'var(--orange)' }
-  return { label: '强烈避险', short: '看跌', color: 'var(--green)' }
+  if (score >= 80) return { label: '强烈看涨', short: '看涨', color: 'var(--accent-danger)' }
+  if (score >= 70) return { label: '建议关注', short: '看涨', color: 'var(--accent-danger)' }
+  if (score >= 55) return { label: '中性观望', short: '观望', color: 'var(--accent-warning)' }
+  if (score >= 40) return { label: '谨慎回调', short: '回调', color: 'var(--accent-warning)' }
+  return { label: '强烈避险', short: '看跌', color: 'var(--accent-success)' }
 }
 
 // 综合评分（2026-07-06 ：纯透传薄壳，权重由后端统一维护）

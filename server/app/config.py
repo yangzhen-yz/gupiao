@@ -18,8 +18,17 @@ HTTP_MAX_CONNECTIONS = 50  # HTTP 最大连接数
 HTTP_KEEPALIVE_CONNECTIONS = 25  # HTTP 保持连接数
 
 
-# ========== 热搜榜配置 ==========
-HOT_SEARCH_TOP_N = 500  # 热搜榜最大显示数量
+# ========== 热搜榜配置（3类合并）==========
+# 数据来源：
+#   1. 人气榜：东方财富真实个股人气榜 API（emappdata.eastmoney.com/stockrank/getAllCurrentList）
+#      — API 最多返回前 100 名，取全部沪深主板
+#   2. 涨幅榜：clist API fid=f3（涨跌幅排序），取前 N 只沪深主板
+#   3. 成交额榜：clist API fid=f6（成交额排序），取前 N 只沪深主板
+# 合并去重后，人气榜股票排前面（hotRank 从 1 开始），涨幅榜独有的排中间，成交额榜独有的排后面
+POPULARITY_RANK_TOP_N = 100       # 人气榜取前 N 只（API 上限 100）
+CHANGE_RANK_TOP_N = 100           # 涨幅榜取前 N 只沪深主板
+TURNOVER_RANK_TOP_N = 400         # 成交额榜取前 N 只沪深主板
+HOT_SEARCH_TOP_N = 600            # 热搜榜最大显示数量（3榜合并后上限）
 HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS = 60  # 热搜榜快照清理天数
 
 
@@ -228,6 +237,16 @@ STRATEGY_INDUSTRY_P20_PENALTY = -2         # 行业内总分 ≤ P20 → -2
 TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN = 3  # 近20日出现连续N个跌停 → 直接剔除
 TREND_EXCLUDE_MARKET_CAP_MIN = 20  # 总市值 < N亿 直接剔除（可配置）
 TREND_RANGE_20D_FLAT_MIN = 5  # 近 20 日振幅 < 5% 视为"完全横盘"（转入扣分项，不再直接排除）
+
+# ========== 风险硬过滤（2026-08-03 新增，参考 CANSLIM/SEPA 风控）==========
+# RSI 超买过滤：RSI≥95 极度超买（强制排除），RSI≥88 严重超买（扣分）
+TREND_RSI_PERIOD = 14                 # RSI 计算周期（标准 14 日）
+TREND_RSI_EXTREME_OVERBOUGHT = 95     # RSI ≥ 此值 → 极度超买，强制排除
+TREND_RSI_OVERBOUGHT = 88             # RSI ≥ 此值 → 严重超买，扣分
+TREND_RSI_OVERBOUGHT_DEDUCT = 8       # 严重超买扣分值
+# 连板透支过滤：5+ 连板后追高风险极高（参考龙头战法"5板以上不追"纪律）
+TREND_CONSECUTIVE_BOARD_EXHAUSTION = 5  # 连板数 ≥ 此值 → 透支风险扣分
+TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT = 10  # 连板透支扣分值
 
 # 公告/利空数据源（东方财富公告接口）
 EASTMONEY_ANN_API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'

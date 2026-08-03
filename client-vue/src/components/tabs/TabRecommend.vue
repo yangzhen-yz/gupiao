@@ -104,7 +104,7 @@
 
 <script setup>
 import { ref, computed, onMounted, inject } from 'vue'
-import { apiFetch } from '../../utils/helpers'
+import { apiFetch, riskLabel, riskLevelClass } from '../../utils/helpers'
 
 const showNotification = inject('showNotification')
 const todayRecommend = ref([])
@@ -138,13 +138,6 @@ function getProfitValue(r) {
   const val = r.profitRatio ?? r.result
   if (val === null || val === undefined) return 0
   return parseFloat(val)
-}
-
-function riskLabel(level) {
-  return { low: '低风险', mid: '中风险', high: '高风险' }[level] || '中风险'
-}
-function riskLevelClass(level) {
-  return { low: 'low', mid: 'mid', high: 'high' }[level] || 'mid'
 }
 
 async function generateRecommendations() {

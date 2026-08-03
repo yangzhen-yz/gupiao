@@ -467,16 +467,16 @@ function getConsecutiveClass(stock) {
 
 function getScoreColor(stock) {
   const c = getRating(stock.score).color
-  if (c === 'var(--red)') return '#dc2626'
-  if (c === 'var(--orange)') return '#f59e0b'
-  return '#16a34a'
+  if (c === 'var(--accent-danger)') return 'var(--accent-danger)'
+  if (c === 'var(--accent-warning)') return 'var(--accent-warning)'
+  return 'var(--accent-success)'
 }
 
 function getScoreStyle(stock) {
   const c = getRating(stock.score).color
-  if (c === 'var(--red)') return { background: 'linear-gradient(135deg,#fef2f2,#fee2e2)', borderColor: '#fca5a5' }
-  if (c === 'var(--orange)') return { background: 'linear-gradient(135deg,#fffbeb,#fef3c7)', borderColor: '#fde68a' }
-  return { background: 'linear-gradient(135deg,#f0fdf4,#dcfce7)', borderColor: '#bbf7d0' }
+  if (c === 'var(--accent-danger)') return { background: 'var(--accent-danger-bg)', borderColor: 'var(--accent-danger-border)' }
+  if (c === 'var(--accent-warning)') return { background: 'var(--accent-warning-bg)', borderColor: 'var(--accent-warning-border)' }
+  return { background: 'var(--accent-success-bg)', borderColor: 'var(--accent-success-border)' }
 }
 
 async function loadTrendStocks() {

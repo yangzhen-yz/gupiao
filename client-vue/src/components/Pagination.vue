@@ -36,22 +36,22 @@ function go(p) {
   gap: 0.5rem;
   padding: 0.5rem 0.25rem 0.25rem;
   font-size: 0.8125rem;
-  color: var(--text-secondary, #52525b);
+  color: var(--text-secondary);
   flex-wrap: wrap;
 }
 .page-btn {
   padding: 0.25rem 0.6rem;
-  border: 1px solid var(--border-color, #e4e4e7);
-  background: var(--bg-card, #fff);
-  color: var(--text-secondary, #52525b);
-  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 0.8125rem;
-  transition: all 0.15s;
+  transition: all var(--transition-fast);
 }
 .page-btn:hover:not(:disabled) {
-  border-color: var(--accent-primary, #2563eb);
-  color: var(--accent-primary, #2563eb);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
 }
 .page-btn:disabled {
   opacity: 0.4;
@@ -65,7 +65,7 @@ function go(p) {
 }
 .page-total {
   margin-left: auto;
-  color: var(--text-tertiary, #a1a1aa);
+  color: var(--text-tertiary);
   font-size: 0.75rem;
 }
 </style>

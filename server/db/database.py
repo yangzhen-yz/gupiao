@@ -16,11 +16,108 @@ def get_db_conn():
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+# ========== 时间戳 UTC→北京时间 迁移 ==========
+# 需要迁移的表及其时间戳列（DEFAULT 曾为 CURRENT_TIMESTAMP=UTC）
+_TS_MIGRATION_TABLES = {
+    'daily_market_reviews': ['created_at'],
+    'trend_scan_results': ['created_at'],
+    'hot_stock_buttons': ['created_at', 'updated_at'],
+    'stock_alias_map': ['created_at', 'updated_at'],
+    'strategy_predict_records': ['created_at'],
+    'strategy_factor_weights': ['updated_at'],
+    'strategy_backtest_reports': ['created_at'],
+    'hot_search_meta': ['updated_at'],
+    'daily_recommendations': ['created_at'],
+    'stock_basic_info': ['updated_at'],
+    'user_scan_pool': ['created_at'],
+    'stock_concept_tags': ['updated_at'],
+    'trend_backtest_records': ['created_at'],
+    'trend_backtest_reports': ['created_at', 'updated_at'],
+}
+
+def _prepare_ts_migration(cursor):
+    """迁移第 1 步（在 CREATE TABLE 之前调用）：
+    检查已有表的 DEFAULT 是否仍为 UTC（CURRENT_TIMESTAMP），
+    若是则重命名为 _old_xxx，让后续 CREATE TABLE IF NOT EXISTS 用新 schema 重建。
+    仅执行一次，用 _schema_migrations 标记。
+    """
+    cursor.execute('CREATE TABLE IF NOT EXISTS _schema_migrations (migration_key TEXT PRIMARY KEY, done_at TEXT)')
+    cursor.execute('SELECT 1 FROM _schema_migrations WHERE migration_key = ?', ('beijing_timestamps',))
+    if cursor.fetchone():
+        return  # 已迁移过
+    migrated = []
+    for table, ts_cols in _TS_MIGRATION_TABLES.items():
+        try:
+            cursor.execute(f'PRAGMA table_info({table})')
+            cols_info = cursor.fetchall()
+            if not cols_info:
+                continue  # 表不存在（首次启动），无需迁移
+            # 检查时间戳列的 DEFAULT 是否仍为 CURRENT_TIMESTAMP
+            needs = False
+            for ci in cols_info:
+                # ci = (cid, name, type, notnull, dflt_value, pk)
+                if ci[1] in ts_cols and ci[4] == 'CURRENT_TIMESTAMP':
+                    needs = True
+                    break
+            if not needs:
+                continue
+            # 重命名旧表（索引会自动跟随，稍后重建）
+            cursor.execute(f'ALTER TABLE {table} RENAME TO _old_{table}')
+            migrated.append(table)
+        except Exception as e:
+            print(f'[数据库迁移] {table} 准备阶段跳过: {e}')
+    if migrated:
+        print(f'[数据库迁移] 以下表将重建为北京时间 DEFAULT: {", ".join(migrated)}')
+
+def _finish_ts_migration(cursor):
+    """迁移第 2 步（在 CREATE TABLE / CREATE INDEX 之后调用）：
+    将 _old_xxx 表中的数据复制到新建的表（UTC 时间 +8 小时→北京时间），然后删除旧表。
+    """
+    cursor.execute('SELECT 1 FROM _schema_migrations WHERE migration_key = ?', ('beijing_timestamps',))
+    if cursor.fetchone():
+        return  # 已迁移过
+    for table, ts_cols in _TS_MIGRATION_TABLES.items():
+        try:
+            # 检查 _old 表是否存在
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (f'_old_{table}',))
+            if not cursor.fetchone():
+                continue
+            # 获取新表的列名
+            cursor.execute(f'PRAGMA table_info({table})')
+            new_cols = [ci[1] for ci in cursor.fetchall()]
+            if not new_cols:
+                continue
+            # 构建 SELECT 列表（时间戳列做 +8 hours 转换）
+            select_cols = []
+            for c in new_cols:
+                if c in ts_cols:
+                    select_cols.append(f"datetime({c}, '+8 hours') AS {c}")
+                else:
+                    select_cols.append(c)
+            select_list = ', '.join(select_cols)
+            col_list = ', '.join(new_cols)
+            # 复制数据
+            cursor.execute(f'INSERT INTO {table} ({col_list}) SELECT {select_list} FROM _old_{table}')
+            rowcount = cursor.rowcount
+            # 删除旧表
+            cursor.execute(f'DROP TABLE _old_{table}')
+            print(f'[数据库迁移] {table}: {rowcount} 行数据已转换 UTC→北京时间')
+        except Exception as e:
+            print(f'[数据库迁移] {table} 数据复制失败: {e}')
+    # 标记迁移完成
+    cursor.execute(
+        "INSERT OR REPLACE INTO _schema_migrations VALUES ('beijing_timestamps', datetime('now', '+8 hours'))"
+    )
+    print('[数据库迁移] 北京时间统一迁移完成')
+
+
 def init_db():
     """初始化数据库表"""
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
+        # 迁移第 1 步：重命名 UTC 时间戳的旧表（仅首次执行）
+        _prepare_ts_migration(cursor)
         # 收评表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS daily_market_reviews (
@@ -30,7 +127,7 @@ def init_db():
                 market_json TEXT,
                 trend_json TEXT,
                 pool_json TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
         # 趋势股票表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trend_scan_results (
@@ -48,7 +145,7 @@ def init_db():
                 total_scanned INTEGER DEFAULT 0,
                 source TEXT DEFAULT '',
                 scan_time TEXT DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(scan_date, symbol))''')
         # 热门股票表
         cursor.execute('''
@@ -56,16 +153,16 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')) )''')
         # 股票名称搜索映射表（名称 -> 代码，含简称，一般不删除）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS stock_alias_map (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 symbol TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')) )''')
         # 策略预测记录表（每次扫描时记录判定结果）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS strategy_predict_records (
@@ -88,7 +185,7 @@ def init_db():
                 actual_change REAL DEFAULT NULL,
                 actual_direction TEXT DEFAULT '',
                 is_correct INTEGER DEFAULT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(predict_date, symbol))''')
         # 索引（2026-07-06 A-）：strategy_predict_records 按日期查询 + 未验证筛选是高频路径
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_date ON strategy_predict_records(predict_date)')
@@ -102,7 +199,7 @@ def init_db():
                 accuracy REAL DEFAULT 50.0,
                 sample_count INTEGER DEFAULT 0,
                 correct_count INTEGER DEFAULT 0,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')) )''')
         # 策略回测报告表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS strategy_backtest_reports (
@@ -118,7 +215,7 @@ def init_db():
                 bear_misjudge_count INTEGER DEFAULT 0,
                 misjudge_analysis TEXT,
                 weight_adjustments TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
         # 热搜榜表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS hot_search_ranking (
@@ -139,7 +236,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 meta_key TEXT NOT NULL UNIQUE,
                 meta_value TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS hot_search_daily_snapshot (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,27 +261,27 @@ def init_db():
                 sell_price TEXT DEFAULT '',
                 reason TEXT,
                 sort_order INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(rec_date, symbol))''')
         # 股票映射表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS stock_basic_info (
                 symbol TEXT NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
         # 自定义扫描池表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_scan_pool (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL UNIQUE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
         # 股票标签表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS stock_concept_tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL UNIQUE,
                 tags_json TEXT,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP )''')
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')) )''')
         # 趋势回测记录表（三周期字段并存于同一行，补验时只 UPDATE 对应周期）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trend_backtest_records (
@@ -215,7 +312,7 @@ def init_db():
                 market_change_5d REAL DEFAULT 0,
                 is_correct_5d INTEGER DEFAULT 0,
                 verified_at_5d TEXT DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(predict_date, symbol))''')
         # 索引（2026-07-06 A-）：trend_backtest_records 回测验证按 verified_1d/3d/5d 筛选未验证记录是高频路径
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_bt_verified_1d ON trend_backtest_records(verified_1d)')
@@ -249,8 +346,8 @@ def init_db():
                 score_80_plus_win_1d INTEGER DEFAULT 0,
                 score_80_plus_win_3d INTEGER DEFAULT 0,
                 score_80_plus_win_5d INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(predict_date))''')
         try:
             cursor.execute('ALTER TABLE hot_search_ranking ADD COLUMN hot_rank INTEGER DEFAULT 0')
@@ -319,6 +416,8 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_symbol ON stock_fundamental(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_kline_cache_symbol ON kline_cache(symbol)')
+        # 迁移第 2 步：将旧表数据（UTC）复制到新表（+8h→北京时间），然后删除旧表
+        _finish_ts_migration(cursor)
         conn.commit()
         print('[数据库] 表初始化完成')
     except Exception as e:
@@ -770,7 +869,7 @@ def save_stock_industry(industry_map: Dict[str, str]) -> bool:
             if not industry:
                 continue
             cursor.execute(
-                'UPDATE stock_basic_info SET industry = ?, updated_at = CURRENT_TIMESTAMP WHERE symbol = ?',
+                "UPDATE stock_basic_info SET industry = ?, updated_at = datetime('now', '+8 hours') WHERE symbol = ?",
                 (industry, symbol.lower())
             )
         conn.commit()
@@ -1292,6 +1391,22 @@ def load_daily_market_reviews() -> List[Dict]:
                 review['topFunds'] = json.loads(row['top_funds_json'])
             else:
                 review['topFunds'] = []
+            if 'ai_analysis_json' in row.keys() and row['ai_analysis_json']:
+                try:
+                    review['aiAnalysis'] = json.loads(row['ai_analysis_json'])
+                except Exception:
+                    review['aiAnalysis'] = None
+            else:
+                review['aiAnalysis'] = None
+            # 涨停/跌停真实总数（2026-07-30 补齐）；若缺失则降级回数组长度（历史数据）
+            if 'limit_up_count' in row.keys() and row['limit_up_count'] is not None:
+                review['limitUpCount'] = int(row['limit_up_count'])
+            else:
+                review['limitUpCount'] = len(review.get('limitUpStocks', []))
+            if 'limit_down_count' in row.keys() and row['limit_down_count'] is not None:
+                review['limitDownCount'] = int(row['limit_down_count'])
+            else:
+                review['limitDownCount'] = len(review.get('limitDownStocks', []))
             # 旧格式兼容
             if 'trend_json' in row.keys() and row['trend_json']:
                 review['trendStocks'] = json.loads(row['trend_json'])
@@ -1307,13 +1422,20 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        # 确保新字段存在
-        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json']
+        # 确保新字段存在（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count）
+        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json', 'ai_analysis_json']
         for col in new_cols:
             try:
                 cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
             except Exception:
                 pass  # 列已存在
+        # 涨停/跌停家数（整数列，真实总数）
+        int_cols = ['limit_up_count', 'limit_down_count']
+        for col in int_cols:
+            try:
+                cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} INTEGER')
+            except Exception:
+                pass
         conn.commit()
         
         for review in reviews:
@@ -1330,10 +1452,18 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             top_funds_json = json.dumps(review.get('topFunds', []), ensure_ascii=False)
             trend_json = json.dumps(review.get('trendStocks', {}), ensure_ascii=False)
             pool_json = json.dumps(review.get('stockPool', {}), ensure_ascii=False)
+            ai_analysis_json = json.dumps(review.get('aiAnalysis'), ensure_ascii=False) if review.get('aiAnalysis') else None
+            # 真实涨停/跌停总数：优先读 count 字段，否则退化为数组长度（兼容旧数据）
+            limit_up_count = review.get('limitUpCount')
+            if limit_up_count is None:
+                limit_up_count = len(review.get('limitUpStocks', []))
+            limit_down_count = review.get('limitDownCount')
+            if limit_down_count is None:
+                limit_down_count = len(review.get('limitDownStocks', []))
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json))
+                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, limit_up_count, limit_down_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, limit_up_count, limit_down_count))
         conn.commit()
         conn.close()
         return True

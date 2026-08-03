@@ -26,6 +26,9 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
     TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD,
     TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
     TREND_RANGE_20D_FLAT_MIN,
+    # 风险硬过滤（2026-08-03 新增）
+    TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT,
+    TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT,
     # 筹码结构修正
     TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN,
     TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN,
@@ -80,6 +83,28 @@ def _ensure_today_date(data: Dict) -> Dict:
     # 2026-07-06 : 已合并到 services.utils.ensure_today_date，此处保留薄壳透传以最小化改动
     from services.utils import ensure_today_date
     return ensure_today_date(data)
+
+def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """计算 RSI（相对强弱指数，2026-08-03 新增）
+
+    参考 CANSLIM/SEPA 风控：RSI≥95 极度超买（强制排除），RSI≥88 严重超买（扣分）。
+    用标准 Wilder 平滑法计算近 period 日 RSI。
+    """
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    # 取最近 period 日的平均涨跌幅度
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
 
 def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 negative_announcement: Optional[Dict] = None,
@@ -167,6 +192,11 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     # 4. 总市值 < 20 亿（小微盘庄股）
     if market_cap is not None and market_cap < TREND_EXCLUDE_MARKET_CAP_MIN:
         exclusions.append(f'总市值仅{market_cap:.1f}亿（<{TREND_EXCLUDE_MARKET_CAP_MIN}亿）')
+    # 5. RSI 极度超买（≥95）→ 强制排除（参考 CANSLIM/SEPA 风控）
+    #    RSI≥95 意味着近期几乎所有交易日都在上涨，短期透支极严重，追高风险极高
+    rsi_value = _calc_rsi(closes, TREND_RSI_PERIOD)
+    if rsi_value is not None and rsi_value >= TREND_RSI_EXTREME_OVERBOUGHT:
+        exclusions.append(f'RSI({rsi_value:.0f})≥{TREND_RSI_EXTREME_OVERBOUGHT}极度超买')
 
     if exclusions:
         return {
@@ -428,6 +458,18 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         base_score -= TREND_DEDUCT_NON_MAIN_BOARD
         deducts.append(('非主板', TREND_DEDUCT_NON_MAIN_BOARD))
 
+    # (12) RSI 严重超买（≥88 且 <95）— 扣分但不排除（参考 CANSLIM/SEPA 风控）
+    # RSI≥88 表示短期上涨力度极强但已接近透支，追高风险显著增加
+    if rsi_value is not None and TREND_RSI_OVERBOUGHT <= rsi_value < TREND_RSI_EXTREME_OVERBOUGHT:
+        base_score -= TREND_RSI_OVERBOUGHT_DEDUCT
+        deducts.append((f'RSI超买({rsi_value:.0f})', TREND_RSI_OVERBOUGHT_DEDUCT))
+
+    # (13) 连板透支风险（5+ 连板）— 龙头战法"5板以上不追"纪律
+    # 5+连板后获利盘极重，一旦情绪退潮容易连续一字跌停，追高风险极高
+    if max_consecutive_boards >= TREND_CONSECUTIVE_BOARD_EXHAUSTION:
+        base_score -= TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT
+        deducts.append((f'连板透支({max_consecutive_boards}板)', TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT))
+
     # ========== 加分项（4 项 + 横盘位置判断，额外奖励） ==========
     bonus_score = 0
     bonuses = []
@@ -493,15 +535,38 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
             deducts.append(('高位横盘(<5%)', dyn_thresh['DEDUCT_AMPLITUDE_FLAT']))
 
     # ========== 扣分项互斥/衰减（同类风险只取扣分最大的一项） ==========
-    deduct_names = {d[0]: d[1] for d in deducts}
+    # 修复：原代码用英文 key（如 'MA20_BROKEN'）匹配 deduct_names 字典，
+    # 但 deducts 中存的是中文名称（如 '近5日跌破MA20未收回'），key 永远不匹配 → 互斥衰减完全失效。
+    # 新版：用前缀映射将中文名称转回英文 key，再与 TREND_DEDUCT_GROUPS 匹配。
+    _DEDUCT_KEY_MAP = {
+        'MA60+MA120双空头': 'MA60_MA120_BEAR',
+        '中高位': 'POSITION_MID',
+        'MA60向下/MA120向上': 'POSITION_MID',
+        '近5日跌破MA20未收回': 'MA20_BROKEN',
+        '近20日单日跌停': 'LIMIT_DOWN',
+        '近5日缩量阴跌': 'SHRINK_VOL',
+        '放量滞涨': 'VOLUME_SPIKE',
+        '量价顶背离': 'VOLUME_DIVERGENCE',
+        '天地板/炸板': 'EXTREME_VOLATILITY',
+        '单日大跌未修复': 'SINGLE_DAY_CRASH',
+    }
     for group_name, keys in TREND_DEDUCT_GROUPS.items():
-        triggered = [(k, deduct_names.get(k, 0)) for k in keys if k in deduct_names]
+        triggered = []
+        for d_name, d_pts in deducts:
+            # 用前缀匹配处理动态格式字符串（如 '中高位(分位65%)'）
+            d_key = ''
+            for prefix, key in _DEDUCT_KEY_MAP.items():
+                if d_name.startswith(prefix):
+                    d_key = key
+                    break
+            if d_key in keys:
+                triggered.append((d_name, d_pts))
         if len(triggered) >= 2:
             # 取扣分最大的保留，其余退还
             triggered.sort(key=lambda x: x[1], reverse=True)
-            for k, pts in triggered[1:]:
+            for name, pts in triggered[1:]:
                 base_score += pts  # 退还扣分
-                deducts = [d for d in deducts if d[0] != k]  # 移除非最大扣分项
+                deducts = [d for d in deducts if d[0] != name]  # 移除非最大扣分项
 
     # ========== 板块动量因子（环境加成/折价 ±5%） ==========
     # 实现（2026-06-30）：基于个股概念标签的同题材平均涨幅做环境修正
@@ -522,7 +587,7 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     # - 基础分非顶格的票 trend_score < 100（区分明显）
     # - 基础分顶格的票 trend_score = 100 + 加分缩放(0~5) → 仍封顶 100，但内部用附加分区分
     # - 三因子修正后封顶 100（不再溢出）
-    base_score_capped = min(100, base_score)
+    base_score_capped = min(100, max(0, base_score))  # 修复：增加下界保护，防止扣分过多导致负分与乘性因子的错误交互
     # 稳步上行与加速拉升互斥（line 451-455 if/else），取稳步上行作为上限代表；
     # 加速拉升 +1 不会同时出现，故 max_bonus 不含 TREND_BONUS_ACCELERATING
     max_bonus = (TREND_BONUS_BULL_ALIGNMENT + TREND_BONUS_VOLUME_BREAKOUT +
@@ -539,15 +604,18 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
 
     # ========== 日内动量加成（v5.4 新增）==========
     # 日内强势股（涨幅≥5%）获得额外评分加成，避免反弹初期评分偏低被误杀
+    # 修复：原代码用 abs(intraday_change_pct) 导致大跌(-9%)也获得+10加分，完全错误。
+    # 新版：仅奖励正涨幅，大跌股不加反减（惩罚日内崩盘）
     intraday_bonus = 0
-    abs_chg = abs(intraday_change_pct)
-    if abs_chg >= 9:
+    if intraday_change_pct >= 9:
         intraday_bonus = 10
-    elif abs_chg >= 7:
+    elif intraday_change_pct >= 7:
         intraday_bonus = 8
-    elif abs_chg >= 5:
+    elif intraday_change_pct >= 5:
         intraday_bonus = 5
-    total_score = min(100, total_score + intraday_bonus)
+    elif intraday_change_pct <= -7:
+        intraday_bonus = -5  # 日内大跌惩罚
+    total_score = min(100, max(0, total_score + intraday_bonus))
 
     # ========== 入选判断 ==========
     # 过滤规则 1：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制排除（原有逻辑保留）
@@ -689,6 +757,8 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'patternFactor': round(pattern_factor, 3),
         # 动态阈值市场状态
         'marketRegime': market_regime,
+        # RSI 超买指标（2026-08-03 新增）
+        'rsi': rsi_value,
         # 三修正系数叠加总值（封顶 0.15）
         'totalFactor': round(min(TREND_TOTAL_FACTOR_CAP, sector_factor + chip_factor + pattern_factor), 3),
     }
@@ -1402,20 +1472,6 @@ async def scan_trend_scan_results(force: bool = False):
             scan_pool = list(dict.fromkeys(fixed_pool + map_symbols))
             source = 'fallback'
             print(f'[趋势扫描] 热搜榜数据为空，使用备选池（固定底仓 + 本地基础信息），共 {len(scan_pool)} 只股票')
-
-        # 把"上一次趋势列表"也并入扫描池，确保昨天在趋势列表里、今天从热搜榜掉出的股票也会被重新评估
-        try:
-            prev_trend = load_trend_scan_results()
-            if prev_trend and prev_trend.get('stocks'):
-                prev_symbols = [s['symbol'] for s in prev_trend['stocks'] if s.get('symbol')]
-                if prev_symbols:
-                    before_count = len(scan_pool)
-                    scan_pool = list(dict.fromkeys(scan_pool + prev_symbols))
-                    added = len(scan_pool) - before_count
-                    if added > 0:
-                        print(f'[趋势扫描] 已合并上一轮趋势列表 {len(prev_symbols)} 只（新增 {added} 只不在热搜榜中的），共 {len(scan_pool)} 只')
-        except Exception as e:
-            print(f'[趋势扫描] 合并上轮趋势列表失败: {str(e)}')
 
         # 排除"用户股票池"中已存在的股票 — 已被用户加入股票池的股票不应再出现在趋势发现列表中
         try:

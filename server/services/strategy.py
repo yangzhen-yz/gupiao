@@ -83,8 +83,9 @@ def _score_holder_structure(holder_num: Optional[int], ratio: Optional[float]) -
     if holder_num <= thr['large_hold'] and ratio > 0:
         return vals['low']  # 5
 
-    # 8. 默认中性
-        return vals['normal']  # 8
+    # 8. 默认中性（修复：原缩进错误导致此行嵌套在 #7 的 if 块内，永不执行，
+    #    函数对未命中任何条件的股票隐式返回 None，在 sum() 时抛 TypeError）
+    return vals['normal']  # 8
 
 
 def _score_rps(rps: Optional[float]) -> float:
@@ -488,10 +489,28 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
 
     predict_direction = 'bull' if total >= bull_threshold else 'bear' if total < STRATEGY_BEAR_THRESHOLD else 'neutral'
 
-    # V4.1: 融合趋势评分（50% 日内 + 50% 趋势），仅当 trend_result 提供时生效
+    # V4.2: 自适应融合趋势评分（权重随大盘状态动态调整），仅当 trend_result 提供时生效
+    # 优化（2026-08-03）：原 V4.1 固定 50/50 融合，不适应不同市场状态：
+    #   - 牛市（market_change > 0.5%）：趋势延续性强，趋势分权重更高 → 40% 日内 + 60% 趋势
+    #   - 熊市（market_change < -0.5%）：趋势信号易被熊市反弹误导，日内分权重更高 → 60% 日内 + 40% 趋势
+    #   - 震荡市（-0.5% ~ 0.5%）：两者均重要 → 50/50
+    # 另修复：趋势分=0（被强制排除的股票）不应直接 50% 融合拖累日内分，
+    #         改为仅取日内分的 70%（轻度折价但不过度惩罚）
     intraday_score = total
     if trend_score is not None:
-        total = round(intraday_score * 0.5 + trend_score * 0.5)
+        if trend_score == 0:
+            # 趋势评分=0 意味着股票被强制排除（ST/利空/RSI超买等），
+            # 轻度折价而非直接拉到 0
+            total = round(intraday_score * 0.7)
+        else:
+            # 自适应权重：根据大盘涨跌幅动态调整
+            if market_change > 0.5:
+                trend_weight = 0.6   # 牛市：趋势分更可信
+            elif market_change < -0.5:
+                trend_weight = 0.4   # 熊市：日内分更敏感
+            else:
+                trend_weight = 0.5   # 震荡：均衡
+            total = round(intraday_score * (1 - trend_weight) + trend_score * trend_weight)
         total = min(100, max(0, total))
         # 融合后重新判定标签和方向
         if total >= strong_bull_threshold:
@@ -878,6 +897,7 @@ async def backtest_yesterday_predictions() -> Dict:
         # 2026-07-14：补充 bear 计数（保持与原硬编码 0 一致 — 暂未按 predict_dir 分桶，避免改动既有 bull_accuracy 语义）
         bear_correct = 0
         bear_total = 0
+        bear_misjudge = []
 
         for pred in predictions:
             symbol = pred['symbol']
@@ -975,24 +995,35 @@ async def backtest_yesterday_predictions() -> Dict:
         traceback.print_exc()
         return {'error': str(error)}
 def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict]:
-    """根据预测准确性调整各因子权重"""
+    """根据预测准确性调整各因子权重
+
+    修复：原代码 factor_accuracy = len(correct_samples) / len(recent) * 100 计算的是整体准确率，
+    每个因子都拿到相同的准确率值 → 权重调整完全无效（所有因子同步增减，相对关系不变）。
+    新版：计算每个因子的"区分度"——高因子值样本 vs 低因子值样本的准确率差异，
+    高因子值样本准确率更高 → 因子有预测力 → 增强权重；反之则减弱。
+    """
     adjustments = []
-    
+
     db_columns = {'outer_ratio', 'volume_ratio', 'turnover_rate', 'change_percent',
                   'weibi', 'avg_price_deviation', 'amplitude',
                   'position', 'main_capital_inflow', 'holder_structure'}
+    # rps/fundamental/smart_money 尚未持久化到 strategy_predict_records，跳过权重调整
 
     for factor_name in DEFAULT_WEIGHTS.keys():
         if factor_name not in db_columns:
             adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '非数据库因子'})
             continue
         # 统计该因子高分时预测的准确率
-        cursor.execute(
-            f'''SELECT predict_direction, actual_change, is_correct, {factor_name} as factor_val
+        try:
+            cursor.execute(
+                f'''SELECT predict_direction, actual_change, is_correct, {factor_name} as factor_val
                FROM strategy_predict_records
                WHERE verified = 1 AND predict_date >= date('now', '-30 days')
                ORDER BY predict_date DESC LIMIT {STRATEGY_BACKTEST_PREDICTION_LIMIT}'''
-        )
+            )
+        except Exception:
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '数据库列不存在'})
+            continue
         recent = cursor.fetchall()
 
         if len(recent) < 10:
@@ -1007,37 +1038,67 @@ def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict
             adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '无错误样本'})
             continue
 
-        # 因子准确率
-        factor_accuracy = len(correct_samples) / len(recent) * 100
+        # 修复：计算因子区分度——高因子值样本组 vs 低因子值样本组的准确率差异
+        # 1. 提取因子值（跳过 None/0 异常值）
+        factor_vals = [r['factor_val'] for r in recent if r['factor_val'] is not None and r['factor_val'] != 0]
+        if len(factor_vals) < 5:
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '因子值有效样本不足'})
+            continue
+
+        # 2. 按中位数分成高/低两组
+        median_val = sorted(factor_vals)[len(factor_vals) // 2]
+        high_group = [r for r in recent if r['factor_val'] is not None and r['factor_val'] > median_val]
+        low_group = [r for r in recent if r['factor_val'] is not None and r['factor_val'] <= median_val]
+
+        if not high_group or not low_group:
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '分组后样本为空'})
+            continue
+
+        # 3. 计算各组准确率
+        high_correct = sum(1 for r in high_group if r['is_correct'] == 1)
+        low_correct = sum(1 for r in low_group if r['is_correct'] == 1)
+        high_accuracy = high_correct / len(high_group) * 100
+        low_accuracy = low_correct / len(low_group) * 100
+
+        # 4. 区分度 = 高组准确率 - 低组准确率
+        # 正值：高因子值预测更准 → 因子有正向预测力 → 增强权重
+        # 负值：高因子值预测更差 → 因子有误导性 → 减弱权重
+        discrimination = high_accuracy - low_accuracy
+        factor_accuracy = (high_accuracy + low_accuracy) / 2  # 平均准确率（用于记录）
+
         current_weight = weights[factor_name]['weight']
         sample_count = len(recent)
         correct_count = len(correct_samples)
 
-        # 更新权重数据
+        # 更新权重元数据
         weights[factor_name]['accuracy'] = round(factor_accuracy, 2)
         weights[factor_name]['sample_count'] = sample_count
         weights[factor_name]['correct_count'] = correct_count
+        weights[factor_name]['discrimination'] = round(discrimination, 2)
 
-        # 权重调整逻辑：
-        # 准确率 > 60%: 增强权重（最高2.0）
-        # 准确率 < 40%: 减弱权重（最低0.3）
-        # 40%-60%: 保持不变
+        # 权重调整逻辑（基于区分度而非整体准确率）：
+        # 区分度 > 10%: 增强权重（最高2.0）
+        # 区分度 < -10%: 减弱权重（最低0.3）
+        # -10% ~ 10%: 保持不变
         old_weight = current_weight
-        if factor_accuracy > 60:
+        if discrimination > 10:
             new_weight = min(2.0, current_weight * 1.05)
             action = 'increase'
-            reason = f'准确率{factor_accuracy:.1f}%>60%，权重从{old_weight:.3f}提升到{new_weight:.3f}'
-        elif factor_accuracy < 40:
+            reason = f'区分度{discrimination:.1f}%(高组{high_accuracy:.0f}%>低组{low_accuracy:.0f}%)，权重{old_weight:.3f}→{new_weight:.3f}'
+        elif discrimination < -10:
             new_weight = max(0.3, current_weight * 0.95)
             action = 'decrease'
-            reason = f'准确率{factor_accuracy:.1f}%<40%，权重从{old_weight:.3f}降低到{new_weight:.3f}'
+            reason = f'区分度{discrimination:.1f}%(高组{high_accuracy:.0f}%<低组{low_accuracy:.0f}%)，权重{old_weight:.3f}→{new_weight:.3f}'
         else:
             new_weight = current_weight
             action = 'keep'
-            reason = f'准确率{factor_accuracy:.1f}%在40%-60%之间，权重保持{old_weight:.3f}'
+            reason = f'区分度{discrimination:.1f}%在±10%内，权重保持{old_weight:.3f}'
 
         weights[factor_name]['weight'] = round(new_weight, 4)
-        adjustments.append({'factor': factor_name, 'action': action, 'old_weight': round(old_weight, 4), 'new_weight': round(new_weight, 4), 'reason': reason})
+        adjustments.append({'factor': factor_name, 'action': action, 'old_weight': round(old_weight, 4),
+                            'new_weight': round(new_weight, 4), 'reason': reason,
+                            'discrimination': round(discrimination, 2),
+                            'high_accuracy': round(high_accuracy, 2), 'low_accuracy': round(low_accuracy, 2)})
 
     return adjustments
 

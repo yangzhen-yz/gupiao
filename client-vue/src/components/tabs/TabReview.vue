@@ -11,12 +11,18 @@
     </div>
 
     <div v-else>
+      <!-- 过期数据警告 -->
+      <div v-if="isStale && currentPage === 1" class="stale-warning">
+        <span class="stale-warning-icon">⚠</span>
+        <span class="stale-warning-text">今日收评尚未生成，当前展示的是 {{ reviews[0]?.date }} 的历史数据（非今日实时收盘）。顶部指数为实时行情，与下方收评数据可能不一致。</span>
+      </div>
       <div v-for="review in pagedReviews" :key="review.date" class="review-card" :class="{ latest: currentPage === 1 }">
         <!-- 头部日期 -->
         <div class="review-header">
           <div class="review-date-block">
             <span class="review-date">{{ review.date }}</span>
-            <span v-if="currentPage === 1" class="tag-bull">最新</span>
+            <span v-if="currentPage === 1 && !isStale" class="tag-bull">最新</span>
+            <span v-if="currentPage === 1 && isStale" class="tag-stale">待更新</span>
           </div>
           <div class="ai-badge" v-if="review.aiAnalysis">
             <span class="ai-dot"></span>
@@ -366,6 +372,14 @@ const pagedReviews = computed(() => {
   return reviews.value.slice(start, start + PAGE_SIZE)
 })
 
+// 过期检测：最新收评日期 ≠ 今日时，数据为历史快照（非今日收盘数据）
+const isStale = computed(() => {
+  if (!reviews.value.length) return false
+  const _d = new Date()
+  const todayStr = _d.getFullYear() + '-' + String(_d.getMonth() + 1).padStart(2, '0') + '-' + String(_d.getDate()).padStart(2, '0')
+  return reviews.value[0].date !== todayStr
+})
+
 const CACHE_KEY = 'review_enrich_cache'
 const CACHE_TTL = 10 * 60 * 1000
 
@@ -427,9 +441,12 @@ function applyEnrichData(review, data) {
 }
 
 function getTotalLimitUp(review) {
+  // 优先读真实总数字段；缺失时降级为数组长度（旧历史数据）
+  if (review && typeof review.limitUpCount === 'number') return review.limitUpCount
   return (review.limitUpStocks || []).length || 0
 }
 function getTotalLimitDown(review) {
+  if (review && typeof review.limitDownCount === 'number') return review.limitDownCount
   return (review.limitDownStocks || []).length || 0
 }
 function getLimitRatioSimple(review) {
@@ -605,6 +622,12 @@ onMounted(() => {
 .review-date-block { display: flex; align-items: center; gap: 8px; }
 .review-date { font-weight: 700; font-size: 1.1rem; color: var(--text-primary); font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .tag-bull { background: var(--accent-danger); color: white; padding: 2px 8px; border-radius: var(--radius-pill); font-size: 0.7rem; font-weight: 600; }
+.tag-stale { background: #f59e0b; color: white; padding: 2px 8px; border-radius: var(--radius-pill); font-size: 0.7rem; font-weight: 600; }
+
+/* 过期数据警告横幅 */
+.stale-warning { display: flex; align-items: flex-start; gap: 8px; padding: 10px 14px; margin-bottom: var(--spacing-md); background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: var(--radius-md); }
+.stale-warning-icon { color: #f59e0b; font-size: 1.1rem; flex-shrink: 0; line-height: 1.4; }
+.stale-warning-text { font-size: 0.8rem; color: #b45309; line-height: 1.5; }
 
 .ai-badge { display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(168, 85, 247, 0.1)); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 999px; font-size: 0.75rem; color: #6366f1; font-weight: 600; }
 .ai-dot { width: 6px; height: 6px; border-radius: 50%; background: #6366f1; animation: pulse 1.5s ease-in-out infinite; }

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import HTTPException
 from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS, EASTMONEY_HEADERS, HTTP_TIMEOUT
 from services.stock import calculate_ma, _sync_post
+from services.fundflow import _BROAD_CONCEPT_BLOCKLIST
 
 # 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 
@@ -210,15 +211,20 @@ async def _fetch_hot_sectors() -> Dict:
             r = requests.get(con_url, headers=_h, timeout=10)
             data = r.json()
             if data.get('data') and data['data'].get('diff'):
+                _con_rank = 0
                 for i, item in enumerate(data['data']['diff']):
+                    _name = item.get('f14', '')
+                    if _name in _BROAD_CONCEPT_BLOCKLIST:
+                        continue
+                    _con_rank += 1
                     con_list.append({
-                        'name': item.get('f14', ''),
+                        'name': _name,
                         'code': item.get('f12', ''),
                         'changePercent': item.get('f3', 0),
                         'mainNetInflow': item.get('f62', 0) or 0,
                         'riseCount': item.get('f104', 0) or 0,
                         'fallCount': item.get('f105', 0) or 0,
-                        'rank': i + 1,
+                        'rank': _con_rank,
                     })
         except Exception as e:
             print(f'[AI诊断] 概念板块请求失败: {e}')

@@ -27,7 +27,17 @@
   --accent-danger: #dc2626;      /* 红：A股"涨" */
   --accent-warning: #ea580c;     /* 橙：警告 orange-600 */
   --accent-info: #0284c7;        /* 青：信息 sky-600 */
-  
+
+  /* === 强调色衍生（淡色背景/边框，用于标签、提示框等） === */
+  --accent-danger-bg: rgba(220, 38, 38, 0.08);
+  --accent-danger-border: rgba(220, 38, 38, 0.22);
+  --accent-success-bg: rgba(22, 163, 74, 0.08);
+  --accent-success-border: rgba(22, 163, 74, 0.22);
+  --accent-warning-bg: rgba(234, 88, 12, 0.08);
+  --accent-warning-border: rgba(234, 88, 12, 0.22);
+  --accent-info-bg: rgba(2, 132, 199, 0.08);
+  --accent-info-border: rgba(2, 132, 199, 0.22);
+
   /* === 边框 === */
   --border-subtle: #e7e5e4;      /* stone-200 */
   --border-medium: #d6d3d1;      /* stone-300 */
@@ -3997,7 +4007,17 @@ body {
     --accent-danger: #f87171;    /* 亮红 */
     --accent-warning: #fb923c;   /* 亮橙 */
     --accent-info: #38bdf8;      /* 亮青 */
-    
+
+    /* 强调色淡色变体（深色模式加透明度） */
+    --accent-danger-bg: rgba(248, 113, 113, 0.12);
+    --accent-danger-border: rgba(248, 113, 113, 0.3);
+    --accent-success-bg: rgba(74, 222, 128, 0.12);
+    --accent-success-border: rgba(74, 222, 128, 0.3);
+    --accent-warning-bg: rgba(251, 146, 60, 0.12);
+    --accent-warning-border: rgba(251, 146, 60, 0.3);
+    --accent-info-bg: rgba(56, 189, 248, 0.12);
+    --accent-info-border: rgba(56, 189, 248, 0.3);
+
     /* 边框 */
     --border-subtle: #292524;
     --border-medium: #44403c;

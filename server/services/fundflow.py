@@ -37,6 +37,42 @@ _FS_ALL_A = 'm:1+t:2,m:0+t:6'
 _FS_INDUSTRY = 'm:90+t:2+f:!50'
 _FS_CONCEPT = 'm:90+t:3+f:!50'
 
+# 概念板块黑名单：东方财富 m:90+t:3 返回的概念板块中混入了大量"风格类 / 通道类 / 筛选类"
+# 宽泛概念（如融资融券、深股通、昨日高振幅等），这些概念因涵盖个股多、主力净流入天然偏大，
+# 会把真正的题材概念（如商业航天、机器人、MLCC）挤出排名。以下集合用于过滤这些宽泛概念。
+_BROAD_CONCEPT_BLOCKLIST = frozenset({
+    # 通道/机制类
+    '融资融券', '沪股通', '深股通', '沪港通', '深港通', '转融券', '标普道琼斯A股', 'MSCI中国',
+    '富时罗素', '标准普尔', 'GDR', '科创板做市商',
+    # 风格/规模类
+    '大盘股', '中盘股', '小盘股', '大盘价值', '大盘成长', '中盘价值', '中盘成长', '小盘价值', '小盘成长',
+    '价值股', '成长股', '蓝筹股', '红利股', '低价股', '高价股', '中价股', '破净股', '高股息股',
+    '科技风格', '消费风格', '金融地产风格', '趋势股',
+    # 持仓/筹码统计类
+    '基金重仓', '机构重仓', 'QFII重仓', '券商金股', '股权分散', '东方财富热股',
+    # 筛选/统计类
+    '昨日涨停', '昨日连板', '昨日高振幅', '昨日强势', '昨日弱势', '昨日大幅回落',
+    '今日涨停', '今日连板', '今日强势', '今日弱势',
+    '连续涨停', '连续跌停', '涨停板', '跌停板',
+    '强势股', '弱势股', '活跃股', '换手率', '量比', '委比',
+    '高换手', '低换手', '放量大涨', '缩量下跌',
+    # 价格/估值筛选类
+    '百元股', '千元股', '低市净率', '高市净率', '低市盈率', '高市盈率',
+    '近期新高', '百日新高', '历史新高', '近期新低', '破增发价股', '破发股',
+    '长期破净', '红利破净股',
+    # 指数成分类
+    '上证50', '沪深300', '中证500', '中证1000', '中证2000', '创业板50', '科创50', '北证50',
+    '上证180', '上证380', '深证100', '深证300', '深成500', 'HS300_', '深证100R',
+    '创业板综', '创业成份', '茅指数', '宁组合',
+    # 业绩/财务类
+    '预盈预增', '预亏预减', '高送转', '高派息', '高分红', '业绩预升', '业绩预降',
+    '2026中报预增', '2026一季报预增', '2025年报预增', '中报预增', '年报预增', '一季报预增',
+    '摘帽', 'ST板块', '退市',
+    # 其他宽泛
+    '全部A股', '沪市A股', '深市A股', '科创板', '创业板', '主板', '北交所',
+    '注册制', '核准制', 'IPO',
+})
+
 
 def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> List[Dict]:
     """东方财富 clist 同步请求，返回 diff 列表（失败抛异常由上层 catch）。
@@ -124,25 +160,36 @@ async def get_stock_fund_flow_rankings(top_n: int = FUND_FLOW_STOCK_TOP_N) -> Di
 
 
 async def get_sector_fund_flow_rankings(top_n: int = FUND_FLOW_SECTOR_TOP_N) -> Dict:
-    """板块（行业 / 概念）净流入 / 净流出排名。"""
+    """板块（行业 / 概念）净流入 / 净流出排名。
+
+    概念板块会过滤掉风格类/通道类宽泛概念（黑名单见 _BROAD_CONCEPT_BLOCKLIST），
+    只保留商业航天、机器人、MLCC 等真正的题材概念。
+    """
+    _concept_fetch = top_n * 2  # 多拉取，过滤后截断到 top_n
+
     def _sync():
         ind_in = _clist('f62', 1, _FS_INDUSTRY, 'f12,f14,f3,f62,f104,f105', top_n)
         time.sleep(0.2)
         ind_out = _clist('f62', 0, _FS_INDUSTRY, 'f12,f14,f3,f62,f104,f105', top_n)
         time.sleep(0.2)
-        con_in = _clist('f62', 1, _FS_CONCEPT, 'f12,f14,f3,f62,f104,f105', top_n)
+        con_in = _clist('f62', 1, _FS_CONCEPT, 'f12,f14,f3,f62,f104,f105', _concept_fetch)
         time.sleep(0.2)
-        con_out = _clist('f62', 0, _FS_CONCEPT, 'f12,f14,f3,f62,f104,f105', top_n)
+        con_out = _clist('f62', 0, _FS_CONCEPT, 'f12,f14,f3,f62,f104,f105', _concept_fetch)
         return ind_in or [], ind_out or [], con_in or [], con_out or []
     ind_in, ind_out, con_in, con_out = await asyncio.to_thread(_sync)
+
+    # 过滤宽泛概念，只保留题材概念
+    con_in_f = [x for x in con_in if (x.get('f14') or '') not in _BROAD_CONCEPT_BLOCKLIST]
+    con_out_f = [x for x in con_out if (x.get('f14') or '') not in _BROAD_CONCEPT_BLOCKLIST]
+
     return {
         'industry': {
             'inflow': [_normalize_sector(x, i + 1) for i, x in enumerate(ind_in)],
             'outflow': [_normalize_sector(x, i + 1) for i, x in enumerate(ind_out)],
         },
         'concept': {
-            'inflow': [_normalize_sector(x, i + 1) for i, x in enumerate(con_in)],
-            'outflow': [_normalize_sector(x, i + 1) for i, x in enumerate(con_out)],
+            'inflow': [_normalize_sector(x, i + 1) for i, x in enumerate(con_in_f[:top_n])],
+            'outflow': [_normalize_sector(x, i + 1) for i, x in enumerate(con_out_f[:top_n])],
         },
     }
 

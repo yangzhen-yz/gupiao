@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os, sys, time, asyncio, threading
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from . import config as _cfg
 import importlib
@@ -22,7 +22,7 @@ _CONFIG_SAME_NAMES = [
     'TENCENT_QUOTE_API', 'TENCENT_KLINE_API', 'EASTMONEY_HOT_LIST_API',
     'AI_CONFIG_FILE',
     'HTTP_TIMEOUT', 'HTTP_CONNECT_TIMEOUT', 'HTTP_MAX_CONNECTIONS', 'HTTP_KEEPALIVE_CONNECTIONS',
-    'HOT_SEARCH_TOP_N', 
+    'HOT_SEARCH_TOP_N', 'POPULARITY_RANK_TOP_N', 'CHANGE_RANK_TOP_N', 'TURNOVER_RANK_TOP_N',
     'SCAN_CONCURRENCY', 'SCAN_KLINE_TIMEOUT', 'SCAN_CACHE_TTL',
     'TREND_MIN_SCORE', 'TREND_MIN_KLINE_DAYS', 'TREND_LIMIT_UP_THRESHOLD',
     'TREND_LIMIT_UP_120_MIN', 'TREND_LIMIT_UP_250_MIN', 'TREND_MAX_DRAWDOWN',
@@ -89,10 +89,11 @@ def _reload_config():
 
 
 
-from db.database import init_db, save_hot_search_ranking, load_trend_scan_results
+from db.database import init_db, save_hot_search_ranking, load_trend_scan_results, load_daily_market_reviews
 from services.stock import fetch_eastmoney_hot_list
 from services.trend import scan_trend_task
 from services.ai import load_ai_config
+from services.trading_calendar import is_trading_day
 
 _last_scan_result = None
 _last_scan_date = ''
@@ -128,6 +129,63 @@ async def lifespan(app: FastAPI):
                 asyncio.create_task(scan_trend_task(force=True))
     except Exception as error:
         print(f'[初始化] 预加载趋势数据失败: {str(error)}')
+    # 启动时收评补生成：交易日 15:10 后若今日收评缺失，后台自动补生成
+    try:
+        _now = datetime.now()
+        _today_str = _now.strftime('%Y-%m-%d')
+        if is_trading_day(_today_str) and _now.strftime('%H:%M') >= '15:10':
+            _existing_reviews = load_daily_market_reviews()
+            _has_today_review = any(r.get('date') == _today_str for r in (_existing_reviews or [])[:3])
+            if not _has_today_review:
+                print(f'[初始化] 今日({_today_str})收评缺失，后台补生成中...')
+                from services.review import generate_daily_review
+                from db.database import save_daily_market_reviews
+                async def _startup_review():
+                    try:
+                        _review = await generate_daily_review()
+                        save_daily_market_reviews([_review])
+                        print(f'[初始化] 收评补生成完成，情绪分={_review.get("aiAnalysis",{}).get("sentimentScore","N/A")}')
+                    except Exception as _e:
+                        print(f'[初始化] 收评补生成失败: {_e}')
+                asyncio.create_task(_startup_review())
+    except Exception as error:
+        print(f'[初始化] 收评补生成检查失败: {str(error)}')
+    # 启动时回测补执行：交易日 15:20 后若最近交易日回测报告缺失，后台自动补跑
+    try:
+        _now = datetime.now()
+        if is_trading_day(_now.date()) and _now.strftime('%H:%M') >= _cfg.SCHEDULE_BACKTEST_TIME:
+            # 计算最近一个交易日（与 backtest_yesterday_predictions 的逻辑一致）
+            _today = _now.date()
+            if _today.weekday() == 0:      # 周一 → 上周五
+                _latest_td = _today - timedelta(days=3)
+            elif _today.weekday() == 6:    # 周日 → 上周五
+                _latest_td = _today - timedelta(days=2)
+            elif _today.weekday() == 5:    # 周六 → 上周五
+                _latest_td = _today - timedelta(days=1)
+            else:
+                _latest_td = _today - timedelta(days=1)
+            _latest_str = _latest_td.isoformat()
+            from db.database import get_db_conn
+            _conn = get_db_conn()
+            _row = _conn.execute(
+                'SELECT id FROM strategy_backtest_reports WHERE backtest_date = ?', (_latest_str,)
+            ).fetchone()
+            _conn.close()
+            if not _row:
+                print(f'[初始化] 最近交易日({_latest_str})回测报告缺失，后台补跑中...')
+                from services.strategy import backtest_yesterday_predictions
+                async def _startup_backtest():
+                    try:
+                        _r = await backtest_yesterday_predictions()
+                        if 'error' in _r:
+                            print(f'[初始化] 回测补跑失败: {_r["error"]}')
+                        else:
+                            print(f'[初始化] 回测补跑完成: 准确率{_r.get("accuracy", 0)}%')
+                    except Exception as _e:
+                        print(f'[初始化] 回测补跑失败: {_e}')
+                asyncio.create_task(_startup_backtest())
+    except Exception as error:
+        print(f'[初始化] 回测补跑检查失败: {str(error)}')
     # -fix: 全局改用 requests + asyncio.to_thread，不再需要 httpx 连接池
     scheduler_thread = threading.Thread(target=lambda: _lazy_start_scheduler(), daemon=True)
     scheduler_thread.start()
