@@ -78,7 +78,8 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
     """东方财富 clist 同步请求，返回 diff 列表（失败抛异常由上层 catch）。
 
     fltt=2：价格/涨跌幅已为真实数值（f3 直接是百分比，无需 /100）。
-    东方财富接口偶发返回空 body / 非 JSON（限流或 gzip 异常），此处重试 2 次提高健壮性。
+    东方财富接口偶发返回空 body / 非 JSON（限流或 gzip 异常），此处重试 3 次提高健壮性；
+    最后一次失败会在日志里打印 fid/fs 便于定位。
     """
     params = {
         'pn': pn, 'pz': pz, 'po': po, 'np': 1, 'fltt': 2, 'invt': 2,
@@ -86,9 +87,10 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
         'ut': 'b2884a393a59ad64002292a3e90d46a5',
     }
     last_err = None
-    for attempt in range(3):
+    retries = 3
+    for attempt in range(retries):
         try:
-            r = requests.get(_EASTMONEY_CLIST, params=params, headers=EASTMONEY_HEADERS, timeout=10)
+            r = requests.get(_EASTMONEY_CLIST, params=params, headers=EASTMONEY_HEADERS, timeout=12)
             r.raise_for_status()
             text = r.text.strip()
             if not text:
@@ -104,9 +106,10 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
             return (data.get('data') or {}).get('diff') or []
         except Exception as e:
             last_err = e
-            if attempt < 2:
+            if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
-    # 全部重试失败，抛出供上层捕获
+    # 全部重试失败：打印 fid/fs 便于排查，再抛出上层
+    print(f'[资金流向] clist 全部{retries}次重试失败 fid={fid!r} fs={fs!r} err={last_err}')
     raise last_err if last_err else RuntimeError('clist unknown error')
 
 

@@ -55,7 +55,7 @@ gupiao/
 │   │   ├── strategy.py          # 10 因子 AI 选股评分（calc_stock_score_v2）+ 行业中性化
 │   │   ├── recommend.py         # 智能推荐
 │   │   ├── market.py            # 大盘/板块数据
-│   │   ├── review.py            # 每日收评生成
+│   │   ├── review.py            # 每日收评生成（含 AI 智能分析：情绪评分/操作建议/明日展望/风险提示/亮点摘要）
 │   │   ├── ai.py                # AI 诊断（字节方舟/豆包）
 │   │   ├── pattern.py           # 量价 6 形态分类（±4% 乘性修正）
 │   │   ├── trend_backtest.py    # 趋势评分回测验证（1/3/5 日跑赢大盘胜率）
@@ -394,6 +394,10 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | **15:30** | **趋势评分回测验证** | `trend_backtest_records` / `trend_backtest_reports` 表（1/3/5 日跑赢大盘胜率） |
 | **18:00** | **更新股东人数筹码面数据** | `stock_holder_num` 表（全市场最新一期股东户数/户均持股，月度披露每日刷新） |
 
+> **交易日判断（2026-08-03 加固）**：以上所有盘中定时任务（热搜榜/趋势扫描/智能推荐/MA10 检查/每日收评/回测/趋势回测/大盘预警）均在 scheduler 入口通过 `services.trading_calendar.is_trading_day(today)` 过滤，**非交易日（周末/法定节假日）直接跳过不执行**，避免用拉取到的 0 条空数据覆盖前一交易日的真数据（典型场景：周六 15:10 生成的空收评会把周五收盘时的真实收评顶掉）。股东人数/基本面/估值/聪明钱这 4 个"上一交易日数据也有价值"的任务不会被该判断拦截，周末也可补拉。
+>
+> **调度稳健性（2026-08-03 加固）**：`run_scheduler()` 主循环包 try-except，单个 job 抛错（比如东方财富 503、某段逻辑 RuntimeError）不会把整个调度线程带崩，当日后续任务照常执行；每处任务日志均带精确时间戳 + 异常堆栈前 400~500 字符，排查失败时一眼可见根因（东方财富限流/DB 锁/空 body 等）。
+>
 > 趋势扫描时点可通过 `config.py` 的 `SCHEDULE_TREND_SCAN_START` / `SCHEDULE_TREND_SCAN_END` / `SCHEDULE_TREND_SCAN_INTERVAL_MIN` 调整，修改后热加载即生效。
 
 > 智能推荐生成时间可通过 `config.py` 的 `SCHEDULE_RECOMMENDATION_TIMES` 调整（默认 `['09:45', '13:30']`）。
@@ -742,6 +746,8 @@ const r = getRating(stock.score)   // { label, short, color }
 
 | 日期 | 模块 | 变更 |
 |------|------|------|
+| 2026-08-03 | 每日收评 | **4 大关键修复：收评不自动生成/AI 三栏空/涨停跌停误显示 20**：① 调度层 `scheduler.py`：所有盘中任务（收评 15:10/推荐 09:45,13:30/趋势扫描/大盘预警/回测等）加入 `is_trading_day` 交易日判断，非交易日直接跳过（避免周六 15:10 空收评把周五真收评顶掉）；主循环包 try-except，单个 job 异常不中断调度线程；日志统一加时间戳 + 堆栈。② 数据层 `database.py`：`daily_market_reviews` 新增 `ai_analysis_json TEXT`（保存情绪评分/操作建议/明日展望/风险提示/亮点摘要 6 项 AI 智能分析结论，之前入库漏存导致前端 AI 三栏全空），同时新增 `limit_up_count / limit_down_count INTEGER`（保存真实涨停/跌停总数）。③ 收评生成 `review.py`：生成时同步写入 `limitUpCount / limitDownCount` 两个整数，数组只截前 20 只用于前端详情列表（之前只截数组，导致前端 KPI 卡显示成 20）。④ 前端 `TabReview.vue`：`getTotalLimitUp/Down` 优先读 `limitUpCount / limitDownCount` 两个真实总数字段，缺失时才退化为数组长度（兼容老数据）。修复后今日收评显示真实"涨停 66 / 跌停 100"，情绪评分环 + AI 三栏可正常展示。 |
+| 2026-08-03 | 数据服务 | **东方财富 clist 接口 503/429/空 body 全面加固**：① 新增 `services/review.py::_em_clist_get()` 统一封装（与 fundflow._clist 同源）：3 次重试 + 指数退避 + `raise_for_status` + `rc` 校验 + 空 body 处理，**全部失败时返回 [] 绝不向上抛**，收评里原 8 处硬编码长 URL（行业/概念板块、涨跌停、涨幅/跌幅榜、主力 TOP20）全部改为参数化调用，消除重复与漏 try 的隐患。② `services/fundflow.py::_clist`：超时 10s→12s；最后一次重试失败打印 `fid` + `fs`（之前只看到"板块排名失败:503"，不知道是哪个端点失败）。③ 上层调用均为独立 try 互不拖垮：收评的某一列表失败、资金流向的"板块排名/非热点上涨股"失败只会对应列表空，不会让整个收评/资金流 Tab 挂掉。Live 验证：2026-08-03 周一 fundflow 个股 50×2/板块 30×2/非热点 50 全部正常返回，收评涨停 100/跌停 30。 |
 | 2026-08-03 | 热搜榜 | **3 类榜单合并替代旧 f127 热度榜**：发现旧 `fid=f127` 并非东方财富APP真实人气榜（前10名零重叠），改用真实人气榜API `emappdata.eastmoney.com/stockrank/getAllCurrentList`（httpx POST，requests 被拒连）；热搜榜股票池由 3 类合并去重：① 真实人气榜前100（API上限100，含全市场，本地筛选沪深主板）→ ② 涨幅榜(fid=f3)前100 → ③ 成交额榜(fid=f6)前400；人气榜独有股票通过 push2 `ulist.np` 批量行情API补充名称/行情；`config.py` 新增 `POPULARITY_RANK_TOP_N`/`CHANGE_RANK_TOP_N`/`TURNOVER_RANK_TOP_N` 替代旧 `HOT_RANK_TOP_N`；合并后约470只沪深主板 |
 | 2026-07-18 | 聪明钱 | **交易日后自动拉取龙虎榜+北向数据**：`core/scheduler.py` 新增 17:30 定时任务（仅交易日执行），调用 `services/smartmoney.refresh_smart_money_task()` 强制跳过缓存拉取最新龙虎榜与北向资金，前端策略页无需手动刷新即可展示当日数据；`app/config.py` 新增 `SMART_MONEY_UPDATE_TIME` 配置 |
 | 2026-07-18 | 趋势发现 | **市场温度计分页优化**：`TabTrend.vue` 市场温度计默认每页展示近 21 个交易日（约一个月），超出部分翻页；前端请求 `history-counts?days=90` 保留更多历史，表格与迷你柱状图均按当前页 21 条渲染；新增翻页控件，柱状图高度基于当前页最大值动态缩放 |

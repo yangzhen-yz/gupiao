@@ -1,5 +1,5 @@
 """review.py - split from main.py"""
-import json, asyncio, requests as _requests
+import json, asyncio, time, requests as _requests
 from typing import List, Dict
 from datetime import date, datetime, timedelta
 from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOP_SECTORS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, INDEX_SYMBOLS, TENCENT_QUOTE_API, MARKET_CRASH_THRESHOLD, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, EASTMONEY_HEADERS
@@ -7,6 +7,44 @@ from app.config import STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT
 from db.database import get_db_conn, save_daily_market_reviews, load_daily_recommendations, load_trend_scan_results
 from services.stock import fetch_stock_data
 from services.fundflow import _BROAD_CONCEPT_BLOCKLIST
+
+_EASTMONEY_CLIST_BASE = 'https://push2delay.eastmoney.com/api/qt/clist/get'
+_EM_UT = 'b2884a393a59ad64002292a3e90d46a5'
+
+
+def _em_clist_get(fid: str, fs: str, fields: str, pz: int, po: int = 1, pn: int = 1, retries: int = 3, timeout: float = 12.0) -> List[Dict]:
+    """统一东方财富 clist 请求封装（与 fundflow._clist 一致）。
+    - 3 次重试 + 指数退避；
+    - raise_for_status（503/429 走重试）；
+    - 空 body / rc!=0 / JSONDecodeError 统一走重试；
+    - 所有重试失败：返回 []（绝不抛异常，上层业务 100% 降级）。
+    """
+    params = {
+        'pn': pn, 'pz': pz, 'po': po, 'np': 1, 'fltt': 2, 'invt': 2,
+        'fid': fid, 'fs': fs, 'fields': fields, 'ut': _EM_UT,
+    }
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = _requests.get(_EASTMONEY_CLIST_BASE, params=params, headers=EASTMONEY_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            text = r.text.strip() if r.text else ''
+            if not text:
+                last_err = ValueError('empty response')
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            data = r.json()
+            if data.get('rc') not in (0, None):
+                last_err = ValueError(f"rc={data.get('rc')}")
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return (data.get('data') or {}).get('diff') or []
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+    print(f'[收评] clist 全部{retries}次重试失败 fid={fid!r} fs={fs!r} err={last_err}')
+    return []
 
 async def generate_daily_review() -> Dict:
     try:
@@ -49,28 +87,43 @@ async def generate_daily_review() -> Dict:
         industry_sectors = []
         concept_sectors = []
         def _sync_fetch_sectors():
-            _h = {**EASTMONEY_HEADERS}
             ind_list, con_list = [], []
             try:
-                ind_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50'
-                r = _requests.get(ind_url, headers=_h, timeout=12)
-                ind_json = r.json()
-                if ind_json.get('data') and ind_json['data'].get('diff'):
-                    for item in ind_json['data']['diff']:
-                        ind_list.append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'mainNetInflow': item.get('f62', 0), 'volume': item.get('f5', 0), 'amount': item.get('f6', 0), 'riseCount': item.get('f104', 0), 'fallCount': item.get('f105', 0)})
+                # 行业板块 fid=f3（涨跌幅降序）；f:!50 排除 B 股干扰
+                diff = _em_clist_get(fid='f3', po=1, pz=50, fs='m:90+t:2+f:!50',
+                                     fields='f12,f14,f3,f6,f5,f62,f104,f105')
+                for item in diff:
+                    ind_list.append({
+                        'name': item.get('f14', ''),
+                        'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0),
+                        'mainNetInflow': item.get('f62', 0),
+                        'volume': item.get('f5', 0),
+                        'amount': item.get('f6', 0),
+                        'riseCount': item.get('f104', 0),
+                        'fallCount': item.get('f105', 0),
+                    })
             except Exception as e:
                 print(f'[收评] 行业板块请求失败: {e}')
             try:
-                con_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=50&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50'
-                r = _requests.get(con_url, headers=_h, timeout=12)
-                con_json = r.json()
-                if con_json.get('data') and con_json['data'].get('diff'):
-                    _blocklist = _BROAD_CONCEPT_BLOCKLIST
-                    for item in con_json['data']['diff']:
-                        _name = item.get('f14', '')
-                        if _name in _blocklist:
-                            continue
-                        con_list.append({'name': _name, 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'mainNetInflow': item.get('f62', 0), 'volume': item.get('f5', 0), 'amount': item.get('f6', 0), 'riseCount': item.get('f104', 0), 'fallCount': item.get('f105', 0)})
+                # 概念板块 fid=f3（涨跌幅降序）；过滤宽泛概念黑名单
+                diff = _em_clist_get(fid='f3', po=1, pz=50, fs='m:90+t:3+f:!50',
+                                     fields='f12,f14,f3,f6,f5,f62,f104,f105')
+                _blocklist = _BROAD_CONCEPT_BLOCKLIST
+                for item in diff:
+                    _name = item.get('f14', '')
+                    if _name in _blocklist:
+                        continue
+                    con_list.append({
+                        'name': _name,
+                        'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0),
+                        'mainNetInflow': item.get('f62', 0),
+                        'volume': item.get('f5', 0),
+                        'amount': item.get('f6', 0),
+                        'riseCount': item.get('f104', 0),
+                        'fallCount': item.get('f105', 0),
+                    })
             except Exception as e:
                 print(f'[收评] 概念板块请求失败: {e}')
             return ind_list, con_list
@@ -87,60 +140,70 @@ async def generate_daily_review() -> Dict:
         top_losers = []
         top_funds = []  # 全市场主力净流入前20
         def _sync_fetch_stocks():
-            _h = {**EASTMONEY_HEADERS}
             result = {'limit_up': [], 'limit_down': [], 'gainers': [], 'losers': [], 'top_funds': []}
-            # 涨停股
+            _fs_all_a = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
+            # 涨停股（f3 >= 10%/20% 由 TREND_LIMIT_UP_THRESHOLD 统一阈值）
             try:
-                zt_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
-                r = _requests.get(zt_url, headers=_h, timeout=12)
-                data = r.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        pct = item.get('f3', 0)
-                        if pct is not None and pct >= TREND_LIMIT_UP_THRESHOLD:
-                            result['limit_up'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': pct, 'price': item.get('f2', 0), 'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0)})
+                diff = _em_clist_get(fid='f3', po=1, pz=200, fs=_fs_all_a,
+                                     fields='f2,f3,f8,f12,f14,f62')
+                for item in diff:
+                    pct = item.get('f3', 0)
+                    if pct is not None and pct >= TREND_LIMIT_UP_THRESHOLD:
+                        result['limit_up'].append({
+                            'name': item.get('f14', ''), 'code': item.get('f12', ''),
+                            'changePercent': pct, 'price': item.get('f2', 0),
+                            'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
+                        })
             except Exception as e:
                 print(f'[收评] 涨停股请求失败: {e}')
             # 跌停股
             try:
-                dt_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=200&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
-                r = _requests.get(dt_url, headers=_h, timeout=12)
-                data = r.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        pct = item.get('f3', 0)
-                        if pct is not None and pct <= TREND_LIMIT_DOWN_THRESHOLD:
-                            result['limit_down'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': pct, 'price': item.get('f2', 0), 'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0)})
+                diff = _em_clist_get(fid='f3', po=0, pz=200, fs=_fs_all_a,
+                                     fields='f2,f3,f8,f12,f14,f62')
+                for item in diff:
+                    pct = item.get('f3', 0)
+                    if pct is not None and pct <= TREND_LIMIT_DOWN_THRESHOLD:
+                        result['limit_down'].append({
+                            'name': item.get('f14', ''), 'code': item.get('f12', ''),
+                            'changePercent': pct, 'price': item.get('f2', 0),
+                            'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
+                        })
             except Exception as e:
                 print(f'[收评] 跌停股请求失败: {e}')
             # 涨幅前20
             try:
-                gain_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f7,f8,f12,f14,f62'
-                r = _requests.get(gain_url, headers=_h, timeout=12)
-                data = r.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        result['gainers'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'price': item.get('f2', 0), 'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0)})
+                diff = _em_clist_get(fid='f3', po=1, pz=20, fs=_fs_all_a,
+                                     fields='f2,f3,f7,f8,f12,f14,f62')
+                for item in diff:
+                    result['gainers'].append({
+                        'name': item.get('f14', ''), 'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
+                        'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                    })
             except Exception as e:
                 print(f'[收评] 涨幅榜请求失败: {e}')
             # 跌幅前20
             try:
-                lose_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f3&po=0&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f7,f8,f12,f14,f62'
-                r = _requests.get(lose_url, headers=_h, timeout=12)
-                data = r.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        result['losers'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'price': item.get('f2', 0), 'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0)})
+                diff = _em_clist_get(fid='f3', po=0, pz=20, fs=_fs_all_a,
+                                     fields='f2,f3,f7,f8,f12,f14,f62')
+                for item in diff:
+                    result['losers'].append({
+                        'name': item.get('f14', ''), 'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
+                        'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                    })
             except Exception as e:
                 print(f'[收评] 跌幅榜请求失败: {e}')
             # 主力净流入全市场前20（按f62排序，与涨幅榜完全独立）
             try:
-                funds_url = 'https://push2delay.eastmoney.com/api/qt/clist/get?fid=f62&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f7,f8,f12,f14,f62'
-                r = _requests.get(funds_url, headers=_h, timeout=12)
-                data = r.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        result['top_funds'].append({'name': item.get('f14', ''), 'code': item.get('f12', ''), 'changePercent': item.get('f3', 0), 'price': item.get('f2', 0), 'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0)})
+                diff = _em_clist_get(fid='f62', po=1, pz=20, fs=_fs_all_a,
+                                     fields='f2,f3,f7,f8,f12,f14,f62')
+                for item in diff:
+                    result['top_funds'].append({
+                        'name': item.get('f14', ''), 'code': item.get('f12', ''),
+                        'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
+                        'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                    })
             except Exception as e:
                 print(f'[收评] 主力资金榜请求失败: {e}')
             return result
