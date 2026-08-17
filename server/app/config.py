@@ -61,7 +61,7 @@ TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌�
 # ========== 趋势发现配置（中短线波段评分，满分 100 分） ==========
 # 关注周期：未来 ~1 个月
 # 评分结构：4 维度基础分（100 分）+ 扣分项 + 加分项(缩放0~5) + 强制排除
-TREND_MIN_SCORE = 60  # 趋势发现进入趋势池的最低分
+TREND_MIN_SCORE = 65  # 趋势发现进入趋势池的最低分
 TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分
 TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
 TREND_AUTO_ADD_POOL_THRESHOLD = 80  # 趋势评分 ≥ 此值时自动加入用户股票池（0 表示关闭）
@@ -248,6 +248,35 @@ TREND_RSI_OVERBOUGHT_DEDUCT = 8       # 严重超买扣分值
 TREND_CONSECUTIVE_BOARD_EXHAUSTION = 5  # 连板数 ≥ 此值 → 透支风险扣分
 TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT = 10  # 连板透支扣分值
 
+# ========== 早期信号层（第5维度，2026-08-17 新增）==========
+# 在 D1-D4 基础评分上叠加"早期信号加成层"，识别趋势形成前的转折信号，降低均线系统滞后性。
+# 仅对边界股（base_score ∈ [40, 92]）运行，RSI≥88 跳过，命中数×3 封顶 +10。
+TREND_EARLY_SIGNAL_ENABLED = True
+TREND_EARLY_SIGNAL_PER_HIT_SCORE = 3
+TREND_EARLY_SIGNAL_MAX_BONUS = 10
+TREND_EARLY_SIGNAL_POSITION_GATE = 70       # 分位 > 此值时大部分信号失效（高位无早期信号价值）
+TREND_EARLY_SIGNAL_BASE_SCORE_MIN = 40      # base_score 下界（低于此分说明趋势太弱，早期信号无意义）
+TREND_EARLY_SIGNAL_BASE_SCORE_MAX = 92      # base_score 上界（高于此分已确认强势，无需早期信号加成）
+
+# 检测器1: NR7 / Inside Bar 缩量变盘
+TREND_EARLY_SIGNAL_NR7_PERIOD = 7           # NR7 比较周期（当前 N 日区间 vs 近 30 日最小）
+TREND_EARLY_SIGNAL_NR7_RANGE_RATIO = 1.0    # 当前区间 ≤ 历史最小 × 此比例 → 命中 NR7
+
+# 检测器2: VCP 波动率收缩（Minervini SEPA 体系）
+TREND_EARLY_SIGNAL_VCP_MIN_CONTRACTIONS = 2  # 最少收缩次数（振幅严格递减）
+TREND_EARLY_SIGNAL_VCP_VOL_DECAY = 0.3       # 量能衰减容忍度（最后一次 ≤ 第一次 × (1+此值)）
+
+# 检测器3: RSI 底背离
+TREND_EARLY_SIGNAL_RSI_BOTTOM_LOOKBACK = 60  # 回看周期（找两个价格低点）
+TREND_EARLY_SIGNAL_RSI_BOTTOM_PERIOD = 14    # RSI 计算周期
+
+# 检测器4: 底部首板
+TREND_EARLY_SIGNAL_FIRST_LIMIT_UP_POSITION_MAX = 50  # 分位 ≤ 此值才算"底部"
+TREND_EARLY_SIGNAL_FIRST_LIMIT_UP_LOOKBACK = 60      # 回看周期（此期间无其他涨停才算"首板"）
+
+# 检测器5: 缩量整理后首放
+TREND_EARLY_SIGNAL_CONSOLIDATION_BREAKOUT_VOL_RATIO = 1.8  # 当日量 ≥ 20日均量 × 此比例 → 倍量确认
+
 # 公告/利空数据源（东方财富公告接口）
 EASTMONEY_ANN_API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
 TREND_ANNOUNCEMENT_LOOKBACK_DAYS = 20  # 公告回看天数
@@ -298,6 +327,46 @@ RISK_CONTROL_STOP_LOSS_VOL_MULT = 1.5  # 止损幅度 = 当日振幅 × 此系�
 # 风险等级阈值（基于综合评分 + 估值/聪明钱/筹码信号综合判定）
 RISK_CONTROL_SCORE_HIGH_RISK = 55   # 评分 < 此值 → 高风险
 RISK_CONTROL_SCORE_MID_RISK = 65    # 评分 < 此值 → 中风险，否则低风险
+
+# ========== 买卖点位置+龙头感知修正（V4.2，2026-08-17）==========
+# 在 V4.1 振幅动态调整基础上，叠加位置高低/龙头跟风/评分置信度三维修正。
+# 止盈倍率 = 位置倍率 × 龙头倍率 × 评分倍率，封顶 BUY_SELL_MAX_TARGET_PCT。
+# 位置信息优先取 trend_details.positionPct（精确年度分位），fallback 用 base_scores['position']（5/10/15 粗估）。
+
+# 位置分位门限（年度分位 0-100）
+BUY_SELL_POSITION_LOW_GATE = 30         # ≤ 此值 = 低位（预期空间大）
+BUY_SELL_POSITION_MIDLOW_GATE = 50      # ≤ 此值 = 中低位
+BUY_SELL_POSITION_HIGH_GATE = 70        # ≥ 此值 = 高位（预期空间收窄）
+
+# 位置止盈倍率
+BUY_SELL_TARGET_POSITION_LOW_MULT = 1.4     # 低位：预期空间放大 40%
+BUY_SELL_TARGET_POSITION_MIDLOW_MULT = 1.2  # 中低位：放大 20%
+BUY_SELL_TARGET_POSITION_HIGH_MULT = 0.7    # 高位：收缩 30%
+
+# 龙头/跟风止盈倍率
+BUY_SELL_TARGET_LEADER_MULT = 1.3           # 龙头：预期上限放大 30%
+BUY_SELL_TARGET_FOLLOWER_MULT = 0.9         # 跟风：收缩 10%
+
+# 评分置信度止盈倍率
+BUY_SELL_TARGET_SCORE_HIGH_MULT = 1.1       # 评分≥80：放大 10%
+BUY_SELL_TARGET_SCORE_LOW_MULT = 0.8        # 评分<55：收缩 20%
+
+# 龙头判定条件
+BUY_SELL_LEADER_CONSECUTIVE_BOARDS = 2      # 连板≥此值 = 龙头（trend_details 可用时）
+BUY_SELL_LEADER_SCORE_GATE = 80             # 评分≥此值且非高位 = 龙头
+BUY_SELL_LEADER_FALLBACK_CHANGE_PCT = 5.0   # 无 trend_details 时：涨幅≥此值 + 量比≥2 = 龙头
+BUY_SELL_LEADER_FALLBACK_VOL_RATIO = 2.0    # 无 trend_details 时：量比阈值
+
+# 止盈/止损封顶
+BUY_SELL_MAX_TARGET_PCT = 0.15              # 止盈上限封顶 15%
+
+# 位置止损倍率（叠加在振幅止损基础上）
+BUY_SELL_STOP_POSITION_LOW_MULT = 1.2       # 低位：止损放宽 20%（波动空间大，给更多恢复余地）
+BUY_SELL_STOP_POSITION_HIGH_MULT = 0.8      # 高位：止损收紧 20%（下跌风险大，破位快跑）
+
+# 龙头/跟风止损倍率
+BUY_SELL_STOP_LEADER_MULT = 1.1             # 龙头：止损略宽 10%（回撤后恢复概率高）
+BUY_SELL_STOP_FOLLOWER_MULT = 0.9           # 跟风：止损收紧 10%（破位快）
 
 # ========== 策略综合评分配置 ==========
 STRATEGY_BULL_THRESHOLD = 60  # 策略评分上涨阈值

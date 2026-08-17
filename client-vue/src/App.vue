@@ -31,12 +31,6 @@
         <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'">
           <TabReview @open-kline="openKline" />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-backtest' }]" v-show="activeTab === 'tab-backtest'">
-          <TabBacktest />
-        </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-strategy' }]" v-show="activeTab === 'tab-strategy'">
-          <TabStrategy @open-kline="openKline" />
-        </div>
       </div>
     </div>
     <!-- K线弹窗 -->
@@ -62,9 +56,7 @@ import TabScan from './components/tabs/TabScan.vue'
 import TabTrend from './components/tabs/TabTrend.vue'
 import TabRecommend from './components/tabs/TabRecommend.vue'
 import TabReview from './components/tabs/TabReview.vue'
-import TabStrategy from './components/tabs/TabStrategy.vue'
 import TabFlow from './components/tabs/TabFlow.vue'
-import TabBacktest from './components/tabs/TabBacktest.vue'
 import KlineModal from './components/KlineModal.vue'
 import AiDiagModal from './components/AiDiagModal.vue'
 
@@ -139,7 +131,5 @@ const tabs = [
   { id: 'tab-recommend', label: '智能推荐' },
   { id: 'tab-flow', label: '资金流向' },
   { id: 'tab-review', label: '每日收评' },
-  { id: 'tab-backtest', label: '策略回测' },
-  { id: 'tab-strategy', label: '策略优化' },
 ]
 </script>

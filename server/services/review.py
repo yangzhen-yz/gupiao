@@ -10,6 +10,66 @@ from services.fundflow import _BROAD_CONCEPT_BLOCKLIST
 
 _EASTMONEY_CLIST_BASE = 'https://push2delay.eastmoney.com/api/qt/clist/get'
 _EM_UT = 'b2884a393a59ad64002292a3e90d46a5'
+# 东方财富涨停池/跌停池专用API（返回当日真实涨跌停股票，而非按涨幅阈值估算）
+_EM_ZT_POOL_URL = 'https://push2ex.eastmoney.com/getTopicZTPool'
+_EM_DT_POOL_URL = 'https://push2ex.eastmoney.com/getTopicDTPool'
+_EM_POOL_UT = '7eea3edcaed734bea9cbfc24409ed989'
+_EM_POOL_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Referer': 'https://quote.eastmoney.com/ztb/detail',
+    'Accept': 'application/json, text/plain, */*',
+}
+
+
+def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, retries: int = 3, timeout: float = 12.0) -> List[Dict]:
+    """东方财富涨停池/跌停池专用API。
+    Args:
+        date_str: 日期 'YYYYMMDD' 格式
+        pool_type: 'zt'=涨停池, 'dt'=跌停池
+    Returns:
+        涨停/跌停股票列表，每项含 c(代码)/n(名称)/zdp(涨跌幅)/p(价格)/fund(封板资金)/hs(换手率)/lbc(连板数) 等字段。
+        失败返回 []。
+    """
+    url = _EM_ZT_POOL_URL if pool_type == 'zt' else _EM_DT_POOL_URL
+    sort_type = 'fbt:asc' if pool_type == 'zt' else 'fund:asc'
+    params = {
+        'ut': _EM_POOL_UT,
+        'dpt': 'wz.ztzt',
+        'Pageindex': 0,
+        'pagesize': pagesize,
+        'sort': sort_type,
+        'date': date_str,
+    }
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = _requests.get(url, params=params, headers=_EM_POOL_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            pool = (data.get('data') or {}).get('pool') or []
+            return pool
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+    print(f'[收评] {pool_type}pool 全部{retries}次重试失败 date={date_str} err={last_err}')
+    return []
+
+
+def _get_limit_threshold_by_code(code: str) -> float:
+    """根据股票代码前缀返回涨停涨幅阈值（降级方案用）。
+    主板(60/00): 10% → 9.8%
+    科创板(688)/创业板(300/301): 20% → 19.8%
+    北交所(8/4): 30% → 29.8%
+    """
+    if not code:
+        return 9.8
+    if code.startswith('688') or code.startswith('300') or code.startswith('301'):
+        return 19.8
+    elif code.startswith('8') or code.startswith('4'):
+        return 29.8
+    else:
+        return 9.8
 
 
 def _em_clist_get(fid: str, fs: str, fields: str, pz: int, po: int = 1, pn: int = 1, retries: int = 3, timeout: float = 12.0) -> List[Dict]:
@@ -133,7 +193,7 @@ async def generate_daily_review() -> Dict:
         except Exception as e:
             print(f'获取板块数据失败: {e}')
         
-        # 3. 获取涨跌停个股（东方财富API）— 改用 requests 同步，避免 httpx 被封
+        # 3. 获取涨跌停个股 — 优先使用东方财富涨停池/跌停池专用API（准确），降级用clist+分板阈值
         limit_up_stocks = []
         limit_down_stocks = []
         top_gainers = []
@@ -142,34 +202,66 @@ async def generate_daily_review() -> Dict:
         def _sync_fetch_stocks():
             result = {'limit_up': [], 'limit_down': [], 'gainers': [], 'losers': [], 'top_funds': []}
             _fs_all_a = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
-            # 涨停股（f3 >= 10%/20% 由 TREND_LIMIT_UP_THRESHOLD 统一阈值）
-            try:
-                diff = _em_clist_get(fid='f3', po=1, pz=200, fs=_fs_all_a,
-                                     fields='f2,f3,f8,f12,f14,f62')
-                for item in diff:
-                    pct = item.get('f3', 0)
-                    if pct is not None and pct >= TREND_LIMIT_UP_THRESHOLD:
-                        result['limit_up'].append({
-                            'name': item.get('f14', ''), 'code': item.get('f12', ''),
-                            'changePercent': pct, 'price': item.get('f2', 0),
-                            'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
-                        })
-            except Exception as e:
-                print(f'[收评] 涨停股请求失败: {e}')
-            # 跌停股
-            try:
-                diff = _em_clist_get(fid='f3', po=0, pz=200, fs=_fs_all_a,
-                                     fields='f2,f3,f8,f12,f14,f62')
-                for item in diff:
-                    pct = item.get('f3', 0)
-                    if pct is not None and pct <= TREND_LIMIT_DOWN_THRESHOLD:
-                        result['limit_down'].append({
-                            'name': item.get('f14', ''), 'code': item.get('f12', ''),
-                            'changePercent': pct, 'price': item.get('f2', 0),
-                            'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
-                        })
-            except Exception as e:
-                print(f'[收评] 跌停股请求失败: {e}')
+            _today_yyyymmdd = datetime.now().strftime('%Y%m%d')
+
+            # ---- 涨停股：优先用涨停池专用API ----
+            _zt_pool = _em_zt_pool_get(_today_yyyymmdd, pool_type='zt')
+            if _zt_pool:
+                for item in _zt_pool:
+                    result['limit_up'].append({
+                        'name': item.get('n', ''), 'code': item.get('c', ''),
+                        'changePercent': item.get('zdp', 0),
+                        'price': round(item.get('p', 0) / 1000, 2),  # API返回毫元，转为元
+                        'mainNetInflow': item.get('fund', 0), 'turnoverRate': item.get('hs', 0),
+                    })
+                print(f'[收评] 涨停池API成功: {len(_zt_pool)}只涨停')
+            else:
+                # 降级：clist 涨幅排序 + 分板阈值
+                print(f'[收评] 涨停池API无数据，降级为clist+分板阈值')
+                try:
+                    diff = _em_clist_get(fid='f3', po=1, pz=500, fs=_fs_all_a,
+                                         fields='f2,f3,f8,f12,f14,f62')
+                    for item in diff:
+                        pct = item.get('f3', 0)
+                        code = item.get('f12', '')
+                        if pct is not None and pct >= _get_limit_threshold_by_code(code):
+                            result['limit_up'].append({
+                                'name': item.get('f14', ''), 'code': code,
+                                'changePercent': pct, 'price': item.get('f2', 0),
+                                'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
+                            })
+                except Exception as e:
+                    print(f'[收评] 涨停股降级请求失败: {e}')
+
+            # ---- 跌停股：优先用跌停池专用API ----
+            _dt_pool = _em_zt_pool_get(_today_yyyymmdd, pool_type='dt')
+            if _dt_pool:
+                for item in _dt_pool:
+                    result['limit_down'].append({
+                        'name': item.get('n', ''), 'code': item.get('c', ''),
+                        'changePercent': item.get('zdp', 0),
+                        'price': round(item.get('p', 0) / 1000, 2),  # API返回毫元，转为元
+                        'mainNetInflow': item.get('fund', 0), 'turnoverRate': item.get('hs', 0),
+                    })
+                print(f'[收评] 跌停池API成功: {len(_dt_pool)}只跌停')
+            else:
+                # 降级：clist 跌幅排序 + 分板阈值
+                print(f'[收评] 跌停池API无数据，降级为clist+分板阈值')
+                try:
+                    diff = _em_clist_get(fid='f3', po=0, pz=500, fs=_fs_all_a,
+                                         fields='f2,f3,f8,f12,f14,f62')
+                    for item in diff:
+                        pct = item.get('f3', 0)
+                        code = item.get('f12', '')
+                        if pct is not None and pct <= -_get_limit_threshold_by_code(code):
+                            result['limit_down'].append({
+                                'name': item.get('f14', ''), 'code': code,
+                                'changePercent': pct, 'price': item.get('f2', 0),
+                                'mainNetInflow': item.get('f62', 0), 'turnoverRate': item.get('f8', 0),
+                            })
+                except Exception as e:
+                    print(f'[收评] 跌停股降级请求失败: {e}')
+
             # 涨幅前20
             try:
                 diff = _em_clist_get(fid='f3', po=1, pz=20, fs=_fs_all_a,

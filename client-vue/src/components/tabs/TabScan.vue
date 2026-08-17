@@ -27,7 +27,7 @@
     <div v-if="scanResults.length">
       <div class="stock-table">
         <div class="stock-table-header">
-          <span>名称</span><span>现价</span><span>涨跌幅</span><span>量比</span><span>换手率</span><span>委比</span><span>RPS</span><span>综合评分</span><span>风控/估值</span>
+          <span>名称</span><span>现价</span><span>涨跌幅</span><span>量比</span><span>换手率</span><span>RPS</span><span>综合评分</span><span>目标价/涨幅</span><span>止损</span><span>风控/估值</span>
         </div>
         <div v-for="r in pagedResults" :key="r.symbol" class="stock-table-row clickable" @click="goToQuote(r.symbol)">
           <span class="name">{{ r.name }}<br><small style="color:#94a3b8;font-weight:400;">{{ r.symbol.toUpperCase() }}</small></span>
@@ -35,10 +35,24 @@
           <span class="change-pct" :style="{ color: r.change >= 0 ? '#dc2626' : '#16a34a', fontWeight: 600 }">{{ r.change >= 0 ? '+' : '' }}{{ r.changePercent.toFixed(2) }}%</span>
           <span class="volume-ratio">{{ r.volumeRatio.toFixed(2) }}</span>
           <span class="turnover">{{ r.turnoverRate.toFixed(2) }}%</span>
-          <span class="weibi-val" :style="{ color: r.weibi >= 0 ? '#dc2626' : '#16a34a', fontWeight: 600 }">{{ r.weibi >= 0 ? '+' : '' }}{{ r.weibi.toFixed(2) }}%</span>
           <span class="rps-cell" :style="{ color: r.rps != null ? (r.rps >= 90 ? '#dc2626' : r.rps >= 70 ? '#f59e0b' : r.rps >= 50 ? '#64748b' : '#94a3b8') : '#94a3b8', fontWeight: 700 }">{{ r.rps != null ? r.rps.toFixed(0) : '-' }}</span>
           <span class="score-cell" :style="{ color: r.score >= 70 ? '#dc2626' : r.score >= 40 ? '#f59e0b' : '#16a34a' }">
             {{ r.score }}<br><span :class="r.score >= 70 ? 'tag-bull' : r.score < 40 ? 'tag-bear' : 'tag-hold'">{{ r.score >= 70 ? '看涨' : r.score < 40 ? '看跌' : '观望' }}</span>
+          </span>
+          <span class="target-cell">
+            <template v-if="expectedGain(r) !== null">
+              <div class="target-price">{{ parseFloat(r.buySellPoints.sell).toFixed(2) }}</div>
+              <div class="gain-val">+{{ expectedGain(r).toFixed(1) }}%</div>
+              <div v-if="r.buySellPoints.stockType" class="stock-type-tag" :class="{ 'type-leader': r.buySellPoints.stockType.includes('龙头') }">{{ r.buySellPoints.stockType }}</div>
+            </template>
+            <span v-else class="na-val">—</span>
+          </span>
+          <span class="stoploss-cell">
+            <template v-if="r.riskControl && r.riskControl.stop_loss != null && r.riskControl.stop_loss > 0">
+              <div class="stop-price">{{ r.riskControl.stop_loss.toFixed(2) }}</div>
+              <div class="loss-val">-{{ Math.abs(r.riskControl.stop_loss_pct || 0).toFixed(1) }}%</div>
+            </template>
+            <span v-else class="na-val">—</span>
           </span>
           <span class="risk-cell">
             <span class="risk-badge" :class="riskLevelClass(r.riskControl?.risk_level)">{{ riskLabel(r.riskControl?.risk_level) }}</span>
@@ -147,6 +161,16 @@ function goToQuote(symbol) {
   if (navigateToQuote) navigateToQuote(symbol)
 }
 
+// 预期涨幅：(目标价 - 现价) / 现价 * 100
+// buySellPoints.sell 后端返回字符串（如 "12.34"），需 parseFloat；
+// buySellPoints 为 null/{} 或 sell 为空 → 返回 null，模板显示 "—"
+function expectedGain(r) {
+  if (!r.buySellPoints || !r.buySellPoints.sell) return null
+  const sell = parseFloat(r.buySellPoints.sell)
+  if (isNaN(sell) || !r.price || r.price <= 0) return null
+  return (sell - r.price) / r.price * 100
+}
+
 async function startScan(silent = false) {
   if (scanning.value) return
   scanning.value = true
@@ -248,31 +272,78 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
-/* RPS 列（P0，2026-07-16）+ 风控/估值列（P2a/P2c）：表格扩展为 9 列 */
+/* 表格列（10 列）：名称/现价/涨跌幅/量比/换手率/RPS/综合评分/目标价涨幅/止损/风控估值 */
+/* 移除委比列（盘口瞬时数据，对批量筛选无决策价值）；新增目标价涨幅 + 止损列 */
 .stock-table-header,
 .stock-table-row {
-  grid-template-columns: 2fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr 1.2fr 1.1fr;
+  grid-template-columns: 2fr 1fr 1fr 0.8fr 0.8fr 0.7fr 1.1fr 1.1fr 1fr 1.1fr;
 }
 .rps-cell {
   font-family: 'SF Mono', 'Courier New', monospace;
   font-weight: 700;
+}
+/* 目标价/涨幅列 + 止损列：价格继承默认色，涨幅绿色/止损红色（CSS 变量兼容暗色模式） */
+.target-cell,
+.stoploss-cell {
+  font-family: 'SF Mono', 'Courier New', monospace;
+  font-size: 0.8125rem;
+  line-height: 1.3;
+}
+.target-cell .gain-val {
+  color: var(--scan-gain-color, #dc2626);
+  font-weight: 600;
+}
+.stock-type-tag {
+  display: inline-block;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-top: 2px;
+  color: #475569;
+  background: #f1f5f9;
+  border: 0.5px solid #e2e8f0;
+}
+.stock-type-tag.type-leader {
+  color: #c2410c;
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+:root[data-theme="dark"] .stock-type-tag {
+  color: #94a3b8;
+  background: rgba(71, 85, 105, 0.15);
+  border-color: rgba(226, 232, 240, 0.2);
+}
+:root[data-theme="dark"] .stock-type-tag.type-leader {
+  color: #fdba74;
+  background: rgba(194, 65, 12, 0.15);
+  border-color: rgba(254, 215, 170, 0.3);
+}
+.stoploss-cell .loss-val {
+  color: var(--scan-loss-color, #16a34a);
+  font-weight: 600;
+}
+.na-val {
+  color: var(--scan-na-color, #94a3b8);
 }
 @media (max-width: 640px) {
   .stock-table-header,
   .stock-table-row {
     grid-template-columns: 2fr 1fr 1fr 1.2fr;
   }
-  /* 移动端隐藏：量比(4)/换手(5)/委比(6)/RPS(7)/风控估值(9)，保留 名称/现价/涨跌幅/评分 */
+  /* 移动端隐藏：量比(4)/换手(5)/RPS(6)/目标价涨幅(8)/止损(9)/风控估值(10)，保留 名称/现价/涨跌幅/评分 */
   .stock-table-header span:nth-child(4),
   .stock-table-header span:nth-child(5),
   .stock-table-header span:nth-child(6),
-  .stock-table-header span:nth-child(7),
+  .stock-table-header span:nth-child(8),
   .stock-table-header span:nth-child(9),
+  .stock-table-header span:nth-child(10),
   .stock-table-row span:nth-child(4),
   .stock-table-row span:nth-child(5),
   .stock-table-row span:nth-child(6),
-  .stock-table-row span:nth-child(7),
-  .stock-table-row span:nth-child(9) {
+  .stock-table-row span:nth-child(8),
+  .stock-table-row span:nth-child(9),
+  .stock-table-row span:nth-child(10) {
     display: none;
   }
 }

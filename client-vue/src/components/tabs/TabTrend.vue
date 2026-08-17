@@ -199,6 +199,13 @@
                 <div v-if="(stock.bonuses || []).length > 0" class="trend-bonus-tags">
                   <span v-for="b in (stock.bonuses || [])" :key="b.name" class="trend-bonus-tag">+{{ b.points }} {{ b.name }}</span>
                 </div>
+                <div v-if="(stock.details?.earlySignals || []).length > 0" class="trend-early-signal-tags">
+                  <span class="trend-early-signal-label">早期信号</span>
+                  <span v-for="s in (stock.details?.earlySignals || [])" :key="s.name"
+                        class="trend-early-signal-tag" :title="s.desc">
+                    +{{ s.score }} {{ signalNameMap[s.name] || s.name }}
+                  </span>
+                </div>
               </div>
               <div v-else style="color:var(--text-tertiary);font-size:0.85rem;">暂无详细数据</div>
               <div class="metric-legend">
@@ -449,6 +456,15 @@ const METRIC_TIPS = {
   consecutive: '从最新一天往回数连续阳线天数，与评分无关，仅作展示。',
 }
 function metricTip(key) { return METRIC_TIPS[key] || '' }
+
+// 早期信号中文映射（第5维度）
+const signalNameMap = {
+  nr7_inside_bar: 'NR7缩量',
+  vcp: 'VCP收缩',
+  rsi_bottom_div: 'RSI底背离',
+  bottom_first_limit: '底部首板',
+  consolidation_break: '缩量后首放',
+}
 
 // 成交量格式化（万/亿）
 function formatVol(v) {
@@ -984,4 +1000,31 @@ onUnmounted(() => {
 .leg-dot.frozen  { background: #fca5a5; }
 .leg-dot.cold    { background: #fcd34d; }
 .leg-dot.normal  { background: #86efac; }
+
+/* ========== 早期信号 chips（橙色系，呼应"早期/未确认"语义） ========== */
+.trend-early-signal-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+  align-items: center;
+}
+.trend-early-signal-label {
+  font-size: 0.72rem;
+  color: #ea580c;
+  font-weight: 600;
+  margin-right: 2px;
+}
+.trend-early-signal-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: #fff7ed;
+  color: #c2410c;
+  border: 0.5px solid #fed7aa;
+  cursor: help;
+}
 </style>

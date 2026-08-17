@@ -39,7 +39,7 @@
       <div class="block-title">📈 跨报告加权胜率</div>
       <div class="metric-grid">
         <div class="metric-card" v-for="p in periods" :key="'wr-' + p">
-          <div class="metric-label">{{ p }}日胜率</div>
+          <div class="metric-label">{{ p.replace('d','') }}日胜率</div>
           <div class="metric-value" :style="{ color: winRateColor(summary.winRates[p]) }">{{ summary.winRates[p] }}%</div>
         </div>
       </div>
@@ -48,7 +48,7 @@
       <div class="block-title">💹 平均超额收益（跑赢大盘）</div>
       <div class="metric-grid">
         <div class="metric-card" v-for="p in periods" :key="'ex-' + p">
-          <div class="metric-label">{{ p }}日超额</div>
+          <div class="metric-label">{{ p.replace('d','') }}日超额</div>
           <div class="metric-value" :style="{ color: summary.avgExcessReturn[p] >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">
             {{ summary.avgExcessReturn[p] >= 0 ? '+' : '' }}{{ summary.avgExcessReturn[p] }}%
           </div>

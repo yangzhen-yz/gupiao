@@ -13,7 +13,13 @@ from typing import Dict, Optional
 
 from app.config import (RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX,
                         RISK_CONTROL_STOP_LOSS_VOL_MULT, RISK_CONTROL_SCORE_HIGH_RISK,
-                        RISK_CONTROL_SCORE_MID_RISK)
+                        RISK_CONTROL_SCORE_MID_RISK,
+                        BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_HIGH_GATE,
+                        BUY_SELL_LEADER_CONSECUTIVE_BOARDS, BUY_SELL_LEADER_SCORE_GATE,
+                        BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO,
+                        BUY_SELL_STOP_POSITION_LOW_MULT, BUY_SELL_STOP_POSITION_HIGH_MULT,
+                        BUY_SELL_STOP_LEADER_MULT, BUY_SELL_STOP_FOLLOWER_MULT,
+                        TREND_LIMIT_UP_THRESHOLD)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -81,7 +87,7 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
     if isinstance(score_result, dict):
         score_total = float(score_result.get('total', 0) or 0)
 
-    # ---- 1. 动态止损幅度（基于振幅波动率缩放） ----
+    # ---- 1. 动态止损幅度（振幅波动率缩放 + 位置/龙头修正） ----
     amplitude = 0.0
     if isinstance(stock, dict):
         try:
@@ -90,10 +96,47 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
             amplitude = 0.0
     # 振幅为 0（停牌/无数据）时给一个中性默认 6%；否则 振幅×系数 再 clamp
     if amplitude <= 0:
-        stop_pct = 0.06
+        base_stop_pct = 0.06
     else:
-        stop_pct = _clamp(amplitude / 100.0 * RISK_CONTROL_STOP_LOSS_VOL_MULT,
-                          RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX)
+        base_stop_pct = _clamp(amplitude / 100.0 * RISK_CONTROL_STOP_LOSS_VOL_MULT,
+                               RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX)
+
+    # V4.2: 位置 + 龙头止损修正（从 score_result 提取上下文）
+    stop_mult = 1.0
+    if isinstance(score_result, dict):
+        base_scores = score_result.get('base_scores', {}) or {}
+        factor_values = score_result.get('factor_values', {}) or {}
+
+        # 位置分位：优先 trend_details（score_result 无 details），fallback base_scores['position']
+        position_pct = None
+        pos_score = base_scores.get('position', 10)
+        if pos_score <= 5:
+            position_pct = 80   # 高位
+        elif pos_score >= 15:
+            position_pct = 20   # 低位
+        else:
+            position_pct = 50   # 中位
+
+        # 位置止损倍率
+        if position_pct <= BUY_SELL_POSITION_LOW_GATE:
+            stop_mult *= BUY_SELL_STOP_POSITION_LOW_MULT      # 低位：放宽
+        elif position_pct >= BUY_SELL_POSITION_HIGH_GATE:
+            stop_mult *= BUY_SELL_STOP_POSITION_HIGH_MULT      # 高位：收紧
+
+        # 龙头判定（fallback：涨停 / 涨幅+量比 / 高分+非高位）
+        change_pct = abs(float(factor_values.get('change_percent', 0) or
+                               (stock.get('changePercent', 0) if stock else 0) or 0))
+        vol_ratio = float(factor_values.get('volume_ratio', 0) or
+                          (stock.get('volumeRatio', 0) if stock else 0) or 0)
+        is_leader = (change_pct >= TREND_LIMIT_UP_THRESHOLD or
+                     (change_pct >= BUY_SELL_LEADER_FALLBACK_CHANGE_PCT and
+                      vol_ratio >= BUY_SELL_LEADER_FALLBACK_VOL_RATIO) or
+                     (score_total >= BUY_SELL_LEADER_SCORE_GATE and
+                      position_pct < BUY_SELL_POSITION_HIGH_GATE))
+
+        stop_mult *= BUY_SELL_STOP_LEADER_MULT if is_leader else BUY_SELL_STOP_FOLLOWER_MULT
+
+    stop_pct = _clamp(base_stop_pct * stop_mult, RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX)
     stop_loss = round(price * (1 - stop_pct), 2)
     stop_pct = round((price - stop_loss) / price * 100, 2)
 
@@ -113,7 +156,16 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
     note_parts.append(f"综合评分{score_total:.0f}分→{level_map_cn(level)}")
     if danger:
         note_parts.append('；'.join(danger))
-    if amplitude > 0:
+    # 位置/龙头提示
+    if isinstance(score_result, dict):
+        pos_label = '低位' if position_pct <= BUY_SELL_POSITION_LOW_GATE else \
+                    '高位' if position_pct >= BUY_SELL_POSITION_HIGH_GATE else ''
+        leader_label = '龙头' if is_leader else '跟风'
+        if pos_label:
+            note_parts.append(f"{pos_label}{leader_label}止损{stop_pct:.1f}%")
+        else:
+            note_parts.append(f"{leader_label}止损{stop_pct:.1f}%")
+    elif amplitude > 0:
         note_parts.append(f"止损≈现价-{stop_pct:.1f}%（基于振幅波动率）")
     risk_note = '，'.join(note_parts)
 

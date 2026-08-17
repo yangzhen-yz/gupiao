@@ -12,7 +12,7 @@ from services.trend import scan_trend_scan_results, scan_and_remove_below_ma10, 
 from services.trend_backtest import backtest_trend_predictions
 from services.trading_calendar import is_trading_day
 from services.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
-from services.recommend import auto_generate_recommendations_task
+from services.recommend import auto_generate_recommendations_task, calc_buy_sell_points
 from services.review import generate_daily_review
 from services.market import predict_market_risk, check_market_crash, load_market_alert
 from services.fundflow import get_fund_flow_summary
@@ -148,6 +148,8 @@ async def get_stock_analysis(symbol: str):
                 "score": int(score_val) if isinstance(score_val, (int, float)) else 0,
                 "max": int(max_val),
             })
+        # 买卖点（预期涨幅，V4.2 位置+龙头感知版）
+        buy_sell_points = calc_buy_sell_points(stock_data, score_result=result)
         return {
             "success": True,
             "data": {
@@ -160,6 +162,7 @@ async def get_stock_analysis(symbol: str):
                 "smartMoney": sm_data,
                 "valuation": val,
                 "riskControl": risk_control,
+                "buySellPoints": buy_sell_points,
                 "details": details,
             }
         }
@@ -236,6 +239,9 @@ async def get_stock_full(symbol: str):
                 "score": int(score_val) if isinstance(score_val, (int, float)) else 0,
                 "max": int(max_val),
             })
+        # 买卖点（V4.2 位置+龙头感知版）：raw 始终可用（缓存命中或新拉取），解析后纯函数计算
+        _parsed_full = parse_tencent_batch_data(raw) if raw else []
+        buy_sell_points = calc_buy_sell_points(_parsed_full[0], score_result=result) if _parsed_full else {}
         return {
             "success": True,
             "data": {
@@ -249,6 +255,7 @@ async def get_stock_full(symbol: str):
                 "smartMoney": sm_data,
                 "valuation": val,
                 "riskControl": risk_control,
+                "buySellPoints": buy_sell_points,
                 "details": details,
             }
         }
@@ -460,7 +467,17 @@ def _ensure_today_date(data: Dict) -> Dict:
 async def get_trend_scan_results():
     try:
         trend_data = load_trend_scan_results()
-        return {"success": True, "data": _ensure_today_date(trend_data)}
+        trend_data = _ensure_today_date(trend_data)
+        # V4.2: 为每只趋势股票注入买卖点（位置+龙头感知，trend_details 精确度最高）
+        stocks = trend_data.get('stocks', [])
+        for s in stocks:
+            try:
+                details = s.get('details', {}) or {}
+                score_result = {'total': s.get('score', 0), 'base_scores': {}, 'factor_values': {}}
+                s['buySellPoints'] = calc_buy_sell_points(s, score_result=score_result, trend_details=details)
+            except Exception as _e:
+                print(f'[趋势] 买卖点计算失败 {s.get("symbol")}: {_e}')
+        return {"success": True, "data": trend_data}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取趋势股票失败: {str(error)}")
 
@@ -1091,6 +1108,7 @@ async def hot_stock_buttons_scan(codes: str = ''):
                                if (sm := sm_map.get(s['symbol'].lower())) else None),
                 'valuation': s.get('valuation'),
                 'riskControl': s.get('riskControl'),
+                'buySellPoints': calc_buy_sell_points(s, score_result=s.get('score')),
             }
             for s in all_results
         ]

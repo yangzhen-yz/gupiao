@@ -90,8 +90,6 @@
                 <div class="grid-item"><div class="grid-label">振幅</div><div class="grid-value">{{ (quoteData.amplitude || 0).toFixed(2) }}%</div></div>
                 <div class="grid-item"><div class="grid-label">委比</div><div class="grid-value" :style="{ color: quoteData.weibi > 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">{{ quoteData.weibi > 0 ? '+' : '' }}{{ (quoteData.weibi || 0).toFixed(2) }}%</div></div>
                 <div class="grid-item"><div class="grid-label">均价</div><div class="grid-value">{{ (quoteData.avgPrice || 0).toFixed(2) }}</div></div>
-                <div class="grid-item"><div class="grid-label">买一</div><div class="grid-value">{{ quoteData.bid1 }}</div></div>
-                <div class="grid-item"><div class="grid-label">卖一</div><div class="grid-value">{{ quoteData.ask1 }}</div></div>
                 <div class="grid-item" v-if="quoteData.circulateMarketCap > 0"><div class="grid-label">流通市值</div><div class="grid-value">{{ formatNumber(quoteData.circulateMarketCap * 10000) }}</div></div>
               </div>
             </div>
@@ -129,6 +127,43 @@
               </div>
             </div>
           </div>
+        </div>
+
+        <!-- 交易决策卡（止损 / 买卖点 / 仓位建议） -->
+        <div v-if="showDecisionCard" class="decision-card">
+          <div class="decision-card-header">
+            <span class="decision-card-title">🎯 交易决策参考</span>
+            <span v-if="buySellPoints?.stockType" class="decision-type-badge"
+              :class="{ 'type-leader': buySellPoints.stockType.includes('龙头'), 'type-follower': buySellPoints.stockType.includes('跟风') }">{{ buySellPoints.stockType }}</span>
+            <span v-if="riskControl?.risk_level" class="decision-risk-tag"
+              :style="{ color: riskLevelMeta.color, background: `color-mix(in srgb, ${riskLevelMeta.color} 12%, transparent)`, borderColor: `color-mix(in srgb, ${riskLevelMeta.color} 33%, transparent)` }">{{ riskLevelMeta.text }}</span>
+          </div>
+          <div class="decision-grid">
+            <!-- 买入参考价 -->
+            <div class="decision-item">
+              <div class="decision-label">买入参考</div>
+              <div class="decision-value">{{ buySellPoints?.buy || '--' }}</div>
+            </div>
+            <!-- 目标卖点价 + 预期涨幅 -->
+            <div class="decision-item">
+              <div class="decision-label">目标卖点</div>
+              <div class="decision-value">{{ buySellPoints?.sell || '--' }}</div>
+              <div v-if="expectedGainPct !== null" class="decision-sub gain">预期 +{{ expectedGainPct.toFixed(2) }}%</div>
+            </div>
+            <!-- 止损价 + 止损幅度 -->
+            <div class="decision-item">
+              <div class="decision-label">止损价</div>
+              <div class="decision-value loss">{{ riskControl?.stop_loss || '--' }}</div>
+              <div v-if="stopLossPctText" class="decision-sub loss">幅度 {{ stopLossPctText }}</div>
+            </div>
+            <!-- 仓位建议 -->
+            <div class="decision-item">
+              <div class="decision-label">仓位建议</div>
+              <div class="decision-value position-text">{{ riskControl?.position_suggest || '--' }}</div>
+            </div>
+          </div>
+          <div v-if="buySellPoints?.expectationNote" class="decision-note expectation-note">{{ buySellPoints.expectationNote }}</div>
+          <div v-if="riskControl?.risk_note" class="decision-note">{{ riskControl.risk_note }}</div>
         </div>
 
         <!-- 内外盘 -->
@@ -225,6 +260,38 @@ const scoreLabel = computed(() => rating.value.short)
 const analysis = computed(() => quoteData.value ? getEnhancedAnalysis(quoteData.value) : null)
 const tradingStatusText = computed(() => getTradingStatusText())
 
+// ===== 交易决策卡（风控止损 + 买卖点） =====
+const buySellPoints = computed(() => quoteData.value?.buySellPoints || null)
+const riskControl = computed(() => quoteData.value?.riskControl || null)
+const showDecisionCard = computed(() => !!buySellPoints.value || !!riskControl.value)
+// 预期涨幅 = (目标卖点 - 当前价) / 当前价 * 100
+const expectedGainPct = computed(() => {
+  const bsp = buySellPoints.value
+  if (!bsp || !bsp.sell) return null
+  const sellPrice = parseFloat(bsp.sell)
+  const curPrice = quoteData.value?.priceRaw
+  if (isNaN(sellPrice) || !curPrice || curPrice <= 0) return null
+  return ((sellPrice - curPrice) / curPrice) * 100
+})
+// 风险等级 → 文本 + 颜色（high=红 / mid=橙 / low=绿）
+const riskLevelMeta = computed(() => {
+  const level = riskControl.value?.risk_level
+  const map = {
+    high: { text: '高风险', color: 'var(--accent-danger)' },
+    mid: { text: '中风险', color: 'var(--accent-warning)' },
+    low: { text: '低风险', color: 'var(--accent-success)' },
+  }
+  return map[level] || { text: level || '--', color: 'var(--text-tertiary)' }
+})
+// 止损幅度文本（兼容数字 / 字符串）
+const stopLossPctText = computed(() => {
+  const pct = riskControl.value?.stop_loss_pct
+  if (pct === null || pct === undefined || pct === '') return ''
+  if (typeof pct === 'number') return '-' + Math.abs(pct).toFixed(2) + '%'
+  const s = String(pct)
+  return s.includes('%') ? s : '-' + s + '%'
+})
+
 let autoRefreshTimer = null
 
 function parseTencentData(raw) {
@@ -266,7 +333,7 @@ function parseTencentData(raw) {
             open: fields[5], high: fields[33], low: fields[34],
             volume: fields[36], volumeRaw, turnover: turnoverRaw, turnoverRate, pe, amplitude,
             volumeRatio, highLimit, lowLimit, circulateMarketCap, totalMarketCap,
-            bid1: fields[11], bid1Vol: fields[12], ask1: fields[21], ask1Vol: fields[22],
+            bid1Vol: fields[12], ask1Vol: fields[22],
             outerPlate: fields[7], innerPlate: fields[8], outerPlateRaw, innerPlateRaw,
             weibi: parseFloat(weibi.toFixed(2)), avgPrice: parseFloat(avgPrice.toFixed(2)),
             avgPriceDeviation: parseFloat(avgPriceDeviation.toFixed(2)),
@@ -297,13 +364,16 @@ async function fetchStockQuote(symbol, silent = false) {
     if (!resp || !resp.success) {
       throw new Error(resp?.detail || '数据获取失败')
     }
-    const { raw, score, label, predictDirection, details } = resp.data
+    const { raw, score, label, predictDirection, details, riskControl, buySellPoints } = resp.data
     const parsed = parseTencentData(raw)
     // 注入后端 score（后端 calc_stock_score_v2 是权威评分源）
     if (parsed) {
       parsed.score = score
       parsed.scoreDetails = details || []
       parsed.label = label
+      // 风控止损 + 买卖点（散户最关心的止损位 / 预期涨幅 / 买入参考价）
+      parsed.riskControl = riskControl || null
+      parsed.buySellPoints = buySellPoints || null
     }
     if (parsed) {
       if (silent && quoteData.value && quoteData.value.symbol === parsed.symbol) {
@@ -459,3 +529,151 @@ function searchStock(symbol) {
 }
 defineExpose({ searchStock })
 </script>
+
+<style scoped>
+/* ===== 交易决策卡 ===== */
+.decision-card {
+  background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-lg);
+  margin-bottom: var(--spacing-lg);
+  border: 1px solid var(--border-subtle);
+  border-left: 4px solid var(--accent-info);
+  box-shadow: var(--shadow-soft);
+}
+
+.decision-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--spacing-md);
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.decision-card-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.decision-type-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  white-space: nowrap;
+  margin-right: auto;
+}
+.decision-type-badge.type-leader {
+  color: #c2410c;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+}
+.decision-type-badge.type-follower {
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+}
+:root[data-theme="dark"] .decision-type-badge.type-leader {
+  color: #fdba74;
+  background: rgba(194, 65, 12, 0.15);
+  border-color: rgba(254, 215, 170, 0.3);
+}
+:root[data-theme="dark"] .decision-type-badge.type-follower {
+  color: #94a3b8;
+  background: rgba(71, 85, 105, 0.15);
+  border-color: rgba(226, 232, 240, 0.2);
+}
+
+.decision-risk-tag {
+  display: inline-block;
+  padding: 3px 12px;
+  border-radius: var(--radius-pill);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  border: 1px solid;
+  white-space: nowrap;
+}
+
+.decision-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--spacing-sm);
+}
+
+@media (max-width: 768px) {
+  .decision-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.decision-item {
+  background: var(--bg-primary);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 72px;
+}
+
+.decision-label {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.decision-value {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+
+.decision-value.loss {
+  color: var(--accent-success);
+}
+
+.decision-value.position-text {
+  font-size: 0.9375rem;
+}
+
+.decision-sub {
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.decision-sub.gain {
+  color: var(--accent-danger);
+}
+
+.decision-sub.loss {
+  color: var(--accent-success);
+}
+
+.decision-note {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+}
+
+.decision-note.expectation-note {
+  color: #c2410c;
+  font-weight: 600;
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+:root[data-theme="dark"] .decision-note.expectation-note {
+  color: #fdba74;
+  background: rgba(194, 65, 12, 0.1);
+  border-color: rgba(254, 215, 170, 0.25);
+}
+</style>

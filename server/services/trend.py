@@ -46,6 +46,7 @@ from services.stock import (has_delisting_risk, is_main_board, get_kline_data,
     parse_tencent_batch_data, has_negative_announcement)
 from services.strategy import calc_stock_score_v2, load_strategy_factor_weights, apply_industry_neutralization
 from services.pattern import detect_volume_price_pattern
+from services.early_signals import detect_early_signals
 
 _last_scan_result = None
 _last_scan_date = ''
@@ -214,6 +215,9 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         closes, opens, highs, lows, vols, _pat_avg_vol_20, _pat_avg_vol_60, latest_idx, amplitude_20d)
     pattern_factor = pattern_result['factor']
     dyn_thresh = _get_dynamic_thresholds(market_regime, pattern_result['pattern'])
+
+    # 全量历史最高点（早期信号层需要，提前计算避免后面重复算）
+    all_time_high = max(highs) if highs else 0
 
     # ========== 计算额外均线（MA60、MA120 用于扣分/加分） ==========
     ma60 = calculate_ma(kline_data, 60)
@@ -617,6 +621,19 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         intraday_bonus = -5  # 日内大跌惩罚
     total_score = min(100, max(0, total_score + intraday_bonus))
 
+    # ========== 早期信号加成（第5维度，2026-08-17）==========
+    # 识别趋势形成前的转折信号（NR7/VCP/RSI底背离/底部首板/缩量后首放），
+    # 降低均线系统滞后性。仅对边界股（base_score 40-92）运行，RSI≥88 跳过。
+    early_signal_result = detect_early_signals(
+        kline_data=kline_data, closes=closes, opens=opens, highs=highs, lows=lows, vols=vols,
+        latest_idx=latest_idx, avg_vol_20=avg_vol_20,
+        position_pct=position_pct, all_time_high=all_time_high,
+        rsi_value=rsi_value, pattern_name=pattern_result['pattern'],
+        base_score=total_score,
+    )
+    early_signal_bonus = early_signal_result['bonus']
+    total_score = min(100, max(0, total_score + early_signal_bonus))
+
     # ========== 入选判断 ==========
     # 过滤规则 1：现价在 MA20 下方 + 60 日累计跌幅 > 15% → 强制排除（原有逻辑保留）
     if ma20_val and check_price < ma20_val:
@@ -664,9 +681,10 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         if ma120_val is not None and check_price < ma120_val:
             ma_long_bearish = True
 
-    if ma_long_bearish and abs(intraday_change_pct) < 7.0:
-        # 使用全量历史数据找最高点，而非仅限 60 日内
-        all_time_high = max(highs) if highs else 0
+    if ma_long_bearish and abs(intraday_change_pct) < 7.0 and early_signal_bonus < 6:
+        # 命中≥2 个早期信号（bonus≥6）视为趋势反转早期，豁免此过滤
+        # 这是降低滞后性的真正发力点：底部首板/RSI底背离最常出现在中长期均线偏空状态
+        # all_time_high 已在形态识别后提前计算，此处直接复用
         peak_drawdown = (all_time_high - check_price) / all_time_high * 100 if all_time_high > 0 else 0
         if peak_drawdown > 30:
             signal_desc = []
@@ -761,6 +779,11 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
         'rsi': rsi_value,
         # 三修正系数叠加总值（封顶 0.15）
         'totalFactor': round(min(TREND_TOTAL_FACTOR_CAP, sector_factor + chip_factor + pattern_factor), 3),
+        # 早期信号加成（第5维度，2026-08-17）
+        'earlySignalBonus': early_signal_bonus,
+        'earlySignals': [{'name': s['name'], 'desc': s['desc'], 'score': s['score']}
+                         for s in early_signal_result['signals']],
+        'earlySignalCount': early_signal_result['hitCount'],
     }
 
     return {

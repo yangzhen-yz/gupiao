@@ -216,37 +216,62 @@ def run_scheduler():
     print(f'[定时任务]   - {",".join(SCHEDULE_MARKET_ALERT_TIMES)}: 大盘风险预警自动扫描（仅交易日）')
     print(f'[定时任务]   - {SMART_MONEY_UPDATE_TIME}: 刷新龙虎榜+北向资金数据（刷新至最近已收盘交易日）\n')
 
-    # 自愈机制：schedule 库的 .day.at() 在 reload/线程异常时可能漏触发，
-    # 主循环每 60s 额外检查：交易日 15:10 后若今日收评仍缺失则自动补生成
-    _review_healed_date = ''
-    # 回测自愈：交易日 15:20 后若最近交易日回测报告缺失则自动补跑
-    _backtest_healed_date = ''
+    # 自愈机制：schedule 库的 .day.at() 可能在 60s 间隔下漏触发（run_pending 恰好跳过目标分钟），
+    # 主循环每 30s 额外检查：交易日 15:10 后若今日收评仍缺失则自动补生成，最多重试 3 次
+    _review_heal_date = ''       # 已成功补生成的日期
+    _review_heal_attempts = 0    # 当天重试次数
+    _review_heal_date_tracker = ''  # 用于检测日期变更时重置计数器
+    # 回测自愈：交易日 15:20 后若最近交易日回测报告缺失则自动补跑，最多重试 3 次
+    _backtest_heal_date = ''
+    _backtest_heal_attempts = 0
+    _backtest_heal_date_tracker = ''
 
     while True:
         try:
             schedule.run_pending()
             _now = datetime.now()
             _hm = _now.strftime('%H:%M')
+            _today_str = _now.strftime('%Y-%m-%d')
 
-            # ---- 收评自愈检查 ----
-            if _hm >= SCHEDULE_DAILY_REVIEW_TIME:
-                _today_str = _now.strftime('%Y-%m-%d')
-                if _review_healed_date != _today_str and is_trading_day(_now.date()):
-                    _review_healed_date = _today_str  # 先标记，避免重复进入
+            # ---- 收评自愈检查（最多重试 3 次，成功后停止）----
+            if _hm >= SCHEDULE_DAILY_REVIEW_TIME and is_trading_day(_now.date()):
+                # 日期变更时重置计数器
+                if _review_heal_date_tracker != _today_str:
+                    _review_heal_date_tracker = _today_str
+                    _review_heal_attempts = 0
+                # 未成功且未超过重试次数
+                if _review_heal_date != _today_str and _review_heal_attempts < 3:
+                    _review_heal_attempts += 1
                     try:
                         from db.database import load_daily_market_reviews
                         _existing = load_daily_market_reviews()
                         _has_today = any(r.get('date') == _today_str for r in (_existing or [])[:3])
-                        if not _has_today:
-                            print(f'[定时任务自愈 {_now:%H:%M:%S}] 检测到今日({_today_str})收评缺失，自动补生成...')
+                        if _has_today:
+                            # DB 中已存在（可能是定时任务成功或手动生成），标记完成
+                            _review_heal_date = _today_str
+                        else:
+                            print(f'[定时任务自愈 {_now:%H:%M:%S}] 检测到今日({_today_str})收评缺失，第{_review_heal_attempts}次补生成...')
                             asyncio.run(generate_review_task())
+                            # 生成后再次检查 DB 确认成功
+                            _existing2 = load_daily_market_reviews()
+                            _has_today2 = any(r.get('date') == _today_str for r in (_existing2 or [])[:3])
+                            if _has_today2:
+                                _review_heal_date = _today_str
+                                print(f'[定时任务自愈 {_now:%H:%M:%S}] 收评补生成成功')
+                            else:
+                                print(f'[定时任务自愈 {_now:%H:%M:%S}] 收评生成后 DB 未确认（第{_review_heal_attempts}次），将在下次循环重试')
                     except Exception as heal_err:
-                        print(f'[定时任务自愈 {_now:%H:%M:%S}] 补生成收评失败: {heal_err}')
+                        print(f'[定时任务自愈 {_now:%H:%M:%S}] 补生成收评失败(第{_review_heal_attempts}次): {heal_err}')
+                        import traceback
+                        print(f'  堆栈: {traceback.format_exc()[:300]}')
 
-            # ---- 回测自愈检查 ----
-            if _hm >= SCHEDULE_BACKTEST_TIME and _backtest_healed_date != _now.strftime('%Y-%m-%d'):
-                if is_trading_day(_now.date()):
-                    _backtest_healed_date = _now.strftime('%Y-%m-%d')  # 先标记
+            # ---- 回测自愈检查（最多重试 3 次，成功后停止）----
+            if _hm >= SCHEDULE_BACKTEST_TIME and is_trading_day(_now.date()):
+                if _backtest_heal_date_tracker != _today_str:
+                    _backtest_heal_date_tracker = _today_str
+                    _backtest_heal_attempts = 0
+                if _backtest_heal_date != _today_str and _backtest_heal_attempts < 3:
+                    _backtest_heal_attempts += 1
                     try:
                         _today = _now.date()
                         if _today.weekday() == 0:
@@ -264,16 +289,30 @@ def run_scheduler():
                             'SELECT id FROM strategy_backtest_reports WHERE backtest_date = ?', (_latest_str,)
                         ).fetchone()
                         _conn.close()
-                        if not _has_bt:
-                            print(f'[定时任务自愈 {_now:%H:%M:%S}] 检测到最近交易日({_latest_str})回测报告缺失，自动补跑...')
+                        if _has_bt:
+                            _backtest_heal_date = _today_str
+                        else:
+                            print(f'[定时任务自愈 {_now:%H:%M:%S}] 检测到最近交易日({_latest_str})回测报告缺失，第{_backtest_heal_attempts}次补跑...')
                             asyncio.run(backtest_task())
+                            _conn2 = get_db_conn()
+                            _has_bt2 = _conn2.execute(
+                                'SELECT id FROM strategy_backtest_reports WHERE backtest_date = ?', (_latest_str,)
+                            ).fetchone()
+                            _conn2.close()
+                            if _has_bt2:
+                                _backtest_heal_date = _today_str
+                                print(f'[定时任务自愈 {_now:%H:%M:%S}] 回测补跑成功')
+                            else:
+                                print(f'[定时任务自愈 {_now:%H:%M:%S}] 回测补跑后 DB 未确认（第{_backtest_heal_attempts}次），将在下次循环重试')
                     except Exception as heal_err:
-                        print(f'[定时任务自愈 {_now:%H:%M:%S}] 补跑回测失败: {heal_err}')
+                        print(f'[定时任务自愈 {_now:%H:%M:%S}] 补跑回测失败(第{_backtest_heal_attempts}次): {heal_err}')
+                        import traceback
+                        print(f'  堆栈: {traceback.format_exc()[:300]}')
         except Exception as loop_err:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] schedule 循环异常（已捕获继续）: {loop_err}')
             import traceback
             print(f'  堆栈: {traceback.format_exc()[:400]}')
-        time.sleep(60)
+        time.sleep(30)
 
 
 

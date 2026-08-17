@@ -2,7 +2,15 @@
 import json, asyncio, re, requests
 from typing import List, Dict, Optional
 from datetime import datetime, date
-from app.config import HOT_STOCK_POOL, STRATEGY_PREDICT_BULL_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD
+from app.config import (HOT_STOCK_POOL, STRATEGY_PREDICT_BULL_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT,
+                        STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD,
+                        BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE,
+                        BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT,
+                        BUY_SELL_TARGET_LEADER_MULT, BUY_SELL_TARGET_FOLLOWER_MULT,
+                        BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT,
+                        BUY_SELL_LEADER_CONSECUTIVE_BOARDS, BUY_SELL_LEADER_SCORE_GATE,
+                        BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO,
+                        BUY_SELL_MAX_TARGET_PCT)
 from db.database import get_db_conn, load_daily_recommendations, save_daily_recommendations, load_user_scan_pool, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry
 from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy import calc_stock_score_v2, apply_industry_neutralization
@@ -98,10 +106,120 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
         return {}
 
 
-def calc_buy_sell_points(stock: Dict) -> Dict:
-    """计算买入点、当前价、卖出点（V4.1 智能版）
-    - 涨停板 (涨跌幅 >= 9.8%)：买入提示「竞价关注」，卖出动态调整
-    - 非涨停板：结合近20日波动率动态调整买卖比例
+def _extract_position_and_leader(stock: Dict, score_result: Optional[Dict],
+                                  trend_details: Optional[Dict]) -> tuple:
+    """从 score_result / trend_details 提取位置分位和龙头身份。
+
+    位置优先级：trend_details.positionPct（精确年度分位）> base_scores['position']（5/10/15 粗估）> None
+    龙头优先级：trend_details.consecutiveUpDays（精确连板）> 涨幅+量比 fallback > 评分+位置 fallback
+
+    Returns: (position_pct: Optional[float], is_leader: bool, position_label: str)
+    """
+    details = {}
+    base_scores = {}
+    factor_values = {}
+    stock_score = 0.0
+
+    if score_result and isinstance(score_result, dict):
+        base_scores = score_result.get('base_scores', {}) or {}
+        factor_values = score_result.get('factor_values', {}) or {}
+        stock_score = float(score_result.get('total', 0) or 0)
+
+    # 也兼容 stock 自带 score dict（hot-stocks-scan 路径 stock['score'] 是 dict）
+    if not stock_score and isinstance(stock.get('score'), dict):
+        stock_score = float(stock['score'].get('total', 0) or 0)
+        base_scores = stock['score'].get('base_scores', {}) or {}
+        factor_values = stock['score'].get('factor_values', {}) or {}
+
+    # ---- 位置分位 ----
+    position_pct = None
+    if trend_details and isinstance(trend_details, dict):
+        position_pct = trend_details.get('positionPct')
+
+    if position_pct is None:
+        # fallback: base_scores['position'] 5=高位 / 10=中位 / 15=低位 → 映射到近似分位
+        pos_score = base_scores.get('position', 10)
+        if pos_score <= 5:
+            position_pct = 80   # 高位
+        elif pos_score >= 15:
+            position_pct = 20   # 低位
+        else:
+            position_pct = 50   # 中位
+
+    # ---- 位置标签 ----
+    if position_pct <= BUY_SELL_POSITION_LOW_GATE:
+        position_label = '低位'
+    elif position_pct <= BUY_SELL_POSITION_MIDLOW_GATE:
+        position_label = '中低位'
+    elif position_pct >= BUY_SELL_POSITION_HIGH_GATE:
+        position_label = '高位'
+    else:
+        position_label = '中位'
+
+    # ---- 龙头判定 ----
+    is_leader = False
+    if trend_details and isinstance(trend_details, dict):
+        consecutive = trend_details.get('consecutiveUpDays', 0) or 0
+        limit_up_count = trend_details.get('limitUpCount20d', 0) or 0
+        is_leader = (consecutive >= BUY_SELL_LEADER_CONSECUTIVE_BOARDS or
+                     limit_up_count >= 3 or
+                     (stock_score >= BUY_SELL_LEADER_SCORE_GATE and position_pct < BUY_SELL_POSITION_HIGH_GATE))
+
+    if not is_leader:
+        # fallback: 涨停 = 龙头；或 涨幅≥5% + 量比≥2 = 龙头
+        change_pct = abs(float(factor_values.get('change_percent', 0) or stock.get('changePercent', 0) or 0))
+        vol_ratio = float(factor_values.get('volume_ratio', 0) or stock.get('volumeRatio', 0) or 0)
+        if change_pct >= TREND_LIMIT_UP_THRESHOLD:
+            is_leader = True
+        elif change_pct >= BUY_SELL_LEADER_FALLBACK_CHANGE_PCT and vol_ratio >= BUY_SELL_LEADER_FALLBACK_VOL_RATIO:
+            is_leader = True
+        elif stock_score >= BUY_SELL_LEADER_SCORE_GATE and position_pct < BUY_SELL_POSITION_HIGH_GATE:
+            is_leader = True
+
+    return position_pct, is_leader, position_label
+
+
+def _build_stock_type(is_leader: bool, position_label: str) -> str:
+    """构建股票类型标签，如 '低位龙头' / '高位跟风'"""
+    leader_str = '龙头' if is_leader else '跟风'
+    return f'{position_label}{leader_str}' if position_label else leader_str
+
+
+def _build_expectation_note(is_leader: bool, position_label: str, score: float, sell_pct: float) -> str:
+    """构建预期说明文字"""
+    parts = []
+    if position_label:
+        parts.append(position_label)
+    parts.append('龙头' if is_leader else '跟风')
+    if score >= 80:
+        parts.append('高分确认')
+    elif score < 55:
+        parts.append('低分谨慎')
+    type_str = ''.join(parts)
+    note = f'{type_str}，预期涨幅{sell_pct*100:.1f}%'
+    if is_leader and position_label in ('低位', '中低位'):
+        note += '，上行空间较大'
+    elif not is_leader and position_label == '高位':
+        note += '，快进快出'
+    elif position_label == '高位':
+        note += '，注意控制仓位'
+    return note
+
+
+def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
+                         trend_details: Optional[Dict] = None) -> Dict:
+    """计算买入点、当前价、卖出点（V4.2 位置+龙头感知版）
+
+    V4.1: 基于振幅动态调整买卖比例
+    V4.2: 叠加位置高低修正 + 龙头/跟风修正 + 评分置信度修正
+          止盈倍率 = 位置倍率 × 龙头倍率 × 评分倍率，封顶 15%
+          龙头判定：连板≥2 / 涨停 / (涨幅≥5%+量比≥2) / (高分+非高位)
+          位置判定：优先 trend_details.positionPct，fallback base_scores['position']
+
+    Args:
+        stock: 行情数据 dict
+        score_result: calc_stock_score_v2 返回值（含 total/base_scores/factor_values）
+        trend_details: 趋势扫描 details dict（含 positionPct/consecutiveUpDays，可选）
     """
     try:
         price = float(stock.get('priceRaw') or stock.get('price') or 0)
@@ -113,40 +231,100 @@ def calc_buy_sell_points(stock: Dict) -> Dict:
     change_pct = float(stock.get('changePercent', 0) or 0)
     amplitude = float(stock.get('amplitude', 0) or 0)
 
-    # 涨停板：不设固定买点，提示竞价关注
+    # ===== 提取位置/龙头/评分上下文 =====
+    position_pct, is_leader, position_label = _extract_position_and_leader(
+        stock, score_result, trend_details)
+
+    stock_score = 0.0
+    if score_result and isinstance(score_result, dict):
+        stock_score = float(score_result.get('total', 0) or 0)
+    elif isinstance(stock.get('score'), dict):
+        stock_score = float(stock['score'].get('total', 0) or 0)
+    elif stock.get('score'):
+        stock_score = float(stock.get('score', 0) or 0)
+
+    # ===== 位置止盈倍率 =====
+    if position_pct <= BUY_SELL_POSITION_LOW_GATE:
+        pos_mult = BUY_SELL_TARGET_POSITION_LOW_MULT
+    elif position_pct <= BUY_SELL_POSITION_MIDLOW_GATE:
+        pos_mult = BUY_SELL_TARGET_POSITION_MIDLOW_MULT
+    elif position_pct >= BUY_SELL_POSITION_HIGH_GATE:
+        pos_mult = BUY_SELL_TARGET_POSITION_HIGH_MULT
+    else:
+        pos_mult = 1.0
+
+    # ===== 龙头止盈倍率 =====
+    leader_mult = BUY_SELL_TARGET_LEADER_MULT if is_leader else BUY_SELL_TARGET_FOLLOWER_MULT
+
+    # ===== 评分置信度止盈倍率 =====
+    if stock_score >= 80:
+        score_mult = BUY_SELL_TARGET_SCORE_HIGH_MULT
+    elif stock_score < 55:
+        score_mult = BUY_SELL_TARGET_SCORE_LOW_MULT
+    else:
+        score_mult = 1.0
+
+    # ===== 涨停板特殊处理 =====
     if change_pct >= TREND_LIMIT_UP_THRESHOLD:
-        # 卖出价：封单坚决 +2%，普通封板 +4%
         weibi = float(stock.get('weibi', 0) or 0)
         turnover = float(stock.get('turnoverRate', 0) or 0)
-        if weibi > 80 and 2 <= turnover <= 15:
-            sell_pct = 0.03  # 龙头封单坚决，次日高溢价
+        # 龙头涨停给更高预期
+        if is_leader and weibi > 80 and 2 <= turnover <= 15:
+            base_sell_pct = 0.05   # 龙头封单坚决
+        elif is_leader:
+            base_sell_pct = 0.07   # 龙头普通封板
         else:
-            sell_pct = 0.05
+            base_sell_pct = 0.04   # 跟风封板
+
+        # 位置修正（龙头倍率已在 base_sell_pct 中体现，此处只叠位置+评分）
+        sell_pct = base_sell_pct * pos_mult * score_mult
+        sell_pct = min(sell_pct, BUY_SELL_MAX_TARGET_PCT)
+
+        stock_type = _build_stock_type(is_leader, position_label)
         return {
             'buy': '竞价关注',
             'current': f'{price:.2f}',
             'sell': f'{price * (1 + sell_pct):.2f}',
+            'sellPct': round(sell_pct * 100, 1),
+            'stockType': stock_type,
+            'expectationNote': _build_expectation_note(is_leader, position_label, stock_score, sell_pct),
         }
 
-    # 非涨停板：根据振幅动态调整买卖比例
-    # 振幅越大 → 波动越剧烈 → 买点回撤更多、卖点空间更大
+    # ===== 非涨停板：振幅基础 + 三维修正 =====
     if amplitude >= 5:
-        buy_pct = 0.03   # 高波动，等更大回撤
-        sell_pct = 0.06
+        base_buy_pct = 0.03
+        base_sell_pct = 0.06
     elif amplitude >= 3:
-        buy_pct = 0.025
-        sell_pct = 0.05
+        base_buy_pct = 0.025
+        base_sell_pct = 0.05
     elif amplitude >= 2:
-        buy_pct = 0.02
-        sell_pct = 0.04
+        base_buy_pct = 0.02
+        base_sell_pct = 0.04
     else:
-        buy_pct = 0.015  # 低波动，小幅回撤即可
-        sell_pct = 0.03
+        base_buy_pct = 0.015
+        base_sell_pct = 0.03
 
+    # 止盈倍率 = 位置 × 龙头 × 评分
+    total_mult = pos_mult * leader_mult * score_mult
+    sell_pct = min(base_sell_pct * total_mult, BUY_SELL_MAX_TARGET_PCT)
+
+    # 买入回撤受位置影响：低位可以多等（可能还有低点），高位少等（机会稍纵即逝）
+    if position_pct <= BUY_SELL_POSITION_LOW_GATE:
+        buy_pct = base_buy_pct * 1.3
+    elif position_pct >= BUY_SELL_POSITION_HIGH_GATE:
+        buy_pct = base_buy_pct * 0.7
+    else:
+        buy_pct = base_buy_pct
+
+    stock_type = _build_stock_type(is_leader, position_label)
     return {
         'buy': f'{price * (1 - buy_pct):.2f}',
         'current': f'{price:.2f}',
         'sell': f'{price * (1 + sell_pct):.2f}',
+        'sellPct': round(sell_pct * 100, 1),
+        'buyPct': round(buy_pct * 100, 1),
+        'stockType': stock_type,
+        'expectationNote': _build_expectation_note(is_leader, position_label, stock_score, sell_pct),
     }
 
 
@@ -398,7 +576,10 @@ async def auto_generate_recommendations_task():
         # ===== 6. 计算买卖点 + 推荐理由 =====
         rec_items = []
         for r in top3:
-            bsp = calc_buy_sell_points(r)
+            sym = r.get('symbol', '').lower()
+            _trend = trend_map.get(sym)
+            bsp = calc_buy_sell_points(r, score_result=r.get('score'),
+                                       trend_details=(_trend or {}).get('details'))
             reason = gen_recommend_reason_server(r, {
                 'total': r['score']['total'],
                 'label': r['score']['label'],
