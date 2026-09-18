@@ -71,6 +71,7 @@ TREND_MIN_SCORE = 65  # 趋势发现进入趋势池的最低分
 TREND_IS_UP_MIN_SCORE = 35  # 认定为"趋势向上"（isUp=true）的最低分
 TREND_MIN_KLINE_DAYS = 60  # 趋势发现最少 K 线天数（覆盖 MA20 + 60日量能均）
 TREND_AUTO_ADD_POOL_THRESHOLD = 80  # 趋势评分 ≥ 此值时自动加入用户股票池（0 表示关闭）
+TREND_POOL_MAX_SIZE = 50  # 股票池上限：自动入池超过此数时，裁掉最早加入的（防无限膨胀）
 
 # 涨停 / 跌停阈值
 TREND_LIMIT_UP_THRESHOLD = 9.8  # 涨停阈值（单日涨幅 % ≥ 此值算涨停）
@@ -671,7 +672,7 @@ MARKET_ALERT_RISK_THRESHOLD = 40  # 风险评分 >= 此值时触发预警推送
 # 盘中准实时推送：满足条件的候选股实时推送到企业微信（wecom-cli message aibot send）。
 # chat_id 为授权真人用户的内部 ID（机器人"杨珍的机器人"的授权人），仅内部调用，不对外展示。
 WECOM_PUSH_ENABLED = True
-WECOM_CLI_CHAT_ID = 'woo0QVPAAAiTuUXPTA8qH_kjcnk1YCSA'   # 授权人 chat_id（内部）
+WECOM_CLI_CHAT_ID = os.environ.get('WECOM_CLI_CHAT_ID', 'woo0QVPAAAiTuUXPTA8qH_kjcnk1YCSA')   # 授权人 chat_id（内部，优先环境变量 WECOM_CLI_CHAT_ID）
 WECOM_PUSH_INTERVAL_SEC = 60        # 盘中轮询间隔（秒），1 分钟级准实时
 WECOM_PUSH_START = '09:31'          # 盘中推送开始时间（连续竞价后）
 WECOM_PUSH_END = '14:57'            # 盘中推送结束时间（收盘前）

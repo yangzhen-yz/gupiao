@@ -9,6 +9,8 @@ __pycache__/
 # 本地数据库与运行时产物
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 server/ai_config.json
 .DS_Store
 Thumbs.db

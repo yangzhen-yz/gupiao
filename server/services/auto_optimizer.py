@@ -58,13 +58,13 @@ WF_MIN_VALID_IMPROVEMENT = 1.0                   # 单项调整在验证窗的�
 
 def _split_train_valid(rows, validation_days: int = WF_VALIDATION_DAYS):
     """按 predict_date 把记录切分为（训练窗, 验证窗）。验证窗为最近 validation_days 个交易日。"""
-    dates = sorted({r['predict_date'] for r in rows if r.get('predict_date')})
+    dates = sorted({r['predict_date'] for r in rows if r['predict_date'] is not None})
     if len(dates) < 4:
         return rows, []
     n_valid = min(validation_days, len(dates) - 2)  # 训练窗至少保留2个交易日
     cutoff = dates[-n_valid]
-    train = [r for r in rows if r.get('predict_date') and r['predict_date'] < cutoff]
-    valid = [r for r in rows if r.get('predict_date') and r['predict_date'] >= cutoff]
+    train = [r for r in rows if r['predict_date'] is not None and r['predict_date'] < cutoff]
+    valid = [r for r in rows if r['predict_date'] is not None and r['predict_date'] >= cutoff]
     return train, valid
 
 
@@ -101,7 +101,7 @@ def _blended_objective(rows, w1: float, w2: float, w3: float, w4: float,
     3日样本不足时退化为纯1日胜率。
     """
     wr_1d = _simulate_top_winrate(rows, w1, w2, w3, w4, top_n, 'is_correct_1d')
-    rows_3d = [r for r in rows if r.get('is_correct_3d') is not None]
+    rows_3d = [r for r in rows if r['is_correct_3d'] is not None]
     if len(rows_3d) < top_n:
         return wr_1d
     wr_3d = _simulate_top_winrate(rows_3d, w1, w2, w3, w4, top_n, 'is_correct_3d')

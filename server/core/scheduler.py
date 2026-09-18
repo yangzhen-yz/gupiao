@@ -196,6 +196,14 @@ def run_scheduler():
             return
         asyncio.run(push_daily_preview_task())
 
+    def job_db_maintenance():
+        # 2026-09-18：每周六凌晨清理过期 K线缓存/热搜快照并 VACUUM（非交易日，不锁库）
+        from services.db_maintenance import cleanup_old_cache
+        try:
+            cleanup_old_cache()
+        except Exception as e:
+            print(f'[DB维护] 异常: {e}')
+
     # ---- 注册定时任务 ----
     # 热搜榜：非交易日不跑，没意义
     def _warp_trading_only(fn):
@@ -253,6 +261,9 @@ def run_scheduler():
     # 企业微信选股推送：开盘前 9:25 推送今日关注池预览（仅交易日）
     schedule.every().day.at(WECOM_PUSH_PREVIEW_TIME).do(job_push_daily_preview)
 
+    # 数据库维护：每周六凌晨3点清理过期缓存+VACUUM（防 SQLite 膨胀）
+    schedule.every().saturday.at("03:00").do(job_db_maintenance)
+
     _now = datetime.now()
     print(f'\n[定时任务 {_now:%Y-%m-%d %H:%M:%S}] 已注册以下定时任务（今日交易日={_today_is_trading()}）：')
     print(f'[定时任务]   - {"/".join(SCHEDULE_UPDATE_HOT_SEARCH_TIMES)}: 更新热搜榜（仅交易日）')
@@ -285,7 +296,12 @@ def run_scheduler():
 
     while True:
         try:
-            schedule.run_pending()
+            # 2026-09-18 稳定性修复：run_pending 单独 try 隔离。
+            # 任何定时 job 抛异常只记录，不再拖累下方的企业微信推送轮询与自愈检查。
+            try:
+                schedule.run_pending()
+            except Exception as _sched_err:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] run_pending 异常（已隔离，不影响推送）: {_sched_err}')
             _now = datetime.now()
             _hm = _now.strftime('%H:%M')
             _today_str = _now.strftime('%Y-%m-%d')
