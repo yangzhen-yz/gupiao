@@ -11,7 +11,6 @@
   极端高估需 PE 与 PB 百分位"双高"才触发，避免单维度误杀。
 - 百分位 = 全市场中"估值不高于该股"的占比，与 RPS(越高越强) 相反（估值越高越贵）。
 """
-import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 

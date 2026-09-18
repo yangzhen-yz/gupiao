@@ -15,10 +15,14 @@ from app.config import (RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX,
                         RISK_CONTROL_STOP_LOSS_VOL_MULT, RISK_CONTROL_SCORE_HIGH_RISK,
                         RISK_CONTROL_SCORE_MID_RISK,
                         BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_HIGH_GATE,
-                        BUY_SELL_LEADER_CONSECUTIVE_BOARDS, BUY_SELL_LEADER_SCORE_GATE,
                         BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO,
+                        BUY_SELL_LEADER_SCORE_GATE,
                         BUY_SELL_STOP_POSITION_LOW_MULT, BUY_SELL_STOP_POSITION_HIGH_MULT,
-                        BUY_SELL_STOP_LEADER_MULT, BUY_SELL_STOP_FOLLOWER_MULT,
+                        BUY_SELL_ROLE_STOP_MULT, BUY_SELL_ROLE_LABELS,
+                        BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CORE_TREND_MV,
+                        BUY_SELL_ROLE_CORE_TREND_SCORE,
+                        BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN,
+                        BUY_SELL_ROLE_FOLLOWER_SCORE_MIN,
                         TREND_LIMIT_UP_THRESHOLD)
 
 
@@ -101,14 +105,15 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
         base_stop_pct = _clamp(amplitude / 100.0 * RISK_CONTROL_STOP_LOSS_VOL_MULT,
                                RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX)
 
-    # V4.2: 位置 + 龙头止损修正（从 score_result 提取上下文）
+    # V4.3: 位置 + 角色止损修正（从 score_result 提取上下文，无 trend_details 时用 fallback 分类）
     stop_mult = 1.0
+    role = 'marginal'
+    position_pct = 50
     if isinstance(score_result, dict):
         base_scores = score_result.get('base_scores', {}) or {}
         factor_values = score_result.get('factor_values', {}) or {}
 
-        # 位置分位：优先 trend_details（score_result 无 details），fallback base_scores['position']
-        position_pct = None
+        # 位置分位：fallback base_scores['position']
         pos_score = base_scores.get('position', 10)
         if pos_score <= 5:
             position_pct = 80   # 高位
@@ -123,18 +128,39 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
         elif position_pct >= BUY_SELL_POSITION_HIGH_GATE:
             stop_mult *= BUY_SELL_STOP_POSITION_HIGH_MULT      # 高位：收紧
 
-        # 龙头判定（fallback：涨停 / 涨幅+量比 / 高分+非高位）
+        # ---- 角色分类（fallback：无 trend_details，用涨幅/量比/换手/市值/评分判定） ----
         change_pct = abs(float(factor_values.get('change_percent', 0) or
                                (stock.get('changePercent', 0) if stock else 0) or 0))
         vol_ratio = float(factor_values.get('volume_ratio', 0) or
                           (stock.get('volumeRatio', 0) if stock else 0) or 0)
-        is_leader = (change_pct >= TREND_LIMIT_UP_THRESHOLD or
-                     (change_pct >= BUY_SELL_LEADER_FALLBACK_CHANGE_PCT and
-                      vol_ratio >= BUY_SELL_LEADER_FALLBACK_VOL_RATIO) or
-                     (score_total >= BUY_SELL_LEADER_SCORE_GATE and
-                      position_pct < BUY_SELL_POSITION_HIGH_GATE))
+        turnover_rate = float(stock.get('turnoverRate', 0) if stock else 0)
+        circ_mv = float(stock.get('circ_mv', 0) if stock else 0)
+        is_limit_up_today = change_pct >= TREND_LIMIT_UP_THRESHOLD
 
-        stop_mult *= BUY_SELL_STOP_LEADER_MULT if is_leader else BUY_SELL_STOP_FOLLOWER_MULT
+        # 涨停 + 高换手 → 情绪先锋
+        if is_limit_up_today and turnover_rate >= BUY_SELL_ROLE_VANGUARD_TURNOVER:
+            role = 'sentiment_vanguard'
+        # 涨停 → 板块龙头（单日涨停至少是板块级别领涨）
+        elif is_limit_up_today:
+            role = 'sector_leader'
+        # 涨幅≥5% + 量比≥2 → 板块龙头
+        elif change_pct >= BUY_SELL_LEADER_FALLBACK_CHANGE_PCT and vol_ratio >= BUY_SELL_LEADER_FALLBACK_VOL_RATIO:
+            role = 'sector_leader'
+        # 大市值 + 评分≥65 → 中军
+        elif circ_mv >= BUY_SELL_ROLE_CORE_TREND_MV and score_total >= BUY_SELL_ROLE_CORE_TREND_SCORE:
+            role = 'core_trend'
+        # 高分 + 非高位 → 中军（趋势型强势股）
+        elif score_total >= BUY_SELL_LEADER_SCORE_GATE and position_pct < BUY_SELL_POSITION_HIGH_GATE:
+            role = 'core_trend'
+        # 涨幅≥3% + 量比≥1 + 评分≥50 → 跟风
+        elif (change_pct >= BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN and
+              vol_ratio >= BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN and
+              score_total >= BUY_SELL_ROLE_FOLLOWER_SCORE_MIN):
+            role = 'follower'
+        else:
+            role = 'marginal'
+
+        stop_mult *= BUY_SELL_ROLE_STOP_MULT.get(role, 1.0)
 
     stop_pct = _clamp(base_stop_pct * stop_mult, RISK_CONTROL_STOP_LOSS_MIN, RISK_CONTROL_STOP_LOSS_MAX)
     stop_loss = round(price * (1 - stop_pct), 2)
@@ -156,15 +182,15 @@ def calc_risk_control(price: float, score_result: Optional[Dict] = None,
     note_parts.append(f"综合评分{score_total:.0f}分→{level_map_cn(level)}")
     if danger:
         note_parts.append('；'.join(danger))
-    # 位置/龙头提示
+    # 位置/角色提示
     if isinstance(score_result, dict):
         pos_label = '低位' if position_pct <= BUY_SELL_POSITION_LOW_GATE else \
                     '高位' if position_pct >= BUY_SELL_POSITION_HIGH_GATE else ''
-        leader_label = '龙头' if is_leader else '跟风'
+        role_label = BUY_SELL_ROLE_LABELS.get(role, '杂毛')
         if pos_label:
-            note_parts.append(f"{pos_label}{leader_label}止损{stop_pct:.1f}%")
+            note_parts.append(f"{pos_label}{role_label}止损{stop_pct:.1f}%")
         else:
-            note_parts.append(f"{leader_label}止损{stop_pct:.1f}%")
+            note_parts.append(f"{role_label}止损{stop_pct:.1f}%")
     elif amplitude > 0:
         note_parts.append(f"止损≈现价-{stop_pct:.1f}%（基于振幅波动率）")
     risk_note = '，'.join(note_parts)

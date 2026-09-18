@@ -134,7 +134,7 @@
           <div class="decision-card-header">
             <span class="decision-card-title">🎯 交易决策参考</span>
             <span v-if="buySellPoints?.stockType" class="decision-type-badge"
-              :class="{ 'type-leader': buySellPoints.stockType.includes('龙头'), 'type-follower': buySellPoints.stockType.includes('跟风') }">{{ buySellPoints.stockType }}</span>
+              :class="stockRoleClass">{{ buySellPoints.stockType }}</span>
             <span v-if="riskControl?.risk_level" class="decision-risk-tag"
               :style="{ color: riskLevelMeta.color, background: `color-mix(in srgb, ${riskLevelMeta.color} 12%, transparent)`, borderColor: `color-mix(in srgb, ${riskLevelMeta.color} 33%, transparent)` }">{{ riskLevelMeta.text }}</span>
           </div>
@@ -264,6 +264,18 @@ const tradingStatusText = computed(() => getTradingStatusText())
 const buySellPoints = computed(() => quoteData.value?.buySellPoints || null)
 const riskControl = computed(() => quoteData.value?.riskControl || null)
 const showDecisionCard = computed(() => !!buySellPoints.value || !!riskControl.value)
+// 角色 CSS 类（7级分类：总龙头/板块龙头/中军/情绪先锋/补涨龙/跟风/杂毛）
+const stockRoleClass = computed(() => {
+  const t = buySellPoints.value?.stockType || ''
+  if (t.includes('总龙头')) return 'role-total-leader'
+  if (t.includes('板块龙头')) return 'role-sector-leader'
+  if (t.includes('中军')) return 'role-core-trend'
+  if (t.includes('情绪先锋')) return 'role-vanguard'
+  if (t.includes('补涨龙')) return 'role-catch-up'
+  if (t.includes('跟风')) return 'role-follower'
+  if (t.includes('杂毛')) return 'role-marginal'
+  return 'role-marginal'
+})
 // 预期涨幅 = (目标卖点 - 当前价) / 当前价 * 100
 const expectedGainPct = computed(() => {
   const bsp = buySellPoints.value
@@ -566,25 +578,77 @@ defineExpose({ searchStock })
   white-space: nowrap;
   margin-right: auto;
 }
-.decision-type-badge.type-leader {
+/* 7级角色配色（龙头系暖橙、中军蓝、先锋紫、补涨青、跟风灰、杂毛暗灰） */
+.decision-type-badge.role-total-leader {
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+.decision-type-badge.role-sector-leader {
   color: #c2410c;
   background: #fff7ed;
   border: 1px solid #fed7aa;
 }
-.decision-type-badge.type-follower {
+.decision-type-badge.role-core-trend {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+}
+.decision-type-badge.role-vanguard {
+  color: #7e22ce;
+  background: #faf5ff;
+  border: 1px solid #e9d5ff;
+}
+.decision-type-badge.role-catch-up {
+  color: #0e7490;
+  background: #ecfeff;
+  border: 1px solid #a5f3fc;
+}
+.decision-type-badge.role-follower {
   color: #475569;
   background: #f1f5f9;
   border: 1px solid #e2e8f0;
 }
-:root[data-theme="dark"] .decision-type-badge.type-leader {
+.decision-type-badge.role-marginal {
+  color: #78716c;
+  background: #f5f5f4;
+  border: 1px solid #d6d3d1;
+}
+/* 暗色模式 */
+:root[data-theme="dark"] .decision-type-badge.role-total-leader {
+  color: #fca5a5;
+  background: rgba(185, 28, 28, 0.15);
+  border-color: rgba(254, 202, 202, 0.3);
+}
+:root[data-theme="dark"] .decision-type-badge.role-sector-leader {
   color: #fdba74;
   background: rgba(194, 65, 12, 0.15);
   border-color: rgba(254, 215, 170, 0.3);
 }
-:root[data-theme="dark"] .decision-type-badge.type-follower {
+:root[data-theme="dark"] .decision-type-badge.role-core-trend {
+  color: #93c5fd;
+  background: rgba(29, 78, 216, 0.15);
+  border-color: rgba(191, 219, 254, 0.3);
+}
+:root[data-theme="dark"] .decision-type-badge.role-vanguard {
+  color: #d8b4fe;
+  background: rgba(126, 34, 206, 0.15);
+  border-color: rgba(233, 213, 255, 0.3);
+}
+:root[data-theme="dark"] .decision-type-badge.role-catch-up {
+  color: #67e8f9;
+  background: rgba(14, 116, 144, 0.15);
+  border-color: rgba(165, 243, 252, 0.3);
+}
+:root[data-theme="dark"] .decision-type-badge.role-follower {
   color: #94a3b8;
   background: rgba(71, 85, 105, 0.15);
   border-color: rgba(226, 232, 240, 0.2);
+}
+:root[data-theme="dark"] .decision-type-badge.role-marginal {
+  color: #a8a29e;
+  background: rgba(120, 113, 108, 0.15);
+  border-color: rgba(214, 211, 209, 0.2);
 }
 
 .decision-risk-tag {

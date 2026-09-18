@@ -10,13 +10,11 @@
 - 北向为市场级情绪指标,供策略页展示 + 可选大盘环境修饰
 - 所有数据缺失均降级,不阻塞主流程
 """
-import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import (Dict, List)
 from datetime import datetime, timedelta
 import requests
 
-from db.database import get_db_conn  # noqa: F401 (预留:未来可持久化龙虎榜历史)
 from app.config import SMART_MONEY_DRAGON_TIGER_DAYS
 
 DRAGON_API = 'https://datacenter-web.eastmoney.com/api/data/v1/get'

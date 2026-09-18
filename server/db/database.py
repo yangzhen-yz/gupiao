@@ -1,5 +1,5 @@
 """database.py - split from main.py"""
-import sqlite3, json
+import sqlite3, json, time
 from typing import List, Dict
 from datetime import date, timedelta
 from app.config import SQLITE_DB_PATH, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, HOT_SEARCH_TOP_N, HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS, DEFAULT_WEIGHTS
@@ -15,6 +15,29 @@ def get_db_conn():
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+# ========== 高频读取 TTL 内存缓存（2026-08-31 性能优化） ==========
+# 背景：load_stock_basic_info / load_stock_alias_map / load_hot_search_ranking
+#       在每次请求中都会被调用，每次都新建 SQLite 连接全表扫描。
+#       这些数据更新频率极低（盘后/定时更新），60s 内存缓存可消除绝大部分重复 DB 读。
+# 注意：对应的 save_* 函数已做缓存失效，保证写后立即可见。
+_DB_TTL_CACHE: Dict[str, Dict] = {}
+
+def _db_cache_get(key: str):
+    """命中且在 TTL 内返回缓存数据，否则 None"""
+    item = _DB_TTL_CACHE.get(key)
+    if item and (time.time() - item['ts']) < item['ttl']:
+        return item['data']
+    return None
+
+def _db_cache_set(key: str, data, ttl: float = 60.0):
+    _DB_TTL_CACHE[key] = {'ts': time.time(), 'ttl': ttl, 'data': data}
+    # 惰性清理：超过 200 条时全清（防止内存无限增长）
+    if len(_DB_TTL_CACHE) > 200:
+        _DB_TTL_CACHE.clear()
+
+def _db_cache_invalidate(key: str):
+    _DB_TTL_CACHE.pop(key, None)
 
 # ========== 时间戳 UTC→北京时间 迁移 ==========
 # 需要迁移的表及其时间戳列（DEFAULT 曾为 CURRENT_TIMESTAMP=UTC）
@@ -417,6 +440,70 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_kline_cache_symbol ON kline_cache(symbol)')
         # 迁移第 2 步：将旧表数据（UTC）复制到新表（+8h→北京时间），然后删除旧表
+        # V4.4：自动优化引擎表（趋势维度权重 + 角色门槛 + 角色表现 + 优化历史）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trend_dimension_weights (
+                dimension TEXT PRIMARY KEY,   -- 'd1', 'd2', 'd3', 'd4'
+                weight REAL DEFAULT 1.0,
+                accuracy REAL DEFAULT 0,
+                discrimination REAL DEFAULT 0,
+                sample_count INTEGER DEFAULT 0,
+                correct_count INTEGER DEFAULT 0,
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+            )''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS role_thresholds (
+                role TEXT PRIMARY KEY,        -- 'total_leader','sector_leader','core_trend',...
+                min_boards INTEGER DEFAULT 0,
+                min_limitups INTEGER DEFAULT 0,
+                min_mv REAL DEFAULT 0,
+                min_score REAL DEFAULT 0,
+                min_turnover REAL DEFAULT 0,
+                max_position REAL DEFAULT 100,
+                min_change REAL DEFAULT 0,
+                min_vol_ratio REAL DEFAULT 0,
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+            )''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS role_performance (
+                role TEXT NOT NULL,
+                record_date TEXT NOT NULL,    -- 统计日期 YYYY-MM-DD
+                total INTEGER DEFAULT 0,
+                win INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                avg_change REAL DEFAULT 0,
+                avg_market REAL DEFAULT 0,
+                excess_return REAL DEFAULT 0,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                PRIMARY KEY (role, record_date)
+            )''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS optimization_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                module TEXT NOT NULL,          -- 'trend_dimension_weights'/'role_thresholds'/'grid_search'
+                parameter_set TEXT DEFAULT '', -- JSON 参数快照
+                metric_name TEXT DEFAULT '',
+                metric_value REAL DEFAULT 0,
+                old_value REAL DEFAULT NULL,
+                new_value REAL DEFAULT NULL,
+                details TEXT DEFAULT '',       -- JSON 详情
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+            )''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_optimization_module ON optimization_history(module)
+        ''')
+        # V4.4：趋势回测记录表添加 role 字段（角色门槛优化需要）
+        try:
+            cursor.execute('ALTER TABLE trend_backtest_records ADD COLUMN role TEXT DEFAULT ""')
+        except Exception:
+            pass  # 列已存在
+        # V4.4：趋势回测记录表添加 s_d1/s_d2/s_d3/s_d4 字段（D1-D4权重优化需要）
+        for dim_col in ['s_d1', 's_d2', 's_d3', 's_d4']:
+            try:
+                cursor.execute(f'ALTER TABLE trend_backtest_records ADD COLUMN {dim_col} REAL DEFAULT NULL')
+            except Exception:
+                pass  # 列已存在
+
         _finish_ts_migration(cursor)
         conn.commit()
         print('[数据库] 表初始化完成')
@@ -634,8 +721,9 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
             cursor.execute('''
                 INSERT OR REPLACE INTO trend_backtest_records
                     (predict_date, symbol, name, score, predict_direction,
-                     sector_factor, chip_factor, pattern, pattern_factor, market_regime, total_factor)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     sector_factor, chip_factor, pattern, pattern_factor, market_regime, total_factor,
+                     role, s_d1, s_d2, s_d3, s_d4)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 predict_date,
                 r.get('symbol', ''),
@@ -648,6 +736,11 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
                 float(details.get('patternFactor', 0) or 0),
                 str(details.get('marketRegime', 'range') or 'range'),
                 float(details.get('totalFactor', 0) or 0),
+                str(r.get('stockRole', '') or ''),
+                details.get('sD1'),
+                details.get('sD2'),
+                details.get('sD3'),
+                details.get('sD4'),
             ))
         conn.commit()
         conn.close()
@@ -830,13 +923,19 @@ def load_latest_trend_backtest_report() -> Dict:
 
 
 def load_stock_basic_info() -> Dict:
+    _ck = 'stock_basic_info'
+    _hit = _db_cache_get(_ck)
+    if _hit is not None:
+        return _hit
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
         cursor.execute('SELECT symbol, name FROM stock_basic_info')
         rows = cursor.fetchall()
         conn.close()
-        return {row['symbol']: row['name'] for row in rows}
+        _result = {row['symbol']: row['name'] for row in rows}
+        _db_cache_set(_ck, _result, 60.0)
+        return _result
     except Exception as error:
         print(f'加载股票映射失败: {str(error)}')
         return {}
@@ -853,6 +952,7 @@ def save_stock_basic_info(stock_basic_info: Dict) -> bool:
             )
         conn.commit()
         conn.close()
+        _db_cache_invalidate('stock_basic_info')
         return True
     except Exception as error:
         print(f'保存股票映射失败: {str(error)}')
@@ -1398,6 +1498,12 @@ def load_daily_market_reviews() -> List[Dict]:
                     review['aiAnalysis'] = None
             else:
                 review['aiAnalysis'] = None
+            # 短线情绪周期（2026-09-04 新增；历史数据无此字段时前端不渲染该区块）
+            if 'sentiment_cycle_json' in row.keys() and row['sentiment_cycle_json']:
+                try:
+                    review['sentimentCycle'] = json.loads(row['sentiment_cycle_json'])
+                except Exception:
+                    review['sentimentCycle'] = None
             # 涨停/跌停真实总数（2026-07-30 补齐）；若缺失则降级回数组长度（历史数据）
             if 'limit_up_count' in row.keys() and row['limit_up_count'] is not None:
                 review['limitUpCount'] = int(row['limit_up_count'])
@@ -1422,8 +1528,8 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        # 确保新字段存在（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count）
-        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json', 'ai_analysis_json']
+        # 确保新字段存在（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count；2026-09-04 新增 sentiment_cycle_json）
+        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json', 'ai_analysis_json', 'sentiment_cycle_json']
         for col in new_cols:
             try:
                 cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
@@ -1453,6 +1559,7 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             trend_json = json.dumps(review.get('trendStocks', {}), ensure_ascii=False)
             pool_json = json.dumps(review.get('stockPool', {}), ensure_ascii=False)
             ai_analysis_json = json.dumps(review.get('aiAnalysis'), ensure_ascii=False) if review.get('aiAnalysis') else None
+            sentiment_cycle_json = json.dumps(review.get('sentimentCycle'), ensure_ascii=False) if review.get('sentimentCycle') else None
             # 真实涨停/跌停总数：优先读 count 字段，否则退化为数组长度（兼容旧数据）
             limit_up_count = review.get('limitUpCount')
             if limit_up_count is None:
@@ -1461,9 +1568,9 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             if limit_down_count is None:
                 limit_down_count = len(review.get('limitDownStocks', []))
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, limit_up_count, limit_down_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, limit_up_count, limit_down_count))
+                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, limit_up_count, limit_down_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, limit_up_count, limit_down_count))
         conn.commit()
         conn.close()
         return True
@@ -1637,7 +1744,256 @@ def save_hot_search_ranking(data: Dict) -> bool:
             pass
         conn.commit()
         conn.close()
+        _db_cache_invalidate('hot_search_ranking')
         return True
     except Exception as error:
         print(f'保存hot_search_ranking数据失败: {str(error)}')
         return False
+
+
+# ========== 自动优化引擎 CRUD（V4.4）==========
+
+def load_trend_dimension_weights() -> Dict:
+    """加载 D1-D4 趋势维度权重（无数据时返回 1.0 默认值）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM trend_dimension_weights')
+        rows = cursor.fetchall()
+        conn.close()
+        result = {
+            'd1': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
+            'd2': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
+            'd3': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
+            'd4': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
+        }
+        for row in rows:
+            d = row['dimension'].lower()
+            if d in result:
+                result[d] = {
+                    'weight': float(row['weight']),
+                    'accuracy': float(row['accuracy']),
+                    'discrimination': float(dict(row).get('discrimination') or 0),
+                    'sample_count': int(row['sample_count']),
+                    'correct_count': int(row['correct_count']),
+                }
+        return result
+    except Exception as error:
+        print(f'加载趋势维度权重失败: {str(error)}')
+        return {'d1': {'weight': 1.0}, 'd2': {'weight': 1.0}, 'd3': {'weight': 1.0}, 'd4': {'weight': 1.0}}
+
+
+def save_trend_dimension_weights(weights_data: Dict) -> bool:
+    """保存 D1-D4 趋势维度权重"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for dim_key, data in weights_data.items():
+            weight = data.get('weight', 1.0)
+            accuracy = data.get('accuracy', 0)
+            discrimination = data.get('discrimination', 0)
+            sample_count = data.get('sample_count', 0)
+            correct_count = data.get('correct_count', 0)
+            cursor.execute('''
+                INSERT OR REPLACE INTO trend_dimension_weights
+                    (dimension, weight, accuracy, discrimination, sample_count, correct_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
+            ''', (dim_key, weight, accuracy, discrimination, sample_count, correct_count))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存趋势维度权重失败: {str(error)}')
+        return False
+
+
+def load_role_thresholds() -> Dict:
+    """加载角色分类门槛（无数据时返回 config 默认值）"""
+    from app.config import (
+        BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS,
+        BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS,
+        BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE,
+        BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX,
+        BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN,
+        BUY_SELL_ROLE_FOLLOWER_SCORE_MIN,
+    )
+    defaults = {
+        'total_leader': {
+            'min_boards': BUY_SELL_ROLE_TOTAL_LEADER_BOARDS,
+            'min_limitups': BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS,
+        },
+        'sector_leader': {
+            'min_boards': BUY_SELL_ROLE_SECTOR_LEADER_BOARDS,
+            'min_limitups': BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS,
+        },
+        'core_trend': {
+            'min_mv': BUY_SELL_ROLE_CORE_TREND_MV,
+            'min_score': BUY_SELL_ROLE_CORE_TREND_SCORE,
+        },
+        'sentiment_vanguard': {
+            'min_turnover': BUY_SELL_ROLE_VANGUARD_TURNOVER,
+        },
+        'catch_up': {
+            'max_position': BUY_SELL_ROLE_CATCHUP_POSITION_MAX,
+        },
+        'follower': {
+            'min_change': BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN,
+            'min_vol_ratio': BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN,
+            'min_score': BUY_SELL_ROLE_FOLLOWER_SCORE_MIN,
+        },
+        'marginal': {},
+    }
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM role_thresholds')
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return defaults
+        result = dict(defaults)
+        for row in rows:
+            role = row['role']
+            if role not in result:
+                result[role] = {}
+            for col in ['min_boards', 'min_limitups', 'min_mv', 'min_score',
+                        'min_turnover', 'max_position', 'min_change', 'min_vol_ratio']:
+                val = dict(row).get(col)
+                if val is not None and val != 0:
+                    result[role][col] = val
+        return result
+    except Exception as error:
+        print(f'加载角色门槛失败: {str(error)}')
+        return defaults
+
+
+def save_role_thresholds(thresholds_data: Dict) -> bool:
+    """保存角色分类门槛"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        for role, data in thresholds_data.items():
+            cursor.execute('''
+                INSERT OR REPLACE INTO role_thresholds
+                    (role, min_boards, min_limitups, min_mv, min_score,
+                     min_turnover, max_position, min_change, min_vol_ratio, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
+            ''', (
+                role,
+                int(data.get('min_boards', 0)),
+                int(data.get('min_limitups', 0)),
+                float(data.get('min_mv', 0)),
+                float(data.get('min_score', 0)),
+                float(data.get('min_turnover', 0)),
+                float(data.get('max_position', 100)),
+                float(data.get('min_change', 0)),
+                float(data.get('min_vol_ratio', 0)),
+            ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存角色门槛失败: {str(error)}')
+        return False
+
+
+def load_role_performance() -> Dict[str, Dict]:
+    """加载最近的角色表现统计"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        today_str = date.today().isoformat()
+        cursor.execute('''
+            SELECT role, total, win, win_rate, avg_change, avg_market, excess_return
+            FROM role_performance
+            WHERE record_date = ?
+        ''', (today_str,))
+        rows = cursor.fetchall()
+        conn.close()
+        result = {}
+        for row in rows:
+            result[row['role']] = {
+                'total': int(row['total']),
+                'win': int(row['win']),
+                'win_rate': float(row['win_rate']),
+                'avg_change': float(row['avg_change']),
+                'avg_market': float(row['avg_market']),
+                'excess_return': float(row['excess_return']),
+            }
+        return result
+    except Exception as error:
+        print(f'加载角色表现统计失败: {str(error)}')
+        return {}
+
+
+def save_role_performance(perf_data: Dict[str, Dict]) -> bool:
+    """保存角色表现统计"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        today_str = date.today().isoformat()
+        for role, stats in perf_data.items():
+            cursor.execute('''
+                INSERT OR REPLACE INTO role_performance
+                    (role, record_date, total, win, win_rate, avg_change, avg_market, excess_return)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                role, today_str,
+                int(stats.get('total', 0)),
+                int(stats.get('win', 0)),
+                float(stats.get('win_rate', 0)),
+                float(stats.get('avg_change', 0)),
+                float(stats.get('avg_market', 0)),
+                float(stats.get('excess_return', 0)),
+            ))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存角色表现统计失败: {str(error)}')
+        return False
+
+
+def save_optimization_history(module: str, parameter_set: str = '',
+                              metric_name: str = '', metric_value: float = 0,
+                              old_value: float = None, new_value: float = None,
+                              details: str = '') -> bool:
+    """保存优化历史"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO optimization_history (module, parameter_set, metric_name, metric_value,
+                                              old_value, new_value, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (module, parameter_set, metric_name, metric_value,
+              old_value, new_value, details))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存优化历史失败: {str(error)}')
+        return False
+
+
+def load_optimization_history(module: str = None, limit: int = 50) -> List[Dict]:
+    """加载优化历史"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if module:
+            cursor.execute(
+                'SELECT * FROM optimization_history WHERE module = ? ORDER BY created_at DESC LIMIT ?',
+                (module, limit)
+            )
+        else:
+            cursor.execute(
+                'SELECT * FROM optimization_history ORDER BY created_at DESC LIMIT ?',
+                (limit,)
+            )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'加载优化历史失败: {str(error)}')
+        return []

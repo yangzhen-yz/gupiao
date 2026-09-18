@@ -3,12 +3,13 @@
 让趋势评分系统能"回头看自己"：
 1. 每次趋势扫描入选的趋势股作为"预测记录"落库（在 trend.py 中调用 save_trend_backtest_records）
 2. 每日 15:30 定时任务对历史预测做 N 日（1/3/5 日）涨跌回测
-3. 跑赢大盘判定：is_correct_Nd = actual_change_Nd > market_change_Nd（严格大于）
+3. 跑赢基准判定：is_correct_Nd = actual_change_Nd > market_change_Nd（严格大于）
+   基准风格化（2026-09-04）：主板→上证指数，创业板(300/301)→创业板指，科创板(688)→科创50
 4. 按 predict_date 生成聚合报告，含三周期总胜率 + 分数段胜率
 5. 补验机制：每次回测扫描所有 verified_Nd=0 的记录（不限日期），避免漏验
 """
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import (date, datetime)
 from typing import List, Dict, Optional
 
 from app.config import (SCAN_KLINE_TIMEOUT, TREND_BACKTEST_PERIODS,
@@ -27,6 +28,20 @@ def _is_weekend(date_str: str) -> bool:
         return dt.weekday() >= 5
     except Exception:
         return False
+
+
+def _get_style_benchmark_symbol(symbol: str) -> str:
+    """按股票所属板块匹配风格化基准指数（2026-09-04）
+
+    主板(60/00) → 上证指数；创业板(300/301) → 创业板指；科创板(688) → 科创50。
+    同板块基准剔除板块风格涨跌，使"跑赢基准"反映个股真实alpha。
+    """
+    code = symbol[2:] if len(symbol) > 2 and symbol[:2] in ('sh', 'sz', 'bj') else symbol
+    if code.startswith('300') or code.startswith('301'):
+        return 'sz399006'
+    if code.startswith('688'):
+        return 'sh000688'
+    return TREND_BACKTEST_MARKET_SYMBOL
 
 
 def _calc_n_day_change(kline: List[List], predict_date: str, n: int) -> Optional[float]:
@@ -179,18 +194,22 @@ async def backtest_trend_predictions() -> Dict:
             continue
         by_predict_date.setdefault(pd, []).append(r)
 
-    # 3. 收集所有待验证 symbol + 大盘指数，去重后批量拉 K 线
+    # 3. 收集所有待验证 symbol + 风格化基准指数，去重后批量拉 K 线
     all_symbols = set()
     for records in by_predict_date.values():
         for r in records:
             sym = r.get('symbol', '')
             if sym:
                 all_symbols.add(sym)
-    all_symbols.add(TREND_BACKTEST_MARKET_SYMBOL)  # 大盘基准
+    # 风格化基准：主板→上证指数，创业板→创业板指，科创板→科创50
+    benchmark_symbols = {_get_style_benchmark_symbol(s) for s in all_symbols}
+    benchmark_symbols.add(TREND_BACKTEST_MARKET_SYMBOL)  # 兜底大盘基准
+    all_symbols |= benchmark_symbols
 
     print(f'[趋势回测] 待验证 {len(pending_records)} 条记录，{len(by_predict_date)} 个预测日，拉取 {len(all_symbols)} 只 K 线...')
     kline_map = await _fetch_kline_batch(list(all_symbols))
-    market_kline = kline_map.get(TREND_BACKTEST_MARKET_SYMBOL)
+    benchmark_kline_map = {bs: kline_map.get(bs) for bs in benchmark_symbols}
+    market_kline = benchmark_kline_map.get(TREND_BACKTEST_MARKET_SYMBOL)
 
     # 4. 逐条验证
     verified_count = 0
@@ -217,10 +236,11 @@ async def backtest_trend_predictions() -> Dict:
                 if actual_change is None:
                     continue  # 未到验证时点
 
-                # 大盘 N 日涨跌
+                # 风格化基准 N 日涨跌（同板块指数，拉取失败降级大盘）
+                bench_kline = benchmark_kline_map.get(_get_style_benchmark_symbol(symbol)) or market_kline
                 market_change = 0.0
-                if market_kline:
-                    mc = _calc_n_day_change(market_kline, predict_date, n)
+                if bench_kline:
+                    mc = _calc_n_day_change(bench_kline, predict_date, n)
                     if mc is not None:
                         market_change = mc
 

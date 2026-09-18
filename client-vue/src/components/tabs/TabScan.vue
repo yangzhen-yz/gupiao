@@ -16,7 +16,7 @@
     </div>
     <div v-if="scanning" class="scan-progress">
       <div class="loading-spinner" style="width:20px;height:20px;border-width:2px;margin:0;"></div>
-      正在扫描 {{ scanPool.length }} 只股票...
+      正在扫描股票池（含趋势池与热门股扩充，覆盖更广）...
     </div>
     <div v-if="scanSummary" class="scan-summary">
       <div class="scan-stat bull">看涨: {{ scanSummary.bull }}只</div>
@@ -30,7 +30,12 @@
           <span>名称</span><span>现价</span><span>涨跌幅</span><span>量比</span><span>换手率</span><span>RPS</span><span>综合评分</span><span>目标价/涨幅</span><span>止损</span><span>风控/估值</span>
         </div>
         <div v-for="r in pagedResults" :key="r.symbol" class="stock-table-row clickable" @click="goToQuote(r.symbol)">
-          <span class="name">{{ r.name }}<br><small style="color:#94a3b8;font-weight:400;">{{ r.symbol.toUpperCase() }}</small></span>
+          <span class="name">
+            <span class="name-line">{{ r.name }}</span>
+            <span v-if="mainlineMap[r.symbol]" class="mainline-tag" :class="'ml-' + mainlineMap[r.symbol].kind" :title="mainlineMap[r.symbol].sector + ' · 当前市场主线'">{{ mainlineMap[r.symbol].sector }}</span>
+            <br>
+            <small style="color:#94a3b8;font-weight:400;">{{ r.symbol.toUpperCase() }}</small>
+          </span>
           <span class="price" :style="{ color: r.change >= 0 ? '#dc2626' : '#16a34a' }">{{ r.price }}</span>
           <span class="change-pct" :style="{ color: r.change >= 0 ? '#dc2626' : '#16a34a', fontWeight: 600 }">{{ r.change >= 0 ? '+' : '' }}{{ r.changePercent.toFixed(2) }}%</span>
           <span class="volume-ratio">{{ r.volumeRatio.toFixed(2) }}</span>
@@ -43,7 +48,7 @@
             <template v-if="expectedGain(r) !== null">
               <div class="target-price">{{ parseFloat(r.buySellPoints.sell).toFixed(2) }}</div>
               <div class="gain-val">+{{ expectedGain(r).toFixed(1) }}%</div>
-              <div v-if="r.buySellPoints.stockType" class="stock-type-tag" :class="{ 'type-leader': r.buySellPoints.stockType.includes('龙头') }">{{ r.buySellPoints.stockType }}</div>
+              <div v-if="r.buySellPoints.stockType" class="stock-type-tag" :class="roleClass(r)">{{ r.buySellPoints.stockType }}</div>
             </template>
             <span v-else class="na-val">—</span>
           </span>
@@ -78,6 +83,7 @@
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay, formatNowTime, riskLabel, riskLevelClass } from '../../utils/helpers'
 import { getRating } from '../../utils/score'
+import { matchMainLine } from '../../utils/mainline'
 import { useStockData } from '../../composables/useStockData'
 
 const showNotification = inject('showNotification')
@@ -95,14 +101,16 @@ const scanPool = ref([])
 // 区间划分：score < bearMaxScore 看跌；bearMaxScore ≤ score < bullMinScore 观望；score ≥ bullMinScore 看涨
 // "观望以上" = score ≥ bearMaxScore（包含 40-69 观望区 + ≥70 看涨区，排除 <40 看跌）
 const tabConfig = ref({  // 后端配置缓存
-  filterModes: ['all', 'bull_only', 'bull_and_hold', 'min_score'],
-  defaultMode: 'all',
+  filterModes: ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score'],
+  defaultMode: 'min_score',
+  defaultMinScore: 60,
   bullMinScore: 70,
   bearMaxScore: 40,
-  modeLabels: { all: '全部', bull_only: '仅看涨', bull_and_hold: '观望以上', min_score: '自定义最低分' },
+  leadersMinGain: 3.0,
+  modeLabels: { leaders_only: '仅优质龙头', all: '全部', bull_only: '仅看涨', bull_and_hold: '观望以上', min_score: '自定义最低分' },
 })
-const filterMode = ref('all')
-const customMinScore = ref(50)  // 自定义模式默认 50 分
+const filterMode = ref('min_score')
+const customMinScore = ref(60)  // 自定义模式默认 60 分
 
 // 异步加载后端配置（不阻塞 onMounted 主流程；失败用默认值兜底）
 async function loadTabConfig() {
@@ -110,7 +118,8 @@ async function loadTabConfig() {
     const r = await apiFetch('/api/tab-scan-config')
     if (r && r.success && r.data) {
       tabConfig.value = { ...tabConfig.value, ...r.data }
-      filterMode.value = r.data.defaultMode || 'all'
+      filterMode.value = r.data.defaultMode || 'min_score'
+      customMinScore.value = r.data.defaultMinScore ?? 60
     }
   } catch (e) {
     console.warn('加载 tab-scan-config 失败，使用默认值:', e.message)
@@ -128,7 +137,18 @@ function resetPage() {
 // 阈值全部读自 tabConfig（后端单一源），不在前端硬编码
 const sortedResults = computed(() => {
   const sorted = [...scanResults.value].sort((a, b) => b.score - a.score)
-  const { bullMinScore, bearMaxScore } = tabConfig.value
+  const { bullMinScore, bearMaxScore, leadersMinGain } = tabConfig.value
+  if (filterMode.value === 'leaders_only') {
+    // 仅优质龙头（2026-08-31 默认模式）：去掉 跟风/杂毛 弱势票，且预期涨幅达标。
+    // 实测扫描宇宙中 93% 是跟风/杂毛，用户只需高预期龙头/先锋/中军。
+    const minGain = leadersMinGain ?? 3.0
+    return sorted.filter(r => {
+      const role = r.buySellPoints?.stockType || ''
+      if (/跟风|杂毛/.test(role)) return false
+      const g = expectedGain(r)
+      return g !== null && g >= minGain
+    })
+  }
   if (filterMode.value === 'all') return sorted
   if (filterMode.value === 'bull_only') {
     // 仅看涨：score >= bullMinScore（看涨区）
@@ -146,6 +166,16 @@ const sortedResults = computed(() => {
 })
 
 const filteredCount = computed(() => sortedResults.value.length)
+
+// 主线标记：按股票名称匹配当前主线板块词库，生成 symbol → 板块信息 映射
+const mainlineMap = computed(() => {
+  const m = {}
+  for (const r of sortedResults.value) {
+    const hit = r.name ? matchMainLine(r.name) : null
+    if (hit) m[r.symbol] = hit
+  }
+  return m
+})
 const totalPages = computed(() => Math.max(1, Math.ceil(sortedResults.value.length / PAGE_SIZE)))
 const pagedResults = computed(() => {
   const start = (currentPage.value - 1) * PAGE_SIZE
@@ -169,6 +199,19 @@ function expectedGain(r) {
   const sell = parseFloat(r.buySellPoints.sell)
   if (isNaN(sell) || !r.price || r.price <= 0) return null
   return (sell - r.price) / r.price * 100
+}
+
+// 角色 CSS 类（7级分类）
+function roleClass(r) {
+  const t = r.buySellPoints?.stockType || ''
+  if (t.includes('总龙头')) return 'role-total-leader'
+  if (t.includes('板块龙头')) return 'role-sector-leader'
+  if (t.includes('中军')) return 'role-core-trend'
+  if (t.includes('情绪先锋')) return 'role-vanguard'
+  if (t.includes('补涨龙')) return 'role-catch-up'
+  if (t.includes('跟风')) return 'role-follower'
+  if (t.includes('杂毛')) return 'role-marginal'
+  return 'role-marginal'
 }
 
 async function startScan(silent = false) {
@@ -304,20 +347,82 @@ onUnmounted(() => {
   background: #f1f5f9;
   border: 0.5px solid #e2e8f0;
 }
-.stock-type-tag.type-leader {
+/* 7级角色配色 */
+.stock-type-tag.role-total-leader {
+  color: #b91c1c;
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+.stock-type-tag.role-sector-leader {
   color: #c2410c;
   background: #fff7ed;
   border-color: #fed7aa;
 }
+.stock-type-tag.role-core-trend {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+.stock-type-tag.role-vanguard {
+  color: #7e22ce;
+  background: #faf5ff;
+  border-color: #e9d5ff;
+}
+.stock-type-tag.role-catch-up {
+  color: #0e7490;
+  background: #ecfeff;
+  border-color: #a5f3fc;
+}
+.stock-type-tag.role-follower {
+  color: #475569;
+  background: #f1f5f9;
+  border-color: #e2e8f0;
+}
+.stock-type-tag.role-marginal {
+  color: #78716c;
+  background: #f5f5f4;
+  border-color: #d6d3d1;
+}
+/* 暗色模式 */
 :root[data-theme="dark"] .stock-type-tag {
   color: #94a3b8;
   background: rgba(71, 85, 105, 0.15);
   border-color: rgba(226, 232, 240, 0.2);
 }
-:root[data-theme="dark"] .stock-type-tag.type-leader {
+:root[data-theme="dark"] .stock-type-tag.role-total-leader {
+  color: #fca5a5;
+  background: rgba(185, 28, 28, 0.15);
+  border-color: rgba(254, 202, 202, 0.3);
+}
+:root[data-theme="dark"] .stock-type-tag.role-sector-leader {
   color: #fdba74;
   background: rgba(194, 65, 12, 0.15);
   border-color: rgba(254, 215, 170, 0.3);
+}
+:root[data-theme="dark"] .stock-type-tag.role-core-trend {
+  color: #93c5fd;
+  background: rgba(29, 78, 216, 0.15);
+  border-color: rgba(191, 219, 254, 0.3);
+}
+:root[data-theme="dark"] .stock-type-tag.role-vanguard {
+  color: #d8b4fe;
+  background: rgba(126, 34, 206, 0.15);
+  border-color: rgba(233, 213, 255, 0.3);
+}
+:root[data-theme="dark"] .stock-type-tag.role-catch-up {
+  color: #67e8f9;
+  background: rgba(14, 116, 144, 0.15);
+  border-color: rgba(165, 243, 252, 0.3);
+}
+:root[data-theme="dark"] .stock-type-tag.role-follower {
+  color: #94a3b8;
+  background: rgba(71, 85, 105, 0.15);
+  border-color: rgba(226, 232, 240, 0.2);
+}
+:root[data-theme="dark"] .stock-type-tag.role-marginal {
+  color: #a8a29e;
+  background: rgba(120, 113, 108, 0.15);
+  border-color: rgba(214, 211, 209, 0.2);
 }
 .stoploss-cell .loss-val {
   color: var(--scan-loss-color, #16a34a);
@@ -325,6 +430,43 @@ onUnmounted(() => {
 }
 .na-val {
   color: var(--scan-na-color, #94a3b8);
+}
+
+/* 主线徽标：进攻主线暖色 / 防守主线冷色 */
+.name-line {
+  display: inline-block;
+  vertical-align: middle;
+}
+.mainline-tag {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 6px;
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.mainline-tag.ml-attack {
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 0.5px solid #fecaca;
+}
+.mainline-tag.ml-defense {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border: 0.5px solid #bfdbfe;
+}
+:root[data-theme="dark"] .mainline-tag.ml-attack {
+  color: #fca5a5;
+  background: rgba(185, 28, 28, 0.15);
+  border-color: rgba(254, 202, 202, 0.3);
+}
+:root[data-theme="dark"] .mainline-tag.ml-defense {
+  color: #93c5fd;
+  background: rgba(29, 78, 216, 0.15);
+  border-color: rgba(191, 219, 254, 0.3);
 }
 @media (max-width: 640px) {
   .stock-table-header,

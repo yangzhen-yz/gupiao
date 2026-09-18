@@ -16,17 +16,7 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from app.config import (
-    EASTMONEY_HEADERS,
-    RPS_ENABLED,
-    RPS_PERIOD_DAYS,
-    RPS_PERIODS,
-    RPS_CACHE_TTL,
-    RPS_MIN_SAMPLES,
-    RPS_TOP_N,
-    KLINE_START_DATE,
-    TENCENT_KLINE_API,
-)
+from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API)
 from db.database import get_db_conn
 from services.stock import _sync_get
 

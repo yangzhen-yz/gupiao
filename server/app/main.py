@@ -3,7 +3,6 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os, sys, time, asyncio, threading
-import json
 from datetime import date, datetime, timedelta
 
 from . import config as _cfg

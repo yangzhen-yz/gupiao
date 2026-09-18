@@ -50,8 +50,14 @@ SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 # 第二个 Tab "股票筛选"（/api/hot-stocks-scan）的可选过滤模式
 # 用户在前端可切换：all(全部) / bull_only(仅看涨) / bull_and_hold(观望以上) / min_score(自定义分)
 # 注意：当前后端默认仍返回全量，前端按此配置做客户端过滤；如需服务端过滤可将 FILTER_MODE 设为 'all' 之外的任意值并改 hot-stocks-scan 路由
-TAB_SCAN_FILTER_MODES = ['all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
-TAB_SCAN_DEFAULT_MODE = 'bull_and_hold'  # 默认模式：全量展示（不隐藏任何股票）
+# 2026-08-31 选股策略优化：新增 leaders_only（仅优质龙头）过滤并设为默认。
+# 背景：扫描宇宙扩大后弱势票（跟风/杂毛）占比高（实测 93%），用户只需高预期优质票。
+# leaders_only 规则：去掉 跟风/杂毛 角色，且预期涨幅 ≥ TAB_SCAN_LEADERS_MIN_GAIN。
+# 2026-09-10 调整为默认"自定义最低分 60"，让用户一进页面就看到相对高分的股票（观望/看涨），避免弱票刷屏。
+TAB_SCAN_FILTER_MODES = ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
+TAB_SCAN_LEADERS_MIN_GAIN = 3.0  # 仅优质龙头模式的最低预期涨幅(%)
+TAB_SCAN_DEFAULT_MODE = 'min_score'  # 默认模式：自定义最低分
+TAB_SCAN_DEFAULT_MIN_SCORE = 60  # 自定义最低分模式默认值
 TAB_SCAN_BULL_MIN_SCORE = 70  # "看涨"区间的最低分（≥ 此值为看涨）
 TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌）
 # 区间划分：score < BEAR_MAX(40) 为看跌，BEAR_MAX(40) ≤ score < BULL_MIN(70) 为观望，score ≥ BULL_MIN(70) 为看涨
@@ -328,9 +334,9 @@ RISK_CONTROL_STOP_LOSS_VOL_MULT = 1.5  # 止损幅度 = 当日振幅 × 此系�
 RISK_CONTROL_SCORE_HIGH_RISK = 55   # 评分 < 此值 → 高风险
 RISK_CONTROL_SCORE_MID_RISK = 65    # 评分 < 此值 → 中风险，否则低风险
 
-# ========== 买卖点位置+龙头感知修正（V4.2，2026-08-17）==========
-# 在 V4.1 振幅动态调整基础上，叠加位置高低/龙头跟风/评分置信度三维修正。
-# 止盈倍率 = 位置倍率 × 龙头倍率 × 评分倍率，封顶 BUY_SELL_MAX_TARGET_PCT。
+# ========== 买卖点位置+角色感知修正（V4.3，2026-08-17）==========
+# 在 V4.1 振幅动态调整基础上，叠加位置高低/角色分类/评分置信度三维修正。
+# 止盈倍率 = 位置倍率 × 角色倍率 × 评分倍率，封顶 BUY_SELL_MAX_TARGET_PCT。
 # 位置信息优先取 trend_details.positionPct（精确年度分位），fallback 用 base_scores['position']（5/10/15 粗估）。
 
 # 位置分位门限（年度分位 0-100）
@@ -343,19 +349,70 @@ BUY_SELL_TARGET_POSITION_LOW_MULT = 1.4     # 低位：预期空间放大 40%
 BUY_SELL_TARGET_POSITION_MIDLOW_MULT = 1.2  # 中低位：放大 20%
 BUY_SELL_TARGET_POSITION_HIGH_MULT = 0.7    # 高位：收缩 30%
 
-# 龙头/跟风止盈倍率
-BUY_SELL_TARGET_LEADER_MULT = 1.3           # 龙头：预期上限放大 30%
-BUY_SELL_TARGET_FOLLOWER_MULT = 0.9         # 跟风：收缩 10%
-
 # 评分置信度止盈倍率
 BUY_SELL_TARGET_SCORE_HIGH_MULT = 1.1       # 评分≥80：放大 10%
 BUY_SELL_TARGET_SCORE_LOW_MULT = 0.8        # 评分<55：收缩 20%
 
-# 龙头判定条件
-BUY_SELL_LEADER_CONSECUTIVE_BOARDS = 2      # 连板≥此值 = 龙头（trend_details 可用时）
+# ===== 6级角色分类（V4.3，替换原龙头/跟风二分法）=====
+# 角色判定条件（按优先级从高到低匹配，命中即停）
+# 1. total_leader    总龙头：连板≥5 + 涨停次数≥4（全市场最高标）
+# 2. sector_leader   板块龙头：连板≥3 + 涨停次数≥2（板块内连板最高之一）
+# 3. core_trend      中军：大市值(≥300亿) + 连板≤1 + 评分≥65（趋势型权重股）
+# 4. sentiment_vanguard 情绪先锋：今日涨停 + 连板=1 + 高换手(≥5%)（率先试盘的弹性小票）
+# 5. catch_up        补涨龙：低位(分位<50) + 近期涨停(1-2板)（龙头高位后的低位新领涨）
+# 6. follower        跟风：涨幅≥3% + 量比≥1 + 评分≥50（被动跟随）
+# 7. marginal        杂毛：其余（辨识度最低、逻辑最弱）
+
+# 角色止盈倍率（叠在位置倍率之上）
+BUY_SELL_ROLE_TARGET_MULT = {
+    'total_leader':       1.4,   # 总龙头：预期上限放大 40%（容错率最高，穿越分歧）
+    'sector_leader':      1.25,  # 板块龙头：放大 25%
+    'core_trend':         1.15,  # 中军：放大 15%（稳趋势，不靠连板）
+    'sentiment_vanguard': 1.05,  # 情绪先锋：放大 5%（波动大，快进快出）
+    'catch_up':           0.95,  # 补涨龙：收缩 5%（高度通常低于初代龙头）
+    'follower':           0.8,   # 跟风：收缩 20%（无独立行情）
+    'marginal':           0.6,   # 杂毛：收缩 40%（盈亏比极差）
+}
+
+# 角色止损倍率（叠在位置倍率之上）
+BUY_SELL_ROLE_STOP_MULT = {
+    'total_leader':       1.2,   # 总龙头：止损放宽 20%（回撤后恢复概率最高）
+    'sector_leader':      1.1,   # 板块龙头：放宽 10%
+    'core_trend':         1.0,   # 中军：标准（大市值波动小）
+    'sentiment_vanguard': 0.8,   # 情绪先锋：收紧 20%（波动极大，转弱最先被杀）
+    'catch_up':           0.9,   # 补涨龙：收紧 10%（龙头崩盘易跟随崩）
+    'follower':           0.85,  # 跟风：收紧 15%（破位快）
+    'marginal':           0.8,   # 杂毛：收紧 20%（无主力运作，下跌最快）
+}
+
+# 角色中文标签（前端展示）
+BUY_SELL_ROLE_LABELS = {
+    'total_leader':       '总龙头',
+    'sector_leader':      '板块龙头',
+    'core_trend':         '中军',
+    'sentiment_vanguard': '情绪先锋',
+    'catch_up':           '补涨龙',
+    'follower':           '跟风',
+    'marginal':           '杂毛',
+}
+
+# 角色判定条件参数
+BUY_SELL_ROLE_TOTAL_LEADER_BOARDS = 5       # 总龙头最低连板数
+BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS = 4     # 总龙头最低涨停次数
+BUY_SELL_ROLE_SECTOR_LEADER_BOARDS = 3      # 板块龙头最低连板数
+BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS = 2    # 板块龙头最低涨停次数
+BUY_SELL_ROLE_CORE_TREND_MV = 300e8         # 中军最低流通市值（300亿，单位元）
+BUY_SELL_ROLE_CORE_TREND_SCORE = 65         # 中军最低评分
+BUY_SELL_ROLE_VANGUARD_TURNOVER = 5.0       # 情绪先锋最低换手率(%)
+BUY_SELL_ROLE_CATCHUP_POSITION_MAX = 50     # 补涨龙最高位置分位
+BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN = 3.0     # 跟风最低涨幅(%)
+BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN = 1.0  # 跟风最低量比
+BUY_SELL_ROLE_FOLLOWER_SCORE_MIN = 50       # 跟风最低评分
+
+# 无 trend_details 时的 fallback 龙头判定（保持向后兼容）
+BUY_SELL_LEADER_FALLBACK_CHANGE_PCT = 5.0   # 涨幅≥此值 + 量比≥2 = 龙头
+BUY_SELL_LEADER_FALLBACK_VOL_RATIO = 2.0    # 量比阈值
 BUY_SELL_LEADER_SCORE_GATE = 80             # 评分≥此值且非高位 = 龙头
-BUY_SELL_LEADER_FALLBACK_CHANGE_PCT = 5.0   # 无 trend_details 时：涨幅≥此值 + 量比≥2 = 龙头
-BUY_SELL_LEADER_FALLBACK_VOL_RATIO = 2.0    # 无 trend_details 时：量比阈值
 
 # 止盈/止损封顶
 BUY_SELL_MAX_TARGET_PCT = 0.15              # 止盈上限封顶 15%
@@ -364,16 +421,25 @@ BUY_SELL_MAX_TARGET_PCT = 0.15              # 止盈上限封顶 15%
 BUY_SELL_STOP_POSITION_LOW_MULT = 1.2       # 低位：止损放宽 20%（波动空间大，给更多恢复余地）
 BUY_SELL_STOP_POSITION_HIGH_MULT = 0.8      # 高位：止损收紧 20%（下跌风险大，破位快跑）
 
-# 龙头/跟风止损倍率
-BUY_SELL_STOP_LEADER_MULT = 1.1             # 龙头：止损略宽 10%（回撤后恢复概率高）
-BUY_SELL_STOP_FOLLOWER_MULT = 0.9           # 跟风：止损收紧 10%（破位快）
-
 # ========== 策略综合评分配置 ==========
 STRATEGY_BULL_THRESHOLD = 60  # 策略评分上涨阈值
 STRATEGY_BEAR_THRESHOLD = 40  # 策略评分下跌阈值
 STRATEGY_PREDICT_BULL_MIN_SCORE = 65  # 策略预测上涨最小分数阈值
 STRATEGY_BACKTEST_PREDICTION_LIMIT = 500  # 策略回测预测限制分数
 STRATEGY_BACKTEST_HISTORY_DAYS = 30  # 策略回测历史天数阈值
+
+# 2026-09-01 预测保存质量门槛 v2（数据驱动，全周期 05-27~08-31 共 1973 条已验证回测）：
+#   涨停(当日涨幅>=9.8%) 是最稳健的核心信号：全周期胜率 56.6%、次日均涨 +1.82%，
+#     前后半段均稳定为正（59.7% / 51.8%），64/65 个交易日有信号。
+#   非涨停整体负期望（47.2% / -0.08%），仅"综合评分>=80"的高分票为正期望（+1.5%+均涨）。
+#   上一版"量比>=0.9 且(非高位或涨停)"门槛经全周期复核反而跑输基准（45.8% vs 49.5%）：
+#     错杀"涨停+缩量<1"最优子集（60.7%胜率），且 position 字段 74% 缺失不可靠。
+# 新门槛（v2）：
+#   当日涨停 或 综合评分 >= PREDICT_SAVE_MIN_SCORE（默认80）。
+#   全周期胜率 57.3%、次日均涨 +1.80%，每日选出中位 6 只。
+PREDICT_SAVE_QUALITY_GATE = True
+PREDICT_SAVE_LIMIT_UP_MIN = 9.8    # 涨停判定涨幅(%)
+PREDICT_SAVE_MIN_SCORE = 80        # 非涨停票保留所需最低综合评分
 
 
 # 策略评分阈值配置 - 各指标的档位划分标准
@@ -577,6 +643,7 @@ HOT_STOCK_POOL = [
 # ========== 定时任务配置 ==========
 SCHEDULE_UPDATE_HOT_SEARCH_TIMES = ['10:00', '14:00']  # 更新热门搜索时间
 SCHEDULE_MA10_CHECK_TIME = '15:05'  # 检查10日均线时间
+POOL_CONSECUTIVE_DOWN_THRESHOLD = 3  # 连跌N天自动移出股票池（0=不启用）
 SCHEDULE_DAILY_REVIEW_TIME = '15:10'  # 每日审核时间
 SCHEDULE_BACKTEST_TIME = '15:20'  # 回测时间
 SCHEDULE_RECOMMENDATION_TIMES = ['09:45', '13:30']  # 智能推荐生成时间（上午开盘后、下午开盘后）
@@ -599,6 +666,22 @@ TREND_BACKTEST_PERIODS = [1, 3, 5]                  # 回测周期（天）
 # 9:35 = 开盘5分钟早期预警；10:00/10:30 = 上午检查；13:05 = 下午开盘；14:00 = 尾盘
 SCHEDULE_MARKET_ALERT_TIMES = ['09:35', '10:00', '10:30', '13:05', '14:00']
 MARKET_ALERT_RISK_THRESHOLD = 40  # 风险评分 >= 此值时触发预警推送
+
+# ========== 企业微信选股推送（2026-09-01） ==========
+# 盘中准实时推送：满足条件的候选股实时推送到企业微信（wecom-cli message aibot send）。
+# chat_id 为授权真人用户的内部 ID（机器人"杨珍的机器人"的授权人），仅内部调用，不对外展示。
+WECOM_PUSH_ENABLED = True
+WECOM_CLI_CHAT_ID = 'woo0QVPAAAiTuUXPTA8qH_kjcnk1YCSA'   # 授权人 chat_id（内部）
+WECOM_PUSH_INTERVAL_SEC = 60        # 盘中轮询间隔（秒），1 分钟级准实时
+WECOM_PUSH_START = '09:31'          # 盘中推送开始时间（连续竞价后）
+WECOM_PUSH_END = '14:57'            # 盘中推送结束时间（收盘前）
+WECOM_PUSH_PREVIEW_TIME = '09:25'   # 开盘前推送"今日关注池"预览时间
+# 推送过滤条件（与用户确认的方案，2026-09-01）
+WECOM_PUSH_MIN_SCORE = 70           # 综合评分 >= 此值
+WECOM_PUSH_MIN_GAIN = 3.0           # 预期涨幅 >= 此值（%）
+WECOM_PUSH_MIN_VOL_RATIO = 1.0      # 量比 >= 此值
+WECOM_PUSH_MAX_CHANGE = 9.8         # 涨幅 < 此值（未涨停，保留买入空间）
+WECOM_PUSH_EXCLUDE_ROLES = ('跟风', '杂毛')  # 排除的角色关键词（stockType 中命中即排除）
 TREND_BACKTEST_KLINE_CONCURRENCY = 5                # 批量拉 K 线并发度
 TREND_BACKTEST_MARKET_SYMBOL = 'sh000001'           # 大盘基准（上证指数）
 TREND_BACKTEST_SCORE_SEGMENTS = [(60, 70), (70, 80), (80, 101)]  # 分数段（左闭右开，80+ 用 101 兜顶）

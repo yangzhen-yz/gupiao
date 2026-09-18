@@ -2,8 +2,8 @@
 import asyncio, re, json, os
 from typing import List, Dict, Optional
 from datetime import date, datetime
-from app.config import INDEX_SYMBOLS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, TENCENT_QUOTE_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, MARKET_ALERT_RISK_THRESHOLD
-from db.database import get_db_conn, load_hot_search_ranking, load_hot_stock_buttons, load_user_scan_pool, load_stock_basic_info
+from app.config import (INDEX_SYMBOLS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, MARKET_ALERT_RISK_THRESHOLD)
+from db.database import (load_hot_search_ranking, load_hot_stock_buttons, load_user_scan_pool, load_stock_basic_info)
 from services.stock import fetch_with_retry, parse_tencent_batch_data
 
 # ========== 大盘预警持久化 ==========

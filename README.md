@@ -21,7 +21,7 @@ gupiao/
 │       │   │   ├── TabScan.vue       # 股票筛选
 │       │   │   ├── TabRecommend.vue  # 智能推荐
 │       │   │   ├── TabReview.vue     # 每日收评
-│       │   │   └── TabStrategy.vue   # 策略因子
+│       │   │   └── TabFlow.vue       # 资金流向
 │       │   ├── KlineModal.vue        # K线查看弹窗
 │       │   ├── AiDiagModal.vue       # AI 诊断弹窗
 │       │   └── IndexBar.vue          # 大盘指数栏
@@ -50,7 +50,8 @@ gupiao/
 │   │   └── scheduler.py         # 定时任务注册（基于 schedule 库）
 │   ├── services/                # 业务逻辑层
 │   │   ├── stock.py             # 行情/K线/热搜榜（数据源）
-│   │   ├── trend.py             # 趋势扫描 + 股票池指标 + P0/P2/P3 乘性修正系数族
+│   │   ├── trend.py             # 趋势扫描 + 股票池指标 + P0/P2/P3 乘性修正系数族 + 早期信号层
+│   │   ├── early_signals.py     # 早期信号层（第5维度：NR7/VCP/RSI底背离/底部首板/缩量后首放）
 │   │   ├── trading_calendar.py   # A股交易日历（排除周末+法定节假日，用于市场温度计过滤）
 │   │   ├── strategy.py          # 10 因子 AI 选股评分（calc_stock_score_v2）+ 行业中性化
 │   │   ├── recommend.py         # 智能推荐
@@ -210,8 +211,11 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | **中期下跌过滤 ①** | MA20下方 **且** 60日累计跌幅 > 15% | **2026-06-18 新增**：避免"短线反弹但中长期下跌"的票误判为趋势向上，直接 `isUp=False` |
 | **中期下跌过滤 ②（v5.4）** | MA 偏空（双空头/死亡交叉/现价<MA120 三选一）**且** 距全量历史高点回撤 > **30%**；**日内涨幅 ≥ 7% 豁免**（涨停/大涨股不适用反弹过滤） | **2026-07-09 v5.4 放宽**：回撤阈值 20%→30%（避免深跌后反弹被误杀）；新增涨停/大涨股豁免；是 `is_up_trend()` 接收 `intraday_change_pct` 参数驱动 |
 | **isUp 门槛** | ≥ 35分 | 认定为"趋势向上"，进入备选池 |
-| **趋势池门槛** | ≥ 60分 | 从isUp中筛选，最终进入趋势发现列表 |
+| **趋势池门槛** | ≥ 65分 | 从isUp中筛选，最终进入趋势发现列表 |
 | **自动加入股票池门槛** | ≥ 80分 | 满足该分数的趋势股会自动写入 `user_scan_pool`，方便后续重点跟踪（阈值配置见 `TREND_AUTO_ADD_POOL_THRESHOLD`） |
+| **RSI 极度超买** | RSI ≥ 95 | 强制排除，不进入评分（超买严重，追高风险极大） |
+| **RSI 严重超买** | RSI ≥ 88 | 扣 8 分（超买区，追高风险惩罚） |
+| **连板透支** | 连板 ≥ 5 | 扣 10 分（连板过多，透支风险极大） |
 
 ---
 
@@ -264,8 +268,37 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | 3 | 加分缩放：触发多头排列(5)+倍量突破(4)=9 → 缩放 (9/18)*5 = 2.5 | 61 + 2.5 = **63.5** |
 | 4 | 三修正系数叠加（封顶 0.15）：板块+0.05 + 筹码+0.03 + 形态+0.04 = 0.12 | totalFactor = min(0.15, 0.12) = **0.12** |
 | 5 | 乘性修正：raw × (1 + totalFactor) | 63.5 × 1.12 = **71.1** |
-| 6 | 最终得分 71.1 ≥ 35 → **isUp = true**；≥ 60 → 进入趋势池 | — |
+| 6 | 最终得分 71.1 ≥ 35 → **isUp = true**；≥ 65 → 进入趋势池 | — |
 
+
+#### 2.10 早期信号层（第5维度，2026-08-17 新增）
+
+> 在 V4.0 四维度评分系统上叠加"早期信号加成层"，识别"趋势形成前"的转折信号，降低整体滞后性（均线系统内在滞后 2-5 天）。参考 Mark Minervini SEPA 体系 + 经典技术分析形态。
+>
+> **实现**：`services/early_signals.py`（5 个纯函数检测器 + 1 个聚合函数），仅依赖 OHLCV 序列，无 IO/无状态。在 `is_up_trend()` 评分流程末尾调用，加成直接叠加到 `total_score`（封顶 100）。
+
+**性能 gating**（避免给所有票都跑 5 个检测器）：
+- 全局开关 `TREND_EARLY_SIGNAL_ENABLED`（默认开启）
+- 仅 `base_score ∈ [40, 92]` 时运行（边界股才有早期信号价值；太弱无意义，太强已确认）
+- `RSI ≥ 88` 时不运行（避免给超买股加分）
+- 位置分位 > 70 时，NR7/VCP 两个检测器跳过（高位无早期信号价值）
+- 单检测器异常不影响其他（容错 try/except）
+
+| 检测器 | 信号名称 | 命中条件 | 加分 | 说明 |
+|--------|----------|----------|------|------|
+| NR7 / Inside Bar | `nr7_inside_bar` | 当前7日区间为近30日最小 + Inside Bar或缩量确认 | +3 | 波动率收缩到极致，变盘在即 |
+| VCP 波动率收缩 | `vcp` | 近30日2-3次枢轴间振幅严格递减 + 量能递减 | +3 | Minervini SEPA 核心买入形态：收缩到极致后突破概率高 |
+| RSI 底背离 | `rsi_bottom_div` | 价格创新低但RSI抬高 + RSI < 50 | +3 | 下跌动能衰竭，底部反转前兆 |
+| 底部首板 | `bottom_first_limit` | 今日涨停 + 近60日无其他涨停 + 位置分位 < 50% | +3 | 低位首板，趋势启动信号 |
+| 缩量后首放 | `consolidation_break` | 前7日区间收敛+缩量，当日倍量阳线突破 | +3 | 与 pattern.py 的 volume_breakout 互斥去重 |
+
+**封顶**：`bonus = min(命中数 × PER_HIT_SCORE, MAX_BONUS)`（每命中 +3，最多 +10 分）
+
+**前端展示**：趋势发现页展开卡片中显示"早期信号"标签（橙色系，呼应"早期/未确认"语义），鼠标悬停显示详细描述。
+
+**配置项**（`config.py`）：`TREND_EARLY_SIGNAL_ENABLED` / `TREND_EARLY_SIGNAL_PER_HIT_SCORE=3` / `TREND_EARLY_SIGNAL_MAX_BONUS=10` / `TREND_EARLY_SIGNAL_BASE_SCORE_MIN=40` / `TREND_EARLY_SIGNAL_BASE_SCORE_MAX=92` / `TREND_EARLY_SIGNAL_POSITION_GATE=70` + 各检测器专属参数。
+
+---
 
 ### 3. 趋势股排除条件
 
@@ -276,7 +309,7 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | K线数据不足 | K线天数 < 60 天 | `TREND_MIN_KLINE_DAYS` |
 | 强制排除（ST / 主板 / 利空 / 横盘） | 见 §2.5 | [services/trend.py `is_up_trend`](file:///d:/Desktop/guizhou/gupiao/server/services/trend.py) |
 | 退市风险 | 名称含 `ST`/`*ST`/`退市` 等关键词 | [services/stock.py `has_delisting_risk`](file:///d:/Desktop/guizhou/gupiao/server/services/stock.py) |
-| 趋势评分不够 | 总分 < 60 分 | `TREND_MIN_SCORE` |
+| 趋势评分不够 | 总分 < 65 分 | `TREND_MIN_SCORE` |
 
 > **非沪深主板**（创业板/科创板）不直接排除，改为在评分中扣 `TREND_DEDUCT_NON_MAIN_BOARD`（默认 -5）分，见 §2.2 扣分项表末行。
 
@@ -363,7 +396,7 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `TREND_MIN_SCORE` | 60 | 进入趋势池的最低分数（V3 评分下从 85 调低） |
+| `TREND_MIN_SCORE` | 65 | 进入趋势池的最低分数（V3 评分下从 85 调低，后微调至 65） |
 | `TREND_MIN_KLINE_DAYS` | 60 | 最少K线天数（覆盖MA20+60日量能） |
 | `TREND_IS_UP_MIN_SCORE` | 35 | 认定为"趋势向上"的最低分数（V3 评分下从 60 调低） |
 | `TREND_AUTO_ADD_POOL_THRESHOLD` | 80 | 趋势发现中得分 ≥ 该值的股票自动加入用户股票池；设为 0 关闭 |
@@ -379,6 +412,26 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | `CHANGE_RANK_TOP_N` | 100 | 涨幅榜获取数量（沪深主板） |
 | `TURNOVER_RANK_TOP_N` | 400 | 成交额榜获取数量（沪深主板） |
 | `HOT_SEARCH_TOP_N` | 600 | 热搜榜合并后上限 |
+| `TREND_RSI_PERIOD` | 14 | RSI 计算周期（标准 14 日） |
+| `TREND_RSI_EXTREME_OVERBOUGHT` | 95 | RSI ≥ 此值 → 极度超买，强制排除 |
+| `TREND_RSI_OVERBOUGHT` | 88 | RSI ≥ 此值 → 严重超买，扣分 |
+| `TREND_RSI_OVERBOUGHT_DEDUCT` | 8 | 严重超买扣分值 |
+| `TREND_CONSECUTIVE_BOARD_EXHAUSTION` | 5 | 连板数 ≥ 此值 → 透支风险扣分 |
+| `TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT` | 10 | 连板透支扣分值 |
+| `TREND_EARLY_SIGNAL_ENABLED` | True | 早期信号层全局开关 |
+| `TREND_EARLY_SIGNAL_PER_HIT_SCORE` | 3 | 单个早期信号命中加分 |
+| `TREND_EARLY_SIGNAL_MAX_BONUS` | 10 | 早期信号总加成上限 |
+| `BUY_SELL_POSITION_LOW_GATE` | 30 | 位置分位 ≤ 此值 = 低位（止盈放大） |
+| `BUY_SELL_POSITION_HIGH_GATE` | 70 | 位置分位 ≥ 此值 = 高位（止盈收缩） |
+| `BUY_SELL_TARGET_POSITION_LOW_MULT` | 1.4 | 低位止盈倍率（预期空间放大 40%） |
+| `BUY_SELL_TARGET_POSITION_HIGH_MULT` | 0.7 | 高位止盈倍率（收缩 30%） |
+| `BUY_SELL_TARGET_LEADER_MULT` | 1.3 | 龙头止盈倍率（上限放大 30%） |
+| `BUY_SELL_TARGET_FOLLOWER_MULT` | 0.9 | 跟风止盈倍率（收缩 10%） |
+| `BUY_SELL_MAX_TARGET_PCT` | 0.15 | 止盈上限封顶 15% |
+| `BUY_SELL_STOP_POSITION_LOW_MULT` | 1.2 | 低位止损放宽 20% |
+| `BUY_SELL_STOP_POSITION_HIGH_MULT` | 0.8 | 高位止损收紧 20% |
+| `BUY_SELL_STOP_LEADER_MULT` | 1.1 | 龙头止损略宽 10% |
+| `BUY_SELL_STOP_FOLLOWER_MULT` | 0.9 | 跟风止损收紧 10% |
 
 ### 8. 定时任务总览
 
@@ -546,7 +599,8 @@ bull_threshold += penalty      # 仅影响 predict_direction，不影响标签�
 
 **P2a 风控止损输出（`services/risk_control.py`）**——为每只被推荐/被查看的股票输出一套"可执行的风控结论"，纯函数（零 IO）可在扫描循环内逐股同步调用，不增加网络请求：
 
-- **止损价 `stop_loss`**：基于当日振幅（波动率代理）动态缩放止损幅度 = `clamp(振幅% × 1.5, 4%, 12%)`；停牌/无振幅数据给中性默认 6%。低波动股止损窄、高波动股止损宽。
+- **止损价 `stop_loss`**：基于当日振幅（波动率代理）动态缩放止损幅度 = `clamp(振幅% × 1.5, 4%, 12%)`；停牌/无振幅数据给中性默认 6%。低波动股止损窄、高波动股止损宽。**V4.2 增强**：止损幅度叠加位置倍率（低位放宽 20%、高位收紧 20%）和龙头倍率（龙头放宽 10%、跟风收紧 10%），实现"低位给更多恢复余地、高位破位快跑"的位置感知止损。
+- **买卖点 `buy_sell_points`**（V4.2 位置+龙头感知版）：止盈幅度 = 基础振幅比例 × 位置倍率 × 龙头倍率 × 评分倍率，封顶 15%。位置判定优先 `trend_details.positionPct`（精确年度分位），fallback `base_scores['position']`；龙头判定：连板≥2 / 涨停 / (涨幅≥5%+量比≥2) / (高分+非高位)。输出含 `stockType`（如"低位龙头"）和 `expectationNote`（预期说明文字）。
 - **风险等级 `risk_level`**（low / mid / high）：基础由综合评分决定（`<55→high`，`<65→mid`，否则 `low`）；叠加高危信号（估值极端高估 / 龙虎榜净卖出 / 股东户数环比 ≥10% 散户化）至少升 `mid`，高风险不可被降级。
 - **仓位建议 `position_suggest`**：low→可重仓(≤80%)，mid→半仓(≤50%)，high→轻仓(≤30%)。
 - **一句话 `risk_note`** 直连前端展示。注入点：单股分析端点、full 端点、扫描端点、智能推荐（推荐卡片内嵌"🛡️ 风控建议"区块）。
@@ -564,7 +618,7 @@ bull_threshold += penalty      # 仅影响 predict_direction，不影响标签�
 
 **新增 `GET /api/trend/backtest-summary?limit=30`**：跨所有回测报告聚合——总样本数、1/3/5 日**加权胜率**（按各周期验证样本数加权）、**平均超额收益**（个股 N 日涨跌 − 大盘 N 日涨跌，来自 `trend_backtest_records` 的 `actual_change_Nd - market_change_Nd`）、近期报告列表。让"回头看自己"的闭环对前端可见、可量化。
 
-**前端新增「策略回测」Tab（`TabBacktest.vue`，注册于 `App.vue`）**：胜率卡片（1/3/5 日）+ 平均超额收益卡片 + 近期回测报告表，交易终端风格，可手动刷新。
+> **注**：「策略回测」Tab（`TabBacktest.vue`）已于 2026-08-17 移除，回测数据仍可通过趋势发现页的回测徽章/历史区查看（见 §11.1）。
 
 ### 10. 统一评级阈值（`client-vue/src/utils/score.js` `getRating`）
 
@@ -584,7 +638,7 @@ import { getRating } from '@/utils/score'
 const r = getRating(stock.score)   // { label, short, color }
 ```
 
-涉及统一阈值的页面：实时行情（TabQuote）、趋势发现（TabTrend）、股票筛选（TabScan）、策略因子（TabStrategy）、智能推荐（TabRecommend）、AI 诊断弹窗（AiDiagModal）。
+涉及统一阈值的页面：实时行情（TabQuote）、趋势发现（TabTrend）、股票筛选（TabScan）、智能推荐（TabRecommend）、AI 诊断弹窗（AiDiagModal）。
 
 ---
 
@@ -616,8 +670,8 @@ const r = getRating(stock.score)   // { label, short, color }
 | **股票筛选** | `calc_stock_score_v2()` — 10 因子日内评分（含 主力净流入 + 股东人数筹码面 + 行业中性化后处理） | ✅ 是 |
 | **智能推荐** | 50% 日内因子 + 50% 趋势因子融合 | ✅ 是 |
 | **每日收评**（明日关注） | 三层来源：①智能推荐(50%日内+50%趋势) → ②策略预测(`strategy_predict_records`) → ③趋势扫描高分票 | ✅ 是 |
-| **趋势发现** | `is_up_trend()` — 4 维度趋势评分（MA/资金异动/量能/回撤）+ // 乘性修正 + 动态阈值 | ❌ 独立体系 |
-| **实时行情**（综合评分） | 前端 `utils/score.js` — 纯客户端计算 | ❌ 独立体系 |
+| **趋势发现** | `is_up_trend()` — 4 维度趋势评分（MA/资金异动/量能/回撤）+ 早期信号层 + // 乘性修正 + 动态阈值 | ❌ 独立体系 |
+| **实时行情**（综合评分） | 后端 `calc_stock_score_v2` 注入 `score` 字段，前端 `utils/score.js` 透传展示（权重由后端统一维护） | ✅ 是 |
 
 **策略权重的修改链路**：策略优化页调整权重 → `strategy_factor_weights` 表更新 → 回测自动微调 → 股票筛选/智能推荐/每日收评的评分实时变化。趋势发现和实时行情的评分完全不受策略权重影响。
 
@@ -638,9 +692,9 @@ const r = getRating(stock.score)   // { label, short, color }
 │ • amplitude     振幅    权重可调 │     │ + // 乘性修正族  │
 │ • position      仓位评估权重可调 │     │   (板块/筹码/形态, 封顶0.15)  │
 │ • main_capital_inflow 主力净流入 │     │ + 动态阈值(市场×形态)   │
-│ • holder_structure 股东人数筹码 │     │                              │
-│ + 行业中性化后处理(±2)     │     │ + 多层强制过滤               │
-│                                 │     │                              │
+│ • holder_structure 股东人数筹码 │     │ + 早期信号层(+10封顶)         │
+│ + 行业中性化后处理(±2)     │     │ + RSI超买风控(≥95排除/≥88扣8) │
+│                                 │     │ + 连板透支风控(≥5板扣10)      │
 │ → 股票筛选 / 智能推荐 / 收评    │     │ → 趋势发现                   │
 └─────────────────────────────────┘     └──────────────────────────────┘
 ```
@@ -662,6 +716,7 @@ const r = getRating(stock.score)   // { label, short, color }
 | v8 | **综合优化（性能 + 策略 + 清理 + 可观测性）**：① 性能：`/api/market-predict` 60s 内存缓存、`/api/hot-stocks-scan` 批量行情 batch=100 + `asyncio.gather`、`/api/daily_recommendations` 历史盈亏回填批量并发、`get_kline_data(return_realtime=True)` 复用实时行情、`auto_generate_recommendations_task`/`check_market_crash`/`backtest_yesterday_predictions` 三处 gather 化、`/api/custom-scan-pool/symbols` 轻量端点；② 策略：9 因子权重表（，新增 `main_capital_inflow:1.3`）、趋势加分项上限 20（`TREND_BONUS_BULL_ALIGNMENT=6`/`CONSECUTIVE_YANG=4`）、涨停阈值统一常量 `TREND_LIMIT_UP_THRESHOLD`（）、稳步上行/加速拉升形态区分（，`TREND_BONUS_STEADY_UPTREND=3`/`ACCELERATING=1`）；③ 清理：删除孤儿函数/`stocks-config.js`/`forbidden-keywords.js`/`check_ma10_api` 调试端点；④ 可观测性：删除 `/__force_reload__` + `/api/debug-eastmoney-review` 两个临时调试接口、8 处 bare except 加 print 日志、17 处 HTTPException 透传 `str(error)`、清理 routes.py 4 个未使用 import；⑤ Bug 修复：`strategy.py` 拆分时漏 `import asyncio` + `fetch_with_retry`/`parse_tencent_batch_data` 导致回测 `accuracy=0.0` | 解决性能瓶颈（500 股扫描串行 → 并发）、评分区分度（全 100 → 封顶+缩放）、可观测性盲点（静默吞异常 → 日志透传） |
 | v9 | **RPS 相对强度因子接入评分体系（P0，2026-07-16）**：① 11 因子扩展，新增 `rps` 因子（权重 1.1，无数据降级 7 分），RPS≥90→15分 / ≥80→10 / ≥70→7 / ≥50→3 / <50→0；② 算法：东方财富 clist 分页拉全市场代码（单页上限 100，翻页合并去重约 1843 只）+ 腾讯前复权日线算区间涨幅 → 全市场百分位排名写入 SQLite `rps_cache` 表；③ 盘前/手动 `refresh_rps` 预计算（线程池 max_workers=10，约 30–40 秒），盘中读写缓存（秒级）；④ 新增 `GET /api/rps`（强势股榜）、`POST /api/rps/refresh`（后台预计算）；⑤ 前端 `TabScan` 加 RPS 列、`TabStrategy` 加 RPS 强势股榜区块 | 选股胜率 P0 提升项：把"个股区间表现强于全市场多少比例"量化为龙头识别标志，弱市里率先走强的票被优先评分 |
 | v10 | **基本面质量 + 聪明钱双因子（P1，2026-07-16）**：① 13 因子扩展，新增 `fundamental`（第12，权重1.0，ROE+净利润同比，季度披露）与 `smart_money`（第13，权重0.6，龙虎榜净买+北向，纯加分）；② `fundamental`：东方财富 datacenter `RPT_LICO_FN_CPD`（`ISNEW=1` 取最新一期 ROE/净利同比），全市场分页拉取（约 5208 只）存 `stock_fundamental` 表，每日 18:05 定时更新，无数据降级 8 分；③ `smart_money`：龙虎榜 `RPT_DAILY_BILLBOARD_DETAILS`（近 5 日净买入额聚合）+ 北向 `kamt`（市场级情绪），均无数据=0 分不拖累；④ 新增 `POST /api/fundamental/refresh`、`GET /api/dragon-tiger`、`GET /api/northbound`；⑤ 前端 `TabStrategy` 新增"聪明钱信号"面板（龙虎榜净买榜 + 北向净流入）；单股详情与扫描评分已注入两因子 | 选股胜率 P1 提升项：用"基本面质地（规避垃圾股）+ 机构/游资资金认同（聪明钱）"双维度加固，与 RPS 强势形成"强逻辑+强资金+强质地"三角验证 |
+| v11 | **早期信号层 + RSI/连板风控 + 买卖点位置感知 + UI 精简（2026-08-17）**：① 早期信号层（第5维度，`services/early_signals.py`）：5 个纯函数检测器（NR7缩量/VCP收缩/RSI底背离/底部首板/缩量后首放），每命中+3分封顶+10，性能 gating（base_score ∈ [40,92] + RSI<88 + 位置门控）；② RSI 超买风控：RSI≥95 强制排除、RSI≥88 扣8分（参考 CANSLIM/SEPA）；连板≥5 扣10分（透支风险）；③ V4.2 买卖点位置+龙头+评分三维修正：止盈倍率 = 位置倍率 × 龙头倍率 × 评分倍率封顶15%，止损同步位置/龙头修正，输出 stockType（如"低位龙头"）+ expectationNote；④ TREND_MIN_SCORE 60→65（提升趋势池质量门槛）；⑤ UI 精简：移除 TabStrategy/TabBacktest，保留6个核心Tab；⑥ 颜色统一：止盈红涨绿跌A股惯例（止盈=红、止损=绿） | 解决三大痛点：均线系统滞后2-5天（早期信号提前识别转折）；买卖点一刀切无视位置/龙头（三维修正）；趋势池门槛偏低致质量参差（65分门槛） |
 
 ## 11. P4 优化（2026-07-01）：趋势回测验证闭环 + 资金流并发优化
 
@@ -742,10 +797,16 @@ const r = getRating(stock.score)   // { label, short, color }
 
 > 阈值（`THERMOMETER_*`）在前端 `TabTrend.vue` 的 `THERMOMETER` 常量中调整；数据源完全复用现有 `trend_scan_results`，不新增定时任务。
 
-## 系统更新日志（2026-06 ~ 08）
+## 系统更新日志（2026-06 ~ 09）
 
 | 日期 | 模块 | 变更 |
 |------|------|------|
+| 2026-09-10 | 股票筛选 | **默认过滤模式改为"自定义最低分 60 分"**：`app/config.py` `TAB_SCAN_DEFAULT_MODE` 由 `leaders_only` 改为 `min_score`，新增 `TAB_SCAN_DEFAULT_MIN_SCORE = 60`；`/api/tab-scan-config` 新增 `defaultMinScore` 字段；前端 `TabScan.vue` 默认值与兜底逻辑同步改为 `min_score` + `60`，`loadTabConfig` 读取后端配置并回写 `customMinScore`。用户进入股票筛选 Tab 默认只看综合评分 ≥60 的票，减少弱票刷屏 |
+| 2026-09-14 | 股票池 | **收盘自动移除连跌≥2天的股票**：`services/trend.py` 新增 `check_consecutive_down()` 纯函数（从最新一天往前数连续收盘价低于前一日，达阈值返回 shouldRemove=True）；集成到现有 `scan_and_remove_below_ma10()` 15:05 定时任务流程（MA10 未触发时追加连跌检查，任一命中即移除）；`app/config.py` 新增 `POOL_CONSECUTIVE_DOWN_THRESHOLD = 2`（设为 0 关闭）；`core/scheduler.py` 日志更新。用户股票池+趋势池均生效 |
+| 2026-08-17 | 趋势评分 | **早期信号层（第5维度）+ RSI/连板风控**：① 新建 `services/early_signals.py`，5 个纯函数检测器（NR7缩量变盘/VCP波动率收缩/RSI底背离/底部首板/缩量后首放），每命中+3分封顶+10分，叠加到 `total_score`；性能 gating（base_score ∈ [40,92] + RSI<88 + 位置分位门控），单检测器异常容错；② RSI 超买风控：RSI≥95 强制排除、RSI≥88 扣8分（参考 CANSLIM/SEPA 体系）；③ 连板透支风控：连板≥5 扣10分；④ `config.py` 新增 `TREND_EARLY_SIGNAL_*` / `TREND_RSI_*` / `TREND_CONSECUTIVE_BOARD_EXHAUSTION*` 配置项；⑤ 前端 TabTrend 展开卡片显示"早期信号"橙色标签（含 hover 描述） |
+| 2026-08-17 | 买卖点/风控 | **V4.2 买卖点位置+龙头+评分三维修正**：① `recommend.py::calc_buy_sell_points` 重写：止盈倍率 = 位置倍率(低位1.4/高位0.7) × 龙头倍率(龙头1.3/跟风0.9) × 评分倍率(高分1.1/低分0.8)，封顶15%；② `risk_control.py::calc_risk_control` 增强：止损幅度叠加位置倍率(低位放宽20%/高位收紧20%) × 龙头倍率(龙头放宽10%/跟风收紧10%)；③ 龙头判定：连板≥2/涨停/(涨幅≥5%+量比≥2)/(高分+非高位)，位置判定优先 `trend_details.positionPct` fallback `base_scores['position']`；④ 输出 `stockType`（如"低位龙头"）+ `expectationNote`（预期说明文字）；⑤ `config.py` 新增 `BUY_SELL_*` 系列配置项 |
+| 2026-08-17 | UI 精简 | **移除 TabStrategy/TabBacktest + 颜色统一**：① App.vue 移除 TabStrategy（策略因子）和 TabBacktest（策略回测）两个 Tab，保留6个核心Tab（行情/筛选/趋势/推荐/资金/收评）；② 止盈止损颜色统一为A股惯例：止盈=红色(--accent-danger)、止损=绿色(--accent-success)，TabQuote 交易决策卡 + TabScan 目标价/止损列同步调整；③ TabQuote 新增 stockType 徽章（龙头=橙底/跟风=灰底）+ expectationNote 预期说明；④ TabScan 新增 stockType 标签 |
+| 2026-08-17 | 趋势评分 | **TREND_MIN_SCORE 60→65**：提升趋势池质量门槛，减少低分噪音股进入趋势发现列表。同步更新 README §2.6 门槛判断、§3 排除条件、§7 配置项 |
 | 2026-08-03 | 每日收评 | **4 大关键修复：收评不自动生成/AI 三栏空/涨停跌停误显示 20**：① 调度层 `scheduler.py`：所有盘中任务（收评 15:10/推荐 09:45,13:30/趋势扫描/大盘预警/回测等）加入 `is_trading_day` 交易日判断，非交易日直接跳过（避免周六 15:10 空收评把周五真收评顶掉）；主循环包 try-except，单个 job 异常不中断调度线程；日志统一加时间戳 + 堆栈。② 数据层 `database.py`：`daily_market_reviews` 新增 `ai_analysis_json TEXT`（保存情绪评分/操作建议/明日展望/风险提示/亮点摘要 6 项 AI 智能分析结论，之前入库漏存导致前端 AI 三栏全空），同时新增 `limit_up_count / limit_down_count INTEGER`（保存真实涨停/跌停总数）。③ 收评生成 `review.py`：生成时同步写入 `limitUpCount / limitDownCount` 两个整数，数组只截前 20 只用于前端详情列表（之前只截数组，导致前端 KPI 卡显示成 20）。④ 前端 `TabReview.vue`：`getTotalLimitUp/Down` 优先读 `limitUpCount / limitDownCount` 两个真实总数字段，缺失时才退化为数组长度（兼容老数据）。修复后今日收评显示真实"涨停 66 / 跌停 100"，情绪评分环 + AI 三栏可正常展示。 |
 | 2026-08-03 | 数据服务 | **东方财富 clist 接口 503/429/空 body 全面加固**：① 新增 `services/review.py::_em_clist_get()` 统一封装（与 fundflow._clist 同源）：3 次重试 + 指数退避 + `raise_for_status` + `rc` 校验 + 空 body 处理，**全部失败时返回 [] 绝不向上抛**，收评里原 8 处硬编码长 URL（行业/概念板块、涨跌停、涨幅/跌幅榜、主力 TOP20）全部改为参数化调用，消除重复与漏 try 的隐患。② `services/fundflow.py::_clist`：超时 10s→12s；最后一次重试失败打印 `fid` + `fs`（之前只看到"板块排名失败:503"，不知道是哪个端点失败）。③ 上层调用均为独立 try 互不拖垮：收评的某一列表失败、资金流向的"板块排名/非热点上涨股"失败只会对应列表空，不会让整个收评/资金流 Tab 挂掉。Live 验证：2026-08-03 周一 fundflow 个股 50×2/板块 30×2/非热点 50 全部正常返回，收评涨停 100/跌停 30。 |
 | 2026-08-03 | 热搜榜 | **3 类榜单合并替代旧 f127 热度榜**：发现旧 `fid=f127` 并非东方财富APP真实人气榜（前10名零重叠），改用真实人气榜API `emappdata.eastmoney.com/stockrank/getAllCurrentList`（httpx POST，requests 被拒连）；热搜榜股票池由 3 类合并去重：① 真实人气榜前100（API上限100，含全市场，本地筛选沪深主板）→ ② 涨幅榜(fid=f3)前100 → ③ 成交额榜(fid=f6)前400；人气榜独有股票通过 push2 `ulist.np` 批量行情API补充名称/行情；`config.py` 新增 `POPULARITY_RANK_TOP_N`/`CHANGE_RANK_TOP_N`/`TURNOVER_RANK_TOP_N` 替代旧 `HOT_RANK_TOP_N`；合并后约470只沪深主板 |

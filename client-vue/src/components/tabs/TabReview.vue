@@ -138,6 +138,63 @@
           </div>
         </div>
 
+        <!-- 2.5) 短线情绪周期 -->
+        <div v-if="review.sentimentCycle" class="review-section">
+          <div class="section-title-row">
+            <div class="section-title-small">🌡️ 短线情绪周期</div>
+            <span class="section-sub">五维合成：涨停家数 · 炸板率 · 连板高度 · 昨涨停溢价 · 涨跌家数比</span>
+          </div>
+          <div class="cycle-card">
+            <div class="cycle-main">
+              <div class="cycle-stage" :class="'stage-' + getCycleKey(review.sentimentCycle.cycle)">{{ review.sentimentCycle.cycle }}</div>
+              <div class="cycle-score-row">
+                <span class="cycle-score">{{ review.sentimentCycle.cycleScore }}</span>
+                <span class="cycle-score-unit">/100</span>
+              </div>
+              <div class="cycle-advice">{{ review.sentimentCycle.advice }}</div>
+            </div>
+            <div class="cycle-right">
+              <div class="cycle-track">
+                <div v-for="st in CYCLE_STAGES" :key="st.key"
+                     class="cycle-node"
+                     :class="[{ active: st.name === review.sentimentCycle.cycle }, 'stage-' + st.key]">
+                  <div class="cycle-node-bar"></div>
+                  <div class="cycle-node-name">{{ st.name }}</div>
+                </div>
+              </div>
+              <div class="cycle-detail">{{ review.sentimentCycle.detail }}</div>
+              <div class="cycle-indicators" v-if="review.sentimentCycle.indicators">
+                <div class="cycle-ind" v-if="review.sentimentCycle.indicators.maxLianban">
+                  <span class="cycle-ind-val">{{ review.sentimentCycle.indicators.maxLianban }}板</span>
+                  <span class="cycle-ind-lbl">最高连板</span>
+                </div>
+                <div class="cycle-ind" v-if="review.sentimentCycle.indicators.zhabanRate != null">
+                  <span class="cycle-ind-val">{{ review.sentimentCycle.indicators.zhabanRate }}%</span>
+                  <span class="cycle-ind-lbl">炸板率</span>
+                </div>
+                <div class="cycle-ind" v-if="review.sentimentCycle.indicators.yesterdayPremium != null">
+                  <span class="cycle-ind-val" :class="review.sentimentCycle.indicators.yesterdayPremium >= 0 ? 'up' : 'down'">
+                    {{ review.sentimentCycle.indicators.yesterdayPremium > 0 ? '+' : '' }}{{ review.sentimentCycle.indicators.yesterdayPremium }}%
+                  </span>
+                  <span class="cycle-ind-lbl">昨涨停今溢价</span>
+                </div>
+                <div class="cycle-ind" v-if="review.sentimentCycle.indicators.riseCount">
+                  <span class="cycle-ind-val">{{ review.sentimentCycle.indicators.riseCount }}:{{ review.sentimentCycle.indicators.fallCount }}</span>
+                  <span class="cycle-ind-lbl">涨跌家数</span>
+                </div>
+                <div class="cycle-ind" v-if="review.sentimentCycle.indicators.lianbanGe3">
+                  <span class="cycle-ind-val">{{ review.sentimentCycle.indicators.lianbanGe3 }}</span>
+                  <span class="cycle-ind-lbl">3连板以上</span>
+                </div>
+              </div>
+              <div v-if="review.sentimentCycle.weakSignals && review.sentimentCycle.weakSignals.length" class="cycle-weak">
+                <span class="cycle-weak-icon">⚠</span>
+                <span v-for="(w, i) in review.sentimentCycle.weakSignals" :key="i" class="cycle-weak-chip">{{ w }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- 3) 大盘指数 -->
         <div v-if="review.market && Object.keys(review.market).length" class="review-section">
           <div class="section-title-row">
@@ -522,6 +579,21 @@ function getRiskBadgeText(level) {
   return { low: '低', mid: '中', high: '高' }[level] || '低'
 }
 
+// ===== 短线情绪周期 =====
+// 阶段顺序即情绪周期轮动顺序：冰点→回暖→发酵→高潮→分歧→退潮→(回到冰点)
+const CYCLE_STAGES = [
+  { name: '冰点', key: 'bingdian' },
+  { name: '回暖', key: 'huinuan' },
+  { name: '发酵', key: 'fajiao' },
+  { name: '高潮', key: 'gaochao' },
+  { name: '分歧', key: 'fenqi' },
+  { name: '退潮', key: 'tuichao' },
+]
+function getCycleKey(name) {
+  const st = CYCLE_STAGES.find(s => s.name === name)
+  return st ? st.key : 'fenqi'
+}
+
 // ===== 交互：个股 → K线 =====
 function openStockKline(s) {
   if (!s || !s.code) return
@@ -810,11 +882,53 @@ onMounted(() => {
 .loading-tip, .error-tip { padding: 24px; text-align: center; color: var(--text-secondary); font-size: 0.85rem; }
 .error-tip { color: #dc2626; }
 
+/* ===== 短线情绪周期 ===== */
+.cycle-card { display: flex; gap: 16px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 14px 16px; }
+.cycle-main { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-width: 130px; padding-right: 16px; border-right: 1px dashed var(--border-subtle); flex-shrink: 0; }
+.cycle-stage { font-size: 1.35rem; font-weight: 800; padding: 4px 20px; border-radius: var(--radius-pill); color: white; letter-spacing: 2px; }
+.stage-bingdian { background: #3b82f6; }
+.stage-huinuan { background: #06b6d4; }
+.stage-fajiao { background: #f59e0b; }
+.stage-gaochao { background: #dc2626; }
+.stage-fenqi { background: #a855f7; }
+.stage-tuichao { background: #16a34a; }
+.cycle-score-row { display: flex; align-items: baseline; gap: 3px; }
+.cycle-score { font-size: 1.8rem; font-weight: 700; font-family: 'SF Mono', 'JetBrains Mono', monospace; color: var(--text-primary); line-height: 1; }
+.cycle-score-unit { font-size: 0.7rem; color: var(--text-secondary); }
+.cycle-advice { font-size: 0.72rem; color: var(--text-secondary); text-align: center; line-height: 1.5; max-width: 170px; }
+.cycle-right { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; justify-content: center; }
+
+.cycle-track { display: flex; align-items: flex-end; gap: 4px; }
+.cycle-node { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+.cycle-node-bar { width: 100%; height: 6px; border-radius: 3px; background: var(--border-subtle); opacity: 0.45; transition: all 0.3s; }
+.cycle-node-name { font-size: 0.7rem; color: var(--text-secondary); font-weight: 500; }
+.cycle-node.active .cycle-node-bar { opacity: 1; }
+.cycle-node.active .cycle-node-name { font-weight: 700; color: var(--text-primary); }
+.cycle-node.active.stage-bingdian .cycle-node-bar { background: #3b82f6; }
+.cycle-node.active.stage-huinuan .cycle-node-bar { background: #06b6d4; }
+.cycle-node.active.stage-fajiao .cycle-node-bar { background: #f59e0b; }
+.cycle-node.active.stage-gaochao .cycle-node-bar { background: #dc2626; }
+.cycle-node.active.stage-fenqi .cycle-node-bar { background: #a855f7; }
+.cycle-node.active.stage-tuichao .cycle-node-bar { background: #16a34a; }
+
+.cycle-detail { font-size: 0.75rem; color: var(--text-secondary); line-height: 1.5; }
+.cycle-indicators { display: flex; gap: 8px; flex-wrap: wrap; }
+.cycle-ind { display: flex; flex-direction: column; align-items: center; gap: 2px; background: var(--bg-secondary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 6px 12px; min-width: 62px; }
+.cycle-ind-val { font-size: 0.95rem; font-weight: 700; font-family: 'SF Mono', 'JetBrains Mono', monospace; color: var(--text-primary); line-height: 1.2; }
+.cycle-ind-val.up { color: var(--accent-danger); }
+.cycle-ind-val.down { color: var(--accent-success); }
+.cycle-ind-lbl { font-size: 0.65rem; color: var(--text-secondary); }
+.cycle-weak { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.cycle-weak-icon { color: #f59e0b; font-size: 0.9rem; }
+.cycle-weak-chip { padding: 2px 8px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 4px; font-size: 0.7rem; color: #b45309; }
+
 /* 响应式 */
 @media (max-width: 768px) {
   .kpi-grid { grid-template-columns: 1fr 1fr; }
   .ai-grid { grid-template-columns: 1fr; }
   .dual-section { grid-template-columns: 1fr; }
   .market-grid-3 { grid-template-columns: 1fr; }
+  .cycle-card { flex-direction: column; }
+  .cycle-main { border-right: none; border-bottom: 1px dashed var(--border-subtle); padding: 0 0 10px; width: 100%; }
 }
 </style>

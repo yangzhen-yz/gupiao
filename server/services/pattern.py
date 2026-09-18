@@ -11,7 +11,7 @@
   ⑤ 量价背离(volume_divergence)：价微涨+20日均量放大超30%，顶背离风险
   ⑥ 缩量横盘(shrink_sideways)：振幅<5%+量能萎缩，动能不足
 """
-from typing import List, Dict, Optional
+from typing import (List, Dict)
 from app.config import (
     TREND_PATTERN_FACTOR,
     TREND_PATTERN_VOLUME_BREAKOUT_RATIO, TREND_PATTERN_VOLUME_BREAKOUT_CHANGE,

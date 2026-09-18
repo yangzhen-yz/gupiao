@@ -2,8 +2,8 @@
 import asyncio
 from typing import List, Dict, Optional
 from datetime import date, timedelta
-from app.config import STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, MARKET_CRASH_THRESHOLD, MARKET_SEVERE_CRASH_THRESHOLD, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD
-from db.database import get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions
+from app.config import (STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD)
+from db.database import (get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions)
 from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data, get_kline_data
 from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
@@ -363,14 +363,23 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         else:
             base_scores['change_percent'] = 14
     elif change_percent > 0:
-        base_scores['change_percent'] = 16
+        # 2026-08-31 评分优化：缩量上涨扣分（量价背离）。
+        # 0<涨幅≤3% 且量比<0.6（明显缩量）= 无量推升，做多动能不足、持续性差，
+        # 不给满额涨幅分，避免"无量微涨"混入强势梯队。
+        if volume_ratio < 0.6:
+            base_scores['change_percent'] = 12
+        else:
+            base_scores['change_percent'] = 16
     else:
         pass
 
     # ====== 2026-07-14 修复：涨停股反转惩罚不应因收盘委比归0而误触发 ======
     # 只有真实负委比或天量（量比>8）/低外盘才视为弱封板/烂板，需要额外惩罚
     if change_percent > 9.5:
-        weak_board = (weibi < 0) or (volume_ratio > 8) or (outer_ratio < 45)
+        # 2026-08-31 评分优化：换手率>20%（天量换手）视为弱板信号。
+        # 涨停当日 20% 以上筹码换手 = 大量获利盘/解套盘兑现，次日抛压显著，
+        # 在大盘走弱时反转风险高，应与烂板同档处理。
+        weak_board = (weibi < 0) or (volume_ratio > 8) or (outer_ratio < 45) or (turnover_rate > 20)
         if weak_board:
             if market_change < -0.5:
                 # 大盘显著下跌：涨停股次日反转风险极高，重罚
@@ -995,39 +1004,59 @@ async def backtest_yesterday_predictions() -> Dict:
         traceback.print_exc()
         return {'error': str(error)}
 def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict]:
-    """根据预测准确性调整各因子权重
+    """根据预测准确性调整各因子权重（2026-09-04 升级：IC/IC_IR 引擎优先，中位数区分度法兜底）
 
-    修复：原代码 factor_accuracy = len(correct_samples) / len(recent) * 100 计算的是整体准确率，
-    每个因子都拿到相同的准确率值 → 权重调整完全无效（所有因子同步增减，相对关系不变）。
-    新版：计算每个因子的"区分度"——高因子值样本 vs 低因子值样本的准确率差异，
-    高因子值样本准确率更高 → 因子有预测力 → 增强权重；反之则减弱。
+    V2（IC 引擎，对标华泰金工/米筐多因子体系）：
+      - 对每个截面日计算"因子值 vs 次日超额收益"的 Spearman Rank IC
+      - IC_IR = IC均值/IC标准差 作为因子质量核心指标
+      - IC_IR > +0.30 → 增权（×1.05，上限2.0）；< -0.30 → 降权（×0.95，下限0.3）
+      - 方向一致占比 < 50% 的因子不增权（避免噪声驱动），反向且占比 < 40% 额外压低
+      - 截面日 < 5 个时该因子回退"中位数区分度"旧逻辑（冷启动兼容）
+
+    旧逻辑（V1 区分度）保留为兜底：高因子值组 vs 低因子值组的预测准确率差异。
     """
+    from services.factor_ic import FACTOR_COLUMNS, compute_factor_ic_stats, adjust_weights_by_ic_ir
+
     adjustments = []
 
-    db_columns = {'outer_ratio', 'volume_ratio', 'turnover_rate', 'change_percent',
-                  'weibi', 'avg_price_deviation', 'amplitude',
-                  'position', 'main_capital_inflow', 'holder_structure'}
+    db_columns = set(FACTOR_COLUMNS)
     # rps/fundamental/smart_money 尚未持久化到 strategy_predict_records，跳过权重调整
 
-    for factor_name in DEFAULT_WEIGHTS.keys():
-        if factor_name not in db_columns:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '非数据库因子'})
-            continue
-        # 统计该因子高分时预测的准确率
-        try:
-            cursor.execute(
-                f'''SELECT predict_direction, actual_change, is_correct, {factor_name} as factor_val
-               FROM strategy_predict_records
-               WHERE verified = 1 AND predict_date >= date('now', '-30 days')
-               ORDER BY predict_date DESC LIMIT {STRATEGY_BACKTEST_PREDICTION_LIMIT}'''
-            )
-        except Exception:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '数据库列不存在'})
-            continue
-        recent = cursor.fetchall()
+    # 一次性拉取近30天已验证记录（所有因子列共用，消除逐因子 N 次查询）
+    rows = []
+    try:
+        cursor.execute(
+            f'''SELECT predict_date, predict_direction, actual_change, is_correct, market_change,
+                        {', '.join(FACTOR_COLUMNS)}
+           FROM strategy_predict_records
+           WHERE verified = 1 AND predict_date >= date('now', '-30 days')
+           ORDER BY predict_date DESC LIMIT {STRATEGY_BACKTEST_PREDICTION_LIMIT}'''
+        )
+        rows = cursor.fetchall()
+    except Exception:
+        rows = []
 
+    # ---- 主路径：IC/IC_IR 引擎 ----
+    ic_stats = compute_factor_ic_stats(rows) if rows else {}
+    if ic_stats:
+        adjustments.extend(adjust_weights_by_ic_ir(weights, ic_stats))
+        # 记录引擎标识，便于回测报告区分新旧逻辑
+        for a in adjustments:
+            a['engine'] = 'ic_ir'
+
+    # ---- 兜底 + 补齐：IC 截面不足或无数据的因子走旧区分度逻辑 ----
+    for factor_name in DEFAULT_WEIGHTS.keys():
+        if factor_name in ic_stats:
+            # 权重元数据沿用 IC 口径
+            weights[factor_name]['sample_count'] = ic_stats[factor_name]['n_total']
+            continue
+        if factor_name not in db_columns:
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '非数据库因子', 'engine': 'ic_ir' if ic_stats else 'legacy'})
+            continue
+
+        recent = rows
         if len(recent) < 10:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '样本不足'})
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': f'样本不足({len(recent)})', 'engine': 'ic_ir' if ic_stats else 'legacy'})
             continue
 
         # 计算该因子在预测正确和错误样本中的分布差异
@@ -1035,36 +1064,30 @@ def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict
         wrong_samples = [r for r in recent if r['is_correct'] == 0]
 
         if not correct_samples or not wrong_samples:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '无错误样本'})
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '无错误样本', 'engine': 'ic_ir' if ic_stats else 'legacy'})
             continue
 
-        # 修复：计算因子区分度——高因子值样本组 vs 低因子值样本组的准确率差异
-        # 1. 提取因子值（跳过 None/0 异常值）
-        factor_vals = [r['factor_val'] for r in recent if r['factor_val'] is not None and r['factor_val'] != 0]
+        # 中位数区分度——高因子值样本组 vs 低因子值样本组的准确率差异
+        factor_vals = [r[factor_name] for r in recent if r[factor_name] is not None and r[factor_name] != 0]
         if len(factor_vals) < 5:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '因子值有效样本不足'})
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '因子值有效样本不足', 'engine': 'ic_ir' if ic_stats else 'legacy'})
             continue
 
-        # 2. 按中位数分成高/低两组
         median_val = sorted(factor_vals)[len(factor_vals) // 2]
-        high_group = [r for r in recent if r['factor_val'] is not None and r['factor_val'] > median_val]
-        low_group = [r for r in recent if r['factor_val'] is not None and r['factor_val'] <= median_val]
+        high_group = [r for r in recent if r[factor_name] is not None and r[factor_name] > median_val]
+        low_group = [r for r in recent if r[factor_name] is not None and r[factor_name] <= median_val]
 
         if not high_group or not low_group:
-            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '分组后样本为空'})
+            adjustments.append({'factor': factor_name, 'action': 'keep', 'reason': '分组后样本为空', 'engine': 'ic_ir' if ic_stats else 'legacy'})
             continue
 
-        # 3. 计算各组准确率
         high_correct = sum(1 for r in high_group if r['is_correct'] == 1)
         low_correct = sum(1 for r in low_group if r['is_correct'] == 1)
         high_accuracy = high_correct / len(high_group) * 100
         low_accuracy = low_correct / len(low_group) * 100
 
-        # 4. 区分度 = 高组准确率 - 低组准确率
-        # 正值：高因子值预测更准 → 因子有正向预测力 → 增强权重
-        # 负值：高因子值预测更差 → 因子有误导性 → 减弱权重
         discrimination = high_accuracy - low_accuracy
-        factor_accuracy = (high_accuracy + low_accuracy) / 2  # 平均准确率（用于记录）
+        factor_accuracy = (high_accuracy + low_accuracy) / 2
 
         current_weight = weights[factor_name]['weight']
         sample_count = len(recent)
@@ -1076,10 +1099,6 @@ def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict
         weights[factor_name]['correct_count'] = correct_count
         weights[factor_name]['discrimination'] = round(discrimination, 2)
 
-        # 权重调整逻辑（基于区分度而非整体准确率）：
-        # 区分度 > 10%: 增强权重（最高2.0）
-        # 区分度 < -10%: 减弱权重（最低0.3）
-        # -10% ~ 10%: 保持不变
         old_weight = current_weight
         if discrimination > 10:
             new_weight = min(2.0, current_weight * 1.05)
@@ -1098,7 +1117,8 @@ def _adjust_weights(predictions: List[Dict], weights: Dict, cursor) -> List[Dict
         adjustments.append({'factor': factor_name, 'action': action, 'old_weight': round(old_weight, 4),
                             'new_weight': round(new_weight, 4), 'reason': reason,
                             'discrimination': round(discrimination, 2),
-                            'high_accuracy': round(high_accuracy, 2), 'low_accuracy': round(low_accuracy, 2)})
+                            'high_accuracy': round(high_accuracy, 2), 'low_accuracy': round(low_accuracy, 2),
+                            'engine': 'ic_ir' if ic_stats else 'legacy'})
 
     return adjustments
 

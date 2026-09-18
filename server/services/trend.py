@@ -1,46 +1,10 @@
 """trend.py - split from main.py"""
-import json, asyncio, time
+import asyncio, time
 from typing import List, Dict, Optional
-from datetime import date, timedelta
+from datetime import date
 from fastapi import HTTPException
-from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD,
-    TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS,
-    SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS,
-    STRATEGY_PREDICT_BULL_MIN_SCORE, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD,
-    TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE,
-    TREND_D1_DIVERGENCE_PENALTY_TIERS,
-    TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS,
-    TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS,
-    TREND_D4_DRAWDOWN_TIERS,
-    TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID,
-    TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL,
-    TREND_DEDUCT_VOLUME_SPIKE, TREND_DEDUCT_VOLUME_DIVERGENCE,
-    TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH,
-    TREND_DEDUCT_AMPLITUDE_FLAT, TREND_DEDUCT_NON_MAIN_BOARD,
-    TREND_DEDUCT_GROUPS,
-    TREND_POSITION_BREAKTHROUGH_GAIN,
-    TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS,
-    TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG,
-    TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING,
-    TREND_SECTOR_MOMENTUM_WEIGHT, TREND_SECTOR_HOT_RANK_MIN,
-    TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD,
-    TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN, TREND_EXCLUDE_MARKET_CAP_MIN,
-    TREND_RANGE_20D_FLAT_MIN,
-    # 风险硬过滤（2026-08-03 新增）
-    TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT,
-    TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT,
-    # 筹码结构修正
-    TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN,
-    TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN,
-    TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL,
-    TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL,
-    TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL,
-    # 动态阈值
-    TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE,
-    TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS,
-    # 行业中性化
-    STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED)
-from db.database import get_db_conn, load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry
+from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED)
+from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry)
 from services.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)
@@ -106,6 +70,25 @@ def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
         return 100.0
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
+
+# 缓存 D1-D4 动态权重（V4.4：自动优化引擎，每日刷新一次）
+_TREND_DIM_WEIGHTS = None
+_TREND_DIM_WEIGHTS_DATE = ''
+
+def _get_dim_weights() -> Dict:
+    """惰性加载 D1-D4 动态权重（每次扫描周期只查一次 DB）"""
+    global _TREND_DIM_WEIGHTS, _TREND_DIM_WEIGHTS_DATE
+    today = date.today().isoformat()
+    if _TREND_DIM_WEIGHTS is not None and _TREND_DIM_WEIGHTS_DATE == today:
+        return _TREND_DIM_WEIGHTS
+    try:
+        from db.database import load_trend_dimension_weights
+        _TREND_DIM_WEIGHTS = load_trend_dimension_weights()
+        _TREND_DIM_WEIGHTS_DATE = today
+        return _TREND_DIM_WEIGHTS
+    except Exception:
+        return {'d1': {'weight': 1.0}, 'd2': {'weight': 1.0}, 'd3': {'weight': 1.0}, 'd4': {'weight': 1.0}}
+
 
 def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
                 negative_announcement: Optional[Dict] = None,
@@ -385,7 +368,12 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
             s_d4 = sc
             break
 
-    # ========== 基础分合计 ==========
+    # ========== 基础分合计（V4.4：叠加动态权重）==========
+    dim_weights = _get_dim_weights()
+    s_d1 = s_d1 * dim_weights.get('d1', {}).get('weight', 1.0)
+    s_d2 = s_d2 * dim_weights.get('d2', {}).get('weight', 1.0)
+    s_d3 = s_d3 * dim_weights.get('d3', {}).get('weight', 1.0)
+    s_d4 = s_d4 * dim_weights.get('d4', {}).get('weight', 1.0)
     base_score = s_d1 + s_d2 + s_d3 + s_d4
 
     # ========== 扣分项（12 项，可叠加） ==========
@@ -1282,7 +1270,7 @@ def check_below_ma10(kline_data: List[List]) -> Dict:
         }
 async def scan_and_remove_below_ma10():
     """
-    扫描股票池，删除跌破10日线且未收回的股票
+    扫描股票池，删除跌破10日线且未收回的股票 + 连跌达到阈值的股票
 
     同时检查两个池：
     1. user_scan_pool（用户股票池）
@@ -1343,7 +1331,14 @@ async def scan_and_remove_below_ma10():
                 stock_name = get_cached_stock_name(symbol) or symbol
                 in_user = symbol in user_set
                 in_trend = symbol in trend_set
-                
+
+                # 若MA10未触发，再检查连跌天数
+                if not result['shouldRemove']:
+                    from app.config import POOL_CONSECUTIVE_DOWN_THRESHOLD
+                    cd_result = check_consecutive_down(kline_data, POOL_CONSECUTIVE_DOWN_THRESHOLD)
+                    if cd_result['shouldRemove']:
+                        result = cd_result  # 连跌命中，覆盖为移除
+
                 if result['shouldRemove']:
                     pool_tags = []
                     if in_user:
@@ -1412,6 +1407,53 @@ async def scan_and_remove_below_ma10():
             
     except Exception as error:
         print(f'[10日线检查] 扫描失败: {str(error)}')
+
+
+def check_consecutive_down(kline_data: List[List], min_days: int = 2) -> Dict:
+    """
+    检查股票是否连续下跌达到阈值天数
+
+    判定标准：
+    - 从最新一天往前数，连续收盘价低于前一日
+    - 连跌天数 >= min_days → shouldRemove=True
+
+    返回: {'shouldRemove': True/False, 'reason': '原因', 'consecutiveDown': N}
+    """
+    if min_days <= 0:
+        return {'shouldRemove': False, 'reason': '连跌检查未启用', 'consecutiveDown': 0}
+
+    if not kline_data or len(kline_data) < min_days + 1:
+        return {
+            'shouldRemove': False,
+            'reason': f'K线数据不足，需要至少{min_days + 1}日数据',
+            'consecutiveDown': 0
+        }
+
+    closes = [float(k[2]) for k in kline_data]
+    latest_idx = len(kline_data) - 1
+
+    # 计算连跌天数（从最新一天往前数）
+    consecutive_down = 0
+    for i in range(latest_idx, 0, -1):
+        if closes[i] < closes[i - 1]:
+            consecutive_down += 1
+        else:
+            break
+
+    if consecutive_down >= min_days:
+        return {
+            'shouldRemove': True,
+            'reason': f'连续下跌{consecutive_down}天（阈值{min_days}天）',
+            'consecutiveDown': consecutive_down
+        }
+    else:
+        return {
+            'shouldRemove': False,
+            'reason': f'连跌{consecutive_down}天，未达阈值{min_days}天',
+            'consecutiveDown': consecutive_down
+        }
+
+
 def auto_add_high_score_to_pool(trend_results: List[Dict]) -> List[str]:
     """
     将评分 ≥ TREND_AUTO_ADD_POOL_THRESHOLD 的趋势股自动加入用户股票池。
@@ -1766,6 +1808,15 @@ async def scan_trend_scan_results(force: bool = False):
                 if r.get('strategyScore') and r.get('realtimeData'):
                     score_data = r['strategyScore']
                     realtime_data = r['realtimeData']
+                    # 2026-09-01 记录角色（总龙头/板块龙头/中军/情绪先锋/补涨龙/跟风/杂毛），
+                    # 供趋势回测按角色验证（role 列此前一直为空，无法做角色级回测）。
+                    try:
+                        from services.recommend import _classify_stock_role
+                        _role = _classify_stock_role(realtime_data, score_data, r.get('details'))[1]
+                        r['stockRole'] = _role
+                    except Exception as _e:
+                        print(f'[趋势扫描] 角色计算失败 {r.get("symbol")}: {type(_e).__name__}: {_e}')
+                        r['stockRole'] = ''
                     if score_data['predict_direction'] == 'bull':
                         predictions.append({
                             'predict_date': today,
@@ -1793,7 +1844,8 @@ async def scan_trend_scan_results(force: bool = False):
                     'ma5': r['ma5'],
                     'ma10': r['ma10'],
                     'ma20': r['ma20'],
-                    'recent5Days': r['recent5Days']
+                    'recent5Days': r['recent5Days'],
+                    'stockRole': r.get('stockRole', ''),
                 }
                 cleaned_results.append(cleaned_r)
             

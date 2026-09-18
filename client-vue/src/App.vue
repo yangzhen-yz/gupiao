@@ -9,27 +9,30 @@
           v-for="tab in tabs"
           :key="tab.id"
           :class="['tab-bar-item', { active: activeTab === tab.id }]"
-          @click="activeTab = tab.id"
+          @click="activateTab(tab.id)"
         >{{ tab.label }}</button>
       </nav>
       <div class="app-main">
-        <div :class="['tab-content', { active: activeTab === 'tab-quote' }]" v-show="activeTab === 'tab-quote'">
+        <div :class="['tab-content', { active: activeTab === 'tab-quote' }]" v-show="activeTab === 'tab-quote'" v-if="mountedTabs.has('tab-quote')">
           <TabQuote ref="tabQuoteRef" @open-kline="openKline" @open-ai-diag="openAiDiag" />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-scan' }]" v-show="activeTab === 'tab-scan'">
+        <div :class="['tab-content', { active: activeTab === 'tab-scan' }]" v-show="activeTab === 'tab-scan'" v-if="mountedTabs.has('tab-scan')">
           <TabScan />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-trend' }]" v-show="activeTab === 'tab-trend'">
+        <div :class="['tab-content', { active: activeTab === 'tab-trend' }]" v-show="activeTab === 'tab-trend'" v-if="mountedTabs.has('tab-trend')">
           <TabTrend @open-kline="openKline" />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'">
+        <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'" v-if="mountedTabs.has('tab-recommend')">
           <TabRecommend />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-flow' }]" v-show="activeTab === 'tab-flow'">
+        <div :class="['tab-content', { active: activeTab === 'tab-flow' }]" v-show="activeTab === 'tab-flow'" v-if="mountedTabs.has('tab-flow')">
           <TabFlow />
         </div>
-        <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'">
+        <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'" v-if="mountedTabs.has('tab-review')">
           <TabReview @open-kline="openKline" />
+        </div>
+        <div :class="['tab-content', { active: activeTab === 'tab-optimization' }]" v-show="activeTab === 'tab-optimization'" v-if="mountedTabs.has('tab-optimization')">
+          <TabOptimization />
         </div>
       </div>
     </div>
@@ -48,19 +51,33 @@
 </template>
 
 <script setup>
-import { ref, provide, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, provide, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import { useNotification, isTradingTime, apiFetch } from './utils/helpers'
 import IndexBar from './components/IndexBar.vue'
 import TabQuote from './components/tabs/TabQuote.vue'
-import TabScan from './components/tabs/TabScan.vue'
-import TabTrend from './components/tabs/TabTrend.vue'
-import TabRecommend from './components/tabs/TabRecommend.vue'
-import TabReview from './components/tabs/TabReview.vue'
-import TabFlow from './components/tabs/TabFlow.vue'
-import KlineModal from './components/KlineModal.vue'
-import AiDiagModal from './components/AiDiagModal.vue'
+
+// 2026-08-31 性能优化：非默认 Tab 与弹窗改为动态导入（配合懒挂载）。
+// 效果：首屏只加载「实时行情」+ 核心依赖；ECharts（仅 KlineModal 使用，~1MB）
+// 与其余 Tab 拆成独立 chunk，首次用到时才下载，首屏 JS 体积显著下降。
+const TabScan = defineAsyncComponent(() => import('./components/tabs/TabScan.vue'))
+const TabTrend = defineAsyncComponent(() => import('./components/tabs/TabTrend.vue'))
+const TabRecommend = defineAsyncComponent(() => import('./components/tabs/TabRecommend.vue'))
+const TabReview = defineAsyncComponent(() => import('./components/tabs/TabReview.vue'))
+const TabFlow = defineAsyncComponent(() => import('./components/tabs/TabFlow.vue'))
+const TabOptimization = defineAsyncComponent(() => import('./components/tabs/TabOptimization.vue'))
+const KlineModal = defineAsyncComponent(() => import('./components/KlineModal.vue'))
+const AiDiagModal = defineAsyncComponent(() => import('./components/AiDiagModal.vue'))
 
 const activeTab = ref('tab-quote')
+
+// 懒挂载：已激活过的 Tab 集合（2026-08-31 性能优化）。
+// 初始只挂载「实时行情」，其余 Tab 在首次点击时挂载，挂载后保持不销毁以保留状态。
+const mountedTabs = ref(new Set(['tab-quote']))
+function activateTab(id) {
+  mountedTabs.value.add(id)
+  activeTab.value = id
+}
+
 const { notifications, showNotification, TYPE_ICONS } = useNotification()
 
 provide('showNotification', showNotification)
@@ -131,5 +148,6 @@ const tabs = [
   { id: 'tab-recommend', label: '智能推荐' },
   { id: 'tab-flow', label: '资金流向' },
   { id: 'tab-review', label: '每日收评' },
+  { id: 'tab-optimization', label: '自动优化' },
 ]
 </script>

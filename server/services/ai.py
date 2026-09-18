@@ -1,8 +1,8 @@
 """ai_diagnose.py - split from main.py"""
 import json, os, asyncio, requests
-from typing import List, Dict, Any, Optional
+from typing import (List, Dict, Optional)
 from fastapi import HTTPException
-from app.config import AI_CONFIG_FILE, INDEX_SYMBOLS, EASTMONEY_HEADERS, HTTP_TIMEOUT
+from app.config import (AI_CONFIG_FILE, EASTMONEY_HEADERS, HTTP_TIMEOUT)
 from services.stock import calculate_ma, _sync_post
 from services.fundflow import _BROAD_CONCEPT_BLOCKLIST
 

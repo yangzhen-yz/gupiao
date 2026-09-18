@@ -4,9 +4,9 @@ from fastapi.responses import Response
 from typing import List, Dict, Optional
 import json, asyncio, time, re, inspect
 from datetime import date, datetime
-from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, HOT_SEARCH_TOP_N, KLINE_DATA_LIMIT, KLINE_DISPLAY_MA_POINTS, KLINE_START_DATE, INDEX_SYMBOLS, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, TENCENT_QUOTE_API, TENCENT_KLINE_API, TREND_MIN_SCORE, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, RPS_TOP_N, FUNDAMENTAL_ENABLED, FUNDAMENTAL_UPDATE_TIME, SMART_MONEY_ENABLED, SMART_MONEY_DRAGON_TIGER_DAYS)
-from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, save_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
-from services.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get)
+from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
+from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
+from services.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
 from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
 from services.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
 from services.trend_backtest import backtest_trend_predictions
@@ -29,6 +29,61 @@ TENCENT_API = TENCENT_QUOTE_API
 REQUEST_TIMEOUT = 8.0
 MAX_RETRIES = 2
 
+# ========== 批量扫描结果内存缓存（2026-08-31 性能优化） ==========
+_HOT_SCAN_CACHE: Dict[str, Dict] = {}
+_HOT_SCAN_CACHE_TTL = 15  # 秒
+
+def _invalidate_hot_scan_cache():
+    """清空批量扫描缓存（添加/移除自选股后调用，避免脏缓存）"""
+    _HOT_SCAN_CACHE.clear()
+
+# ========== 扫描宇宙扩展（2026-08-31 选股策略优化） ==========
+# 背景：原「股票筛选」只扫前端传入的用户自选池（通常 20~30 只），覆盖面窄。
+#       而趋势扫描已覆盖 ~477 只，热搜榜有全市场最活跃的 ~600 只。
+# 方案：默认合并 用户池 ∪ 趋势池 ∪ 默认热门池 ∪ 热搜前 N，去重后封顶 SCAN_UNIVERSE_CAP，
+#       让筛选 Tab 能看到更完整的市场机会；传入 pool_only=1 可退化为仅扫用户池。
+SCAN_UNIVERSE_CAP = 120          # 扫描宇宙封顶（兼顾覆盖面与首扫耗时）
+SCAN_UNIVERSE_HOT_TOP_N = 60     # 热搜榜补充数量
+SCAN_UNIVERSE_MIN_POOL = 15      # 用户池 ≥ 此数量时不再补充热搜榜（尊重用户自选规模）
+
+def _build_scan_universe(codes_list: List[str], pool_only: bool = False) -> List[str]:
+    """构建扫描宇宙：用户池 + 趋势池 + 默认热门池 + 热搜前 N（去重、过滤风险股）"""
+    universe = [c.lower() for c in codes_list]
+    if pool_only:
+        return universe[:SCAN_UNIVERSE_CAP]
+
+    # 合并默认热门池（HOT_STOCK_POOL 是经过人工挑选的备选池）
+    for c in HOT_STOCK_POOL:
+        if c.lower() not in universe:
+            universe.append(c.lower())
+
+    # 合并趋势扫描池（已通过趋势评分 ≥ TREND_MIN_SCORE 的强势股，跨系统联动）
+    try:
+        trend_data = load_trend_scan_results()
+        for st in (trend_data.get('stocks') or []):
+            sym = (st.get('symbol') or '').lower()
+            if re.match(r'^(sh|sz)\d{6}$', sym) and sym not in universe:
+                universe.append(sym)
+    except Exception as _e:
+        print(f'[扫描宇宙] 趋势池合并失败: {_e}')
+
+    # 用户池规模较小时，补充热搜榜前排活跃股（扩大市场覆盖面）
+    if len(codes_list) < SCAN_UNIVERSE_MIN_POOL:
+        try:
+            hot = load_hot_search_ranking()
+            for st in (hot.get('stocks') or [])[:SCAN_UNIVERSE_HOT_TOP_N]:
+                sym = (st.get('symbol') or '').lower()
+                if not re.match(r'^(sh|sz)\d{6}$', sym):
+                    continue
+                if is_forbidden_stock(st.get('name') or '') or has_delisting_risk(st.get('name') or '', sym):
+                    continue
+                if sym not in universe:
+                    universe.append(sym)
+        except Exception as _e:
+            print(f'[扫描宇宙] 热搜池合并失败: {_e}')
+
+    return universe[:SCAN_UNIVERSE_CAP]
+
 @router.get("/api/health", tags=["健康检查"])
 async def health_check():
     return {"status": "ok", "time": datetime.now().isoformat()}
@@ -50,15 +105,19 @@ async def get_tab_scan_config():
     from app.config import (
         TAB_SCAN_FILTER_MODES, TAB_SCAN_DEFAULT_MODE,
         TAB_SCAN_BULL_MIN_SCORE, TAB_SCAN_BEAR_MAX_SCORE,
+        TAB_SCAN_LEADERS_MIN_GAIN, TAB_SCAN_DEFAULT_MIN_SCORE,
     )
     return {
         "success": True,
         "data": {
             "filterModes": TAB_SCAN_FILTER_MODES,
             "defaultMode": TAB_SCAN_DEFAULT_MODE,
+            "defaultMinScore": TAB_SCAN_DEFAULT_MIN_SCORE,
             "bullMinScore": TAB_SCAN_BULL_MIN_SCORE,
             "bearMaxScore": TAB_SCAN_BEAR_MAX_SCORE,
+            "leadersMinGain": TAB_SCAN_LEADERS_MIN_GAIN,
             "modeLabels": {
+                "leaders_only": "仅优质龙头",
                 "all": "全部",
                 "bull_only": "仅看涨",
                 "bull_and_hold": "观望以上",
@@ -830,6 +889,7 @@ async def update_user_scan_pool_api(data: Dict):
                 valid_symbols.append(s.lower())
         
         save_user_scan_pool(valid_symbols)
+        _invalidate_hot_scan_cache()
         return {"success": True, "data": {"symbols": valid_symbols, "count": len(valid_symbols)}}
     except HTTPException:
         raise
@@ -855,6 +915,7 @@ async def add_to_user_scan_pool_api(data: Dict):
                 current_pool.append(s_lower)
         
         save_user_scan_pool(current_pool)
+        _invalidate_hot_scan_cache()
         return {"success": True, "data": {"symbols": current_pool, "count": len(current_pool)}}
     except HTTPException:
         raise
@@ -887,12 +948,13 @@ async def remove_from_user_scan_pool_api(data: Dict):
 async def clear_user_scan_pool_api():
     try:
         save_user_scan_pool([])
+        _invalidate_hot_scan_cache()
         return {"success": True, "message": "自定义扫描池已清空"}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"清空自定义扫描池失败: {str(error)}")
 
 @router.get("/api/hot-stocks-scan", tags=["股票扫描"])
-async def hot_stock_buttons_scan(codes: str = ''):
+async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only: bool = False):
     t0 = time.time()
     try:
         if not codes:
@@ -901,6 +963,19 @@ async def hot_stock_buttons_scan(codes: str = ''):
         codes_list = [c for c in codes.split(',') if re.match(r'^(sh|sz)\d{6}$', c.lower())]
         if not codes_list:
             return {"error": "无有效股票代码"}
+
+        # 2026-08-31 选股策略优化：扩展扫描宇宙。
+        # 默认合并 用户池 ∪ 趋势池 ∪ 默认热门池 ∪ 热搜前N（去重、过滤风险股，封顶 120）。
+        # 传 pool_only=1 仅扫用户池。需在缓存检查前构建，保证缓存覆盖完整宇宙。
+        codes_list = _build_scan_universe(codes_list, pool_only)
+
+        # 2026-08-31 性能优化：15s 内存缓存，覆盖前端 30s 轮询的重复请求。
+        # 命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
+        cache_key = ','.join(sorted(set(codes_list)))
+        _now_ts = time.time()
+        _cached = _HOT_SCAN_CACHE.get(cache_key)
+        if not force and _cached and (_now_ts - _cached['ts']) < _HOT_SCAN_CACHE_TTL:
+            return _cached['data']
         
         # 2026-07-08 修复：取消 100 只截断，支持全量扫描
         # 原 codes_list[:100] 导致 80% 股票未被扫描
@@ -1045,13 +1120,24 @@ async def hot_stock_buttons_scan(codes: str = ''):
         # 原逻辑直接丢弃低于 60 分的股票，导致用户无法看到完整市场全貌
         # 前端 TabScan 已有按分数排序 + 分页，用户可自行筛选
         
-        # 保存预测记录 - 只记录看涨的
+        # 保存预测记录 - 只记录看涨的（2026-09-01 增加质量门槛）
         today_str = date.today().isoformat()
         predictions = []
+        skipped = 0
         for s in all_results:
             score_data = s['score']
             if score_data['predict_direction'] != 'bull':
                 continue
+            # 质量门槛 v2（2 个月全周期回测，1973 条已验证样本）：
+            # 涨停是最稳健核心信号（56.6% 胜率 / +1.82% 次日）；非涨停仅保留综合评分>=80 的高分票。
+            # 上一版"量比>=0.9 且(非高位或涨停)"经复核全周期反而跑输基准，已废弃。
+            if PREDICT_SAVE_QUALITY_GATE:
+                _chg = float(s.get('changePercent', 0) or 0)
+                _score = float(score_data.get('total', 0) or 0)
+                _is_limit_up = _chg >= PREDICT_SAVE_LIMIT_UP_MIN
+                if not _is_limit_up and _score < PREDICT_SAVE_MIN_SCORE:
+                    skipped += 1
+                    continue
             predictions.append({
                 'predict_date': today_str,
                 'symbol': s['symbol'],
@@ -1074,6 +1160,8 @@ async def hot_stock_buttons_scan(codes: str = ''):
             })
         if predictions:
             save_predictions(predictions)
+        if PREDICT_SAVE_QUALITY_GATE and skipped:
+            print(f'[扫描] 质量门槛v2过滤 {skipped} 只看涨信号（非涨停且评分<{PREDICT_SAVE_MIN_SCORE}），保留 {len(predictions)} 条')
         
         response = [
             {
@@ -1114,6 +1202,9 @@ async def hot_stock_buttons_scan(codes: str = ''):
         ]
         
         print(f'[批量扫描] 完成: {len(response)} 只, 耗时 {(time.time() - t0):.1f}s')
+
+        # 2026-08-31 性能优化：写入内存缓存（TTL 15s），下次轮询直接命中
+        _HOT_SCAN_CACHE[cache_key] = {'ts': time.time(), 'data': response}
         return response
     except Exception as error:
         print(f'批量扫描失败: {str(error)}')
@@ -1788,6 +1879,106 @@ async def proxy_eastmoney(request: Request, path: str):
     except Exception as e:
         print(f'[东方财富代理] 请求失败: {e}')
         return Response(content=b"{}", status_code=502, media_type="application/json")
+
+
+# ========== 自动优化引擎 API（V4.4）==========
+
+@router.get("/api/optimization/history", tags=["自动优化"])
+async def get_optimization_history(module: str = '', limit: int = 50):
+    """查询自动优化历史"""
+    from db.database import load_optimization_history
+    module_param = module if module else None
+    data = load_optimization_history(module=module_param, limit=limit)
+    return {"success": True, "data": data}
+
+
+@router.get("/api/optimization/status", tags=["自动优化"])
+async def get_optimization_status():
+    """查询当前优化状态（D1-D4权重 + 角色门槛 + 角色表现）"""
+    from db.database import load_trend_dimension_weights, load_role_thresholds, load_role_performance
+    dim_weights = load_trend_dimension_weights()
+    role_thresholds = load_role_thresholds()
+    role_performance = load_role_performance()
+    return {
+        "success": True,
+        "data": {
+            "dimensionWeights": dim_weights,
+            "roleThresholds": role_thresholds,
+            "rolePerformance": role_performance,
+        }
+    }
+
+
+@router.post("/api/optimization/trigger", tags=["自动优化"])
+async def trigger_optimization(run_grid: bool = False):
+    """手动触发自动优化"""
+    from services.auto_optimizer import run_auto_optimization
+    result = await run_auto_optimization(run_grid=run_grid)
+    return {"success": True, "data": result}
+
+
+@router.get("/api/optimization/trend", tags=["自动优化"])
+async def get_optimization_trend():
+    """优化趋势聚合数据（前端面板展示用）"""
+    from db.database import get_db_conn
+    conn = get_db_conn()
+    cursor = conn.cursor()
+
+    # 1. 权重变化趋势（按天聚合 optimization_history 中 trend_dimension_weights 模块）
+    cursor.execute('''
+        SELECT created_at, parameter_set, metric_value, details
+        FROM optimization_history
+        WHERE module = 'trend_dimension_weights'
+        ORDER BY created_at DESC LIMIT 60
+    ''')
+    weight_history = [dict(r) for r in cursor.fetchall()]
+
+    # 2. 角色近期表现（最近7天）
+    cursor.execute('''
+        SELECT role, record_date, total, win_rate, excess_return
+        FROM role_performance
+        WHERE record_date >= date('now', '-7 days')
+        ORDER BY record_date DESC, role
+    ''')
+    role_perf = [dict(r) for r in cursor.fetchall()]
+
+    # 3. 网格搜索结果历史
+    cursor.execute('''
+        SELECT created_at, metric_value as best_winrate,
+               old_value as current_winrate,
+               new_value - old_value as improvement,
+               parameter_set
+        FROM optimization_history
+        WHERE module = 'grid_search'
+        ORDER BY created_at DESC LIMIT 10
+    ''')
+    grid_history = [dict(r) for r in cursor.fetchall()]
+
+    # 4. 全量优化统计
+    cursor.execute('SELECT count(*) as cnt FROM optimization_history')
+    total_opt = cursor.fetchone()['cnt']
+
+    cursor.execute('''
+        SELECT count(*) as cnt FROM optimization_history
+        WHERE created_at >= date('now', '-7 days')
+    ''')
+    week_opt = cursor.fetchone()['cnt']
+
+    conn.close()
+
+    return {
+        "success": True,
+        "data": {
+            "weightHistory": weight_history,
+            "rolePerformance": role_perf,
+            "gridHistory": grid_history,
+            "stats": {
+                "totalOptimizations": total_opt,
+                "weeklyOptimizations": week_opt,
+            }
+        }
+    }
+
 
 # 最后挂载静态文件，这样API路由会先被匹配到
 

@@ -514,7 +514,6 @@ async function loadTrendStocks() {
           trendStocks.value.every(s => !s.details || typeof s.details.consecutiveUpDays === 'undefined')
         if (isStale || isOldFormat) {
           _autoRescanTriggered = true
-          console.log(`[TabTrend] 数据过期（扫描日期=${scanDate}，今天=${today}），自动触发重新扫描...`)
           scanTrendStocks().catch(() => { _autoRescanTriggered = false })
         }
       }

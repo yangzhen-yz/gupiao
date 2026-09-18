@@ -1,5 +1,9 @@
 <template>
   <div class="index-bar">
+    <div class="index-brand">
+      <span class="index-brand-title">A股 · 实时行情</span>
+      <span class="index-brand-status" :class="statusClass">{{ tradingStatus }}</span>
+    </div>
     <div class="index-item" v-for="idx in indexes" :key="idx.code">
       <span class="index-name">{{ idx.name }}</span>
       <span class="index-price" :class="idx.change > 0 ? 'up' : idx.change < 0 ? 'down' : 'flat'">
@@ -13,14 +17,24 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
-import { isTradingTime, getNextRefreshDelay } from '../utils/helpers'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { isTradingTime, getNextRefreshDelay, getTradingStatusText } from '../utils/helpers'
 
 const indexes = ref([
   { code: 'sh000001', name: '上证', price: '', change: 0, changeText: '' },
   { code: 'sz399001', name: '深证', price: '', change: 0, changeText: '' },
   { code: 'sz399006', name: '创业板', price: '', change: 0, changeText: '' },
 ])
+
+// 市场状态徽章（2026-08-31 美化：顶部栏增加交易状态/品牌，替代原来光秃秃的三只指数）
+const tradingStatus = ref(getTradingStatusText().replace(/^[^\u4e00-\u9fa5]+\s*/, ''))
+const statusClass = computed(() => {
+  if (isTradingTime()) return 'trading'
+  const t = tradingStatus.value
+  if (t.includes('收盘')) return 'closed'
+  if (t.includes('休市')) return 'rest'
+  return 'idle'
+})
 
 let timer = null
 
@@ -63,6 +77,7 @@ function scheduleRefresh() {
   if (timer) clearTimeout(timer)
   const delay = isTradingTime() ? 5000 : getNextRefreshDelay()
   timer = setTimeout(async () => {
+    tradingStatus.value = getTradingStatusText().replace(/^[^\u4e00-\u9fa5]+\s*/, '')
     await loadIndexBar()
     scheduleRefresh()
   }, delay)
