@@ -710,6 +710,15 @@ KLINE_START_DATE = '2025-01-01'  # K线数据开始日期
 KLINE_DATA_LIMIT = 200  # K线数据数量限制
 KLINE_DISPLAY_MA_POINTS = 10  # 显示移动平均线点数
 
+# ========== 本地历史日K线库（A 级优化，2026-09-25 新增） ==========
+# 借鉴 Sequoia-X：用 baostock（免费/免注册/无限流）把全市场前复权日K落到本地 SQLite，
+# RPS/趋势/评分的区间涨幅从本地库向量化计算，彻底绕开东方财富限流与逐股现拉导致的 167s 扫描。
+# 选前复权：最新价=实盘价，与实时行情拼接无缝；前/后复权对收益率只差常数倍，RPS 排名不受影响。
+KLINE_HISTORY_ENABLED = True
+KLINE_HISTORY_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'history_kline.db')
+KLINE_HISTORY_START_DATE = '2024-01-01'  # 回填起点（约 2.5 年，覆盖 250 日 RPS 所需窗口）
+KLINE_HISTORY_SYNC_TIME = '16:00'  # 每日盘后增量同步（收盘 15:00 后 K 线已定，16:00 留足 baostock 当日数据落地缓冲；仅交易日执行）
+
 # ========== 东方财富请求头（统一常量） ==========
 # 2026-07-02 优化：从 review.py/ai.py/routes.py 三处分散定义统一到此处
 EASTMONEY_HEADERS = {

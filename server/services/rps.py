@@ -16,7 +16,7 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API)
+from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API, KLINE_HISTORY_ENABLED)
 from db.database import get_db_conn
 from services.stock import _sync_get
 
@@ -148,6 +148,57 @@ def _compute_rps(period_days: int, limit_codes: Optional[int] = None) -> Tuple[D
     return rps_map, gains
 
 
+def _compute_rps_vectorized(period_days: int) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """向量化计算全市场 RPS（读本地历史库，秒级，无需联网）。
+
+    借鉴 Sequoia-X：从本地前复权日K库一次性取出最近窗口，纯 Python 算区间涨幅 + 百分位排名。
+    前复权口径使最新价=实盘价，与实时行情拼接无缝；前/后复权对区间收益率只差常数倍，RPS 百分位排名不受影响。
+
+    Returns:
+        (rps_map, gain_map)：symbol_lower -> RPS(0~100) / 区间涨跌幅(%)；
+        本地库未就绪/样本不足返回 ({}, {})（调用方回退腾讯逐股法）。
+    """
+    if not KLINE_HISTORY_ENABLED:
+        return {}, {}
+    try:
+        from services.kline_history import get_engine, history_available
+    except Exception:
+        return {}, {}
+
+    if not history_available():
+        return {}, {}
+
+    try:
+        eng = get_engine()
+        latest, data = eng.load_recent_closes(period_days)
+        if not latest or len(data) < RPS_MIN_SAMPLES:
+            return {}, {}
+
+        gains: Dict[str, float] = {}
+        for sym, series in data.items():
+            # 需要 period_days+1 根 K 线才能算起点→终点区间涨幅
+            if len(series) < period_days + 1:
+                continue
+            c0 = series[-(period_days + 1)][1]  # 区间起点收盘价（前复权）
+            c1 = series[-1][1]                  # 区间终点收盘价
+            if c0 and c0 > 0:
+                gains[sym] = (c1 - c0) / c0 * 100
+
+        if len(gains) < RPS_MIN_SAMPLES:
+            return {}, {}
+
+        # 与既有腾讯路径一致：按区间涨幅升序排名，RPS = 强于多少比例的股票
+        items = sorted(gains.items(), key=lambda x: x[1])
+        n = len(items)
+        rps_map: Dict[str, float] = {}
+        for rank, (sym, _g) in enumerate(items):
+            rps_map[sym] = round(rank / (n - 1) * 100, 1) if n > 1 else 50.0
+        return rps_map, gains
+    except Exception as e:
+        print(f"[RPS] 向量化计算异常，回退腾讯法: {e}")
+        return {}, {}
+
+
 def _save_rps(period_days: int, rps_map: Dict[str, float], gains: Dict[str, float]) -> None:
     conn = get_db_conn()
     _ensure_schema(conn)
@@ -187,11 +238,21 @@ async def get_rps_map(period_days: int = RPS_PERIOD_DAYS) -> Dict[str, float]:
 
 
 async def refresh_rps(period_days: int = RPS_PERIOD_DAYS, limit_codes: Optional[int] = None) -> Dict:
-    """预计算全市场 RPS 并写入缓存（盘前/手动触发，后台任务）。"""
-    rps_map, gains = await asyncio.to_thread(_compute_rps, period_days, limit_codes)
+    """预计算全市场 RPS 并写入缓存（盘前/手动触发，后台任务）。
+
+    优先级：本地历史库向量化（秒级、免限流）→ 回退腾讯逐股拉 K 线（旧路径，慢但兼容）。
+    limit_codes 仅对回退路径生效（本地库路径一次算全市场）。
+    """
+    # 首选：本地历史库向量化（快、不依赖东方财富限流）
+    rps_map, gains = await asyncio.to_thread(_compute_rps_vectorized, period_days)
+    source = 'local_history'
+    if not rps_map:
+        # 回退：腾讯逐股拉前复权K线（旧实现，首次回填前或本地库异常时使用）
+        rps_map, gains = await asyncio.to_thread(_compute_rps, period_days, limit_codes)
+        source = 'tencent'
     if rps_map:
         await asyncio.to_thread(_save_rps, period_days, rps_map, gains)
-    return {'periodDays': period_days, 'count': len(rps_map)}
+    return {'periodDays': period_days, 'count': len(rps_map), 'source': source}
 
 
 async def get_rps_leaderboard(period_days: int = RPS_PERIOD_DAYS, top_n: int = RPS_TOP_N) -> Dict:

@@ -3,14 +3,65 @@ import asyncio, time
 from typing import List, Dict, Optional
 from datetime import date
 from fastapi import HTTPException
-from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED)
+from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED)
 from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry)
 from services.stock import (has_delisting_risk, is_main_board, get_kline_data,
-    calculate_ma, get_cached_stock_name, fetch_with_retry, fetch_stock_data, get_stock_name,
+    calculate_ma, get_cached_stock_name, fetch_with_retry, parse_realtime_fields, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)
 from services.strategy import calc_stock_score_v2, load_strategy_factor_weights, apply_industry_neutralization
 from services.pattern import detect_volume_price_pattern
 from services.early_signals import detect_early_signals
+from services.kline_history import history_available, get_engine
+
+
+async def _load_kline_for_scan(symbol: str):
+    """趋势扫描取数：优先本地前复权日K库（秒级、免腾讯限流），失败回退腾讯原逻辑。
+
+    返回 (kline, realtime_raw)：
+      - kline：与腾讯 qfqday 同构 [[date,open,close,high,low,volume], ...]（升序，最新日在末尾）
+      - realtime_raw：实时行情原始字符串（供 parse_tencent_batch_data 复用）
+    仅替换"历史K线来源"，实时行情合并逻辑 1:1 复制 get_kline_data（stock.py:570-593），
+    保证盘中最新价/涨幅与现网一致。三层回退：本地库未就绪 / 新股不足 30 根 / 异常 → 腾讯原逻辑。
+    """
+    today = date.today().isoformat()
+    if KLINE_HISTORY_ENABLED:
+        try:
+            if history_available():
+                local = await asyncio.to_thread(
+                    get_engine().get_kline_tencent_format, symbol, KLINE_DATA_LIMIT
+                )
+                if local and len(local) >= 30:
+                    # 1:1 复制 get_kline_data 实时合并（只补实时 bar，不重拉全量历史）
+                    realtime_raw = None
+                    try:
+                        realtime_raw = await fetch_with_retry(symbol)
+                        if realtime_raw:
+                            fields = parse_realtime_fields(realtime_raw)
+                            if fields and fields['price']:
+                                latest = local[-1]
+                                latest_date = latest[0]
+                                open_val = fields['open'] or fields['price']
+                                price_val = fields['price']
+                                high_val = fields['high'] or fields['price']
+                                low_val = fields['low'] or fields['price']
+                                vol_val = fields['volume'] or 0
+                                if latest_date != today:
+                                    local.append([today, open_val, price_val, high_val, low_val, vol_val])
+                                else:
+                                    latest[2] = price_val
+                                    latest[3] = max(float(latest[3]), float(high_val))
+                                    latest[4] = min(float(latest[4]), float(low_val))
+                    except Exception:
+                        realtime_raw = None
+                    return local, realtime_raw
+        except Exception as e:
+            print(f'[趋势扫描] 本地库取数失败，回退腾讯: {symbol}: {e}')
+    # 回退：腾讯原逻辑（含实时合并），零回归
+    return await asyncio.wait_for(
+        get_kline_data(symbol, return_realtime=True),
+        timeout=SCAN_KLINE_TIMEOUT
+    )
+
 
 _last_scan_result = None
 _last_scan_date = ''
@@ -1666,16 +1717,14 @@ async def scan_trend_scan_results(force: bool = False):
         async def process_one_stock(symbol: str) -> Optional[Dict]:
             async with get_scan_semaphore():
                 try:
-                    # 性能优化（2026-07-02）：get_kline_data 内部已拉实时行情校准最新 K 线
-                    # 通过 return_realtime=True 复用 realtime_raw，避免二次 fetch_with_retry 冗余请求
-                    kline, realtime_raw = await asyncio.wait_for(
-                        get_kline_data(symbol, return_realtime=True),
-                        timeout=SCAN_KLINE_TIMEOUT
-                    )
+                    # 趋势扫描取数（2026-09-25 优化）：优先本地前复权日K库（秒级、免腾讯限流），
+                    # 实时行情合并逻辑 1:1 复制 get_kline_data，保证与现网一致；
+                    # 三层回退：本地库未就绪 / 新股不足 30 根 / 异常 → 自动走腾讯原逻辑，零回归。
+                    kline, realtime_raw = await _load_kline_for_scan(symbol)
                     if not kline:
                         return None
 
-                    # 复用 get_kline_data 内部已拉的实时行情原始数据
+                    # 复用取数函数内部已拉的实时行情原始数据
                     realtime_data = None
                     if realtime_raw:
                         parsed_list = parse_tencent_batch_data(realtime_raw)

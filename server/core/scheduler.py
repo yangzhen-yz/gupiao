@@ -2,7 +2,7 @@
 import asyncio, schedule, time
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_PREVIEW_TIME)
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
 
 from services.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
@@ -204,6 +204,26 @@ def run_scheduler():
         except Exception as e:
             print(f'[DB维护] 异常: {e}')
 
+    def job_sync_history():
+        """A 级优化：每日盘后增量同步本地历史日K线库 + 同步后向量化刷新 RPS。
+
+        本地库由 baostock 前复权数据维护，最新价=实盘价与实时行情无缝；RPS 从此本地库向量化计算（秒级、免东方财富限流）；
+        首次回填需手动跑 `python backfill_kline.py --mode backfill`，之后每日增量即可。
+        """
+        if not KLINE_HISTORY_ENABLED:
+            return
+        try:
+            from services.kline_history import get_engine, history_available
+            eng = get_engine()
+            eng.sync_today_bulk()
+            # 同步后若本地库已就绪，立即向量化刷新 RPS（秒级，不依赖东方财富限流）
+            if history_available():
+                from services.rps import refresh_rps
+                asyncio.run(refresh_rps(RPS_PERIOD_DAYS))
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库增量同步 + RPS 向量化刷新完成')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库同步/RPS刷新异常: {e}')
+
     # ---- 注册定时任务 ----
     # 热搜榜：非交易日不跑，没意义
     def _warp_trading_only(fn):
@@ -258,6 +278,11 @@ def run_scheduler():
     # 交易日后定时拉取最新龙虎榜+北向资金数据，前端无需手动刷新
     schedule.every().day.at(SMART_MONEY_UPDATE_TIME).do(job_update_smart_money)
 
+    # A 级优化：每日 18:15 增量同步本地历史日K线库 + 向量化刷新 RPS（避开估值 18:10 并发）
+    if KLINE_HISTORY_ENABLED:
+        # 仅交易日执行：非交易日无新 K 线，跑也是 0 条；且 RPS 重算无意义
+        schedule.every().day.at(KLINE_HISTORY_SYNC_TIME).do(_warp_trading_only(job_sync_history))
+
     # 企业微信选股推送：开盘前 9:25 推送今日关注池预览（仅交易日）
     schedule.every().day.at(WECOM_PUSH_PREVIEW_TIME).do(job_push_daily_preview)
 
@@ -279,6 +304,8 @@ def run_scheduler():
     print(f'[定时任务]   - {VALUATION_UPDATE_TIME}: 更新估值分位数据（PE/PB 百分位）')
     print(f'[定时任务]   - {",".join(SCHEDULE_MARKET_ALERT_TIMES)}: 大盘风险预警自动扫描（仅交易日）')
     print(f'[定时任务]   - {SMART_MONEY_UPDATE_TIME}: 刷新龙虎榜+北向资金数据（刷新至最近已收盘交易日）')
+    if KLINE_HISTORY_ENABLED:
+        print(f'[定时任务]   - {KLINE_HISTORY_SYNC_TIME}: 增量同步本地历史日K线库 + 向量化刷新 RPS（仅交易日，A 级优化）')
     print(f'[定时任务]   - {WECOM_PUSH_PREVIEW_TIME}: 推送今日关注池预览（企业微信，仅交易日）')
     print(f'[定时任务]   - 盘中 {WECOM_PUSH_START}~{WECOM_PUSH_END} 每{WECOM_PUSH_INTERVAL_SEC}秒: 达标候选股实时推送企业微信（仅交易日）\n')
 

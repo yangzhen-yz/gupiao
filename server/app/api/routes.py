@@ -17,6 +17,7 @@ from services.review import generate_daily_review
 from services.market import predict_market_risk, check_market_crash, load_market_alert
 from services.fundflow import get_fund_flow_summary
 from services.rps import get_rps_map, get_rps_leaderboard
+from services.kline_history import normalize_local_symbol  # 将带前缀 symbol 规整为本地库纯代码，匹配 RPS 缓存 key
 from services.fundamental import get_fundamental_batch, update_fundamental_task
 from services.smartmoney import get_dragon_tiger, get_northbound_market, get_dragon_tiger_symbol_map
 from services.valuation import get_valuation_batch, update_valuation_task
@@ -179,7 +180,7 @@ async def get_stock_analysis(symbol: str):
         holder_map = get_holder_num_batch([sym])
         hd = holder_map.get(sym)
         rps_map = await get_rps_map()
-        rps = rps_map.get(sym)
+        rps = rps_map.get(normalize_local_symbol(sym))
         # P1a/P1b: 基本面质量 + 聪明钱(龙虎榜)注入
         fd = get_fundamental_batch([sym]).get(sym)
         dt_map = await asyncio.to_thread(get_dragon_tiger_symbol_map, SMART_MONEY_DRAGON_TIGER_DAYS)
@@ -267,7 +268,7 @@ async def get_stock_full(symbol: str):
                 asyncio.to_thread(get_valuation_batch, [sym]),
             )
             hd = holder_map.get(sym)
-            rps = rps_map.get(sym)
+            rps = rps_map.get(normalize_local_symbol(sym))
             # P1a/P1b: 基本面质量 + 聪明钱(龙虎榜)注入
             fd = fd_map.get(sym)
             sm = dt_map.get(sym)
@@ -1086,7 +1087,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             sym = stock.get('symbol', '').lower()
             ff = fund_flow_map.get(sym)
             hd = holder_map.get(sym)
-            rps = rps_map.get(sym)
+            rps = rps_map.get(normalize_local_symbol(sym))
             fd = fund_map.get(sym)
             sm = sm_map.get(sym)
             val = val_map.get(sym)
@@ -1188,7 +1189,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
                 'score': s['score']['total'],
                 'scoreLabel': s['score']['label'],
                 'predictDirection': s['score']['predict_direction'],
-                'rps': rps_map.get(s['symbol'].lower()),
+                'rps': rps_map.get(normalize_local_symbol(s['symbol'])),
                 'fundamental': fund_map.get(s['symbol'].lower()),
                 'smartMoney': ({'on_board': True,
                                 'net_amt': (sm or {}).get('net_amt', 0),
@@ -1694,6 +1695,69 @@ async def refresh_rps_api(period_days: int = RPS_PERIOD_DAYS, limit_codes: int =
             print(f'[RPS] 预计算失败: {e}')
     asyncio.create_task(_bg())
     return {"success": True, "message": "RPS 预计算已在后台启动", "periodDays": period_days}
+
+
+@router.get("/api/kline-history/stats", tags=["本地历史K线库"])
+async def kline_history_stats_api():
+    """查看本地历史日K线库统计（股票数/K线行数/数据区间）。
+
+    A 级优化：RPS/趋势/评分的区间涨幅从此本地库向量化计算，绕开东方财富限流。
+    若 symbolCount=0 表示尚未回填，需先执行 `python backfill_kline.py --mode backfill`。
+    """
+    try:
+        from services.kline_history import get_engine, history_available
+        eng = get_engine()
+        stats = eng.get_db_stats()
+        stats["available"] = history_available()
+        return {"success": True, "data": stats}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取历史库统计失败: {str(error)}")
+
+
+@router.post("/api/kline-history/sync", tags=["本地历史K线库"])
+async def kline_history_sync_api():
+    """后台触发本地历史日K线库每日增量同步（baostock 前复权），完成后向量化刷新 RPS。
+
+    轻量（1~2 分钟），对已有数据幂等；立即返回 accepted。
+    """
+    async def _bg():
+        try:
+            from services.kline_history import get_engine, history_available
+            eng = get_engine()
+            eng.sync_today_bulk()
+            if history_available():
+                from services.rps import refresh_rps
+                await refresh_rps(RPS_PERIOD_DAYS)
+            print("[历史K线] 增量同步 + RPS 刷新完成")
+        except Exception as e:
+            print(f"[历史K线] 增量同步失败: {e}")
+    asyncio.create_task(_bg())
+    return {"success": True, "message": "本地历史库增量同步已在后台启动"}
+
+
+@router.post("/api/kline-history/backfill", tags=["本地历史K线库"])
+async def kline_history_backfill_api(start_date: str = None, limit: int = 0):
+    """后台触发全市场历史日K线回填（baostock 前复权，单线程断点续传，约 12 分钟）。
+
+    仅首次部署需要；日常用 /sync 即可。立即返回 accepted。
+    """
+    async def _bg():
+        try:
+            from services.kline_history import get_engine
+            eng = get_engine()
+            from app.config import KLINE_HISTORY_START_DATE
+            symbols = eng.get_all_symbols()
+            if not symbols:
+                print("[历史K线] 无法获取股票列表（baostock 登录失败？），回填终止")
+                return
+            if limit and limit > 0:
+                symbols = symbols[:limit]
+            eng.backfill(symbols=symbols, start_date=start_date or KLINE_HISTORY_START_DATE)
+            print("[历史K线] 全量回填完成")
+        except Exception as e:
+            print(f"[历史K线] 全量回填失败: {e}")
+    asyncio.create_task(_bg())
+    return {"success": True, "message": "全市场历史K线回填已在后台启动（约12分钟）"}
 
 
 @router.post("/api/fundamental/refresh", tags=["基本面质量"])

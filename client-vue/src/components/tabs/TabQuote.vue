@@ -21,10 +21,14 @@
           <button class="btn-icon" @click="loadQuickStocks" title="刷新热门股票">🔄</button>
         </div>
         <div class="quick-buttons">
-          <button v-for="s in quickStocks" :key="s.code" class="quick-btn"
-            :class="{ active: currentSymbol === s.code }"
-            @click="selectQuickStock(s.code)"
-            @contextmenu.prevent="confirmRemoveQuickStock(s)">{{ s.name }}</button>
+          <div v-for="s in quickStocks" :key="s.code" class="quick-btn-wrapper">
+            <button class="quick-btn"
+              :class="{ active: currentSymbol === s.code }"
+              @click="selectQuickStock(s.code)"
+              @contextmenu.prevent="confirmRemoveQuickStock(s)">{{ s.name }}</button>
+            <button class="quick-btn-remove" title="移除该股票"
+              @click.stop="confirmRemoveQuickStock(s)">×</button>
+          </div>
         </div>
       </div>
       <div class="refresh-controls">

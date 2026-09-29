@@ -9,10 +9,15 @@ SQLITE_DB_PATH = SQLITE_DB_PATH
 
 def get_db_conn():
     """获取 SQLite 数据库连接"""
-    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=10)
+    # isolation_level='IMMEDIATE'：写语句隐式以 BEGIN IMMEDIATE 开启事务，一开始就抢写锁。
+    # 避免 DEFERRED 事务「先读后写」升级锁时 SQLite 不重试 busy_timeout 直接返回 SQLITE_BUSY。
+    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=30, isolation_level='IMMEDIATE')
     conn.row_factory = sqlite3.Row
+    # busy_timeout 必须先于 journal_mode 设置：切换 WAL 本身也需要抢数据库锁。
+    # 30s 是上限而非典型等待耗时：定时任务并发时单个写事务可能持续数秒，
+    # 原来的 5s 会在这种情况下直接抛 "database is locked"。
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -501,6 +506,20 @@ def init_db():
         for dim_col in ['s_d1', 's_d2', 's_d3', 's_d4']:
             try:
                 cursor.execute(f'ALTER TABLE trend_backtest_records ADD COLUMN {dim_col} REAL DEFAULT NULL')
+            except Exception:
+                pass  # 列已存在
+        # 收评表补充字段（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count；2026-09-04 新增 sentiment_cycle_json）
+        # 只在初始化时执行一次；此前放在 save_daily_market_reviews 内，每次保存都要跑 12 条 DDL
+        for col in ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json',
+                    'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json',
+                    'ai_analysis_json', 'sentiment_cycle_json']:
+            try:
+                cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
+            except Exception:
+                pass  # 列已存在
+        for col in ['limit_up_count', 'limit_down_count']:
+            try:
+                cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} INTEGER')
             except Exception:
                 pass  # 列已存在
 
@@ -1528,22 +1547,6 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        # 确保新字段存在（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count；2026-09-04 新增 sentiment_cycle_json）
-        new_cols = ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json', 'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json', 'ai_analysis_json', 'sentiment_cycle_json']
-        for col in new_cols:
-            try:
-                cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
-            except Exception:
-                pass  # 列已存在
-        # 涨停/跌停家数（整数列，真实总数）
-        int_cols = ['limit_up_count', 'limit_down_count']
-        for col in int_cols:
-            try:
-                cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} INTEGER')
-            except Exception:
-                pass
-        conn.commit()
-        
         for review in reviews:
             review_date = review.get('date', '')
             summary = review.get('summary', '')

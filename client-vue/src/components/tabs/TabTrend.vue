@@ -152,29 +152,29 @@
                 <div class="trend-metric-item" :title="metricTip('d1')">
                   <span class="trend-metric-label">MA趋势</span>
                   <span class="trend-metric-value" :class="(stock.details.sD1 || 0) >= 20 ? 'metric-on' : (stock.details.sD1 || 0) >= 10 ? 'metric-warn' : 'metric-off'">
-                    <span class="metric-icon">{{ stock.details.sD1 || 0 }}分</span>
-                    <span class="metric-sub">{{ stock.details.ma20 ? 'MA20=' + stock.details.ma20 : '—' }}</span>
+                    <span class="metric-icon">{{ fmtNum(stock.details.sD1) }}分</span>
+                    <span class="metric-sub">{{ stock.details.ma20 ? 'MA20=' + fmtNum(stock.details.ma20) : '—' }}</span>
                   </span>
                 </div>
                 <div class="trend-metric-item" :title="metricTip('d2')">
                   <span class="trend-metric-label">资金异动</span>
                   <span class="trend-metric-value" :class="(stock.details.sD2 || 0) >= 20 ? 'metric-on' : (stock.details.sD2 || 0) >= 10 ? 'metric-warn' : 'metric-off'">
-                    <span class="metric-icon">{{ stock.details.sD2 || 0 }}分</span>
+                    <span class="metric-icon">{{ fmtNum(stock.details.sD2) }}分</span>
                     <span class="metric-sub">{{ stock.details.limitUpCount20d || 0 }}板/{{ stock.details.consecutiveYangCount || 0 }}阳</span>
                   </span>
                 </div>
                 <div class="trend-metric-item" :title="metricTip('d3')">
                   <span class="trend-metric-label">量能配合</span>
                   <span class="trend-metric-value" :class="(stock.details.sD3 || 0) >= 15 ? 'metric-on' : (stock.details.sD3 || 0) >= 8 ? 'metric-warn' : 'metric-off'">
-                    <span class="metric-icon">{{ stock.details.sD3 || 0 }}分</span>
-                    <span class="metric-sub">{{ stock.details.volRatio ? '倍率=' + stock.details.volRatio : '—' }}</span>
+                    <span class="metric-icon">{{ fmtNum(stock.details.sD3) }}分</span>
+                    <span class="metric-sub">{{ stock.details.volRatio ? '倍率=' + fmtNum(stock.details.volRatio) : '—' }}</span>
                   </span>
                 </div>
                 <div class="trend-metric-item" :title="metricTip('d4')">
                   <span class="trend-metric-label">风险回撤</span>
                   <span class="trend-metric-value" :class="(stock.details.sD4 || 0) >= 15 ? 'metric-on' : (stock.details.sD4 || 0) >= 10 ? 'metric-warn' : 'metric-off'">
-                    <span class="metric-icon">{{ stock.details.sD4 || 0 }}分</span>
-                    <span class="metric-sub">{{ stock.details.currentDrawdown || 0 }}%</span>
+                    <span class="metric-icon">{{ fmtNum(stock.details.sD4) }}分</span>
+                    <span class="metric-sub">{{ fmtNum(stock.details.currentDrawdown) }}%</span>
                   </span>
                 </div>
                 <div class="trend-metric-item" v-if="stock.details.consecutiveUpDays" :title="metricTip('consecutive')">
@@ -472,6 +472,12 @@ function formatVol(v) {
   if (v >= 1e8) return (v / 1e8).toFixed(1) + '亿'
   if (v >= 1e4) return (v / 1e4).toFixed(1) + '万'
   return String(v)
+}
+
+// 数值格式化：最多保留两位小数，去掉浮点尾数（如 19.679199999999998 → 19.68）
+function fmtNum(v) {
+  if (v === null || v === undefined || isNaN(Number(v))) return 0
+  return Number(Number(v).toFixed(2))
 }
 
 function getConsecutiveClass(stock) {

@@ -3,3 +3,4 @@ uvicorn>=0.23.2
 schedule>=1.2.0
 pydantic>=2.0.0
 requests>=2.31.0
+baostock>=0.9.4
