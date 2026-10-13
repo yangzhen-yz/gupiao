@@ -281,6 +281,8 @@ function toggleList(key) {
 const { start } = usePolling(() => load(), {
   interval: () => (data.value && data.value.nextPollMs) || 60000,
   active: () => props.active,
+  // onMounted 里已经 load() 过一次，start() 不能再立刻打第二遍
+  immediate: false,
 })
 
 // dev 覆盖时段：#/desk?phase=tail 或 /?phase=tail 都能在非尾盘时段截出尾盘版式（shot_desk.py 依赖它）

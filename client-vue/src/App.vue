@@ -1,6 +1,9 @@
 <template>
   <!-- 未登录时只显示登录页：持仓等私有数据按账号隔离，行情/推荐/收评登录后才可见入口 -->
-  <LoginPage v-if="!authReady || !currentUser" @success="onLoginSuccess" />
+  <!-- 带着本地 token 启动时先走校验，不渲染登录页：否则每次刷新都会闪一下登录界面，
+       登录页还会顺手打 /api/auth/status 与 /api/auth/users 两个无用的请求 -->
+  <div v-if="!authReady" class="boot-splash"><span>正在恢复登录状态…</span></div>
+  <LoginPage v-else-if="!currentUser" @success="onLoginSuccess" />
   <div v-else class="main-container">
     <!-- 大盘指数栏：行动台的 hero 卡已经带了「大盘风险 + 三大指数」，在默认页再挂一条
          既是重复信息，也会每 5s 打 3 个指数请求（收盘后全是 --）。只在明细页显示。 -->
@@ -388,6 +391,18 @@ function openAiDiag(symbol) {
   cursor: pointer;
 }
 .theme-btn:hover { border-color: var(--accent-strong, var(--accent-primary)); }
+
+/* 启动占位：校验本地 token 期间（通常 <200ms）显示，避免闪登录页 */
+.boot-splash {
+  min-height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.875rem;
+  color: var(--text-tertiary);
+  animation: bootPulse 1.1s ease-in-out infinite;
+}
+@keyframes bootPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
 
 /* 当前登录账号区（2026-10-12 多用户）：固定在左下角浮层，不占用顶部空间 */
 .user-zone {
