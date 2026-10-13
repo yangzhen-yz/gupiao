@@ -388,10 +388,10 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
 
 
 def _load_watch_symbols(user_id: int = 1) -> List[Dict]:
-    """自选清单 = 热门股 chips + 趋势自选池（Stage 2 起按账号隔离）"""
+    """自选清单 = 热门股 chips + 趋势自选池（按账号隔离，2026-10-13）"""
     out, seen = [], set()
     try:
-        for row in load_hot_stock_buttons():
+        for row in load_hot_stock_buttons(user_id=user_id):
             sym = _norm(row.get('code'))
             if sym and sym not in seen:
                 seen.add(sym)
@@ -399,7 +399,7 @@ def _load_watch_symbols(user_id: int = 1) -> List[Dict]:
     except Exception as e:
         print(f'[行动台] 读取自选股失败: {e}')
     try:
-        for sym in load_user_scan_pool():
+        for sym in load_user_scan_pool(user_id=user_id):
             sym = _norm(sym)
             if sym and sym not in seen:
                 seen.add(sym)

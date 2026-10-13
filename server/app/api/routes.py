@@ -1222,9 +1222,9 @@ async def update_stock_basic_info_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.get("/api/custom-scan-pool", tags=["自定义扫描池"])
-async def get_user_scan_pool_api():
+async def get_user_scan_pool_api(user: Dict = Depends(current_user)):
     try:
-        symbols = load_user_scan_pool()
+        symbols = load_user_scan_pool(user_id=int(user.get('id') or 1))
         # 获取每只股票的名称 + 实时价 + 连涨连跌天数 + 是否在5日线上方
         stocks_info = []
         if symbols:
@@ -1285,19 +1285,19 @@ async def get_user_scan_pool_api():
         raise HTTPException(status_code=500, detail=f"获取自定义扫描池失败: {error}")
 
 @router.get("/api/custom-scan-pool/symbols", tags=["自定义扫描池"])
-async def get_user_scan_pool_symbols_api():
+async def get_user_scan_pool_symbols_api(user: Dict = Depends(current_user)):
     """轻量端点：仅返回扫描池代码列表，不拉 K 线/行情
     性能优化（2026-07-02）：TabQuote/TabScan 只需 symbols 列表，
     原先调 /api/custom-scan-pool 会触发 N 次 K 线计算（2-4s 纯浪费）。
     """
     try:
-        symbols = load_user_scan_pool()
+        symbols = load_user_scan_pool(user_id=int(user.get('id') or 1))
         return {"success": True, "data": {"symbols": symbols, "count": len(symbols)}}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取扫描池代码列表失败: {error}")
 
 @router.post("/api/custom-scan-pool", tags=["自定义扫描池"])
-async def update_user_scan_pool_api(data: Dict):
+async def update_user_scan_pool_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         symbols = data.get('symbols', [])
         if not isinstance(symbols, list):
@@ -1309,7 +1309,7 @@ async def update_user_scan_pool_api(data: Dict):
             if re.match(r'^(sh|sz)\d{6}$', s.lower()):
                 valid_symbols.append(s.lower())
         
-        save_user_scan_pool(valid_symbols)
+        save_user_scan_pool(valid_symbols, user_id=int(user.get('id') or 1))
         _invalidate_hot_scan_cache()
         return {"success": True, "data": {"symbols": valid_symbols, "count": len(valid_symbols)}}
     except HTTPException:
@@ -1318,7 +1318,7 @@ async def update_user_scan_pool_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.put("/api/custom-scan-pool/add", tags=["自定义扫描池"])
-async def add_to_user_scan_pool_api(data: Dict):
+async def add_to_user_scan_pool_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         # 同时支持 'symbol' 和 'symbols' 参数
         if 'symbol' in data:
@@ -1328,14 +1328,14 @@ async def add_to_user_scan_pool_api(data: Dict):
             if not isinstance(symbols_to_add, list):
                 symbols_to_add = [str(symbols_to_add)]
         
-        current_pool = load_user_scan_pool()
+        current_pool = load_user_scan_pool(user_id=int(user.get('id') or 1))
         
         for s in symbols_to_add:
             s_lower = s.lower()
             if re.match(r'^(sh|sz)\d{6}$', s_lower) and s_lower not in current_pool:
                 current_pool.append(s_lower)
         
-        save_user_scan_pool(current_pool)
+        save_user_scan_pool(current_pool, user_id=int(user.get('id') or 1))
         _invalidate_hot_scan_cache()
         return {"success": True, "data": {"symbols": current_pool, "count": len(current_pool)}}
     except HTTPException:
@@ -1344,7 +1344,7 @@ async def add_to_user_scan_pool_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.put("/api/custom-scan-pool/remove", tags=["自定义扫描池"])
-async def remove_from_user_scan_pool_api(data: Dict):
+async def remove_from_user_scan_pool_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         # 同时支持 'symbol' 和 'symbols' 参数
         if 'symbol' in data:
@@ -1355,10 +1355,10 @@ async def remove_from_user_scan_pool_api(data: Dict):
                 symbols_to_remove = [str(symbols_to_remove)]
         
         symbols_to_remove = [s.lower() for s in symbols_to_remove]
-        current_pool = load_user_scan_pool()
+        current_pool = load_user_scan_pool(user_id=int(user.get('id') or 1))
         current_pool = [s for s in current_pool if s not in symbols_to_remove]
         
-        save_user_scan_pool(current_pool)
+        save_user_scan_pool(current_pool, user_id=int(user.get('id') or 1))
         return {"success": True, "data": {"symbols": current_pool, "count": len(current_pool)}}
     except HTTPException:
         raise
@@ -1366,9 +1366,9 @@ async def remove_from_user_scan_pool_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.delete("/api/custom-scan-pool", tags=["自定义扫描池"])
-async def clear_user_scan_pool_api():
+async def clear_user_scan_pool_api(user: Dict = Depends(current_user)):
     try:
-        save_user_scan_pool([])
+        save_user_scan_pool([], user_id=int(user.get('id') or 1))
         _invalidate_hot_scan_cache()
         return {"success": True, "message": "自定义扫描池已清空"}
     except Exception as error:
@@ -1643,9 +1643,9 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         raise HTTPException(status_code=502, detail=f"扫描失败: {str(error)}")
 
 @router.get("/api/hot-stocks", tags=["热门股票"])
-async def get_hot_stock_buttons_api():
+async def get_hot_stock_buttons_api(user: Dict = Depends(current_user)):
     try:
-        stocks = load_hot_stock_buttons()
+        stocks = load_hot_stock_buttons(user_id=int(user.get('id') or 1))
         # 获取实时价格用于排序
         if stocks:
             try:
@@ -1669,7 +1669,7 @@ async def get_hot_stock_buttons_api():
         raise HTTPException(status_code=500, detail=f"获取热门股票失败: {str(error)}")
 
 @router.post("/api/hot-stocks", tags=["热门股票"])
-async def update_hot_stock_buttons_api(data: Dict):
+async def update_hot_stock_buttons_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         stocks = data.get('stocks', [])
         if not isinstance(stocks, list):
@@ -1685,7 +1685,7 @@ async def update_hot_stock_buttons_api(data: Dict):
                         'name': s['name']
                     })
         
-        save_hot_stock_buttons(valid_stocks)
+        save_hot_stock_buttons(valid_stocks, user_id=int(user.get('id') or 1))
         return {"success": True, "data": {"stocks": valid_stocks, "count": len(valid_stocks)}}
     except HTTPException:
         raise
@@ -1693,7 +1693,7 @@ async def update_hot_stock_buttons_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.put("/api/hot-stocks/add", tags=["热门股票"])
-async def add_to_hot_stock_buttons_api(data: Dict):
+async def add_to_hot_stock_buttons_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         code = data.get('code')
         name = data.get('name')
@@ -1704,7 +1704,7 @@ async def add_to_hot_stock_buttons_api(data: Dict):
         if not re.match(r'^(sh|sz)\d{6}$', code.lower()):
             raise HTTPException(status_code=400, detail="股票代码格式无效")
         
-        current_stocks = load_hot_stock_buttons()
+        current_stocks = load_hot_stock_buttons(user_id=int(user.get('id') or 1))
         
         # 检查是否已存在
         exists = any(s['code'].lower() == code.lower() for s in current_stocks)
@@ -1716,7 +1716,7 @@ async def add_to_hot_stock_buttons_api(data: Dict):
             'name': name
         })
         
-        save_hot_stock_buttons(current_stocks)
+        save_hot_stock_buttons(current_stocks, user_id=int(user.get('id') or 1))
         return {"success": True, "data": {"stocks": current_stocks, "count": len(current_stocks)}}
     except HTTPException:
         raise
@@ -1724,17 +1724,17 @@ async def add_to_hot_stock_buttons_api(data: Dict):
         raise HTTPException(status_code=500, detail=str(error))
 
 @router.put("/api/hot-stocks/remove", tags=["热门股票"])
-async def remove_from_hot_stock_buttons_api(data: Dict):
+async def remove_from_hot_stock_buttons_api(data: Dict, user: Dict = Depends(current_user)):
     try:
         code = data.get('code')
         if not code:
             raise HTTPException(status_code=400, detail="参数缺失：需要code")
         
         code_lower = code.lower()
-        current_stocks = load_hot_stock_buttons()
+        current_stocks = load_hot_stock_buttons(user_id=int(user.get('id') or 1))
         current_stocks = [s for s in current_stocks if s['code'].lower() != code_lower]
         
-        save_hot_stock_buttons(current_stocks)
+        save_hot_stock_buttons(current_stocks, user_id=int(user.get('id') or 1))
         return {"success": True, "data": {"stocks": current_stocks, "count": len(current_stocks)}}
     except HTTPException:
         raise

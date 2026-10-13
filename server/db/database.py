@@ -1,6 +1,6 @@
 """database.py - split from main.py"""
 import sqlite3, json, time
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import date, timedelta
 from app.config import SQLITE_DB_PATH, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, HOT_SEARCH_TOP_N, HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS, DEFAULT_WEIGHTS
 
@@ -648,6 +648,51 @@ def init_db():
             cursor.execute('DROP TABLE user_positions')
             cursor.execute('ALTER TABLE user_positions_v2 RENAME TO user_positions')
             print('[数据库] user_positions 已迁移为按用户隔离 UNIQUE(user_id, symbol)')
+
+        # ========== 自选股 / 趋势池按用户隔离（2026-10-13，今日行动台） ==========
+        # 这两张表原本是全局 UNIQUE：A 加一只票，B 的列表里也跟着多，互相覆盖。
+        # 与 user_positions 的关键区别：持仓有"天然归属"（当初就是 1 号建的），
+        # 自选股没有。若照搬"全给 1 号"的做法，2 号打开页面会看到"票不见了"。
+        # 因此存量行**克隆给每个已注册用户**：一条自选不占成本，各自删掉自己
+        # 不要的那几只即可，任何一人都不会丢数据。
+        _hot_cols = {r[1] for r in cursor.execute('PRAGMA table_info(hot_stock_buttons)').fetchall()}
+        if _hot_cols and 'user_id' not in _hot_cols:
+            cursor.execute('''
+                CREATE TABLE hot_stock_buttons_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                    updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                    UNIQUE(user_id, code))''')
+            cursor.execute('''
+                INSERT OR IGNORE INTO hot_stock_buttons_v2
+                    (user_id, code, name, created_at, updated_at)
+                SELECT u.id, t.code, t.name, t.created_at, t.updated_at
+                FROM users u CROSS JOIN hot_stock_buttons t''')
+            cursor.execute('DROP TABLE hot_stock_buttons')
+            cursor.execute('ALTER TABLE hot_stock_buttons_v2 RENAME TO hot_stock_buttons')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_hot_buttons_user ON hot_stock_buttons(user_id)')
+            print('[数据库] hot_stock_buttons 已迁移为按用户隔离（存量克隆给每个用户）')
+
+        _pool_cols = {r[1] for r in cursor.execute('PRAGMA table_info(user_scan_pool)').fetchall()}
+        if _pool_cols and 'user_id' not in _pool_cols:
+            cursor.execute('''
+                CREATE TABLE user_scan_pool_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    symbol TEXT NOT NULL,
+                    created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                    UNIQUE(user_id, symbol))''')
+            cursor.execute('''
+                INSERT OR IGNORE INTO user_scan_pool_v2 (user_id, symbol, created_at)
+                SELECT u.id, t.symbol, t.created_at
+                FROM users u CROSS JOIN user_scan_pool t''')
+            cursor.execute('DROP TABLE user_scan_pool')
+            cursor.execute('ALTER TABLE user_scan_pool_v2 RENAME TO user_scan_pool')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_pool_user ON user_scan_pool(user_id)')
+            print('[数据库] user_scan_pool 已迁移为按用户隔离（存量克隆给每个用户）')
 
         # ========== 模拟交易（2026-10-12，纯模拟盘·不下真单） ==========
         # 每个 app 用户一个独立模拟账户，与真实券商无关，零真金白银风险。
@@ -1604,11 +1649,35 @@ def save_predictions(predictions: List[Dict]) -> bool:
     except Exception as error:
         print(f'保存预测记录失败: {str(error)}')
         return False
-def load_user_scan_pool() -> List[str]:
+def list_user_ids() -> List[int]:
+    """全部注册用户 id（调度器按用户循环写各自的池/自选时用）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute('SELECT symbol FROM user_scan_pool ORDER BY id')
+        cursor.execute('SELECT id FROM users ORDER BY id')
+        rows = cursor.fetchall()
+        conn.close()
+        return [r['id'] for r in rows]
+    except Exception as error:
+        print(f'读取用户列表失败: {str(error)}')
+        return []
+
+
+def load_user_scan_pool(user_id: Optional[int] = None) -> List[str]:
+    """自定义扫描池。
+
+    user_id=None → 所有用户的并集（调度器语义：扫描宇宙要覆盖每个人关注的票，
+                   与"谁在查看"无关；漏传也只是退化成改造前的全局行为，不会丢数据）
+    user_id=具体 → 该用户的池（前端展示与写入）
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if user_id is None:
+            cursor.execute('SELECT symbol FROM user_scan_pool GROUP BY symbol ORDER BY MIN(id)')
+        else:
+            cursor.execute('SELECT symbol FROM user_scan_pool WHERE user_id = ? ORDER BY id',
+                           (int(user_id),))
         rows = cursor.fetchall()
         conn.close()
         return [row['symbol'] for row in rows]
@@ -1616,15 +1685,16 @@ def load_user_scan_pool() -> List[str]:
         print(f'加载自定义扫描池失败: {str(error)}')
         return []
 
-def save_user_scan_pool(symbols: List[str]) -> bool:
+def save_user_scan_pool(symbols: List[str], user_id: int = 1) -> bool:
+    """整池覆盖写入（只动该用户的行，不再清空全表）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM user_scan_pool')
+        cursor.execute('DELETE FROM user_scan_pool WHERE user_id = ?', (int(user_id),))
         for symbol in symbols:
             cursor.execute(
-                'INSERT INTO user_scan_pool (symbol) VALUES (?)',
-                (symbol,)
+                'INSERT OR IGNORE INTO user_scan_pool (user_id, symbol) VALUES (?, ?)',
+                (int(user_id), symbol)
             )
         conn.commit()
         conn.close()
@@ -1688,50 +1758,72 @@ def delete_user_position(symbol: str, user_id: int = 1) -> bool:
         print(f'删除持仓失败: {str(error)}')
         return False
 
-def load_hot_stock_buttons() -> List[Dict]:
+_DEFAULT_HOT_STOCKS = [
+    {'name': '深科技', 'code': 'sz000021'},
+    {'name': '亨通光电', 'code': 'sh600487'},
+    {'name': '中天科技', 'code': 'sh600522'},
+    {'name': '东山精密', 'code': 'sz002384'},
+    {'name': '光迅科技', 'code': 'sz002281'},
+    {'name': '利通电子', 'code': 'sh603629'},
+]
+
+
+def load_hot_stock_buttons(user_id: Optional[int] = None) -> List[Dict]:
+    """快捷查询自选（前端 chips）。
+
+    user_id=None → 所有用户的并集（调度器语义：扫描宇宙覆盖每个人关注的票）
+    user_id=具体 → 该用户的 chips
+    """
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute('SELECT code, name FROM hot_stock_buttons ORDER BY id')
+        if user_id is None:
+            cursor.execute('SELECT code, MAX(name) AS name FROM hot_stock_buttons '
+                           'GROUP BY code ORDER BY MIN(id)')
+        else:
+            cursor.execute('SELECT code, name FROM hot_stock_buttons WHERE user_id = ? ORDER BY id',
+                           (int(user_id),))
         rows = cursor.fetchall()
         conn.close()
         if rows:
             return [{'code': row['code'], 'name': row['name']} for row in rows]
-        # 默认热门股票
-        default_stocks = [
-            {'name': '深科技', 'code': 'sz000021'},
-            {'name': '亨通光电', 'code': 'sh600487'},
-            {'name': '中天科技', 'code': 'sh600522'},
-            {'name': '东山精密', 'code': 'sz002384'},
-            {'name': '光迅科技', 'code': 'sz002281'},
-            {'name': '利通电子', 'code': 'sh603629'}
-        ]
-        save_hot_stock_buttons(default_stocks)
-        return default_stocks
+        # 仅在全库为空（全新安装、第一次有人打开）时播下默认自选。
+        # 用户自己清空过就不再自动加回——否则"删干净的列表"会被系统偷偷填满。
+        if user_id is not None:
+            conn = get_db_conn()
+            total = conn.execute('SELECT COUNT(*) AS n FROM hot_stock_buttons').fetchone()['n']
+            conn.close()
+            if total == 0:
+                save_hot_stock_buttons(_DEFAULT_HOT_STOCKS, user_id=user_id)
+                return list(_DEFAULT_HOT_STOCKS)
+        return []
     except Exception as error:
         print(f'加载热门股票失败: {str(error)}')
         return []
 
-def save_hot_stock_buttons(stocks: List[Dict]) -> bool:
+def save_hot_stock_buttons(stocks: List[Dict], user_id: int = 1) -> bool:
+    """整列表覆盖写入（只动该用户的行）"""
+    conn = None
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM hot_stock_buttons')
+        cursor.execute('DELETE FROM hot_stock_buttons WHERE user_id = ?', (int(user_id),))
         for stock in stocks:
             if isinstance(stock, dict) and stock.get('code') and stock.get('name'):
                 cursor.execute(
-                    'INSERT INTO hot_stock_buttons (code, name) VALUES (?, ?)',
-                    (stock['code'].lower(), stock['name'])
+                    'INSERT OR IGNORE INTO hot_stock_buttons (user_id, code, name) VALUES (?, ?, ?)',
+                    (int(user_id), stock['code'].lower(), stock['name'])
                 )
         conn.commit()
-        conn.close()
         return True
     except Exception as error:
         print(f'保存热门股票失败: {str(error)}')
         return False
-    except Exception as error:
-        print(f'保存热门股票失败: {str(error)}')
-        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 DEFAULT_STOCK_TAGS = {
     'sz000021': ['存储芯片', '半导体', '华为概念', '人工智能'],

@@ -4,7 +4,7 @@ from typing import List, Dict, Optional
 from datetime import date
 from fastapi import HTTPException
 from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED)
-from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry)
+from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry, list_user_ids)
 from services.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, parse_realtime_fields, fetch_stock_data, get_stock_name,
     parse_tencent_batch_data, has_negative_announcement)
@@ -1506,7 +1506,12 @@ async def scan_and_remove_below_ma10():
         # 1. 保存更新后的用户股票池
         if symbols:  # 用户池有数据时（即使没有删除也要保持原状）
             if removed_user_symbols:
-                save_user_scan_pool(kept_user_symbols)
+                # 2026-10-13 按用户隔离：kept_user_symbols 是"所有用户池的并集"里留下的部分，
+                # 逐人取交集写回，不能整表覆盖（否则 A 的票会被 B 的裁剪结果冲掉）
+                _kept_set = set(kept_user_symbols)
+                for _uid in list_user_ids():
+                    _u_pool = load_user_scan_pool(user_id=_uid)
+                    save_user_scan_pool([s for s in _u_pool if s in _kept_set], user_id=_uid)
                 print(f'[10日线检查] 用户池扫描完成！共删除{len(removed_user_symbols)}只，保留{len(kept_user_symbols)}只')
                 print(f'[10日线检查] 用户池已删除: {removed_user_symbols}')
             else:
@@ -1622,14 +1627,17 @@ def auto_add_high_score_to_pool(trend_results: List[Dict]) -> List[str]:
             pool_set.add(symbol)
 
     if to_add:
-        new_pool = current_pool + to_add
-        # 2026-09-18 防膨胀：超过上限时裁掉最早加入的（保留最新）
-        if len(new_pool) > TREND_POOL_MAX_SIZE:
-            overflow = len(new_pool) - TREND_POOL_MAX_SIZE
-            dropped = new_pool[:overflow]
-            new_pool = new_pool[overflow:]
-            print(f'[趋势扫描] 股票池超上限({TREND_POOL_MAX_SIZE})，裁掉最早 {overflow} 只: {dropped}')
-        save_user_scan_pool(new_pool)
+        # 2026-10-13 按用户隔离：高分股写进每个人的池，池上限也按人各自裁剪
+        for _uid in list_user_ids():
+            user_pool = [s.lower() for s in load_user_scan_pool(user_id=_uid)]
+            new_pool = user_pool + [s for s in to_add if s not in set(user_pool)]
+            # 2026-09-18 防膨胀：超过上限时裁掉最早加入的（保留最新）
+            if len(new_pool) > TREND_POOL_MAX_SIZE:
+                overflow = len(new_pool) - TREND_POOL_MAX_SIZE
+                dropped = new_pool[:overflow]
+                new_pool = new_pool[overflow:]
+                print(f'[趋势扫描] 用户{_uid} 股票池超上限({TREND_POOL_MAX_SIZE})，裁掉最早 {overflow} 只: {dropped}')
+            save_user_scan_pool(new_pool, user_id=_uid)
         print(f'[趋势扫描] 自动加入股票池 {len(to_add)} 只（≥{threshold}分）: {to_add}')
     else:
         print(f'[趋势扫描] 无高分股达到自动加入阈值（≥{threshold}分）')
