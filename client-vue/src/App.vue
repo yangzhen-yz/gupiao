@@ -2,8 +2,9 @@
   <!-- 未登录时只显示登录页：持仓等私有数据按账号隔离，行情/推荐/收评登录后才可见入口 -->
   <LoginPage v-if="!authReady || !currentUser" @success="onLoginSuccess" />
   <div v-else class="main-container">
-    <!-- 大盘指数栏 -->
-    <IndexBar />
+    <!-- 大盘指数栏：行动台的 hero 卡已经带了「大盘风险 + 三大指数」，在默认页再挂一条
+         既是重复信息，也会每 5s 打 3 个指数请求（收盘后全是 --）。只在明细页显示。 -->
+    <IndexBar v-if="activeTab !== 'tab-desk'" />
     <!-- 顶部功能标签栏（2026-10-13 改为「行动台 + 3 组」，9 个平级 Tab 降级为明细） -->
     <div class="app-body">
       <header class="top-header">
@@ -113,6 +114,7 @@ import { ref, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncCompo
 import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, setUnauthorizedHandler } from './utils/helpers'
 import { useHashRoute, navigate } from './composables/useHashRoute'
 import { usePolling } from './composables/usePolling'
+import { useTheme } from './composables/useTheme'
 import LoginPage from './components/LoginPage.vue'
 import IndexBar from './components/IndexBar.vue'
 
@@ -217,16 +219,18 @@ const { notifications, showNotification, TYPE_ICONS } = useNotification()
 
 provide('showNotification', showNotification)
 
+// ========== 登录态（2026-10-12 多用户账号，持仓按账号隔离） ==========
+const authReady = ref(false)
+const currentUser = ref(getAuthUser())
+const tabPositionRef = ref(null)
+
+// 轮询必须声明在 currentUser 之后：usePolling 建 watch 时会立刻读一次 active，
+// 提前引用处于 TDZ 的 const 会让整个 App setup 抛错（2026-10-13 首屏白屏的成因）。
 const { start: startAlertPoll } = usePolling(_checkMarketAlert, {
   interval: 120000,
   immediate: false,
   active: () => !!currentUser.value,
 })
-
-// ========== 登录态（2026-10-12 多用户账号，持仓按账号隔离） ==========
-const authReady = ref(false)
-const currentUser = ref(getAuthUser())
-const tabPositionRef = ref(null)
 
 async function checkAuth() {
   if (!getToken()) {
@@ -280,18 +284,8 @@ setUnauthorizedHandler(() => {
 // ========== 暗色主题（2026-10-13 真正启用） ==========
 // 此前整套暗色 token 写在 @media (prefers-color-scheme: dark) 里，而代码中
 // data-theme="dark" 的选择器没有任何地方会设置该属性 → 暗色是不可达的死代码。
-const THEME_KEY = 'gupiao_theme'
-const isDark = ref(localStorage.getItem(THEME_KEY) === 'dark')
-function applyTheme() {
-  if (isDark.value) document.documentElement.dataset.theme = 'dark'
-  else document.documentElement.dataset.theme = 'light'
-}
-function toggleTheme() {
-  isDark.value = !isDark.value
-  localStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light')
-  applyTheme()
-}
-applyTheme()
+// 现在样式全部挂在 [data-theme="dark"] 上，主题由 useTheme 决定（未手动选择时跟随系统）。
+const { isDark, toggleTheme } = useTheme()
 
 onMounted(() => {
   checkAuth()

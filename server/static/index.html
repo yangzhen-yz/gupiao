@@ -1,11 +1,25 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>只做龙头，左侧交易</title>
-  <script type="module" crossorigin src="/assets/index-C45Fniu3.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-CdtkM-gB.css">
+  <!-- 主题首帧（2026-10-13）：暗色改由 [data-theme] 控制后，必须在样式生效前写好属性，
+       否则暗色偏好用户每次打开都会先看到亮的一瞬。 -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('gupiao_theme');
+        var dark = (saved === 'dark') || (!saved && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+      } catch (e) {
+        document.documentElement.dataset.theme = 'light';
+      }
+    })();
+  </script>
+  <script type="module" crossorigin src="/assets/index-CSgCzOPr.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-DqivaoZo.css">
 </head>
 <body>
   <div id="app"></div>

@@ -517,8 +517,45 @@ defineExpose({ loadPositions })
 .op-btn:hover { background: #f1f5f9; }
 .op-btn.danger { color: #b91c1c; border-color: #fecaca; }
 .op-btn.danger:hover { background: #fef2f2; }
-@media (max-width: 900px) {
+/* 窄窗口治理（2026-10-13）
+   原实现在 ≤900px 时把表头 display:none、把行压成两列 —— 屏幕窄了不等于数据可以没有标题，
+   那串无标题数字对上班族是最容易看错的一种（止损价和目标价长得几乎一样）。
+   现在：900px 以下用横向滚动保留完整表格；只有窄到手机级（≤620px）才转成卡片，
+   卡片里用 ::before 把每一格的列标题补回来。 */
+@media (max-width: 980px) {
+  .pos-table {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 4px;
+  }
+  .pos-table-header,
+  .pos-table-row { min-width: 760px; }
+}
+
+@media (max-width: 620px) {
+  .pos-table { overflow-x: visible; }
   .pos-table-header { display: none; }
-  .pos-table-row { grid-template-columns: 1fr 1fr; }
+  .pos-table-row {
+    grid-template-columns: 1fr 1fr;
+    min-width: 0;
+    gap: 0.625rem 0.75rem;
+  }
+  .pos-table-row > span { display: flex; flex-direction: column; gap: 2px; }
+  .pos-table-row > span::before {
+    font-size: 0.6875rem;
+    color: #94a3b8;
+    letter-spacing: .02em;
+    margin-bottom: 1px;
+  }
+  .pos-name::before { content: '名称'; }
+  .pos-price::before { content: '成本 / 现价'; }
+  .pos-pnl::before { content: '盈亏'; }
+  .pos-stop::before { content: '止损价'; }
+  .pos-target::before { content: '目标价'; }
+  .pos-flags::before { content: '信号'; }
+  .pos-action::before { content: '建议'; }
+  .pos-ops::before { content: '操作'; }
+  .pos-name, .pos-action, .pos-ops { grid-column: 1 / -1; }
+  .pos-ops { flex-direction: row; }
 }
 </style>

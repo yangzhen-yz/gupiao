@@ -176,6 +176,22 @@ def _to_float(v) -> float:
         return 0.0
 
 
+def _advice_text(advice) -> str:
+    """portfolio.advice 是 {advice_pct,label,note} 结构体 —— 行动台只印一句话，
+    直接把 dict 交给前端会把 JSON 显示在卡片上（2026-10-13 暗色截图里出现过）。"""
+    if not advice:
+        return ''
+    if isinstance(advice, str):
+        return advice
+    pct = advice.get('advice_pct')
+    label = advice.get('label') or ''
+    if label and pct is not None:
+        return f'建议总仓位 {label}（约 {pct}% 以内）'
+    if label:
+        return f'建议总仓位 {label}'
+    return f'建议总仓位 {pct}%' if pct is not None else ''
+
+
 def _build_watchlist(watch_symbols: List[Dict], quote_map: Dict[str, Dict]) -> List[Dict]:
     """自选异动：只保留"值得看一眼"的（|涨幅|≥3% 或放量或触均线），按波动幅度排序"""
     out = []
@@ -354,7 +370,7 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'level': env.get('level'), 'title': env.get('title'), 'detail': env.get('detail'),
             'pct': env.get('pct'), 'marketChange': env.get('marketChange'),
             'urgentSells': env.get('urgentSells'),
-            'suggestedTotal': (diag.get('portfolio') or {}).get('advice'),
+            'suggestedTotal': _advice_text((diag.get('portfolio') or {}).get('advice')),
             'totalPnlPct': (diag.get('portfolio') or {}).get('total_pnl_pct'),
             'warnings': (diag.get('portfolio') or {}).get('warnings') or [],
         } if env else {},

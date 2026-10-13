@@ -24,7 +24,7 @@
 
       <div class="hero-foot">
         <span class="asof">数据 {{ asOfText }}<template v-if="data.degraded.length"> · {{ data.degraded.length }} 项暂未就绪</template></span>
-        <button class="refresh-btn" :disabled="loading" @click="load(true)">
+        <button class="refresh-btn" :disabled="loading" @click="load()">
           {{ loading ? '刷新中…' : '↻ 立即刷新' }}
         </button>
       </div>
@@ -55,7 +55,7 @@
         <div v-if="!data.positionActions.length" class="block-empty">持仓暂无触发信号 —— 这本身就是好消息，不用盯。</div>
         <div v-else class="stack">
           <article
-            v-for="p in data.positionActions"
+            v-for="p in shown('positionActions', data.positionActions)"
             :key="p.symbol"
             :class="['act-card', { urgent: p.urgent }]"
             @click="goQuote(p.symbol)"
@@ -76,6 +76,12 @@
               <span v-for="f in p.flags" :key="f" class="mini-flag">{{ f }}</span>
             </div>
           </article>
+          <button v-if="data.positionActions.length > LIST_LIMIT" class="expand-btn"
+                  @click="toggleList('positionActions')">
+            {{ expanded.positionActions
+                ? '收起 ↑'
+                : `展开全部 ${data.positionActions.length} 条待办（只显示最紧急的 ${LIST_LIMIT} 条）↓` }}
+          </button>
           <div class="block-foot">
             <button class="link-btn" @click="goTab('tab-position')">去持仓管理处理全部 →</button>
           </div>
@@ -96,7 +102,7 @@
               : '今日推荐还没生成（每日 09:45 / 13:30 / 14:45 自动产出）。' }}
         </div>
         <div v-else class="stack">
-          <article v-for="b in data.buyNow" :key="b.symbol" class="buy-card" @click="goQuote(b.symbol)">
+          <article v-for="b in shown('buyNow', data.buyNow)" :key="b.symbol" class="buy-card" @click="goQuote(b.symbol)">
             <div class="buy-top">
               <span class="buy-name">{{ b.name }}<em>{{ (b.symbol || '').toUpperCase() }}</em></span>
               <span :class="['timing-badge', 'timing-' + b.timingType]">{{ timingIcon(b.timingType) }} {{ b.timingLabel || '盘中' }}</span>
@@ -116,6 +122,9 @@
             <p class="buy-logic" v-if="b.logic">{{ b.logic }}</p>
           </article>
         </div>
+        <button v-if="data.buyNow.length > LIST_LIMIT" class="expand-btn" @click="toggleList('buyNow')">
+          {{ expanded.buyNow ? '收起 ↑' : `另有 ${data.buyNow.length - LIST_LIMIT} 只同窗口标的 ↓` }}
+        </button>
         <div v-if="data.deferredBuys && data.deferredBuys.length" class="deferred">
           <span class="deferred-label">稍后时机：</span>
           <button v-for="d in data.deferredBuys" :key="d.symbol" class="deferred-chip" @click="goQuote(d.symbol)">
@@ -137,7 +146,7 @@
           今日收评还没有"重点关注"名单（15:10 左右生成）。可以先过一遍自选异动。
         </div>
         <div v-else class="stack">
-          <article v-for="t in data.tomorrowPlan" :key="t.symbol" class="plan-card" @click="goQuote(t.symbol)">
+          <article v-for="t in shown('tomorrowPlan', data.tomorrowPlan)" :key="t.symbol" class="plan-card" @click="goQuote(t.symbol)">
             <div class="plan-top">
               <span class="plan-name">{{ t.name }}<em>{{ (t.symbol || '').toUpperCase() }}</em></span>
               <span :class="['timing-badge', 'timing-' + (t.timingType || 'intraday')]" v-if="t.timingLabel">
@@ -152,6 +161,11 @@
             </div>
             <p class="plan-veto" v-if="t.plan && t.plan.veto">🚫 {{ t.plan.veto }}</p>
           </article>
+          <button v-if="data.tomorrowPlan.length > LIST_LIMIT" class="expand-btn" @click="toggleList('tomorrowPlan')">
+            {{ expanded.tomorrowPlan
+                ? '收起 ↑'
+                : `展开全部 ${data.tomorrowPlan.length} 只（先排前 ${LIST_LIMIT} 只，其余条件相同）↓` }}
+          </button>
         </div>
         <div class="block-foot">
           <button class="link-btn" @click="goTab('tab-review')">去每日收评看上下文 →</button>
@@ -189,13 +203,16 @@
         <div v-if="!isLive" class="block-empty">休市时段不取实时行情，开盘后自动恢复。</div>
         <div v-else-if="!data.watchlistAlerts.length" class="block-empty">自选股波动平稳（|涨跌|≥3% 或放量才提示），可以不用盯。</div>
         <div v-else class="watch-grid">
-          <button v-for="w in data.watchlistAlerts" :key="w.symbol" class="watch-item" @click="goQuote(w.symbol)">
+          <button v-for="w in shown('watchlist', data.watchlistAlerts, 10)" :key="w.symbol" class="watch-item" @click="goQuote(w.symbol)">
             <span class="w-name">{{ w.name || w.symbol }}</span>
             <span class="w-price">{{ w.price }}</span>
             <span :class="['w-pct', numClass(w.changePercent)]">{{ fmtPct(w.changePercent) }}</span>
             <span v-for="f in w.flags" :key="f" class="mini-flag">{{ f }}</span>
           </button>
         </div>
+        <button v-if="data.watchlistAlerts.length > 10" class="expand-btn" @click="toggleList('watchlist')">
+          {{ expanded.watchlist ? '收起 ↑' : `另有 ${data.watchlistAlerts.length - 10} 只有动静 ↓` }}
+        </button>
       </section>
 
       <!-- 复盘入口（午间/盘后/日历未覆盖时） -->
@@ -249,21 +266,40 @@ const asOfText = computed(() => {
   return t || String(v)
 })
 
+// 行动台是「清单」不是「明细」：一屏要能看完每个区块，长名单折叠，点开才展开。
+const LIST_LIMIT = 5
+const expanded = ref({})
+function shown(key, list, limit = LIST_LIMIT) {
+  if (!Array.isArray(list)) return []
+  return expanded.value[key] ? list : list.slice(0, limit)
+}
+function toggleList(key) {
+  expanded.value = { ...expanded.value, [key]: !expanded.value[key] }
+}
+
 // 轮询间隔由服务端按时段给（尾盘 30s、午间 5min、休市 30min）；拿不到就退回 60s
-const { start } = usePolling(() => load(false), {
+const { start } = usePolling(() => load(), {
   interval: () => (data.value && data.value.nextPollMs) || 60000,
   active: () => props.active,
 })
 
-async function load(force) {
+// dev 覆盖时段：#/desk?phase=tail 或 /?phase=tail 都能在非尾盘时段截出尾盘版式（shot_desk.py 依赖它）
+function phaseOverride() {
+  let v = new URLSearchParams(location.search).get('phase') || ''
+  if (!v) {
+    const m = String(location.hash).match(/[?&]phase=([a-zA-Z]+)/)
+    if (m) v = m[1]
+  }
+  return v
+}
+
+async function load() {
   if (loading.value) return
   loading.value = true
   error.value = ''
   try {
-    // dev 覆盖时段：?phase=tail 便于在非尾盘时段截图验证尾盘版式
-    const override = new URLSearchParams(location.search).get('phase')
-    const url = '/api/action-desk' + (force && override ? `?phase=${encodeURIComponent(override)}` : '')
-    const r = await apiFetch(url)
+    const override = phaseOverride()
+    const r = await apiFetch('/api/action-desk' + (override ? `?phase=${encodeURIComponent(override)}` : ''))
     if (r && r.success) {
       data.value = r.data
     } else {
@@ -307,7 +343,7 @@ function timingIcon(type) {
 
 onMounted(() => {
   if (data.value) start()
-  else load(false).then(start)
+  else load().then(start)
 })
 </script>
 
@@ -394,6 +430,23 @@ onMounted(() => {
 .block-sep { height: 1px; background: var(--border-subtle); margin: 0 0 1.125rem; }
 
 .stack { display: flex; flex-direction: column; gap: 0.625rem; }
+
+/* 折叠按钮：长名单默认只显示最靠前的几条（服务端已按紧急度排序） */
+.expand-btn {
+  grid-column: 1 / -1;
+  align-self: stretch;
+  width: 100%;
+  padding: 0.4375rem 0.75rem;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: border-color 0.16s var(--ease-out), color 0.16s var(--ease-out);
+}
+.expand-btn:hover { border-color: var(--accent-secondary); color: var(--accent-secondary); }
 
 /* 窄窗口（办公室默认 500–900px）保持单列 + 卡片不挤压 */
 @media (min-width: 1100px) {
@@ -514,4 +567,19 @@ onMounted(() => {
 .flat { color: var(--text-secondary); }
 .danger { color: var(--accent-danger); }
 .ok { color: var(--accent-success); }
+
+/* ===== 暗色覆盖（2026-10-13）=====
+   行动台是默认首页，不能出现"外壳暗、内容亮"的割裂，所以本页自带的几处
+   米黄/浅蓝底（提示条、时机徽章）在此显式反色；其余走 token 的自动跟随。 */
+[data-theme="dark"] .hero-error { background: linear-gradient(180deg, #2a1414 0%, var(--bg-secondary) 72%); }
+[data-theme="dark"] .hero-warning { background: linear-gradient(180deg, #2a2013 0%, var(--bg-secondary) 72%); }
+[data-theme="dark"] .hero-info { background: linear-gradient(180deg, #12202b 0%, var(--bg-secondary) 72%); }
+[data-theme="dark"] .calendar-banner { color: #fcd34d; background: #2a2313; border-color: #6b5426; }
+[data-theme="dark"] .buy-note { color: #fbbf24; background: #241d10; border-color: #6b5426; }
+[data-theme="dark"] .timing-auction { background: #211b33; color: #c4b5fd; border-color: #4c3d75; }
+[data-theme="dark"] .timing-early { background: #2b1618; color: #fca5a5; border-color: #5d2b2f; }
+[data-theme="dark"] .timing-tail { background: #2a1d12; color: #fdba74; border-color: #5f3d1e; }
+[data-theme="dark"] .timing-pullback { background: #14203a; color: #93c5fd; border-color: #2a4374; }
+[data-theme="dark"] .timing-intraday { background: var(--bg-tertiary); color: var(--text-secondary); border-color: var(--border-medium); }
+[data-theme="dark"] .act-card.urgent { border-left-color: var(--accent-danger); }
 </style>

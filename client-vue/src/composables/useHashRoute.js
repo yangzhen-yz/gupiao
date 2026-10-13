@@ -30,7 +30,8 @@ const SEG_BY_TAB = Object.fromEntries(Object.entries(TAB_BY_SEG).map(([k, v]) =>
 export const DEFAULT_TAB = 'tab-desk'
 
 function parseHash(hash) {
-  const raw = (hash || '').replace(/^#\/?/, '')
+  // 允许 #/position?phase=tail 这种带查询的写法：先剥掉 ? 之后的部分再认 Tab
+  const raw = (hash || '').replace(/^#\/?/, '').split('?')[0]
   if (!raw) return { tab: DEFAULT_TAB, param: '' }
   const [seg, param = ''] = raw.split('/')
   const tab = TAB_BY_SEG[seg]
