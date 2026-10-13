@@ -203,15 +203,15 @@
         <div v-if="!isLive" class="block-empty">休市时段不取实时行情，开盘后自动恢复。</div>
         <div v-else-if="!data.watchlistAlerts.length" class="block-empty">自选股波动平稳（|涨跌|≥3% 或放量才提示），可以不用盯。</div>
         <div v-else class="watch-grid">
-          <button v-for="w in shown('watchlist', data.watchlistAlerts, 10)" :key="w.symbol" class="watch-item" @click="goQuote(w.symbol)">
+          <button v-for="w in shown('watchlist', data.watchlistAlerts, WATCH_LIMIT)" :key="w.symbol" class="watch-item" @click="goQuote(w.symbol)">
             <span class="w-name">{{ w.name || w.symbol }}</span>
             <span class="w-price">{{ w.price }}</span>
             <span :class="['w-pct', numClass(w.changePercent)]">{{ fmtPct(w.changePercent) }}</span>
             <span v-for="f in w.flags" :key="f" class="mini-flag">{{ f }}</span>
           </button>
         </div>
-        <button v-if="data.watchlistAlerts.length > 10" class="expand-btn" @click="toggleList('watchlist')">
-          {{ expanded.watchlist ? '收起 ↑' : `另有 ${data.watchlistAlerts.length - 10} 只有动静 ↓` }}
+        <button v-if="data.watchlistAlerts.length > WATCH_LIMIT" class="expand-btn" @click="toggleList('watchlist')">
+          {{ expanded.watchlist ? '收起 ↑' : `另有 ${data.watchlistAlerts.length - WATCH_LIMIT} 只有动静 ↓` }}
         </button>
       </section>
 
@@ -267,7 +267,13 @@ const asOfText = computed(() => {
 })
 
 // 行动台是「清单」不是「明细」：一屏要能看完每个区块，长名单折叠，点开才展开。
-const LIST_LIMIT = 5
+// 阈值 2（2026-10-13 从 5 → 3 → 2）：服务端已按紧急度排序，第 3 条起基本都是从属信息，
+// 而整页纵向长度必须控制在约 1.5 屏内 —— 办公室窗口只有 900px 高，且要同时放下 4~5 个区块。
+// 手机屏（<700px）单列，四个区块叠下来必然超 1.5 屏，所以每块只留 1 条；
+// 700px 起卡片双列，同样高度能放 2 条。展开按钮就在下面，多一条也不省眼。
+const LIST_LIMIT = typeof window === 'undefined' ? 2 : (window.innerWidth < 700 ? 1 : 2)
+// 自选异动是「扫一眼」而不是「逐条处理」，可以多给几条；手机屏再收紧
+const WATCH_LIMIT = typeof window === 'undefined' ? 6 : (window.innerWidth >= 700 ? 6 : 4)
 const expanded = ref({})
 function shown(key, list, limit = LIST_LIMIT) {
   if (!Array.isArray(list)) return []
@@ -357,8 +363,8 @@ onMounted(() => {
   position: sticky;
   top: 0;
   z-index: 20;
-  margin: 0 calc(-1 * var(--spacing-md)) 1rem;
-  padding: 0.9375rem 1.125rem 0.8125rem;
+  margin: 0 calc(-1 * var(--spacing-md)) 0.75rem;
+  padding: 0.75rem 1rem 0.6875rem;
   border-radius: var(--radius-md);
   border: 1px solid var(--border-medium);
   background: var(--bg-secondary);
@@ -382,18 +388,20 @@ onMounted(() => {
 .hero-text { margin: 0; font-size: 1.1875rem; line-height: 1.4; font-weight: 700; color: var(--text-primary); }
 .hero-sub { margin: 0.3125rem 0 0; font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }
 
-.hero-market { display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem 0.625rem; margin-top: 0.625rem; }
+.hero-market { display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem 0.625rem; margin-top: 0.5rem; }
 .risk-chip, .idx-chip {
   font-size: 0.75rem; padding: 2px 8px; border-radius: var(--radius-pill);
   border: 1px solid var(--border-subtle); background: var(--bg-tertiary); color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  /* 窄屏这一行是横向滑动的，徽章自身绝不能换行（否则"大盘风险 55"会裂成两行） */
+  white-space: nowrap; flex: 0 0 auto;
 }
 .risk-chip.risk-high { background: var(--accent-danger-bg); border-color: var(--accent-danger-border); color: var(--accent-danger); font-weight: 700; }
 .risk-chip.risk-mid { background: var(--accent-warning-bg); border-color: var(--accent-warning-border); color: #b45309; font-weight: 700; }
 .risk-chip.risk-low { background: var(--accent-success-bg); border-color: var(--accent-success-border); color: var(--accent-success); }
 .idx-chip b { color: var(--text-primary); font-weight: 600; }
 
-.hero-foot { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.625rem; }
+.hero-foot { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem; }
 .asof { font-size: 0.75rem; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 .refresh-btn {
   margin-left: auto; padding: 4px 12px; font-size: 0.75rem; font-family: inherit;
@@ -415,7 +423,7 @@ onMounted(() => {
 .desk-empty .refresh-btn { display: inline-block; margin: 0.75rem auto 0; }
 
 /* ===== Block 外壳 ===== */
-.block { margin-bottom: 1.125rem; }
+.block { margin-bottom: 0.5rem; }
 .block-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
 .block-head h3 { margin: 0; font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); }
 .block-meta { font-size: 0.75rem; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
@@ -429,9 +437,9 @@ onMounted(() => {
   color: var(--accent-secondary); cursor: pointer; text-align: left;
 }
 .link-btn:hover { color: var(--accent-primary); text-decoration: underline; }
-.block-sep { height: 1px; background: var(--border-subtle); margin: 0 0 1.125rem; }
+.block-sep { height: 1px; background: var(--border-subtle); margin: 0 0 0.5rem; }
 
-.stack { display: flex; flex-direction: column; gap: 0.625rem; }
+.stack { display: flex; flex-direction: column; gap: 0.5rem; }
 
 /* 折叠按钮：长名单默认只显示最靠前的几条（服务端已按紧急度排序） */
 .expand-btn {
@@ -449,14 +457,19 @@ onMounted(() => {
   transition: border-color 0.16s var(--ease-out), color 0.16s var(--ease-out);
 }
 .expand-btn:hover { border-color: var(--accent-secondary); color: var(--accent-secondary); }
+/* 双列时区块内的收尾链接要横跨整行 */
+.stack > .block-foot { grid-column: 1 / -1; }
 
-/* 窄窗口（办公室默认 500–900px）保持单列 + 卡片不挤压 */
-@media (min-width: 1100px) {
-  .stack { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
+/* 卡片列表从 700px 起就双列：办公室窗口通常 500–900px 宽、约 900px 高，
+   单列会让"明日计划/可介入"这类多卡片区块直接把整页拉到两屏开外。
+   纵向才是这里的稀缺资源，横向两列约 375px 足够放名称+一行数字+一行说明。 */
+@media (min-width: 700px) {
+  .stack { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
 }
 
 .act-card, .buy-card, .plan-card, .env-card, .digest-card {
-  padding: 0.8125rem 0.9375rem; background: var(--bg-secondary);
+  /* 密度：整页要压在 1.5 屏内，卡片内边距从 13/15px 收到 10/12px */
+  padding: 0.625rem 0.75rem; background: var(--bg-secondary);
   border: 1px solid var(--border-subtle); border-radius: var(--radius-md);
   box-shadow: var(--shadow-soft); transition: border-color .12s, box-shadow .12s;
 }
@@ -482,12 +495,16 @@ onMounted(() => {
 .badge-trailing, .badge-hold { background: var(--bg-tertiary); color: var(--text-secondary); border-color: var(--border-subtle); }
 
 .act-nums, .plan-nums, .env-nums, .buy-price-row {
-  display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.5rem;
+  display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.375rem;
   font-size: 0.8125rem; color: var(--text-secondary); font-variant-numeric: tabular-nums;
 }
 .act-nums b, .plan-nums b, .env-nums b { color: var(--text-primary); font-weight: 600; }
 .act-detail, .buy-logic, .plan-cond {
-  margin: 0.4375rem 0 0; font-size: 0.75rem; line-height: 1.6; color: var(--text-tertiary);
+  margin: 0.3125rem 0 0; font-size: 0.75rem; line-height: 1.5; color: var(--text-tertiary);
+}
+/* 长说明各占一行就够：点卡片进明细页看全文，否则清单页会被段落撑到三四屏 */
+.act-detail, .buy-logic, .plan-cond, .plan-veto, .buy-note {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden;
 }
 .act-flags { margin-top: 0.375rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
 .mini-flag {
@@ -499,22 +516,28 @@ onMounted(() => {
 .bp-label { color: var(--text-tertiary); }
 .buy-price-row b { font-size: 1rem; }
 .buy-points {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.375rem; margin-top: 0.625rem;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.375rem; margin-top: 0.5rem;
 }
 .bp {
   padding: 0.375rem 0.5rem; background: var(--bg-tertiary);
   border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); text-align: center;
 }
 .bp.wide { grid-column: 1 / -1; text-align: left; }
+/* 四格并成一行，省掉整行高度（约 40px）。必须写在 .bp.wide 之后，
+   同特异度下后写的规则才生效 —— 之前放在上面等于没写 */
+@media (min-width: 420px) {
+  .buy-points { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .bp.wide { grid-column: auto; text-align: center; }
+}
 .bp em { display: block; font-style: normal; font-size: 0.6875rem; color: var(--text-tertiary); margin-bottom: 2px; }
 .bp b { font-size: 0.9375rem; color: var(--text-primary); font-variant-numeric: tabular-nums; }
 
 .buy-note {
-  margin: 0.5rem 0 0; padding: 0.3rem 0.5rem; font-size: 0.75rem; line-height: 1.5; color: #b45309;
+  margin: 0.3125rem 0 0; padding: 0.25rem 0.5rem; font-size: 0.75rem; line-height: 1.5; color: #b45309;
   background: #fffbeb; border: 1px dashed #fcd34d; border-radius: var(--radius-sm);
 }
 .plan-veto {
-  margin: 0.4375rem 0 0; font-size: 0.75rem; line-height: 1.5; color: var(--accent-danger);
+  margin: 0.3125rem 0 0; font-size: 0.75rem; line-height: 1.5; color: var(--accent-danger);
 }
 
 /* 买入时机徽章（与智能推荐页同一套语义色） */
@@ -531,7 +554,7 @@ onMounted(() => {
 
 .deferred {
   display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem;
-  margin-top: 0.625rem; padding-top: 0.625rem; border-top: 1px dashed var(--border-subtle);
+  margin-top: 0.4375rem; padding-top: 0.4375rem; border-top: 1px dashed var(--border-subtle);
 }
 .deferred-label { font-size: 0.75rem; color: var(--text-tertiary); }
 .deferred-chip {
@@ -545,10 +568,14 @@ onMounted(() => {
 .env-card.env-danger, .env-card.env-error { border-left: 3px solid var(--accent-danger); }
 .env-card.env-success { border-left: 3px solid var(--accent-success); }
 .env-title { font-size: 0.875rem; font-weight: 700; color: var(--text-primary); }
-.env-detail { margin: 0.375rem 0 0; font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }
-.env-warns { margin: 0.5rem 0 0; padding-left: 1.125rem; font-size: 0.75rem; line-height: 1.7; color: var(--text-tertiary); }
+.env-detail {
+  margin: 0.3125rem 0 0; font-size: 0.8125rem; line-height: 1.5; color: var(--text-secondary);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.env-warns { margin: 0.375rem 0 0; padding-left: 1.125rem; font-size: 0.75rem; line-height: 1.5; color: var(--text-tertiary); }
+.env-warns li { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; }
 
-.watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.5rem; }
+.watch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.375rem; }
 .watch-item {
   display: flex; align-items: center; flex-wrap: wrap; gap: 0.375rem;
   padding: 0.5rem 0.625rem; font-family: inherit; text-align: left; cursor: pointer;
@@ -569,6 +596,20 @@ onMounted(() => {
 .flat { color: var(--text-secondary); }
 .danger { color: var(--accent-danger); }
 .ok { color: var(--accent-success); }
+
+/* ===== 手机屏（<700px）再收一档密度 =====
+   单列 + 4~5 个区块，稍微松一点就冲破 1.5 屏。指数徽章改成横向滑动而不是换行。 */
+@media (max-width: 699px) {
+  .hero { padding: 0.625rem 0.75rem; }
+  .hero-text { font-size: 1.0625rem; }
+  .hero-market { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px; }
+  .block-head { margin-bottom: 0.375rem; }
+  .act-card, .buy-card, .plan-card, .env-card, .digest-card { padding: 0.5rem 0.625rem; }
+  .stack { gap: 0.375rem; }
+  .deferred { margin-top: 0.3125rem; padding-top: 0.3125rem; }
+  .block { margin-bottom: 0.375rem; }
+  .block-sep { margin: 0 0 0.375rem; }
+}
 
 /* ===== 暗色覆盖（2026-10-13）=====
    行动台是默认首页，不能出现"外壳暗、内容亮"的割裂，所以本页自带的几处

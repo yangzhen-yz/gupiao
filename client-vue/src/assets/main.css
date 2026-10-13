@@ -4114,7 +4114,9 @@ body {
     --shadow-focus: 0 0 0 3px rgba(250, 250, 249, 0.12);
   }
 
-body[data-theme="dark"] {
+/* 主题属性挂在 <html> 上（useTheme 写 documentElement.dataset.theme），
+   所以这里必须是 html[data-theme] body —— 写成 body[data-theme] 永远命中不到 */
+html[data-theme="dark"] body {
     background-image:
       radial-gradient(at 0% 0%, rgba(250, 250, 249, 0.03) 0px, transparent 50%),
       radial-gradient(at 100% 100%, rgba(248, 113, 113, 0.02) 0px, transparent 50%);
