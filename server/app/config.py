@@ -780,7 +780,9 @@ EASTMONEY_HEADERS = {
 # 背景：持仓是每个用户私有的，行情/推荐/收评是公共的 —— 因此只对持仓等私有资源做认证，
 # 公共接口保持免登录，收评定时任务、截图脚本等既有自动化不受影响。
 AUTH_ENABLED = True             # 总开关（置 False 可整体回退到免登录模式，持仓归 user_id=1）
-AUTH_ALLOW_REGISTER = True      # 是否允许自助注册（内部系统；如需邀请制可置 False 后用脚本建号）
+# 2026-10-13：临时置 False。系统经 cloudflare 隧道短暂暴露到公网期间，开放自助注册
+# 等于任何人都能建账号进来读全量公共数据。回到内网自用要恢复注册时改回 True 即可。
+AUTH_ALLOW_REGISTER = False     # 是否允许自助注册（内部系统；如需邀请制可置 False 后用脚本建号）
 AUTH_SESSION_DAYS = 30          # 会话有效期（天）
 AUTH_MIN_PASSWORD_LEN = 6       # 最短密码长度
 AUTH_PBKDF2_ROUNDS = 120000     # PBKDF2-SHA256 迭代轮数（标准库实现，无额外依赖）

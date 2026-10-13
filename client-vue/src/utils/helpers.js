@@ -134,6 +134,27 @@ export function clearAuth() {
   localStorage.removeItem(USER_KEY)
 }
 
+// 本机登录过的账号（2026-10-13）：登录页的「已有账号」快捷切换原先读 GET /api/auth/users，
+// 那个接口不需要登录就会把所有用户名暴露出去。系统经隧道短暂对外时已把它改成需登录，
+// 快捷切换因此改成本地记住的账号 —— 自己的设备上好使，陌生人打开链接看不到。
+const RECENT_USERS_KEY = 'gupiao_recent_users'
+
+export function getRecentUsers() {
+  try {
+    const list = JSON.parse(localStorage.getItem(RECENT_USERS_KEY) || '[]')
+    return Array.isArray(list) ? list : []
+  } catch (e) {
+    return []
+  }
+}
+
+export function saveRecentUser(user) {
+  if (!user || !user.username) return
+  const list = getRecentUsers().filter(u => u.username !== user.username)
+  list.unshift({ username: user.username, displayName: user.displayName || user.username })
+  localStorage.setItem(RECENT_USERS_KEY, JSON.stringify(list.slice(0, 5)))
+}
+
 // 会话失效（401）时由 App 注册回调，负责弹回登录页
 let _unauthorizedHandler = null
 export function setUnauthorizedHandler(fn) {

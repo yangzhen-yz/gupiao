@@ -693,8 +693,13 @@ async def api_me(request: Request):
 
 
 @router.get("/api/auth/users", tags=["用户认证"])
-async def api_users():
-    """用户列表（供前端切换账号用，不含任何密码信息）"""
+async def api_users(user: Dict = Depends(current_user)):
+    """用户列表（供已登录账号之间切换用）。
+
+    2026-10-13 加鉴权：原来免登录就能拿到全部用户名，等于把账号列表挂在登录页上。
+    系统经 cloudflare 隧道短暂对外期间，这一步和 AUTH_ALLOW_REGISTER=False 一起做，
+    陌生人打开链接只能看到一个空登录框。前端登录页的快捷切换已改读本机记录。
+    """
     try:
         return {"success": True, "data": list_users()}
     except Exception as error:

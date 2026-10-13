@@ -69,7 +69,7 @@
         <div class="users-list">
           <button
             v-for="u in existingUsers"
-            :key="u.id"
+            :key="u.username"
             class="user-chip"
             :disabled="busy"
             @click="pickUser(u.username)"
@@ -86,7 +86,7 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { saveAuth } from '../utils/helpers'
+import { saveAuth, getRecentUsers, saveRecentUser } from '../utils/helpers'
 
 const emit = defineEmits(['success'])
 
@@ -123,10 +123,9 @@ async function loadStatus() {
     // 状态接口拿不到时保持默认登录态，不阻断登录流程
     console.warn('认证状态获取失败', e)
   }
-  try {
-    const r = await fetch('/api/auth/users').then(r => r.json())
-    if (r && r.success) existingUsers.value = r.data || []
-  } catch (e) { /* 用户列表非关键 */ }
+  // 「已有账号」快捷切换只读本机记住的账号：GET /api/auth/users 现在需要登录，
+  // 而且它本来会把所有用户名暴露给任何打开登录页的人。
+  existingUsers.value = getRecentUsers()
 }
 
 async function submit() {
@@ -157,6 +156,7 @@ async function submit() {
       return
     }
     saveAuth(r.data.token, r.data.user)
+    saveRecentUser(r.data.user)
     emit('success', r.data.user)
   } catch (e) {
     error.value = '网络错误，请确认后端服务已启动'

@@ -111,7 +111,7 @@
 
 <script setup>
 import { ref, computed, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, setUnauthorizedHandler } from './utils/helpers'
+import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, saveRecentUser, setUnauthorizedHandler } from './utils/helpers'
 import { useHashRoute, navigate } from './composables/useHashRoute'
 import { usePolling } from './composables/usePolling'
 import { useTheme } from './composables/useTheme'
@@ -285,6 +285,7 @@ async function checkAuth() {
     if (r && r.success && r.data && r.data.user) {
       currentUser.value = r.data.user
       saveAuth(getToken(), r.data.user)   // 顺带刷新昵称等展示信息
+      saveRecentUser(r.data.user)         // 登录页的「已有账号」快捷切换靠它（用户列表接口已改为需登录）
     } else {
       currentUser.value = null
       clearAuth()
