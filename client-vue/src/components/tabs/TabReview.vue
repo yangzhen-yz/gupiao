@@ -893,7 +893,10 @@ onMounted(() => {
 .empty-tip { padding: 12px; text-align: center; color: var(--text-secondary); font-size: 0.8rem; }
 
 /* 明日关注 */
-.focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 8px; }
+/* minmax 的下限必须再套一层 min(…, 100%)：手机上容器只有 ~330px，
+   写死 minmax(380px, 1fr) 时网格轨道仍是 380px，卡片右侧（策略分、盈亏比那一列）
+   直接被视口裁掉，而且父容器没有横向滚动条 —— 用户看到的就是"内容只显示了部分"。 */
+.focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); gap: 8px; }
 .focus-card { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 10px 12px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); cursor: pointer; transition: all 0.15s; }
 .focus-card:hover { border-color: #6366f1; transform: translateY(-1px); }
 .focus-head { display: flex; align-items: center; gap: 10px; }
@@ -901,7 +904,9 @@ onMounted(() => {
 .focus-body { flex: 1; min-width: 0; }
 .focus-name { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
 .focus-code { font-size: 0.7rem; color: var(--text-secondary); font-family: 'SF Mono', 'JetBrains Mono', monospace; }
-.focus-reason { font-size: 0.72rem; color: var(--text-secondary); margin-top: 2px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+/* 收评是明细页：入选理由被压成一行等于没写（2026-10-13 反馈"内容只显示了部分"）。
+   单行摘要是行动台的职责，那里本来就有「展开全部」。 */
+.focus-reason { font-size: 0.72rem; color: var(--text-secondary); margin-top: 2px; line-height: 1.5; }
 .focus-score { text-align: center; padding-left: 8px; border-left: 1px solid var(--border-subtle); }
 .focus-score-val { font-size: 1rem; font-weight: 700; color: #6366f1; font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .focus-score-lbl { font-size: 0.65rem; color: var(--text-secondary); }
@@ -1009,5 +1014,12 @@ onMounted(() => {
   .market-grid-3 { grid-template-columns: 1fr; }
   .cycle-card { flex-direction: column; }
   .cycle-main { border-right: none; border-bottom: 1px dashed var(--border-subtle); padding: 0 0 10px; width: 100%; }
+  /* 重点关注卡：手机上强制单列，四宫格买入参数改两列 ——
+     4 列时「买入价」轨道只有 85px，"49.83~51.32" 这种数字串会被自己裁掉。 */
+  .review-card { padding: var(--spacing-md); }
+  .focus-grid { grid-template-columns: 1fr; }
+  .plan-grid { grid-template-columns: repeat(2, 1fr); }
+  .plan-item { padding: 6px 8px; }
+  .plan-val { font-size: 0.85rem; }
 }
 </style>

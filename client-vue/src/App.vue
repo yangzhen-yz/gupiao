@@ -252,7 +252,9 @@ async function _checkMarketAlert() {
       const pred = alert.prediction || {}
       const type = alert.riskScore >= 60 ? 'error' : 'warning'
       const msg = `${pred.title || '大盘风险预警'} (风险评分${alert.riskScore}) ${pred.action || ''}`
-      showNotification(msg, type, 8000)
+      // 3 秒：这是每天一次的提醒，不是需要读完的正文 —— 详细内容在收评/行动台里都有。
+      // 原先写 8000，手机上悬浮在页面顶部会把「行动台」标题和第一张卡压住太久（2026-10-13 反馈）。
+      showNotification(msg, type, 3000)
     }
   } catch (e) { /* 静默失败 */ }
 }

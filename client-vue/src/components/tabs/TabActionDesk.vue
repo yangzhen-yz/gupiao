@@ -53,7 +53,7 @@
           </span>
         </header>
         <div v-if="!data.positionActions.length" class="block-empty">持仓暂无触发信号 —— 这本身就是好消息，不用盯。</div>
-        <div v-else class="stack">
+        <div v-else class="stack" :class="{ open: expanded.positionActions }">
           <article
             v-for="p in shown('positionActions', data.positionActions)"
             :key="p.symbol"
@@ -101,7 +101,7 @@
               ? '本时段没有匹配买入时机的标的 —— 按纪律等待，不盘中追高。'
               : '今日推荐还没生成（每日 09:45 / 13:30 / 14:45 自动产出）。' }}
         </div>
-        <div v-else class="stack">
+        <div v-else class="stack" :class="{ open: expanded.buyNow }">
           <article v-for="b in shown('buyNow', data.buyNow)" :key="b.symbol" class="buy-card" @click="goQuote(b.symbol)">
             <div class="buy-top">
               <span class="buy-name">{{ b.name }}<em>{{ (b.symbol || '').toUpperCase() }}</em></span>
@@ -145,7 +145,7 @@
         <div v-if="!data.tomorrowPlan.length" class="block-empty">
           今日收评还没有"重点关注"名单（15:10 左右生成）。可以先过一遍自选异动。
         </div>
-        <div v-else class="stack">
+        <div v-else class="stack" :class="{ open: expanded.tomorrowPlan }">
           <article v-for="t in shown('tomorrowPlan', data.tomorrowPlan)" :key="t.symbol" class="plan-card" @click="goQuote(t.symbol)">
             <div class="plan-top">
               <span class="plan-name">{{ t.name }}<em>{{ (t.symbol || '').toUpperCase() }}</em></span>
@@ -514,6 +514,16 @@ onMounted(() => {
 /* 长说明各占一行就够：点卡片进明细页看全文，否则清单页会被段落撑到三四屏 */
 .act-detail, .buy-logic, .plan-cond, .plan-veto, .buy-note {
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden;
+}
+/* 点了「展开全部」之后必须给全文 —— 折叠态用 1 行摘要换纵向密度是取舍，
+   但展开后还截断就成了"看得到名单、看不到买入条件"（2026-10-13 手机反馈）。 */
+.stack.open .act-detail, .stack.open .buy-logic, .stack.open .plan-cond,
+.stack.open .plan-veto, .stack.open .buy-note {
+  display: block; -webkit-line-clamp: unset; overflow: visible;
+}
+/* 手机上 1 行只有二十来个字，条件句读不完；给到 2 行，纵向增量可控。 */
+@media (max-width: 699px) {
+  .act-detail, .buy-logic, .plan-cond, .plan-veto, .buy-note { -webkit-line-clamp: 2; }
 }
 .act-flags { margin-top: 0.375rem; display: flex; flex-wrap: wrap; gap: 0.25rem; }
 .mini-flag {
