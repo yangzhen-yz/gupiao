@@ -7,6 +7,8 @@
       <button class="sim-reset" @click="onReset" :disabled="busy">重置账户</button>
     </div>
 
+    <DataFreshness :updated="fetchedAt" label="账户状态读取于" stale-hint="数据不是今日的，建议刷新" :loading="busy" @refresh="load" />
+
     <!-- 账户面板 -->
     <div class="sim-account" v-if="state.account">
       <div class="acc-card">
@@ -126,12 +128,15 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { apiFetch, useNotification } from '../../utils/helpers'
+import DataFreshness from '../DataFreshness.vue'
 
 const { showNotification } = useNotification()
 const state = ref({ account: null, positions: [], pending: [], audit: [] })
 const sources = ref(['recommend', 'tomorrow_plan', 'diagnosis', 'screener'])
 const symbolsText = ref('')
 const busy = ref(false)
+// 新鲜度（2026-10-13）：此前本页既无轮询也没有"更新于"，看不出看到的是不是今天的账户状态
+const fetchedAt = ref('')
 
 function fmt(n) {
   if (n == null) return '-'
@@ -147,7 +152,10 @@ function stLabel(s) {
 async function load() {
   try {
     const d = await apiFetch('/api/sim/state')
-    if (d.success) state.value = d
+    if (d.success) {
+      state.value = d
+      fetchedAt.value = Date.now()
+    }
   } catch (e) { /* 静默，登录态由全局处理 */ }
 }
 async function onGenerate() {

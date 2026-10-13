@@ -5,6 +5,8 @@
       <div class="page-subtitle">系统自进化面板 · D1-D4 权重 · 角色门槛 · 网格搜索</div>
     </div>
 
+    <DataFreshness :updated="fetchedAt" label="数据读取于" stale-hint="距今超过一天，建议刷新" :loading="optimizing" @refresh="fetchData" />
+
     <!-- 概览统计 -->
     <div class="opt-stats-row">
       <div class="stat-card">
@@ -138,8 +140,12 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import DataFreshness from '../DataFreshness.vue'
 
 const emit = defineEmits(['open-kline'])
+
+// 新鲜度（2026-10-13）：本页不轮询，标出"读于何时"避免把旧权重当成本轮结果
+const fetchedAt = ref('')
 
 // 维度和角色常量
 const dims = [
@@ -259,6 +265,7 @@ async function fetchData() {
       stats.value = trendRes.data.stats || {}
     }
     pageSize.value = statusRes.data?.trendBacktestSamples || 0
+    fetchedAt.value = Date.now()
   } catch (e) {
     console.error('加载优化数据失败', e)
   }

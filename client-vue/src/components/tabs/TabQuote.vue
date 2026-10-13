@@ -233,12 +233,26 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay, getTradingStatusText, formatNowTime, formatNumber } from '../../utils/helpers'
 import { calculateScore, getEnhancedAnalysis, getRating } from '../../utils/score'
 import { useStockData } from '../../composables/useStockData'
+import { usePolling } from '../../composables/usePolling'
 
+// 轮询治理（2026-10-13）：Tab 隐藏时不再每 2s 打行情，只 gate 定时器，组件永不销毁
+const props = defineProps({ active: { type: Boolean, default: true } })
 const emit = defineEmits(['open-kline', 'open-ai-diag'])
+
+// 自重排的行情轮询：交易时段 2s，休市时按下一个开盘点长睡；隐藏即停
+const { start: startQuotePolling } = usePolling(
+  () => (currentSymbol.value ? fetchStockQuote(currentSymbol.value, true) : Promise.resolve()),
+  {
+    interval: () => (isTradingTime() ? 2000 : getNextRefreshDelay()),
+    active: () => props.active,
+    immediate: false,
+  }
+)
+
 const showNotification = inject('showNotification')
 
 const { quickStocks, loadQuickStocks, stockNameMap, loadStockMap } = useStockData()
@@ -307,8 +321,6 @@ const stopLossPctText = computed(() => {
   const s = String(pct)
   return s.includes('%') ? s : '-' + s + '%'
 })
-
-let autoRefreshTimer = null
 
 function parseTencentData(raw) {
   try {
@@ -468,12 +480,7 @@ function selectQuickStock(code) {
 }
 
 function scheduleRefresh() {
-  if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
-  const tick = async () => {
-    if (currentSymbol.value) await fetchStockQuote(currentSymbol.value, true)
-    autoRefreshTimer = setTimeout(tick, isTradingTime() ? 2000 : getNextRefreshDelay())
-  }
-  tick()
+  startQuotePolling()
 }
 
 async function startAiDiagnose(symbol) {
@@ -548,12 +555,8 @@ onMounted(async () => {
     }
   }
   fetchStockQuote(currentSymbol.value)
-  scheduleRefresh()
+  startQuotePolling()
   checkMarketPredict()
-})
-
-onUnmounted(() => {
-  if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
 })
 
 // 暴露给父组件的方法：搜索指定股票

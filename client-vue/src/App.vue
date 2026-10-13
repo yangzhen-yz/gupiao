@@ -4,37 +4,72 @@
   <div v-else class="main-container">
     <!-- 大盘指数栏 -->
     <IndexBar />
-    <!-- 顶部功能标签栏（交易终端风格） -->
+    <!-- 顶部功能标签栏（2026-10-13 改为「行动台 + 3 组」，9 个平级 Tab 降级为明细） -->
     <div class="app-body">
       <header class="top-header">
-        <!-- 标签栏可横向滚动 -->
-        <nav class="tab-bar">
+        <nav class="tab-bar" @click.stop>
           <button
-            v-for="tab in tabs"
-            :key="tab.id"
-            :class="['tab-bar-item', { active: activeTab === tab.id }]"
-            @click="activateTab(tab.id)"
-          >{{ tab.label }}</button>
+            :class="['tab-bar-item', 'desk-entry', { active: activeTab === 'tab-desk' }]"
+            @click="activateTab('tab-desk')"
+          >🎯 行动台</button>
+
+          <!-- 宽屏：三个组胶囊，点开弹层选子项 -->
+          <div v-for="g in tabGroups" :key="g.key" class="tab-group">
+            <button
+              :class="['tab-bar-item', 'group-chip', { active: g.ids.includes(activeTab) }]"
+              @click="toggleMenu(g.key)"
+            >
+              <span class="group-label">{{ g.label }}</span>
+              <span class="group-current">{{ shortLabel(activeTab, g) }}</span>
+              <i class="caret">▾</i>
+            </button>
+            <div v-if="openMenu === g.key" class="group-menu">
+              <button
+                v-for="t in g.tabs"
+                :key="t.id"
+                :class="['menu-item', { active: activeTab === t.id }]"
+                @click="activateTab(t.id)"
+              >{{ t.label }}</button>
+            </div>
+          </div>
+
+          <!-- 窄屏（办公室 500–900px）：合并成一个「明细」菜单 -->
+          <div class="tab-group all-group">
+            <button class="tab-bar-item group-chip" @click="toggleMenu('all')">
+              <span class="group-label">明细</span><i class="caret">▾</i>
+            </button>
+            <div v-if="openMenu === 'all'" class="group-menu">
+              <button
+                v-for="t in allTabs"
+                :key="t.id"
+                :class="['menu-item', { active: activeTab === t.id }]"
+                @click="activateTab(t.id)"
+              >{{ t.label }}</button>
+            </div>
+          </div>
         </nav>
       </header>
       <div class="app-main">
+        <div :class="['tab-content', { active: activeTab === 'tab-desk' }]" v-show="activeTab === 'tab-desk'" v-if="mountedTabs.has('tab-desk')">
+          <TabActionDesk :active="activeTab === 'tab-desk'" />
+        </div>
         <div :class="['tab-content', { active: activeTab === 'tab-quote' }]" v-show="activeTab === 'tab-quote'" v-if="mountedTabs.has('tab-quote')">
-          <TabQuote ref="tabQuoteRef" @open-kline="openKline" @open-ai-diag="openAiDiag" />
+          <TabQuote ref="tabQuoteRef" :active="activeTab === 'tab-quote'" @open-kline="openKline" @open-ai-diag="openAiDiag" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-scan' }]" v-show="activeTab === 'tab-scan'" v-if="mountedTabs.has('tab-scan')">
-          <TabScan />
+          <TabScan :active="activeTab === 'tab-scan'" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-trend' }]" v-show="activeTab === 'tab-trend'" v-if="mountedTabs.has('tab-trend')">
-          <TabTrend @open-kline="openKline" />
+          <TabTrend :active="activeTab === 'tab-trend'" @open-kline="openKline" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'" v-if="mountedTabs.has('tab-recommend')">
-          <TabRecommend />
+          <TabRecommend :active="activeTab === 'tab-recommend'" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-position' }]" v-show="activeTab === 'tab-position'" v-if="mountedTabs.has('tab-position')">
-          <TabPosition ref="tabPositionRef" />
+          <TabPosition ref="tabPositionRef" :active="activeTab === 'tab-position'" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-flow' }]" v-show="activeTab === 'tab-flow'" v-if="mountedTabs.has('tab-flow')">
-          <TabFlow />
+          <TabFlow :active="activeTab === 'tab-flow'" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-review' }]" v-show="activeTab === 'tab-review'" v-if="mountedTabs.has('tab-review')">
           <TabReview @open-kline="openKline" />
@@ -55,6 +90,10 @@
       </span>
       <button class="user-btn" @click="logout">切换账号</button>
     </div>
+    <!-- 暗色切换（2026-10-13）：右下角浮层，与账号区同一层级，不打扰数据区 -->
+    <button class="theme-btn" :title="isDark ? '切到亮色' : '切到暗色（盯盘护眼）'" @click="toggleTheme">
+      {{ isDark ? '☀️' : '🌙' }}
+    </button>
     <!-- K线弹窗 -->
     <KlineModal :visible="klineVisible" :symbol="klineSymbol" @close="klineVisible = false" />
     <!-- AI诊断弹窗 -->
@@ -70,15 +109,17 @@
 </template>
 
 <script setup>
-import { ref, provide, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { useNotification, isTradingTime, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, setUnauthorizedHandler } from './utils/helpers'
+import { ref, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
+import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, setUnauthorizedHandler } from './utils/helpers'
+import { useHashRoute, navigate } from './composables/useHashRoute'
+import { usePolling } from './composables/usePolling'
 import LoginPage from './components/LoginPage.vue'
 import IndexBar from './components/IndexBar.vue'
-import TabQuote from './components/tabs/TabQuote.vue'
 
 // 2026-08-31 性能优化：非默认 Tab 与弹窗改为动态导入（配合懒挂载）。
-// 效果：首屏只加载「实时行情」+ 核心依赖；ECharts（仅 KlineModal 使用，~1MB）
-// 与其余 Tab 拆成独立 chunk，首次用到时才下载，首屏 JS 体积显著下降。
+// 2026-10-13：默认页换成「行动台」，实时行情降为普通 Tab，首屏只下载 desk chunk。
+const TabQuote = defineAsyncComponent(() => import('./components/tabs/TabQuote.vue'))
+const TabActionDesk = defineAsyncComponent(() => import('./components/tabs/TabActionDesk.vue'))
 const TabScan = defineAsyncComponent(() => import('./components/tabs/TabScan.vue'))
 const TabTrend = defineAsyncComponent(() => import('./components/tabs/TabTrend.vue'))
 const TabRecommend = defineAsyncComponent(() => import('./components/tabs/TabRecommend.vue'))
@@ -90,39 +131,72 @@ const TabOptimization = defineAsyncComponent(() => import('./components/tabs/Tab
 const KlineModal = defineAsyncComponent(() => import('./components/KlineModal.vue'))
 const AiDiagModal = defineAsyncComponent(() => import('./components/AiDiagModal.vue'))
 
-const activeTab = ref('tab-quote')
+// ========== hash 路由（2026-10-13）：刷新停在本页、链接可分享 ==========
+const { activeTab, route } = useHashRoute()
 
-// 懒挂载：已激活过的 Tab 集合（2026-08-31 性能优化）。
-// 初始只挂载「实时行情」，其余 Tab 在首次点击时挂载，挂载后保持不销毁以保留状态。
-const mountedTabs = ref(new Set(['tab-quote']))
-function activateTab(id) {
-  mountedTabs.value.add(id)
-  activeTab.value = id
+// 懒挂载：已激活过的 Tab 集合。挂载后**永不销毁**（保留状态，且跨组件 ref 调用依赖实例存活），
+// 隐藏时只是由 usePolling 停掉定时器，不再打接口。
+const mountedTabs = ref(new Set(['tab-desk']))
+
+const TAB_LABELS = {
+  'tab-quote': '实时行情', 'tab-scan': '股票筛选', 'tab-trend': '趋势发现',
+  'tab-recommend': '智能推荐', 'tab-position': '持仓管理', 'tab-flow': '资金流向',
+  'tab-review': '每日收评', 'tab-sim': '模拟交易', 'tab-optimization': '自动优化',
+  'tab-desk': '行动台',
 }
+const tabGroups = [
+  { key: 'market', label: '盘面', tabs: ['tab-quote', 'tab-trend', 'tab-flow'].map(id => ({ id, label: TAB_LABELS[id] })) },
+  { key: 'decide', label: '决策', tabs: ['tab-recommend', 'tab-position', 'tab-sim'].map(id => ({ id, label: TAB_LABELS[id] })) },
+  { key: 'review', label: '复盘', tabs: ['tab-review', 'tab-scan', 'tab-optimization'].map(id => ({ id, label: TAB_LABELS[id] })) },
+]
+tabGroups.forEach(g => { g.ids = g.tabs.map(t => t.id) })
+const allTabs = tabGroups.reduce((acc, g) => acc.concat(g.tabs), [])
 
-const { notifications, showNotification, TYPE_ICONS } = useNotification()
+const openMenu = ref('')
+function toggleMenu(key) { openMenu.value = openMenu.value === key ? '' : key }
+function closeMenu() { openMenu.value = '' }
+// 组胶囊上直接显示当前所在子页，收起后也知道自己在哪
+function shortLabel(id, g) {
+  if (!g.ids.includes(id)) return g.tabs[0].label
+  return TAB_LABELS[id]
+}
+function activateTab(id) {
+  closeMenu()
+  navigate(id.replace(/^tab-/, ''))
+}
+// 点页面其他地方收起菜单
+function onDocClick() { if (openMenu.value) closeMenu() }
 
-provide('showNotification', showNotification)
-
-// 跨Tab导航：其他Tab点击股票时跳转到实时行情并搜索
+// 跨Tab导航：其他Tab点击股票 → 走 hash 打开实时行情并定位该票
 const tabQuoteRef = ref(null)
 function navigateToQuote(symbol) {
-  activeTab.value = 'tab-quote'
-  // 等待DOM更新后调用TabQuote的搜索方法
-  nextTick(() => {
-    if (tabQuoteRef.value && tabQuoteRef.value.searchStock) {
-      tabQuoteRef.value.searchStock(symbol)
-    }
-  })
+  navigate('quote', symbol || '')
 }
 provide('navigateToQuote', navigateToQuote)
 
+// hash 变化时统一处理：挂载对应 Tab；带 symbol 的行情深链交给 TabQuote 定位
+watch([activeTab, () => route.value.param], ([tab, param], old) => {
+  if (!mountedTabs.value.has(tab)) mountedTabs.value = new Set([...mountedTabs.value, tab])
+  if (tab === 'tab-quote' && param) {
+    // 目标 Tab 的异步 chunk 可能还没下载完，重试直到 ref 就绪
+    const trySearch = (tries) => {
+      if (tabQuoteRef.value && tabQuoteRef.value.searchStock) {
+        tabQuoteRef.value.searchStock(param)
+      } else if (tries > 0) {
+        setTimeout(() => trySearch(tries - 1), 150)
+      }
+    }
+    nextTick(() => trySearch(20))
+  }
+}, { immediate: true })
+
 // ========== 大盘风险预警轮询 ==========
+// 2026-10-13 去掉 isTradingTime() 门禁：上班族常常在收盘后才打开页面，
+// 原逻辑会让"盘中错过就永远没有汇总"。/api/market-alert 只读文件，代价极低，
+// 同一天同一风险分只提示一次（_lastAlertDate 去重）保持不变。
 const _lastAlertDate = ref('')
-let _alertTimer = null
 
 async function _checkMarketAlert() {
-  if (!isTradingTime()) return
   try {
     const result = await apiFetch('/api/market-alert')
     if (!result.success || !result.data) return
@@ -138,6 +212,16 @@ async function _checkMarketAlert() {
     }
   } catch (e) { /* 静默失败 */ }
 }
+
+const { notifications, showNotification, TYPE_ICONS } = useNotification()
+
+provide('showNotification', showNotification)
+
+const { start: startAlertPoll } = usePolling(_checkMarketAlert, {
+  interval: 120000,
+  immediate: false,
+  active: () => !!currentUser.value,
+})
 
 // ========== 登录态（2026-10-12 多用户账号，持仓按账号隔离） ==========
 const authReady = ref(false)
@@ -171,6 +255,8 @@ function onLoginSuccess(user) {
   currentUser.value = user
   authReady.value = true
   showNotification(`欢迎，${user.displayName || user.username}`, 'success')
+  // 登录后回到登录前想看的页面（门禁期间 hash 已经解析好了，这里只需补挂载）
+  if (!location.hash) navigate('desk')
   // 切换账号后立即重载持仓，避免残留上一个账号的数据
   nextTick(() => {
     if (tabPositionRef.value && tabPositionRef.value.loadPositions) {
@@ -191,13 +277,29 @@ setUnauthorizedHandler(() => {
   showNotification('登录已过期，请重新登录', 'warning')
 })
 
+// ========== 暗色主题（2026-10-13 真正启用） ==========
+// 此前整套暗色 token 写在 @media (prefers-color-scheme: dark) 里，而代码中
+// data-theme="dark" 的选择器没有任何地方会设置该属性 → 暗色是不可达的死代码。
+const THEME_KEY = 'gupiao_theme'
+const isDark = ref(localStorage.getItem(THEME_KEY) === 'dark')
+function applyTheme() {
+  if (isDark.value) document.documentElement.dataset.theme = 'dark'
+  else document.documentElement.dataset.theme = 'light'
+}
+function toggleTheme() {
+  isDark.value = !isDark.value
+  localStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light')
+  applyTheme()
+}
+applyTheme()
+
 onMounted(() => {
   checkAuth()
-  _checkMarketAlert()
-  _alertTimer = setInterval(_checkMarketAlert, 60000)
+  startAlertPoll()
+  document.addEventListener('click', onDocClick)
 })
 onUnmounted(() => {
-  if (_alertTimer) clearInterval(_alertTimer)
+  document.removeEventListener('click', onDocClick)
 })
 
 // K线弹窗
@@ -215,21 +317,84 @@ function openAiDiag(symbol) {
   aiDiagSymbol.value = symbol
   aiDiagVisible.value = true
 }
-
-const tabs = [
-  { id: 'tab-quote', label: '实时行情' },
-  { id: 'tab-scan', label: '股票筛选' },
-  { id: 'tab-trend', label: '趋势发现' },
-  { id: 'tab-recommend', label: '智能推荐' },
-  { id: 'tab-position', label: '持仓管理' },
-  { id: 'tab-flow', label: '资金流向' },
-  { id: 'tab-review', label: '每日收评' },
-  { id: 'tab-sim', label: '模拟交易' },
-  { id: 'tab-optimization', label: '自动优化' },
-]
 </script>
 
 <style scoped>
+/* ===== 顶栏分组导航 ===== */
+.tab-bar { align-items: center; gap: 6px; }
+.desk-entry { font-weight: 700; }
+
+.tab-group { position: relative; display: flex; }
+.group-chip { display: inline-flex; align-items: baseline; gap: 5px; white-space: nowrap; }
+.group-label { font-weight: 700; }
+.group-current {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  max-width: 5.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-chip.active .group-current { color: var(--text-secondary); }
+.caret { font-style: normal; font-size: 0.6875rem; color: var(--text-tertiary); }
+
+.group-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 132px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-large);
+}
+.menu-item {
+  padding: 7px 10px;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.menu-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.menu-item.active { background: var(--bg-tertiary); color: var(--accent-primary); font-weight: 700; }
+
+/* 宽屏用组胶囊，窄屏（办公室常见窄窗口/手机）合并成单个「明细」菜单 */
+.all-group { display: none; }
+@media (max-width: 980px) {
+  .tab-group:not(.all-group) { display: none; }
+  .all-group { display: flex; }
+}
+
+/* 暗色切换按钮 */
+.theme-btn {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 50;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.9rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-medium);
+  border-radius: 50%;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.14);
+  cursor: pointer;
+}
+.theme-btn:hover { border-color: var(--accent-strong, var(--accent-primary)); }
+
 /* 当前登录账号区（2026-10-12 多用户）：固定在左下角浮层，不占用顶部空间 */
 .user-zone {
   position: fixed;

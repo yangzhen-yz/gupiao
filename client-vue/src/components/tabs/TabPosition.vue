@@ -148,6 +148,10 @@
 <script setup>
 import { ref, computed, inject, onMounted, onUnmounted } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay } from '../../utils/helpers'
+import { usePolling } from '../../composables/usePolling'
+
+// 轮询治理（2026-10-13）：持仓 60s 价格刷新只在 Tab 可见时跑
+const props = defineProps({ active: { type: Boolean, default: true } })
 
 const showNotification = inject('showNotification', () => {})
 
@@ -162,7 +166,15 @@ const searchResults = ref([])
 const searchLoading = ref(false)
 const currentPrice = ref(null)
 let searchTimer = null
-let refreshTimer = null
+// 交易时段 60s 自动刷新（"及时建议"）；2026-10-13 起仅在 Tab 可见时轮询
+const { start: startPositionPolling } = usePolling(
+  () => loadPositions(),
+  {
+    interval: () => (isTradingTime() ? 60000 : getNextRefreshDelay()),
+    active: () => props.active,
+    immediate: false,
+  }
+)
 
 const priceColor = computed(() => {
   const p = parseFloat(currentPrice.value)
@@ -265,24 +277,11 @@ async function removePosition(p) {
 onMounted(() => {
   loadPositions()
   document.addEventListener('click', onDocClick)
-  // 交易时段60s自动刷新（"及时建议"）
-  if (isTradingTime()) {
-    refreshTimer = setInterval(loadPositions, 60000)
-  } else {
-    refreshTimer = setTimeout(() => {
-      if (isTradingTime()) {
-        loadPositions()
-        refreshTimer = setInterval(loadPositions, 60000)
-      } else {
-        refreshTimer = setTimeout(() => {}, getNextRefreshDelay())
-      }
-    }, getNextRefreshDelay())
-  }
+  startPositionPolling()
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', onDocClick)
-  if (refreshTimer) { clearInterval(refreshTimer); clearTimeout(refreshTimer) }
 })
 
 // 切换登录账号后，由 App 通过 ref 调用以立刻重载（否则会残留上一个账号的持仓）

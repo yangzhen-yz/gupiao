@@ -165,9 +165,12 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, inject } from 'vue'
+import { ref, reactive, onMounted, inject } from 'vue'
 import Pagination from '../Pagination.vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay, getTradingStatusText, formatNowTime } from '../../utils/helpers'
+import { usePolling } from '../../composables/usePolling'
+
+const props = defineProps({ active: { type: Boolean, default: true } })
 
 const showNotification = inject('showNotification')
 const navigateToQuote = inject('navigateToQuote')
@@ -269,31 +272,24 @@ async function refresh() {
   }
 }
 
-let timer = null
-function schedule() {
-  if (timer) clearTimeout(timer)
-  statusText.value = getTradingStatusText()
-  // 非交易日 / 非交易时段：加载一次收盘后的缓存数据（如果还没有数据），然后仅定时唤醒自查
-  if (!isTradingTime()) {
-    if (!data.value) refresh()
-    timer = setTimeout(schedule, getNextRefreshDelay())
-    return
-  }
-  const tick = async () => {
-    await refresh()
+// 轮询治理（2026-10-13）：资金流向 30s 轮询只在 Tab 可见时跑；
+// 休市时段仍会自查一次并长睡到下一个开盘点（保持原有"收盘后看缓存"的行为）。
+const { start: startFlowPolling } = usePolling(
+  async () => {
     statusText.value = getTradingStatusText()
-    if (isTradingTime()) {
-      timer = setTimeout(tick, 30000)
-    } else {
-      // 刚收盘：停止刷新，等下一交易时段再唤醒
-      schedule()
-    }
+    if (isTradingTime() || !data.value) await refresh()
+  },
+  {
+    interval: () => (isTradingTime() ? 30000 : getNextRefreshDelay()),
+    active: () => props.active,
+    immediate: false,
   }
-  tick()
-}
+)
 
-onMounted(() => { schedule() })
-onUnmounted(() => { if (timer) clearTimeout(timer) })
+onMounted(() => {
+  statusText.value = getTradingStatusText()
+  refresh().finally(startFlowPolling)
+})
 </script>
 
 <style scoped>

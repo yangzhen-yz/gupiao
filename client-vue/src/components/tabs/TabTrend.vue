@@ -330,10 +330,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay } from '../../utils/helpers'
 import { useStockData } from '../../composables/useStockData'
 import { getRating } from '../../utils/score'
+import { usePolling } from '../../composables/usePolling'
+
+// 轮询治理（2026-10-13）：隐藏时停掉趋势列表轮询，组件仍由 App 保持挂载
+const props = defineProps({ active: { type: Boolean, default: true } })
 
 const emit = defineEmits(['open-kline'])
 const showNotification = inject('showNotification')
@@ -615,15 +619,15 @@ function getPriceClass(s) {
   return 'price-neutral'
 }
 
-let trendTimer = null
-function scheduleTrendRefresh() {
-  if (trendTimer) clearTimeout(trendTimer)
-  const tick = async () => {
-    await loadTrendStocks()
-    trendTimer = setTimeout(tick, isTradingTime() ? 30000 : getNextRefreshDelay())
+// 趋势列表轮询：交易时段 30s，休市睡到下一个开盘点；仅本 Tab 可见时执行
+const { start: startTrendPolling } = usePolling(
+  () => loadTrendStocks(),
+  {
+    interval: () => (isTradingTime() ? 30000 : getNextRefreshDelay()),
+    active: () => props.active,
+    immediate: false,
   }
-  tick()
-}
+)
 
 // ========== 趋势回测相关方法 ==========
 async function loadLatestBacktest() {
@@ -746,7 +750,7 @@ function sparkBarHeight(count) {
 onMounted(async () => {
   // 性能优化（2026-07-02）：三个串行 await 改 Promise.all，首屏 = max(三者) 而非 sum
   await Promise.all([loadStockMap(), loadPoolWithIndicators(), loadTrendStocks()])
-  scheduleTrendRefresh()
+  startTrendPolling()
   // P4-1: 加载回测数据（非阻塞，不依赖趋势数据）
   loadLatestBacktest()
   loadBacktestHistory()
@@ -754,9 +758,7 @@ onMounted(async () => {
   loadTrendHistoryCounts()
 })
 
-onUnmounted(() => {
-  if (trendTimer) clearTimeout(trendTimer)
-})
+// 轮询定时器由 usePolling 在组件卸载时自动清理（2026-10-13）
 </script>
 
 <style scoped>

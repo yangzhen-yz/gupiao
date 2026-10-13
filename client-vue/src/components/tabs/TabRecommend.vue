@@ -12,6 +12,15 @@
       <div class="toggle-section"><span class="toggle-label">推荐成功率</span></div>
       <div class="last-update">{{ recommendStats }}</div>
     </div>
+    <!-- 新鲜度（2026-10-13）：本页不轮询，若不标出"这是哪天的推荐"，收盘后很容易被当成今日信号 -->
+    <DataFreshness
+      :updated="todayDate"
+      :stale="!todayRecommend.length"
+      :day-compare="false"
+      label="当前推荐日期"
+      stale-hint="今日推荐尚未生成"
+      @refresh="loadRecommendations"
+    />
     <div v-if="reviewData.available" class="review-summary-box">
       <div class="review-summary-title">📊 推荐复盘（近{{ reviewData.recent_days }}天 · 共{{ reviewData.total?.t1?.n || 0 }}期）</div>
       <div class="review-summary-row">
@@ -140,6 +149,10 @@
 <script setup>
 import { ref, computed, onMounted, inject } from 'vue'
 import { apiFetch, riskLabel, riskLevelClass } from '../../utils/helpers'
+import DataFreshness from '../DataFreshness.vue'
+
+// App 传入当前 Tab 是否可见（2026-10-13 轮询治理的统一接口；本页不轮询，仅声明）
+defineProps({ active: { type: Boolean, default: true } })
 
 const showNotification = inject('showNotification')
 const todayRecommend = ref([])

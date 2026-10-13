@@ -80,11 +80,16 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay, formatNowTime, riskLabel, riskLevelClass } from '../../utils/helpers'
 import { getRating } from '../../utils/score'
 import { matchMainLine } from '../../utils/mainline'
 import { useStockData } from '../../composables/useStockData'
+import { usePolling } from '../../composables/usePolling'
+
+// 轮询治理（2026-10-13）：本 Tab 的自动刷新是**全市场扫描**，最贵的一路。
+// Tab 隐藏时必须停掉，否则用户点开过一次之后，它就在后台每 30s 扫一遍。
+const props = defineProps({ active: { type: Boolean, default: true } })
 
 const showNotification = inject('showNotification')
 const navigateToQuote = inject('navigateToQuote')
@@ -239,15 +244,15 @@ async function startScan(silent = false) {
   }
 }
 
-let autoScanTimer = null
-function scheduleScanRefresh() {
-  if (autoScanTimer) clearTimeout(autoScanTimer)
-  const tick = async () => {
-    await startScan(true)
-    autoScanTimer = setTimeout(tick, isTradingTime() ? 30000 : getNextRefreshDelay())
+// 自动扫描：交易时段 30s，休市时睡到下一个开盘点；仅本 Tab 可见时执行
+const { start: startScanPolling } = usePolling(
+  () => startScan(true),
+  {
+    interval: () => (isTradingTime() ? 30000 : getNextRefreshDelay()),
+    active: () => props.active,
+    immediate: false,
   }
-  tick()
-}
+)
 
 onMounted(async () => {
   await loadScanPool()
@@ -255,12 +260,8 @@ onMounted(async () => {
   // 2026-07-08：先加载后端配置（设置默认 filterMode），再启动扫描
   // 配置加载失败时使用默认 'all'，扫描仍可正常进行
   await loadTabConfig()
-  startScan(true)
-  scheduleScanRefresh()
-})
-
-onUnmounted(() => {
-  if (autoScanTimer) clearTimeout(autoScanTimer)
+  await startScan(true)
+  startScanPolling()
 })
 </script>
 
