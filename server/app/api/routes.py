@@ -25,6 +25,7 @@ from services.risk_control import calc_risk_control
 from services.utils import ensure_today_date
 from services.auth import (current_user, create_user, authenticate, logout as auth_logout,
                            get_user_by_token, list_users, has_any_user, change_password)
+from services.action_desk import build_action_desk
 
 router = APIRouter()
 
@@ -1829,6 +1830,21 @@ async def get_market_index_api():
     except Exception as error:
         print(f'[大盘指数API] 错误: {str(error)}')
         raise HTTPException(status_code=500, detail=f"获取大盘指数失败: {str(error)}")
+
+@router.get("/api/action-desk", tags=["今日行动台"])
+async def get_action_desk_api(phase: str = '', user: Dict = Depends(current_user)):
+    """今日行动台：按当前交易时段聚合"现在该做什么"（前端首页唯一数据源）。
+
+    只读聚合，全部走 DB / 文件 / 5 秒行情缓存，不触发任何全市场扫描。
+    phase 参数仅供联调与截图脚本强制时段（如 ?phase=tail），线上不传即可。
+    """
+    try:
+        data = await build_action_desk(user_id=int(user.get('id') or 1),
+                                       phase_override=(phase or '').strip())
+        return {"success": True, "data": data}
+    except Exception as error:
+        print(f'[行动台API] 错误: {str(error)}')
+        raise HTTPException(status_code=500, detail=f"生成行动台数据失败: {str(error)}")
 
 @router.get("/api/kline/{symbol}", tags=["K线数据"])
 async def get_kline(symbol: str):

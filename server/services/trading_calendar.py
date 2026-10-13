@@ -5,6 +5,7 @@
 """
 
 from datetime import datetime, date
+from typing import Dict
 
 
 # 2026 年 A股休市日期（含周末与法定节假日）
@@ -61,3 +62,94 @@ def is_trading_day(d) -> bool:
     if d.isoformat() in CLOSED_DATES:
         return False
     return True
+
+
+# ========== 盘中时段划分（2026-10-13「今日行动台」） ==========
+# 前端 helpers.js 的时段判断有两处已知缺口：把 9:15-9:25 集合竞价算作非交易时段、
+# 没有 15:00 之后的盘后段。行动台需要按"现在该做什么"重排内容，因此时段以服务端为
+# 唯一权威，前端只做倒计时展示。
+
+# 各时段边界（当日分钟数，左闭右开）
+PHASE_BOUNDS = [
+    (0, 'pre'),
+    (9 * 60 + 15, 'auction'),      # 集合竞价
+    (9 * 60 + 30, 'morning'),      # 早盘
+    (11 * 60 + 30, 'lunch'),       # 午间休市
+    (13 * 60, 'mid'),              # 午后盘中
+    (14 * 60 + 30, 'tail'),        # 尾盘确认窗口
+    (15 * 60, 'post'),             # 盘后（收评/回测陆续产出）
+    (18 * 60, 'closed'),           # 当日收尾，只剩明日计划
+]
+
+PHASE_LABELS = {
+    'pre': '盘前',
+    'auction': '集合竞价 9:15-9:25',
+    'morning': '早盘 9:30-11:30',
+    'lunch': '午间休市 11:30-13:00',
+    'mid': '盘中 13:00-14:30',
+    'tail': '尾盘确认 14:30-15:00',
+    'post': '盘后复盘 15:00-18:00',
+    'closed': '休市',
+    'unknown': '交易日历未覆盖',
+}
+
+# 交易日历只硬编码到 2026 年：跨年时必须显式暴露，不能把未知年份静默当交易日
+CALENDAR_YEARS = {2026}
+
+
+def is_calendar_covered(d) -> bool:
+    """当前日期是否落在已维护的日历年份内（跨年守卫）"""
+    if isinstance(d, str):
+        try:
+            d = datetime.strptime(d, '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return False
+    return getattr(d, 'year', None) in CALENDAR_YEARS
+
+
+def get_session_phase(now=None) -> Dict:
+    """判定此刻处于哪个交易时段。
+
+    Returns:
+        {'phase': str, 'phaseLabel': str, 'isTradingDay': bool,
+         'calendarCovered': bool, 'nextPhaseAt': 'HH:MM' | None,
+         'minutesToNext': int | None}
+
+    非交易日 ⇒ phase='closed'（周末/节假日）；
+    交易日但日历未覆盖该年份（如 2027 年工作日）⇒ phase='unknown'，由前端挂横幅提示，
+    而不是假装"交易中"给出误导性的行动建议。
+    """
+    now = now or datetime.now()
+    trading = is_trading_day(now.date())
+    covered = is_calendar_covered(now)
+
+    if not trading:
+        phase = 'closed'
+    elif not covered:
+        phase = 'unknown'
+    else:
+        minutes = now.hour * 60 + now.minute
+        phase = 'pre'
+        for start, name in PHASE_BOUNDS:
+            if minutes >= start:
+                phase = name
+
+    # 下一时段边界（仅交易日内有意义）
+    next_at, minutes_to_next = None, None
+    if phase in ('pre', 'auction', 'morning', 'lunch', 'mid', 'tail', 'post'):
+        minutes = now.hour * 60 + now.minute
+        for start, _name in PHASE_BOUNDS[1:]:
+            if start > minutes:
+                next_at = f'{start // 60:02d}:{start % 60:02d}'
+                minutes_to_next = start - minutes
+                break
+
+    return {
+        'phase': phase,
+        'phaseLabel': PHASE_LABELS.get(phase, phase),
+        'isTradingDay': trading,
+        'calendarCovered': covered,
+        'nextPhaseAt': next_at,
+        'minutesToNext': minutes_to_next,
+    }
+

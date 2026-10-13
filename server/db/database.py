@@ -706,6 +706,29 @@ def init_db():
         conn.close()
 
 # 大盘指数代码
+def _row_to_recommendation(row) -> Dict:
+    """daily_recommendations 单行 → 前端推荐 dict（load_daily_recommendations 与行动台共用）"""
+    # buy_timing 列兼容：旧库尚未执行 ALTER 时 keys 里没有该列，降级为 None
+    has_buy_timing_col = 'buy_timing' in row.keys()
+    return {
+        'name': row['name'],
+        'symbol': row['symbol'],
+        'price': row['price'],
+        'change': float(row['change_val']) if row['change_val'] else 0,
+        'changePercent': float(row['change_percent']) if row['change_percent'] else 0,
+        'score': row['score'] or 0,
+        'buySellPoints': {
+            'buy': row['buy_price'] or '',
+            'current': row['current_price'] or '',
+            'sell': row['sell_price'] or '',
+            # 买入时机（2026-10-12）：旧记录无此列/无此值时为 None，前端自动降级隐藏
+            'buyTiming': (json.loads(row['buy_timing'])
+                          if has_buy_timing_col and row['buy_timing'] else None),
+        } if row['buy_price'] else None,
+        'reason': row['reason'] or ''
+    }
+
+
 def load_daily_recommendations() -> List[Dict]:
     try:
         conn = get_db_conn()
@@ -737,8 +760,6 @@ def load_daily_recommendations() -> List[Dict]:
         result = []
         current_date = None
         current_group = None
-        # buy_timing 列兼容：旧库尚未执行 ALTER 时keys里没有该列，降级为 None
-        has_buy_timing_col = 'buy_timing' in rows[0].keys()
         for row in rows:
             if row['rec_date'] != current_date:
                 if current_group:
@@ -748,29 +769,46 @@ def load_daily_recommendations() -> List[Dict]:
                     'date': current_date,
                     'daily_recommendations': []
                 }
-            current_group['daily_recommendations'].append({
-                'name': row['name'],
-                'symbol': row['symbol'],
-                'price': row['price'],
-                'change': float(row['change_val']) if row['change_val'] else 0,
-                'changePercent': float(row['change_percent']) if row['change_percent'] else 0,
-                'score': row['score'] or 0,
-                'buySellPoints': {
-                    'buy': row['buy_price'] or '',
-                    'current': row['current_price'] or '',
-                    'sell': row['sell_price'] or '',
-                    # 买入时机（2026-10-12）：旧记录无此列/无此值时为 None，前端自动降级隐藏
-                    'buyTiming': (json.loads(row['buy_timing'])
-                                  if has_buy_timing_col and row['buy_timing'] else None),
-                } if row['buy_price'] else None,
-                'reason': row['reason'] or ''
-            })
+            current_group['daily_recommendations'].append(_row_to_recommendation(row))
         if current_group:
             result.append(current_group)
         return result
     except Exception as error:
         print(f'加载推荐记录失败: {str(error)}')
         return []
+
+
+def load_recommendation_group(rec_date: str = None) -> Dict:
+    """只取某一天的推荐（缺省=库内最新一天），行动台专用。
+
+    为什么不用 load_daily_recommendations：那会读最近 N 天（约 30 天 × 3 行）并逐行
+    解析 JSON；行动台每次轮询都要跑，只需要一组。纯 SQL，不触发任何行情重算
+    （/api/daily_recommendations 的 GET 会重算历史价格，绝不可用于热路径）。
+
+    Returns:
+        {'date': 'YYYY-MM-DD' | '', 'stocks': [...]}
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if not rec_date:
+            cursor.execute('SELECT MAX(rec_date) AS d FROM daily_recommendations')
+            row0 = cursor.fetchone()
+            rec_date = row0['d'] if row0 and row0['d'] else ''
+        if not rec_date:
+            conn.close()
+            return {'date': '', 'stocks': []}
+        cursor.execute(
+            'SELECT * FROM daily_recommendations WHERE rec_date = ? ORDER BY sort_order ASC',
+            (rec_date,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return {'date': rec_date, 'stocks': [_row_to_recommendation(r) for r in rows]}
+    except Exception as error:
+        print(f'加载单日推荐失败: {str(error)}')
+        return {'date': '', 'stocks': []}
+
 
 def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
     try:
@@ -834,6 +872,39 @@ def delete_daily_recommendations_by_date(rec_date: str) -> bool:
     except Exception as error:
         print(f'删除推荐记录失败: {str(error)}')
         return False
+
+def load_trend_scan_freshness() -> Dict:
+    """趋势扫描的"数据到哪天了"（行动台用，不解析任何 JSON）。
+
+    load_trend_scan_results 会把最近若干行的 ma5/ma10/details JSON 全部解开，
+    行动台只需要日期与只数，故单开一条聚合查询。
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT scan_date, MAX(created_at) AS scan_at, "
+            "       SUM(CASE WHEN symbol = '__SCAN_EMPTY__' THEN 0 ELSE 1 END) AS found, "
+            "       MAX(total_scanned) AS total_scanned "
+            "FROM trend_scan_results "
+            "WHERE scan_date = (SELECT MAX(scan_date) FROM trend_scan_results)"
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row['scan_date']:
+            return {'date': '', 'scanTime': '', 'found': 0, 'totalScanned': 0}
+        return {
+            'date': row['scan_date'],
+            # 注意：表里的 scan_time 存的是"本次扫描耗时"（如 '446.7s'），
+            # 数据时点要用 created_at，别拿 scan_time 当时间戳显示。
+            'scanTime': str(row['scan_at'] or ''),
+            'found': int(row['found'] or 0),
+            'totalScanned': int(row['total_scanned'] or 0),
+        }
+    except Exception as error:
+        print(f'加载趋势扫描新鲜度失败: {str(error)}')
+        return {'date': '', 'scanTime': '', 'found': 0, 'totalScanned': 0}
+
 
 def load_trend_scan_results() -> Dict:
     try:
@@ -1751,6 +1822,36 @@ def save_stock_concept_tags(tags: Dict[str, List[str]]) -> bool:
     except Exception as error:
         print(f'保存股票标签失败: {str(error)}')
         return False
+def load_latest_focus_plan() -> Dict:
+    """最新一条收评的「明日重点关注」（行动台盘后/休市段的主数据源）。
+
+    只取一行 + 只解析 focus_json，避免 load_daily_market_reviews 那样把最近 N 天
+    收评的全部 JSON（板块/涨停/资金榜…）都解一遍。
+
+    Returns:
+        {'date': 'YYYY-MM-DD' | '', 'items': [...]}  # items 内含 buyTiming / tomorrowPlan
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT review_date, focus_json FROM daily_market_reviews '
+                       'ORDER BY review_date DESC LIMIT 1')
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {'date': '', 'items': []}
+        items = []
+        if 'focus_json' in row.keys() and row['focus_json']:
+            try:
+                items = json.loads(row['focus_json']) or []
+            except Exception:
+                items = []
+        return {'date': row['review_date'] or '', 'items': items}
+    except Exception as error:
+        print(f'加载明日关注计划失败: {str(error)}')
+        return {'date': '', 'items': []}
+
+
 def load_daily_market_reviews() -> List[Dict]:
     try:
         conn = get_db_conn()
