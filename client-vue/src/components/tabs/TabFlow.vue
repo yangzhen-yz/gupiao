@@ -244,6 +244,17 @@ async function refresh() {
       d.sectors.industry = d.sectors.industry || { inflow: [], outflow: [] }
       d.sectors.concept = d.sectors.concept || { inflow: [], outflow: [] }
       d.hiddenGems = d.hiddenGems || []
+      // 防御：若接口整体返回空（东财偶发限流且历史也无数据），但本地已有数据，
+      // 保留本地数据，避免「切 Tab / 30s 轮询」把页面闪成『暂无数据』。
+      const prev = data.value
+      const allEmpty = !d.stocks.inflow.length && !d.stocks.outflow.length &&
+        !d.sectors.industry.inflow.length && !d.sectors.industry.outflow.length &&
+        !d.sectors.concept.inflow.length && !d.sectors.concept.outflow.length &&
+        !d.hiddenGems.length
+      if (prev && allEmpty) {
+        console.warn('[资金流向] 本轮接口返回全空，保留上次数据')
+        return
+      }
       data.value = d
       lastUpdateTime.value = formatNowTime()
       // 数据更新后重置所有分页到第 1 页

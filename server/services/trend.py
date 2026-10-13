@@ -839,6 +839,39 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     }
 
 
+_ONDEMAND_TREND_CACHE: Dict[str, Dict] = {}
+
+
+def compute_trend_result(symbol: str, price: float = 0) -> Optional[Dict]:
+    """为单只票补齐 trend_result（2026-10-13，供单票评分/持仓诊断/推荐池等非趋势扫描路径）。
+
+    背景：calc_stock_score_v2 的多数调用点未传 trend_result，趋势因子缺席，导致下跌趋势
+    股的"单日反弹(死猫反弹)"在纯日内口径下评分虚高，反超趋势良好股。本助手让这些路径也能
+    拿到真实趋势分（含下行趋势/反弹股），配合 strategy.py 的死猫反弹门控抑制虚高。
+
+    取数：仅用本地前复权日K库（线程本地连接，免腾讯限流、秒级）；本地库未就绪/新股K线
+    不足/异常 → 返回 None（调用方回退纯日内分，零回归）。带进程内 memo，避免同票重复计算。
+
+    Returns:
+        与 is_up_trend 同构的 dict（含 score/details/isUp 等），或 None。
+    """
+    key = symbol.lower()
+    if key in _ONDEMAND_TREND_CACHE:
+        return _ONDEMAND_TREND_CACHE[key]
+    try:
+        if not (KLINE_HISTORY_ENABLED and history_available()):
+            return None
+        kline = get_engine().get_kline_tencent_format(symbol, KLINE_DATA_LIMIT)
+        if not kline or len(kline) < TREND_MIN_KLINE_DAYS:
+            return None
+        res = is_up_trend(kline, realtime_price=(price if price and price > 0 else None))
+        _ONDEMAND_TREND_CACHE[key] = res
+        return res
+    except Exception as e:
+        print(f'[趋势补齐] compute_trend_result 失败(回退纯日内分): {symbol}: {e}')
+        return None
+
+
 def _count_max_consecutive_boards(closes: List[float], start: int, end: int) -> int:
     """区间内最大连续涨停数（连板高度）。
     新增（2026-06-30）：用于龙头辨识——5连板+=市场总龙头，3-4连板=板块龙头。
@@ -1202,6 +1235,31 @@ def _calc_chip_factor(check_price: float, ma60_val: Optional[float], ma120_val: 
     return max(TREND_CHIP_FACTOR_MIN, min(TREND_CHIP_FACTOR_MAX, raw))
 
 
+def _merge_today_bar(kline_data: List[List], today_price: Optional[float]) -> List[List]:
+    """把当日实时价合并进日K线（2026-10-12，腾讯日K数据延迟补丁）
+
+    腾讯日K当天bar有数据延迟：收盘后立即拉取，最新一根常常仍是昨收日
+    （实测 2026-10-09 15:33 拉取的K线最新只到 10-08）。
+    直接替换 closes[-1] 会丢掉昨天收盘价导致连跌少算一天，必须区分：
+    - 最后一根bar就是今天 → 用实时价刷新其收盘价（盘中未走完，收盘价在变）
+    - 最后一根bar是昨天及更早 → 追加一根今天bar（开=高=低=收=实时价）
+
+    Returns: 新列表（不改原列表）；today_price 无效时原样返回。
+    """
+    if not kline_data or not today_price or today_price <= 0:
+        return kline_data
+    today_str = date.today().isoformat()
+    merged = [list(k) for k in kline_data]
+    last = merged[-1]
+    if str(last[0]) == today_str:
+        last[2] = float(today_price)  # 今天bar：刷新收盘价
+    else:
+        # 数据延迟：追加今天bar
+        merged.append([today_str, float(today_price), float(today_price),
+                       float(today_price), float(today_price), 0])
+    return merged
+
+
 def calc_pool_stock_indicators(kline_data: List[List], realtime_price: float = 0) -> Dict:
     """
     计算股票池展示所需的轻量级指标：连涨/连跌天数、是否在5日线上方、最新价。
@@ -1210,18 +1268,16 @@ def calc_pool_stock_indicators(kline_data: List[List], realtime_price: float = 0
     if not kline_data or len(kline_data) < 10:
         return {'latestPrice': realtime_price, 'consecutiveUp': 0, 'consecutiveDown': 0, 'aboveMa5': False, 'ma5': None}
 
+    # 2026-10-12：当日实时价合并（数据延迟时追加今天bar而非替换，避免少算一天）；
+    # 与 15:05 删除任务（check_consecutive_down）同口径——徽章显示几天就按几天删。
+    kline_data = _merge_today_bar(kline_data, realtime_price)
+
     closes = [float(k[2]) for k in kline_data]
     ma5_arr = calculate_ma(kline_data, 5)
     latest_idx = len(kline_data) - 1
     latest_close = closes[latest_idx]
 
-    if realtime_price and realtime_price > 0:
-        check_price = realtime_price
-        # 用实时价替换 K 线最后一天 close 作为"今天"的代表价
-        # （盘中时 K 线 API 返回的"最后一天"可能仍是昨收，会导致连涨/连跌误算）
-        closes[-1] = realtime_price
-    else:
-        check_price = latest_close
+    check_price = realtime_price if (realtime_price and realtime_price > 0) else latest_close
 
     ma5_val = ma5_arr[latest_idx] if ma5_arr[latest_idx] else None
 
@@ -1253,7 +1309,7 @@ def calc_pool_stock_indicators(kline_data: List[List], realtime_price: float = 0
     }
 
 
-def check_below_ma10(kline_data: List[List]) -> Dict:
+def check_below_ma10(kline_data: List[List], today_price: Optional[float] = None) -> Dict:
     """
     检查股票是否跌破10日线且当天没有收回
 
@@ -1266,6 +1322,11 @@ def check_below_ma10(kline_data: List[List]) -> Dict:
     - 且当天收盘价 < MA10 → 未收回，应该删除（shouldRemove=True）
     - 若最低价 < MA10 但收盘价 >= MA10 → 视为盘中刺破已收复，不删除
 
+    Args:
+        kline_data: 日K数据
+        today_price: 当日实时价（可选）。腾讯日K当天bar有数据延迟，传入后合并进K线
+            （最后bar是今天则刷新收盘价，否则追加今天bar）再判定，避免用昨收价误判。
+
     返回: {'shouldRemove': True/False, 'reason': '原因', 'latestClose': 收盘价, 'ma10': 10日线}
     """
     if not kline_data or len(kline_data) < 10:
@@ -1275,7 +1336,10 @@ def check_below_ma10(kline_data: List[List]) -> Dict:
             'latestClose': None,
             'ma10': None
         }
-    
+
+    # 数据延迟补丁：当日实时价合并进K线（最后bar是今天则刷新收盘价，否则追加今天bar）
+    kline_data = _merge_today_bar(kline_data, today_price)
+
     # 计算MA10
     ma10_list = calculate_ma(kline_data, 10)
     latest_idx = len(kline_data) - 1
@@ -1354,6 +1418,18 @@ async def scan_and_remove_below_ma10():
         if not all_symbols:
             print('[10日线检查] 股票池为空，无需检查')
             return
+
+        # 2026-10-12：批量拉取实时行情，用当日实时价补K线判定。
+        # 背景：腾讯日K当天bar有数据延迟（15:05收盘后立即拉取，最新只到昨收日），
+        # 导致连跌判定少算一天（周五15:05把连跌3天算成2天，阈值3漏删）、
+        # MA10判定用昨收价。补丁后与前端徽章(calc_pool_stock_indicators)同口径。
+        realtime_map: Dict[str, Dict] = {}
+        try:
+            raw = await fetch_with_retry(','.join(s.lower() for s in all_symbols))
+            for p in parse_tencent_batch_data(raw):
+                realtime_map[p['symbol'].lower()] = p
+        except Exception as e:
+            print(f'[10日线检查] 实时行情拉取失败（连跌/MA10判定回退纯K线口径）: {e}')
         
         # 区分用户池 vs 趋势池中的股票（用于决定从哪个池删除）
         user_set = set(symbols or [])
@@ -1377,16 +1453,23 @@ async def scan_and_remove_below_ma10():
                         kept_trend_symbols.append(symbol)
                     continue
                 
-                # 检查是否跌破10日线
-                result = check_below_ma10(kline_data)
+                # 检查是否跌破10日线（当日实时价补当天K线）
+                rt = realtime_map.get(symbol.lower()) or {}
+                today_price = 0.0
+                try:
+                    today_price = float(rt.get('priceRaw') or rt.get('price') or 0)
+                except (TypeError, ValueError):
+                    pass
+                result = check_below_ma10(kline_data, today_price=today_price)
                 stock_name = get_cached_stock_name(symbol) or symbol
                 in_user = symbol in user_set
                 in_trend = symbol in trend_set
 
-                # 若MA10未触发，再检查连跌天数
+                # 若MA10未触发，再检查连跌天数（同样用实时价补当天）
                 if not result['shouldRemove']:
                     from app.config import POOL_CONSECUTIVE_DOWN_THRESHOLD
-                    cd_result = check_consecutive_down(kline_data, POOL_CONSECUTIVE_DOWN_THRESHOLD)
+                    cd_result = check_consecutive_down(kline_data, POOL_CONSECUTIVE_DOWN_THRESHOLD,
+                                                       today_price=today_price)
                     if cd_result['shouldRemove']:
                         result = cd_result  # 连跌命中，覆盖为移除
 
@@ -1398,14 +1481,13 @@ async def scan_and_remove_below_ma10():
                         pool_tags.append('趋势池')
                     tag_str = '/'.join(pool_tags) if pool_tags else '股票池'
                     print(f'[10日线检查] {stock_name}({symbol}): {result["reason"]} - 从{tag_str}删除')
+                    # 2026-10-12 修复：原先 else 分支把"非用户池"股票也 append 进
+                    # kept_user_symbols，导致趋势池股票被删时反而被写进用户池（污染）。
+                    # 保留列表只应包含用户池中未删除的股票。
                     if in_user:
                         removed_user_symbols.append(symbol)
-                    else:
-                        kept_user_symbols.append(symbol)
                     if in_trend:
                         removed_trend_symbols.append(symbol)
-                    else:
-                        kept_trend_symbols.append(symbol)
                 else:
                     print(f'[10日线检查] {stock_name}({symbol}): {result["reason"]}')
                     if in_user:
@@ -1460,13 +1542,22 @@ async def scan_and_remove_below_ma10():
         print(f'[10日线检查] 扫描失败: {str(error)}')
 
 
-def check_consecutive_down(kline_data: List[List], min_days: int = 2) -> Dict:
+def check_consecutive_down(kline_data: List[List], min_days: int = 2,
+                           today_price: Optional[float] = None) -> Dict:
     """
     检查股票是否连续下跌达到阈值天数
 
     判定标准：
     - 从最新一天往前数，连续收盘价低于前一日
     - 连跌天数 >= min_days → shouldRemove=True
+
+    Args:
+        kline_data: 日K数据 [[date,open,close,high,low,volume], ...]
+        min_days: 连跌阈值天数（≤0 关闭）
+        today_price: 当日实时价（可选）。腾讯日K当天bar有数据延迟（收盘后立即拉取
+            最新只到昨收日），传入后合并进K线再判定（最后bar是今天则刷新收盘价，
+            否则追加今天bar），与前端徽章（calc_pool_stock_indicators）口径一致，
+            避免少算一天。
 
     返回: {'shouldRemove': True/False, 'reason': '原因', 'consecutiveDown': N}
     """
@@ -1479,6 +1570,10 @@ def check_consecutive_down(kline_data: List[List], min_days: int = 2) -> Dict:
             'reason': f'K线数据不足，需要至少{min_days + 1}日数据',
             'consecutiveDown': 0
         }
+
+    # 数据延迟补丁：当日实时价合并进K线（最后bar是今天则刷新收盘价，否则追加今天bar），
+    # 与前端徽章（calc_pool_stock_indicators）同口径——徽章显示几天就按几天删。
+    kline_data = _merge_today_bar(kline_data, today_price)
 
     closes = [float(k[2]) for k in kline_data]
     latest_idx = len(kline_data) - 1
@@ -1795,6 +1890,7 @@ async def scan_trend_scan_results(force: bool = False):
                                    'appearances': (sm or {}).get('appearances', 0)} if sm else None
                         strategy_score = calc_stock_score_v2(realtime_data, weights,
                                                              market_change=market_change,
+                                                             trend_result=trend_result,
                                                              fund_flow_data=ff,
                                                              holder_data=hd,
                                                              fundamental_data=fd,

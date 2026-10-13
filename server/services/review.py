@@ -24,6 +24,237 @@ _EM_POOL_HEADERS = {
     'Accept': 'application/json, text/plain, */*',
 }
 
+# 买入时机简化判定阈值（与 recommend.calc_buy_timing 对齐，本地常量避免循环依赖）
+_SBT_LIMIT_UP = 9.8      # 涨停阈值 → 次日竞价
+_SBT_STRONG = 5.0        # 强势早盘阈值
+_SBT_TAIL_AMP = 5.0      # 尾盘振幅阈值
+_SBT_TAIL_DD = 2.0       # 尾盘自高点回落阈值
+
+
+def _simple_buy_timing(q: Dict) -> Dict:
+    """为收评"明日关注"的票（策略预测/趋势扫描来源）按当日形态简化判定买入时机。
+
+    输入 q 为 parse_tencent_batch_data 解析的行情 dict（含 changePercent/amplitude/highRaw/priceRaw）。
+    规则与 recommend.calc_buy_timing 的优先级一致但只用到行情字段（无角色/位置判定）：
+      1. 已涨停封板(≥9.8%)        → 次日竞价：当日买不到，次日 9:15-9:25 竞价参与
+      2. 振幅≥5% 或 自高点回落≥2% → 尾盘买入：14:30 后确认全天形态再介入
+      3. 涨幅≥5%                  → 早盘买入：次日情绪溢价在早盘
+      4. 其余                     → 盘中灵活：均价线附近介入，不追尾盘急拉
+    返回 {'type','label','note'}，结构同 recommend.calc_buy_timing。
+    """
+    change_pct = float(q.get('changePercent') or 0)
+    amplitude = float(q.get('amplitude') or 0)
+    high = float(q.get('highRaw') or 0)
+    price = float(q.get('priceRaw') or 0)
+
+    # 1. 已涨停封板 → 次日竞价
+    if change_pct >= _SBT_LIMIT_UP:
+        return {
+            'type': 'auction', 'label': '次日竞价',
+            'note': '今日已封板场内难买入，排队性价比低；次日 9:15-9:25 竞价参与，高开 5% 以上不追，防一字/T字诱多'
+        }
+
+    # 自日内高点回落幅度
+    drawdown = ((high - price) / high * 100) if (high > 0 and price > 0) else 0.0
+
+    # 2. 高不确定性（振幅大/回落多） → 尾盘确认
+    if amplitude >= _SBT_TAIL_AMP or drawdown >= _SBT_TAIL_DD:
+        if drawdown >= _SBT_TAIL_DD:
+            note = f'股价已自日内高点回落{drawdown:.1f}%，方向未定；14:30 后确认全天量价形态再介入'
+        else:
+            note = f'日内振幅{amplitude:.1f}%波动剧烈；14:30 后确认再介入，避开盘中诱多'
+        return {'type': 'tail', 'label': '尾盘买入', 'note': note}
+
+    # 3. 强势 → 早盘买入
+    if change_pct >= _SBT_STRONG:
+        return {
+            'type': 'early', 'label': '早盘买入',
+            'note': '次日情绪溢价最高在早盘，尽量 10:00 前决策；只低吸强势回踩，不追直线拉升'
+        }
+
+    # 4. 其余 → 盘中灵活
+    return {'type': 'intraday', 'label': '盘中灵活', 'note': '日内均价线附近介入为宜，避免尾盘急拉时追高'}
+
+
+# ==================== 明日买入计划（2026-10-12） ====================
+# 收评「明日重点关注」是给"明天(T+1)"用的：不再只是"什么时候买"，
+# 而要能直接回答四问 —— 什么条件买 / 什么价格买 / 止盈止损在哪 / 什么情况放弃。
+# 阈值与 recommend.calc_buy_timing 的时机分类配套（本地常量，避免循环依赖）。
+_TP_LIMIT_UP = 9.8      # 涨停阈值（与 _SBT_LIMIT_UP 一致）
+# 各时机可接受的最高开盘涨幅%（超过即定义为追高，进否决清单）
+_TP_CHASE_MAX = {'auction': 5.0, 'early': 3.0, 'tail': 3.0, 'pullback': 2.5, 'intraday': 3.0}
+# 各时机可接受的最低开盘涨幅%（低于此值说明破位/情绪走坏）
+_TP_OPEN_FLOOR = {'auction': 0.0, 'early': -2.0, 'tail': -3.0, 'pullback': -3.0, 'intraday': -3.0}
+_TP_ABORT_LOW = -3.0    # 低开跌破该幅度且 15 分钟不收回 → 破位放弃
+# 止损/止盈都按振幅(波动率代理)缩放，但必须保证盈亏比 —— 短线"快止损、留盈利"
+_TP_STOP_VOL_MULT = 0.8   # 止损 = 振幅 × 0.8（<1：短线容错要小）
+_TP_SELL_VOL_MULT = 1.5   # 兜底止盈 = 振幅 × 1.5（>1：让盈利奔跑）
+_TP_STOP_MIN = 0.04     # 止损幅度下限（低波动股，避免被正常波动扫掉）
+_TP_STOP_MAX = 0.08     # 止损幅度上限（高波动股，避免单笔亏损过大）
+_TP_STOP_MAX_LIMIT_UP = 0.06  # 涨停票次日竞价买入，止损单独收紧（当日振幅不代表次日波动）
+_TP_SELL_MIN = 0.06     # 兜底止盈下限
+_TP_SELL_MAX = 0.12     # 兜底止盈上限
+_TP_MIN_RR = 1.5        # 最低盈亏比：智能推荐给的止盈若不达标则按兜底重算
+
+
+def _price_or_none(v) -> Optional[float]:
+    """把买入参考价这类字段安全转成 float；'竞价关注' 等非数值返回 None。"""
+    try:
+        f = float(v)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_tomorrow_plan(q: Dict, timing: Dict, ref: Optional[Dict] = None,
+                         score: float = 0.0) -> Dict:
+    """为收评「明日重点关注」生成 T+1 可执行买入计划（2026-10-12）。
+
+    收评看的是"明天"，所以给的是**明日开盘的条件式计划**，而非当日追价。
+    回答四问：
+      1. 什么条件买 → condition（开盘涨幅区间 + 分时确认条件）
+      2. 什么价格买 → buyLow/buyHigh（建议挂单区间）+ chaseLimit（追高硬上限）
+      3. 止盈/止损  → takeProfit/takeProfitPct、stopLoss/stopLossPct
+      4. 什么不能买 → veto（否决清单，命中任一条即放弃）
+
+    Args:
+        q: 行情 dict（parse_tencent_batch_data 产物，含 priceRaw/changePercent/amplitude）
+        timing: 该票的 buyTiming dict（type/label/note）
+        ref: 智能推荐来源的买卖点参考 {'buy','sell','stop','position'}（可选，最准优先复用）
+        score: 策略/融合分，用于仓位分档
+    Returns:
+        计划 dict；行情无效（无价）时返回 {} 由调用方跳过。
+    """
+    try:
+        price = float(q.get('priceRaw') or q.get('price') or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0:
+        return {}
+
+    change = float(q.get('changePercent') or 0)
+    amp = float(q.get('amplitude') or 0)
+    ttype = (timing or {}).get('type') or 'intraday'
+    is_limit_up = change >= _TP_LIMIT_UP
+    chase = _TP_CHASE_MAX.get(ttype, 3.0)
+    floor = _TP_OPEN_FLOOR.get(ttype, -3.0)
+    ref = ref or {}
+
+    # ---- 1) 买入价区间（建议挂单范围） ----
+    ref_buy = _price_or_none(ref.get('buy'))
+    if ref_buy:
+        # 智能推荐已按角色/位置算好，直接复用；上限不超过追高线
+        buy_low = ref_buy
+        buy_high = min(ref_buy * 1.01, price * (1 + chase / 100))
+        buy_note = f'低吸参考 {buy_low:.2f} 附近挂单'
+    elif is_limit_up:
+        # 涨停票次日由竞价定价：平开到小高开可接受
+        buy_low = price
+        buy_high = price * 1.03
+        buy_note = '次日竞价挂单（涨停票无法提前定价）'
+    else:
+        pct = 0.03 if amp >= 5 else 0.025 if amp >= 3 else 0.02 if amp >= 2 else 0.015
+        buy_low = price * (1 - pct)
+        buy_high = price
+        buy_note = f'回踩 {buy_low:.2f} 附近挂单，不追高于今收'
+
+    # 买入价中值 = 预期成交价，止盈/止损一律以此为基准，幅度才可比
+    buy_mid = (buy_low + buy_high) / 2 if buy_high >= buy_low else buy_low
+
+    # ---- 2) 止损幅度（振幅缩放，短线快止损；涨停票另设更紧的上限） ----
+    stop_cap = _TP_STOP_MAX_LIMIT_UP if is_limit_up else _TP_STOP_MAX
+    stop_pct = _TP_STOP_MIN if amp <= 0 else min(
+        max(amp / 100.0 * _TP_STOP_VOL_MULT, _TP_STOP_MIN), stop_cap)
+
+    # ---- 3) 止盈幅度（兜底：振幅缩放，保证盈亏比） ----
+    if is_limit_up:
+        fb_sell_pct = 0.07 if amp < 5 else 0.06       # 涨停次日溢价预期
+    else:
+        fb_sell_pct = min(max(amp / 100.0 * _TP_SELL_VOL_MULT, _TP_SELL_MIN),
+                          _TP_SELL_MAX)
+
+    # 止盈：智能推荐给的止盈若满足最低盈亏比则沿用（已含角色/位置修正），否则按兜底重算
+    ref_sell = _price_or_none(ref.get('sell'))
+    if ref_sell and (ref_sell - buy_mid) / buy_mid >= stop_pct * _TP_MIN_RR:
+        take_profit = ref_sell
+        tp_src = '智能推荐'
+    else:
+        take_profit = buy_mid * (1 + fb_sell_pct)
+        tp_src = '按盈亏比重算'
+
+    # 止损：智能推荐给的止损需落在 [0.5×兜底, 1.5×兜底] 区间才沿用
+    # —— 太紧会被日内噪声扫掉，太宽则单笔亏损过大，两种都退回兜底
+    ref_stop = _price_or_none(ref.get('stop'))
+    ref_stop_pct = ((buy_mid - ref_stop) / buy_mid) if (ref_stop and buy_mid) else None
+    if ref_stop_pct is not None and stop_pct * 0.5 <= ref_stop_pct <= stop_pct * 1.5:
+        stop_loss = ref_stop
+    else:
+        stop_loss = buy_mid * (1 - stop_pct)
+
+    tp_pct = (take_profit - buy_mid) / buy_mid * 100 if buy_mid else 0.0
+    sl_pct = (buy_mid - stop_loss) / buy_mid * 100 if buy_mid else 0.0
+
+    # 最终盈亏比保护：无论走哪条路径，盈亏比必须 ≥ _TP_MIN_RR
+    # 否则"赢小亏大"，计划本身不可执行
+    if sl_pct > 0 and tp_pct < sl_pct * _TP_MIN_RR:
+        tp_pct = round(sl_pct * _TP_MIN_RR, 1)
+        take_profit = buy_mid * (1 + tp_pct / 100)
+        tp_src = '按盈亏比重算'
+
+    rr = (tp_pct / sl_pct) if sl_pct > 0 else 0.0   # 盈亏比
+
+    # ---- 4) 买入条件文案（按时机分派，带具体数字） ----
+    if ttype == 'auction':
+        cond = (f'明日 9:15-9:25 竞价高开 {floor:.0f}%~{chase:.0f}%'
+                f'（{buy_low:.2f}~{buy_high:.2f}）参与；9:30 后不追')
+    elif ttype == 'early':
+        cond = (f'明日平开或低开 {floor:.0f}%~0% 时，10:00 前回踩不破均价线低吸；'
+                f'高开 >{chase:.0f}% 等回踩再买')
+    elif ttype == 'tail':
+        cond = (f'明日 14:30 后确认：收盘价站稳均价线且不破 {buy_low:.2f} 再介入，'
+                f'盘中不追')
+    elif ttype == 'pullback':
+        cond = f'明日挂低单等回踩至 {buy_low:.2f}~{buy_high:.2f}，触及即买，不追高'
+    else:
+        cond = f'明日日内回踩均价线附近（{buy_low:.2f}~{buy_high:.2f}）介入，避开尾盘急拉'
+
+    # ---- 5) 否决清单（命中任一条即放弃） ----
+    veto = []
+    if ttype == 'auction':
+        veto.append('一字板 / T字板开盘 → 不排队')
+    veto.append(f'开盘涨幅 >{chase:.0f}% → 追高不买')
+    veto.append(f'低开 <{_TP_ABORT_LOW:.0f}% 且 15 分钟不收回 → 破位放弃')
+    veto.append('开盘 30 分钟内跌破当日均价线 → 放弃')
+    veto.append('大盘低开 >1% → 当日整体降档或空仓')
+
+    # ---- 6) 仓位分档 ----
+    if ref.get('position'):
+        position = str(ref['position'])
+    elif score >= 80:
+        position = '≤30%'
+    elif score >= 60:
+        position = '≤20%'
+    else:
+        position = '≤10%'
+
+    return {
+        'condition': cond,
+        'openLow': round(floor, 1),
+        'openHigh': round(chase, 1),
+        'chaseLimit': round(chase, 1),
+        'buyLow': round(buy_low, 2),
+        'buyHigh': round(buy_high, 2),
+        'buyNote': buy_note,
+        'takeProfit': round(take_profit, 2),
+        'takeProfitPct': round(tp_pct, 1),
+        'takeProfitSrc': tp_src,
+        'stopLoss': round(stop_loss, 2),
+        'stopLossPct': round(sl_pct, 1),
+        'rr': round(rr, 1),          # 盈亏比（止盈幅度/止损幅度）
+        'veto': veto,
+        'position': position,
+    }
+
 
 def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, retries: int = 3, timeout: float = 12.0) -> List[Dict]:
     """东方财富涨停池/跌停池专用API。
@@ -597,6 +828,8 @@ async def generate_daily_review() -> Dict:
         tomorrow_focus = []
         seen_codes = set()
         source_tags = {}
+        rec_buy_timing = {}  # 智能推荐来源的买入时机（code -> buyTiming dict，明日关注复用）
+        rec_ref_points = {}  # 智能推荐来源的买卖点/止损参考（code -> dict，明日关注复用，2026-10-12）
 
         # 第一层：智能推荐
         try:
@@ -614,12 +847,27 @@ async def generate_daily_review() -> Dict:
                 seen_codes.add(code)
                 source_tags[code] = '智能推荐'
                 score = r.get('score', 0) or 0
+                # 记录买入时机（含角色判定，最准；明日关注直接复用）
+                bsp = r.get('buySellPoints') or {}
+                bt = bsp.get('buyTiming')
+                if bt:
+                    rec_buy_timing[code] = bt
+                # 记录买卖点/止损参考（智能推荐已算好角色+位置修正，明日计划优先复用）
+                if bsp or r.get('riskControl'):
+                    rec_ref_points[code] = {
+                        'buy': bsp.get('buy'),
+                        'sell': bsp.get('sell'),
+                        'stop': (r.get('riskControl') or {}).get('stop_loss'),
+                        'stockType': bsp.get('stockType'),
+                        'position': (r.get('riskControl') or {}).get('position_suggest'),
+                    }
                 tomorrow_focus.append({
                     'name': r.get('name', ''),
                     'code': code,
                     'score': score,
                     'reason': f"智能推荐融合分{score}分，{r.get('reason', '')}" if r.get('reason') else f"智能推荐融合分{score}分",
                     'predictDirection': 'bull',
+                    'price': r.get('price') or r.get('current_price'),
                 })
         except Exception as e:
             print(f'[收评] 智能推荐加载失败: {e}')
@@ -678,7 +926,44 @@ async def generate_daily_review() -> Dict:
             tag = source_tags.get(f['code'], '')
             if tag and tag not in f['reason']:
                 f['reason'] = f"[{tag}] " + f['reason']
-        
+
+        # 4.7 为明日关注票标注买入时机 + 生成明日买入计划（2026-10-12）
+        # 明日关注 = 明天(T+1)用，不是今天：每只票要能直接回答——
+        #   什么条件买 / 什么价格买 / 止盈止损在哪 / 什么情况放弃
+        # 智能推荐来源直接复用其 buyTiming + buySellPoints + riskControl（含角色判定，最准）；
+        # 策略预测/趋势扫描来源批量拉实时行情，按当日形态简化判定并现算计划。
+        try:
+            from services.stock import fetch_with_retry, parse_tencent_batch_data
+            focus_codes = [f['code'] for f in tomorrow_focus if f['code']]
+            if focus_codes:
+                raw = await fetch_with_retry(','.join(c.lower() for c in focus_codes))
+                quote_map = {p['symbol'].lower(): p for p in parse_tencent_batch_data(raw)}
+                timed = 0
+                planned = 0
+                for f in tomorrow_focus:
+                    sym = (f['code'] or '').lower()
+                    q = quote_map.get(sym)
+                    bt = rec_buy_timing.get(f['code'])
+                    if not bt and q:
+                        bt = _simple_buy_timing(q)
+                    if bt:
+                        f['buyTiming'] = bt
+                        timed += 1
+                    if q:
+                        plan = _build_tomorrow_plan(
+                            q, bt or {}, ref=rec_ref_points.get(f['code']),
+                            score=float(f.get('score') or 0))
+                        if plan:
+                            f['tomorrowPlan'] = plan
+                            planned += 1
+                print(f'[收评] 明日关注标注：买入时机 {timed}/{len(tomorrow_focus)} 只，'
+                      f'买入计划 {planned}/{len(tomorrow_focus)} 只')
+        except Exception as e:
+            # 2026-10-12：原为静默吞异常，导致字段缺失时无从察觉，此处补堆栈日志
+            import traceback
+            print(f'[收评] 明日关注买入时机/计划生成失败: {e}')
+            print(traceback.format_exc())
+
         # 5. 生成收评
         review = {
             'date': today_str,

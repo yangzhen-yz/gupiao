@@ -616,8 +616,11 @@ def parse_tencent_batch_data(data: str) -> List[Dict]:
             continue
         
         price = float(fields[3]) if fields[3] else 0
+        prev_close = float(fields[4]) if fields[4] else 0
         change_val = float(fields[31]) if fields[31] else 0
         change_pct = float(fields[32]) if fields[32] else 0
+        day_high = float(fields[33]) if fields[33] else 0
+        day_low = float(fields[34]) if fields[34] else 0
         outer_plate = int(fields[7]) if fields[7] else 0
         inner_plate = int(fields[8]) if fields[8] else 0
         volume_raw = int(fields[36]) if fields[36] else 0
@@ -648,6 +651,12 @@ def parse_tencent_batch_data(data: str) -> List[Dict]:
             'code': fields[2],
             'price': fields[3],
             'priceRaw': price,
+            'prevClose': fields[4],
+            'prevCloseRaw': prev_close,
+            'high': fields[33],
+            'highRaw': day_high,
+            'low': fields[34],
+            'lowRaw': day_low,
             'change': change_val,
             'changePercent': change_pct,
             'isUp': change_val > 0,

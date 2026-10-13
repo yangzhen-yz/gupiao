@@ -1,11 +1,11 @@
 """routes - 所有 API 路由定义"""
-from fastapi import HTTPException, APIRouter, Request
+from fastapi import HTTPException, APIRouter, Request, Depends
 from fastapi.responses import Response
 from typing import List, Dict, Optional
 import json, asyncio, time, re, inspect
 from datetime import date, datetime
 from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
-from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
+from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
 from services.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
 from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
 from services.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
@@ -23,6 +23,8 @@ from services.smartmoney import get_dragon_tiger, get_northbound_market, get_dra
 from services.valuation import get_valuation_batch, update_valuation_task
 from services.risk_control import calc_risk_control
 from services.utils import ensure_today_date
+from services.auth import (current_user, create_user, authenticate, logout as auth_logout,
+                           get_user_by_token, list_users, has_any_user, change_password)
 
 router = APIRouter()
 
@@ -187,8 +189,12 @@ async def get_stock_analysis(symbol: str):
         sm = dt_map.get(sym)
         sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                    'appearances': (sm or {}).get('appearances', 0)} if sm else None
+        from services.trend import compute_trend_result
+        _px = float(stock_data.get('priceRaw') or stock_data.get('price') or 0)
+        tr = await asyncio.to_thread(compute_trend_result, sym, _px)
         result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
-                                     fundamental_data=fd, smart_money_data=sm_data)
+                                     fundamental_data=fd, smart_money_data=sm_data,
+                                     trend_result=tr)
         # P2c/P2a: 估值分位 + 风控止损
         val = get_valuation_batch([sym]).get(sym)
         _holder_ratio = (hd or {}).get('total_num_ratio')
@@ -274,8 +280,12 @@ async def get_stock_full(symbol: str):
             sm = dt_map.get(sym)
             sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                        'appearances': (sm or {}).get('appearances', 0)} if sm else None
+            from services.trend import compute_trend_result
+            _px = float(stock_data.get('priceRaw') or stock_data.get('price') or 0)
+            tr = await asyncio.to_thread(compute_trend_result, sym, _px)
             result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
-                                         fundamental_data=fd, smart_money_data=sm_data)
+                                         fundamental_data=fd, smart_money_data=sm_data,
+                                         trend_result=tr)
             # P2c/P2a: 估值分位 + 风控止损
             val = val_map.get(sym)
             _holder_ratio = (hd or {}).get('total_num_ratio')
@@ -440,6 +450,412 @@ async def get_daily_recommendations():
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐记录失败: {str(error)}")
 
+@router.get("/api/recommend-review", tags=["推荐记录"])
+async def get_recommend_review_api(days: int = 30):
+    """智能推荐复盘汇总（2026-10-12）：全量+近N天 T+1/T+3/T+5 胜率与盈亏、最好最差案例"""
+    try:
+        from services.recommend_review import get_review_summary
+        return {"success": True, "data": get_review_summary(days)}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
+
+async def _search_stocks_remote(q: str) -> List[Dict]:
+    """腾讯 smartbox 远程股票搜索（本地库未命中时的回退，2026-10-12）
+
+    接口：https://smartbox.gtimg.cn/s3/?v=2&q={关键词}&t=all
+    返回：v_hint="sz~000949~新乡化纤~xxhx~GP-A;sh~600000~..."（市场~代码~名称~拼音~类型）
+    只保留 A 股（GP-A）；中文为 \\uXXXX 转义需解码。
+    """
+    try:
+        from urllib.parse import quote
+        import codecs
+        # smartbox 不认带交易所前缀的代码（sh600000→无结果），代码查询剥掉前缀再传
+        prefix = q.lower()[:2] if q.lower()[:2] in ('sh', 'sz', 'bj') else ''
+        remote_q = re.sub(r'^(sh|sz|bj)', '', q.lower()) if re.fullmatch(r'(sh|sz|bj)?\d{1,6}', q.lower()) else q
+        url = f'https://smartbox.gtimg.cn/s3/?v=2&q={quote(remote_q)}&t=all'
+        resp = await asyncio.to_thread(_sync_get, url, None, (5, 8))
+        text = resp.text.strip()
+        m = re.search(r'v_hint="([^"]*)"', text)
+        if not m or not m.group(1):
+            return []
+        raw = codecs.decode(m.group(1), 'unicode_escape')
+        out = []
+        seen = set()
+        for item in raw.split(';'):
+            parts = item.split('~')
+            if len(parts) < 3:
+                continue
+            mkt, code, name = parts[0].strip().lower(), parts[1].strip(), parts[2].strip()
+            typ = parts[4].strip() if len(parts) > 4 else ''
+            if not re.fullmatch(r'\d{6}', code) or not name:
+                continue
+            if typ and typ != 'GP-A':
+                continue  # 只要 A 股
+            if mkt not in ('sh', 'sz', 'bj'):
+                continue
+            sym = mkt + code
+            if sym in seen:
+                continue
+            seen.add(sym)
+            out.append({'symbol': sym, 'name': name})
+        # 查询显式带了交易所前缀时，该市场的结果排前（sz000001 优先平安银行）
+        if prefix:
+            out.sort(key=lambda x: 0 if x['symbol'].startswith(prefix) else 1)
+        return out[:10]
+    except Exception as e:
+        print(f'[股票搜索] 远程回退失败: {e}')
+        return []
+
+@router.get("/api/stock-search", tags=["股票行情"])
+async def search_stocks_api(q: str = ''):
+    """股票模糊搜索（2026-10-12）：输入代码或名称（支持部分匹配），返回候选列表
+
+    解决"记不住编码、要手查名称"的痛点：输入"美诺"即可匹配到"美诺华"。
+    数据源：stock_basic_info（742只）+ stock_alias_map + 自选热股按钮 + 扫描池；
+    代码支持纯6位（603538→sh603538）；结果按 精确代码>名称精确>名称前缀>名称包含 排序，
+    批量附带实时价（选中即见现价），最多返回10条。
+    """
+    q = (q or '').strip()
+    if not q:
+        return {"success": True, "data": []}
+    try:
+        basic = load_stock_basic_info()        # {symbol: name}
+        alias = load_stock_alias_map()         # {name: symbol}
+        extra = {}                             # symbol -> name（热股/扫描池补充）
+        for b in load_hot_stock_buttons():
+            if b.get('code'):
+                extra[b['code'].lower()] = b.get('name') or ''
+        for s in load_user_scan_pool():
+            extra.setdefault(s.lower(), basic.get(s.lower(), ''))
+        for name, sym in alias.items():
+            extra.setdefault(sym.lower(), name)
+
+        q_lower = q.lower()
+        is_code_query = bool(re.fullmatch(r'(sh|sz|bj)?\d{1,6}', q_lower))
+        code_q = re.sub(r'^(sh|sz|bj)', '', q_lower) if is_code_query else ''
+
+        hits = {}  # symbol -> {'symbol','name','industry','source','rank'}
+        def _add(sym, name, rank):
+            sym = sym.lower()
+            # 显示名统一用权威名（basic_info），别名只参与匹配不参与显示
+            # （2026-10-12 修复：alias_map 里手工别名"生益"精确匹配盖过权威名"生益科技"）
+            display = basic.get(sym) or name
+            if sym not in hits or hits[sym]['rank'] > rank:
+                hits[sym] = {'symbol': sym, 'name': display, 'rank': rank}
+        if is_code_query:
+            # 代码查询：精确 > 前缀
+            for sym in basic:
+                pure = re.sub(r'^(sh|sz|bj)', '', sym)
+                if pure == code_q:
+                    _add(sym, basic[sym], 0)
+                elif pure.startswith(code_q):
+                    _add(sym, basic[sym], 3)
+            for sym in extra:
+                pure = re.sub(r'^(sh|sz|bj)', '', sym)
+                if pure == code_q:
+                    _add(sym, extra[sym], 1)
+                elif pure.startswith(code_q):
+                    _add(sym, extra[sym], 4)
+        else:
+            # 名称查询：精确 > 前缀 > 包含
+            for sym, name in basic.items():
+                if not name:
+                    continue
+                if name == q:
+                    _add(sym, name, 0)
+                elif name.startswith(q):
+                    _add(sym, name, 1)
+                elif q in name:
+                    _add(sym, name, 2)
+            for name, sym in alias.items():
+                if name == q:
+                    _add(sym, name, 0)
+                elif q in name:
+                    _add(sym, name, 2)
+
+        results = sorted(hits.values(), key=lambda x: (x['rank'], x['symbol']))[:10]
+        # 查询显式带交易所前缀时，该市场排前（本地路径同样适用：sz000001 优先平安银行）
+        _q_prefix = q.lower()[:2] if q.lower()[:2] in ('sh', 'sz', 'bj') else ''
+        if _q_prefix:
+            results.sort(key=lambda x: 0 if x['symbol'].startswith(_q_prefix) else 1)
+
+        # 本地库覆盖不到时（stock_basic_info 仅742只历史积累），回退腾讯 smartbox 远程搜索，
+        # 并把新股票增量回写本地库（越用越全）——解决"新乡化纤/000949 本地查不到"（2026-10-12 用户反馈）
+        if not results:
+            results = await _search_stocks_remote(q)
+            if results:
+                try:
+                    from db.database import add_stock_basic_info
+                    for r in results:
+                        add_stock_basic_info(r['symbol'], r['name'])
+                except Exception:
+                    pass
+        if not results:
+            return {"success": True, "data": []}
+
+        # 批量附带实时价 + 权威名称（行情接口的名字最权威，覆盖别名/简称）
+        price_map = {}
+        name_map = {}
+        try:
+            raw = await fetch_with_retry(','.join(r['symbol'] for r in results))
+            for p in parse_tencent_batch_data(raw):
+                price_map[p['symbol'].lower()] = p.get('priceRaw') or p.get('price')
+                if p.get('name'):
+                    name_map[p['symbol'].lower()] = p['name']
+        except Exception:
+            pass
+        for r in results:
+            r['price'] = price_map.get(r['symbol'])
+            # 行情名优先（修复"生益"简称显示问题）；远程回写本地库也借此纠正旧名
+            auth_name = name_map.get(r['symbol'])
+            if auth_name and auth_name != r['name']:
+                try:
+                    from db.database import add_stock_basic_info
+                    add_stock_basic_info(r['symbol'], auth_name)
+                except Exception:
+                    pass
+                r['name'] = auth_name
+            r.pop('rank', None)
+        return {"success": True, "data": results}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"股票搜索失败: {str(error)}")
+
+# ========== 多用户账号认证（2026-10-12） ==========
+# 只对私有数据（持仓）强制登录；行情/推荐/收评等公共接口保持免登录，
+# 以免影响收评定时任务、推荐快照与截图脚本等既有自动化。
+@router.post("/api/auth/register", tags=["用户认证"])
+async def api_register(payload: Dict):
+    """注册账号（首个注册者 id=1，天然认领迁移过来的存量持仓）"""
+    try:
+        from app.config import AUTH_ALLOW_REGISTER
+        if not AUTH_ALLOW_REGISTER:
+            raise HTTPException(status_code=403, detail="系统未开放注册，请联系管理员开号")
+        ok, message, user = create_user(
+            payload.get('username', ''), payload.get('password', ''),
+            payload.get('displayName', '') or payload.get('display_name', ''))
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+        # 注册成功直接签发会话，省去再登录一次
+        user2, token, err = authenticate(payload.get('username', ''), payload.get('password', ''))
+        if err:
+            return {"success": True, "data": {"user": user, "token": None},
+                    "message": f"{message}，请手动登录"}
+        return {"success": True, "data": {"user": user2, "token": token}, "message": message}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"注册失败: {str(error)}")
+
+
+@router.post("/api/auth/login", tags=["用户认证"])
+async def api_login(payload: Dict):
+    """账号密码登录，返回 token（默认有效期 30 天）"""
+    try:
+        user, token, err = authenticate(payload.get('username', ''), payload.get('password', ''))
+        if err:
+            raise HTTPException(status_code=401, detail=err)
+        return {"success": True, "data": {"user": user, "token": token}, "message": "登录成功"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"登录失败: {str(error)}")
+
+
+@router.post("/api/auth/logout", tags=["用户认证"])
+async def api_logout(request: Request):
+    """注销当前会话"""
+    try:
+        token = request.headers.get('X-Auth-Token', '')
+        auth_header = request.headers.get('Authorization', '')
+        if not token and auth_header.lower().startswith('bearer '):
+            token = auth_header[7:]
+        auth_logout(token)
+        return {"success": True, "message": "已退出登录"}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"退出失败: {str(error)}")
+
+
+@router.get("/api/auth/me", tags=["用户认证"])
+async def api_me(request: Request):
+    """当前登录用户；未登录返回 success=false（前端据此显示登录页，不抛 401）"""
+    try:
+        token = request.headers.get('X-Auth-Token', '')
+        auth_header = request.headers.get('Authorization', '')
+        if not token and auth_header.lower().startswith('bearer '):
+            token = auth_header[7:]
+        user = get_user_by_token(token)
+        if not user:
+            return {"success": False, "data": None, "message": "未登录"}
+        return {"success": True, "data": {"user": user}, "message": "ok"}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"校验失败: {str(error)}")
+
+
+@router.get("/api/auth/users", tags=["用户认证"])
+async def api_users():
+    """用户列表（供前端切换账号用，不含任何密码信息）"""
+    try:
+        return {"success": True, "data": list_users()}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取用户列表失败: {str(error)}")
+
+
+@router.get("/api/auth/status", tags=["用户认证"])
+async def api_auth_status():
+    """认证功能是否开启 / 是否已有账号 / 是否开放注册（登录页初始化用）"""
+    from app.config import AUTH_ENABLED, AUTH_ALLOW_REGISTER
+    return {"success": True, "data": {
+        "enabled": AUTH_ENABLED,
+        "hasUser": has_any_user(),
+        "allowRegister": AUTH_ALLOW_REGISTER,
+    }}
+
+
+@router.post("/api/auth/change-password", tags=["用户认证"])
+async def api_change_password(payload: Dict, user: Dict = Depends(current_user)):
+    """修改当前用户密码（原密码校验，成功后吊销全部会话需重新登录）"""
+    try:
+        ok, message = change_password(user['id'], payload.get('oldPassword', ''),
+                                      payload.get('newPassword', ''))
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+        return {"success": True, "message": message}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"修改密码失败: {str(error)}")
+
+
+@router.get("/api/positions", tags=["持仓管理"])
+async def get_positions_api(user: Dict = Depends(current_user)):
+    """持仓诊断：实时盈亏 + 单票动作（止损/止盈/减仓/持有）+ 组合仓位建议（按登录用户隔离）"""
+    try:
+        from services.position import get_portfolio_diagnosis
+        return {"success": True, "data": await get_portfolio_diagnosis(user_id=user['id'])}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取持仓诊断失败: {str(error)}")
+
+@router.post("/api/positions", tags=["持仓管理"])
+async def save_position_api(pos: Dict, user: Dict = Depends(current_user)):
+    """新增/更新持仓（symbol 唯一，重复提交同一 symbol 为更新）
+
+    2026-10-12 加固：代码格式校验 + 代码/名称互相补全。
+    - 接受 sh600000 / sz000001 / 纯6位（自动补 sh/sz 前缀）
+    - 代码非法但有名称 → 按名称反查代码（用户记不住编码）
+    - 缺名称 → 按代码自动补全名称
+    """
+    try:
+        symbol = (pos.get('symbol') or '').strip().lower()
+        name = (pos.get('name') or '').strip()
+        cost = float(pos.get('cost_price', 0) or 0)
+        shares = int(pos.get('shares', 0) or 0)
+        if cost <= 0 or shares <= 0:
+            raise HTTPException(status_code=400, detail="成本价与股数必须大于0")
+
+        # 纯6位代码自动补交易所前缀（6→沪，0/3→深，4/8→北）
+        if re.fullmatch(r'\d{6}', symbol):
+            if symbol[0] == '6':
+                symbol = 'sh' + symbol
+            elif symbol[0] in '03':
+                symbol = 'sz' + symbol
+            else:
+                symbol = 'bj' + symbol
+
+        if not re.fullmatch(r'(sh|sz|bj)\d{6}', symbol):
+            # 代码非法：尝试反查代码（优先用名称字段；没传名称时把输入本身当名称兜底——
+            # 覆盖"用户输了名称但没从下拉框选"的场景）
+            resolved = ''
+            lookup_name = name or symbol
+            if lookup_name:
+                basic = load_stock_basic_info()
+                alias = load_stock_alias_map()
+                for sym, nm in basic.items():
+                    if nm == lookup_name:
+                        resolved = sym
+                        break
+                if not resolved and lookup_name in alias:
+                    resolved = alias[lookup_name].lower()
+            if resolved:
+                symbol = resolved
+            else:
+                detail = (f'股票代码"{pos.get("symbol")}"格式不正确（应为 sh600000 / sz000001，或直接输6位代码）'
+                          if not lookup_name else
+                          f'代码/名称"{lookup_name}"未匹配到股票，请从下拉列表选择或检查输入')
+                raise HTTPException(status_code=400, detail=detail)
+
+        # 缺名称时按代码补全；basic_info 有权威名时覆盖传入名（防别名/简称/手输错误名入库）
+        authoritative = load_stock_basic_info().get(symbol, '')
+        if authoritative:
+            name = authoritative
+        elif not name:
+            try:
+                name = await get_stock_name(symbol) or symbol
+            except Exception:
+                name = symbol
+
+        pos['symbol'] = symbol
+        pos['name'] = name
+        from db.database import save_user_position
+        if not save_user_position(pos, user_id=user['id']):
+            raise HTTPException(status_code=500, detail="保存失败")
+        return {"success": True, "message": "持仓已保存", "data": {"symbol": symbol, "name": name}}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"保存持仓失败: {str(error)}")
+
+@router.delete("/api/positions/{symbol}", tags=["持仓管理"])
+async def delete_position_api(symbol: str, user: Dict = Depends(current_user)):
+    """删除持仓（只能删自己的）"""
+    try:
+        from db.database import delete_user_position
+        if not delete_user_position(symbol, user_id=user['id']):
+            raise HTTPException(status_code=404, detail="未找到该持仓")
+        return {"success": True, "message": "持仓已删除"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"删除持仓失败: {str(error)}")
+
+# ========== 模拟交易（纯模拟盘·不下真单） ==========
+@router.get("/api/sim/state", tags=["模拟交易"])
+async def sim_state_api(user: Dict = Depends(current_user)):
+    """获取模拟账户 + 持仓 + 待执行建议 + 审计日志"""
+    try:
+        from services.trade_sim import get_sim_state
+        return await get_sim_state(user['id'])
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"获取模拟账户失败: {str(error)}")
+
+@router.post("/api/sim/generate", tags=["模拟交易"])
+async def sim_generate_api(payload: Dict, user: Dict = Depends(current_user)):
+    """从信号源生成建议订单。body: {sources:[...], symbols:[...]}"""
+    try:
+        from services.trade_sim import generate_proposals
+        sources = payload.get('sources') or ['tomorrow_plan', 'diagnosis', 'screener']
+        symbols = payload.get('symbols') or None
+        return await generate_proposals(user['id'], sources, symbols)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"生成建议失败: {str(error)}")
+
+@router.post("/api/sim/execute", tags=["模拟交易"])
+async def sim_execute_api(user: Dict = Depends(current_user)):
+    """执行模拟成交（按实时价撮合 pending 建议，仅在模拟账户记账）"""
+    try:
+        from services.trade_sim import execute_sim
+        return await execute_sim(user['id'])
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"模拟成交失败: {str(error)}")
+
+@router.post("/api/sim/reset", tags=["模拟交易"])
+async def sim_reset_api(user: Dict = Depends(current_user)):
+    """重置模拟账户（清空持仓/订单/现金回到初始）"""
+    try:
+        from services.trade_sim import reset_sim
+        return reset_sim(user['id'])
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"重置失败: {str(error)}")
+
 @router.post("/api/daily_recommendations", tags=["推荐记录"])
 async def post_daily_recommendations(record: Dict):
     try:
@@ -482,7 +898,10 @@ async def delete_recommendation(date: str):
         if len(daily_recommendations) == original_length:
             raise HTTPException(status_code=404, detail="未找到该日期的推荐记录")
         
+        # 2026-10-12 修复：save_daily_recommendations 只替换列表内日期的行，
+        # 被过滤掉的日期必须显式 DELETE，否则旧行残留（端点曾返回"删除成功"但记录仍在）。
         save_daily_recommendations(daily_recommendations)
+        delete_daily_recommendations_by_date(date)
         
         return {"success": True, "message": "推荐记录删除成功"}
     except HTTPException:
@@ -1083,6 +1502,16 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         )
 
         # 评分（传入 market_change + fund_flow_data + holder_data + rps + 基本面 + 聪明钱）
+        # 趋势分复用今日趋势扫描缓存（isUp 票）；全市场逐票现算 is_up_trend 成本过高，
+        # 反弹股抑制已在单票评分/持仓/推荐/趋势扫描路径覆盖，此处作为明确边界。
+        try:
+            from services.trend import load_trend_scan_results
+            _scan_trend = load_trend_scan_results().get('stocks', [])
+            scan_trend_map = {s['symbol'].lower(): {'score': s.get('score'), 'details': s.get('details', {})}
+                              for s in _scan_trend if s.get('symbol') is not None}
+        except Exception as _e:
+            print(f'[批量扫描] 趋势分缓存加载失败(按无趋势评分): {_e}')
+            scan_trend_map = {}
         for stock in all_results:
             sym = stock.get('symbol', '').lower()
             ff = fund_flow_map.get(sym)
@@ -1096,7 +1525,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             stock['score'] = calc_stock_score_v2(stock, market_change=market_change,
                                                   fund_flow_data=ff, holder_data=hd,
                                                   rps_data={'rps': rps},
-                                                  fundamental_data=fd, smart_money_data=sm_data)
+                                                  fundamental_data=fd, smart_money_data=sm_data,
+                                                  trend_result=scan_trend_map.get(sym))
             # P2a/P2c: 风控止损 + 估值分位（纯函数，无额外 IO）
             _holder_ratio = (hd or {}).get('total_num_ratio')
             stock['valuation'] = val

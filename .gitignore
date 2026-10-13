@@ -16,3 +16,8 @@ server/ai_config.json
 Thumbs.db
 .workbuddy/
 
+# 数据库备份与本地截图验证产物，不入库
+*.db.bak_*
+screenshot_*.png
+screenshots/
+

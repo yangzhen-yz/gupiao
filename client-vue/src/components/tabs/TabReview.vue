@@ -338,17 +338,62 @@
             <div class="section-title-small">🎯 明日重点关注</div>
             <span class="section-sub">{{ review.tomorrowFocus.length }} 只</span>
           </div>
+          <div class="section-note-small">
+            明日(T+1)按各自的「买入条件 + 价格区间」参与，不今日追高。
+            每只票给出：什么条件买 · 什么价格买 · 止盈止损 · 什么情况不买（⛔）
+          </div>
           <div class="focus-grid">
-            <div v-for="(s, i) in review.tomorrowFocus.slice(0, 6)" :key="s.code" class="focus-card" @click="openStockKline(s)">
-              <div class="focus-rank">{{ i + 1 }}</div>
-              <div class="focus-body">
-                <div class="focus-name">{{ s.name }}</div>
-                <div class="focus-code">{{ s.code }}</div>
-                <div class="focus-reason" v-if="s.reason">{{ s.reason }}</div>
+            <div v-for="(s, i) in review.tomorrowFocus" :key="s.code" class="focus-card" @click="openStockKline(s)">
+              <div class="focus-head">
+                <div class="focus-rank">{{ i + 1 }}</div>
+                <div class="focus-body">
+                  <div class="focus-name">{{ s.name }}</div>
+                  <div class="focus-code">{{ s.code }}</div>
+                </div>
+                <div class="focus-score" v-if="s.score > 0">
+                  <div class="focus-score-val">{{ s.score }}</div>
+                  <div class="focus-score-lbl">策略分</div>
+                </div>
               </div>
-              <div class="focus-score" v-if="s.score > 0">
-                <div class="focus-score-val">{{ s.score }}</div>
-                <div class="focus-score-lbl">策略分</div>
+              <div class="focus-reason" v-if="s.reason">{{ s.reason }}</div>
+              <div v-if="s.buyTiming" class="focus-timing">
+                <span class="timing-badge" :class="'timing-' + s.buyTiming.type">
+                  {{ timingIcon(s.buyTiming.type) }} {{ s.buyTiming.label }}
+                </span>
+                <span class="focus-timing-note">{{ s.buyTiming.note }}</span>
+              </div>
+
+              <!-- 明日买入计划（2026-10-12）：条件 / 价格 / 止盈止损 / 否决条件 -->
+              <div v-if="s.tomorrowPlan" class="focus-plan" @click.stop>
+                <div class="plan-cond">
+                  <span class="plan-cond-ico">📋</span>{{ s.tomorrowPlan.condition }}
+                </div>
+                <div class="plan-grid">
+                  <div class="plan-item">
+                    <span class="plan-lbl">买入价</span>
+                    <span class="plan-val plan-buy">{{ s.tomorrowPlan.buyLow }}~{{ s.tomorrowPlan.buyHigh }}</span>
+                  </div>
+                  <div class="plan-item">
+                    <span class="plan-lbl">止盈</span>
+                    <span class="plan-val plan-tp">
+                      {{ s.tomorrowPlan.takeProfit }}<small>+{{ s.tomorrowPlan.takeProfitPct }}%</small>
+                    </span>
+                  </div>
+                  <div class="plan-item">
+                    <span class="plan-lbl">止损</span>
+                    <span class="plan-val plan-sl">
+                      {{ s.tomorrowPlan.stopLoss }}<small>-{{ s.tomorrowPlan.stopLossPct }}%</small>
+                    </span>
+                  </div>
+                  <div class="plan-item">
+                    <span class="plan-lbl">盈亏比 / 仓位</span>
+                    <span class="plan-val">{{ s.tomorrowPlan.rr }} : 1 <small>{{ s.tomorrowPlan.position }}</small></span>
+                  </div>
+                </div>
+                <div class="plan-veto" v-if="s.tomorrowPlan.veto && s.tomorrowPlan.veto.length">
+                  <span class="plan-veto-lbl">⛔ 不买</span>
+                  <span class="plan-veto-txt">{{ s.tomorrowPlan.veto.join(' ； ') }}</span>
+                </div>
               </div>
             </div>
           </div>
@@ -607,6 +652,12 @@ function openStockKline(s) {
   emit('open-kline', code)
 }
 
+// 买入时机图标（2026-10-12，与 TabRecommend 对齐）
+function timingIcon(type) {
+  const icons = { auction: '🔔', early: '⚡', tail: '🌙', pullback: '📉', intraday: '⏱️' }
+  return icons[type] || '⏱️'
+}
+
 // ===== 交互：板块 → 弹 Modal =====
 async function openSectorModal(s) {
   if (!s || !s.code) return
@@ -842,9 +893,10 @@ onMounted(() => {
 .empty-tip { padding: 12px; text-align: center; color: var(--text-secondary); font-size: 0.8rem; }
 
 /* 明日关注 */
-.focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
-.focus-card { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); cursor: pointer; transition: all 0.15s; }
+.focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 8px; }
+.focus-card { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 10px 12px; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); cursor: pointer; transition: all 0.15s; }
 .focus-card:hover { border-color: #6366f1; transform: translateY(-1px); }
+.focus-head { display: flex; align-items: center; gap: 10px; }
 .focus-rank { width: 22px; height: 22px; border-radius: 50%; background: linear-gradient(135deg, #6366f1, #a855f7); color: white; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 700; flex-shrink: 0; }
 .focus-body { flex: 1; min-width: 0; }
 .focus-name { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
@@ -853,6 +905,33 @@ onMounted(() => {
 .focus-score { text-align: center; padding-left: 8px; border-left: 1px solid var(--border-subtle); }
 .focus-score-val { font-size: 1rem; font-weight: 700; color: #6366f1; font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .focus-score-lbl { font-size: 0.65rem; color: var(--text-secondary); }
+
+/* 明日关注：买入时机徽章（2026-10-12，配色与 TabRecommend 对齐） */
+.section-note-small { font-size: 0.72rem; color: var(--text-secondary); margin: 4px 0 8px; line-height: 1.4; }
+.focus-timing { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; }
+.focus-timing-note { font-size: 0.7rem; color: var(--text-secondary); line-height: 1.4; }
+.timing-badge { display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border-radius: 10px; font-size: 0.72rem; font-weight: 600; border: 1px solid transparent; white-space: nowrap; }
+.timing-badge.timing-auction { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; }
+.timing-badge.timing-early { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
+.timing-badge.timing-tail { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
+.timing-badge.timing-pullback { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+.timing-badge.timing-intraday { background: #f8fafc; color: #475569; border-color: #e2e8f0; }
+
+/* 明日买入计划（2026-10-12）：收评看明天 —— 条件 / 价格 / 止盈止损 / 否决条件 */
+.focus-plan { margin-top: 4px; padding-top: 8px; border-top: 1px dashed var(--border-subtle); }
+.plan-cond { font-size: 0.73rem; color: var(--text-primary); line-height: 1.5; margin-bottom: 6px; }
+.plan-cond-ico { margin-right: 4px; }
+.plan-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.plan-item { display: flex; flex-direction: column; gap: 2px; padding: 5px 7px; background: var(--bg-secondary); border-radius: 5px; min-width: 0; }
+.plan-lbl { font-size: 0.6rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plan-val { font-size: 0.8rem; font-weight: 700; font-family: 'SF Mono', 'JetBrains Mono', monospace; color: var(--text-primary); }
+.plan-val small { font-size: 0.62rem; font-weight: 500; margin-left: 2px; }
+.plan-buy { color: var(--accent-success); }
+.plan-tp { color: var(--accent-danger); }
+.plan-sl { color: var(--accent-success); }
+.plan-veto { display: flex; gap: 5px; margin-top: 6px; padding: 5px 8px; background: rgba(220, 38, 38, 0.06); border-radius: 5px; }
+.plan-veto-lbl { font-size: 0.68rem; font-weight: 700; color: #dc2626; white-space: nowrap; }
+.plan-veto-txt { font-size: 0.68rem; color: var(--text-secondary); line-height: 1.5; }
 
 /* 收评摘要 */
 .summary-section { background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 12px 16px; }

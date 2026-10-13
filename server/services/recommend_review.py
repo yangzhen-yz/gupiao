@@ -1,0 +1,228 @@
+"""recommend_review.py - 智能推荐复盘闭环（2026-10-12 新增）
+
+背景：用户反馈"推荐的股票买入就吃面"。对 2026-05~10 共 132 条历史推荐的复盘
+（本地历史K线库计算）发现：
+  - 从"买入参考价"（低吸价）算 T+1 胜率 62.9%、均值 +1.52%
+  - 从"推荐时现价"算 T+1 胜率仅 45.5%、均值 -1.12%（用户实际体验）
+  - 隔日平均低开 -1.29%，"现价-3%"的低吸单成交率低
+  - 半山腰（推荐时涨幅 4.5%~9.8% 未涨停）T+1 胜率 44%、均值 -2.31%（死亡区）
+  - 三祥新材被连续推荐两次、各亏 26%+（无黑榜机制）
+
+本模块提供：
+  1. compute_recommendation_performance()  逐条计算 T+1/T+3/T+5 收益 + 5日最大回撤
+  2. run_recommendation_review()           每日复盘任务：聚合并持久化
+  3. get_recent_loser_symbols()            近N天推荐且亏损的黑名单符号（选股避让）
+  4. get_review_summary()                  复盘汇总（API/前端展示）
+
+数据源：本地历史日K线库（data/history_kline.db，baostock 前复权，无网络依赖），
+        T+N 按 rec_date 之后第 N 个交易日收盘价计算。
+"""
+import json
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set
+
+from app.config import KLINE_HISTORY_ENABLED, KLINE_HISTORY_DB_PATH
+from db.database import get_db_conn
+
+
+def _local_history_conn():
+    """本地历史K线库只读连接（独立库，避免与主库事务互相影响）"""
+    conn = sqlite3.connect(f'file:{KLINE_HISTORY_DB_PATH}?mode=ro', uri=True)
+    return conn
+
+
+def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
+    """对推荐记录列表计算 T+1/T+3/T+5 收益与5日最大回撤
+
+    Args:
+        recs: [{'date','symbol','name','price','chg','score','buy'}, ...]
+              buy 为数值买入价（'竞价关注'等非数值记录应提前过滤）
+
+    Returns:
+        与原记录等长的列表（无后续K线的记录被剔除），新增 r1/r3/r5/dd5/exec_r1 字段：
+        r1/r3/r5: 从买入参考价的 T+N 收益%
+        exec_r1:  从推荐时现价立即买入的 T+1 收益%（用户实际体验口径）
+        dd5:      5日内最低价相对买入价的最大回撤%
+    """
+    if not KLINE_HISTORY_ENABLED:
+        return []
+    out = []
+    try:
+        hconn = _local_history_conn()
+    except Exception:
+        return []
+    try:
+        hcur = hconn.cursor()
+        for rec in recs:
+            sym = (rec.get('symbol') or '').lower()
+            code = sym.replace('sh', '').replace('sz', '').replace('bj', '')
+            buy = rec.get('buy')
+            rec_price = rec.get('rec_price')
+            if not isinstance(buy, (int, float)) or buy <= 0:
+                continue
+            try:
+                hcur.execute(
+                    "SELECT date, open, close, low FROM stock_daily WHERE symbol=? AND date>? ORDER BY date LIMIT 5",
+                    (code, rec['date']))
+                bars = hcur.fetchall()
+            except Exception:
+                continue
+            if not bars:
+                continue
+            r = dict(rec)
+            r['r1'] = round((bars[0][2] / buy - 1) * 100, 2)
+            r['r3'] = round((bars[2][2] / buy - 1) * 100, 2) if len(bars) >= 3 else None
+            r['r5'] = round((bars[4][2] / buy - 1) * 100, 2) if len(bars) >= 5 else None
+            r['dd5'] = round((min(x[3] for x in bars) / buy - 1) * 100, 2)
+            if isinstance(rec_price, (int, float)) and rec_price > 0:
+                r['exec_r1'] = round((bars[0][2] / rec_price - 1) * 100, 2)
+            out.append(r)
+    finally:
+        hconn.close()
+    return out
+
+
+def _load_all_recommendations() -> List[Dict]:
+    """从主库加载全部推荐记录（含 price 作为推荐时现价）"""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""SELECT rec_date, symbol, name, price, change_percent, score, buy_price
+                       FROM daily_recommendations ORDER BY rec_date""")
+        recs = []
+        for row in cur.fetchall():
+            try:
+                buy = float(row[6])
+            except (TypeError, ValueError):
+                continue  # '竞价关注'等非数值买入价无法计算
+            if buy <= 0:
+                continue
+            try:
+                price = float(row[3])
+            except (TypeError, ValueError):
+                price = 0
+            recs.append({'date': row[0], 'symbol': (row[1] or '').lower(), 'name': row[2],
+                         'chg': row[4] or 0, 'score': row[5] or 0,
+                         'buy': buy, 'rec_price': price})
+        conn.close()
+        return recs
+    except Exception as e:
+        print(f'[推荐复盘] 加载推荐记录失败: {e}')
+        return []
+
+
+def _aggregate(perf: List[Dict]) -> Dict:
+    """聚合一组复盘结果为汇总指标"""
+    def _stats(key):
+        vals = [r[key] for r in perf if r.get(key) is not None]
+        if not vals:
+            return None
+        return {'n': len(vals),
+                'win_rate': round(sum(1 for v in vals if v > 0) / len(vals) * 100, 1),
+                'avg': round(sum(vals) / len(vals), 2),
+                'median': round(sorted(vals)[len(vals) // 2], 2)}
+    dds = [r['dd5'] for r in perf if r.get('dd5') is not None]
+    return {
+        't1': _stats('r1'), 't3': _stats('r3'), 't5': _stats('r5'),
+        'exec_t1': _stats('exec_r1'),
+        'dd5_avg': round(sum(dds) / len(dds), 2) if dds else None,
+        'noodle_count': sum(1 for r in perf if (r.get('r1') or 0) < -5),
+    }
+
+
+def run_recommendation_review() -> Dict:
+    """每日推荐复盘任务：全量计算 + 按日聚合 + 持久化到 recommendation_review 表
+
+    由 scheduler 每日 16:10 调用（本地K线库 16:00 同步后，保证当天数据就绪）。
+    """
+    recs = _load_all_recommendations()
+    if not recs:
+        print('[推荐复盘] 无推荐记录，跳过')
+        return {}
+    perf = compute_recommendation_performance(recs)
+    if not perf:
+        print('[推荐复盘] 本地K线库无可用数据，跳过')
+        return {}
+
+    # 按日期聚合
+    by_date: Dict[str, List[Dict]] = {}
+    for r in perf:
+        by_date.setdefault(r['date'], []).append(r)
+
+    summary = _aggregate(perf)
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS recommendation_review (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_date TEXT NOT NULL UNIQUE,
+            total_count INTEGER DEFAULT 0,
+            summary_json TEXT,
+            by_date_json TEXT,
+            created_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
+        # 同一天重复跑则覆盖
+        cur.execute('DELETE FROM recommendation_review WHERE review_date = ?',
+                    (datetime.now().strftime('%Y-%m-%d'),))
+        cur.execute('''INSERT INTO recommendation_review
+                       (review_date, total_count, summary_json, by_date_json)
+                       VALUES (?, ?, ?, ?)''',
+                    (datetime.now().strftime('%Y-%m-%d'), len(perf),
+                     json.dumps(summary, ensure_ascii=False),
+                     json.dumps({d: _aggregate(v) for d, v in sorted(by_date.items())},
+                                ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'[推荐复盘] 持久化失败: {e}')
+        return summary
+
+    t1 = summary.get('t1') or {}
+    ex = summary.get('exec_t1') or {}
+    print(f"[推荐复盘] 全量{len(perf)}条: T+1胜率{t1.get('win_rate')}% 均值{t1.get('avg')}%"
+          f" | 现价追入T+1胜率{ex.get('win_rate')}% 均值{ex.get('avg')}%"
+          f" | 吃面(>5%){summary.get('noodle_count')}只")
+    return summary
+
+
+def get_recent_loser_symbols(days: int = 30, loss_threshold: float = 3.0) -> Set[str]:
+    """近N天被推荐过且 T+1 亏损超过阈值的股票代码集合（选股避让黑名单）
+
+    背景：三祥新材 2026-06-10 / 06-29 连续两次被推荐、各亏 26%+——
+    同一只票短期内推荐失败后不应再次出现。
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    recs = [r for r in _load_all_recommendations() if r['date'] >= cutoff]
+    if not recs:
+        return set()
+    perf = compute_recommendation_performance(recs)
+    losers = set()
+    for r in perf:
+        if (r.get('r1') or 0) < -loss_threshold:
+            losers.add(r['symbol'])
+    if losers:
+        print(f'[推荐复盘] 近{days}天亏损黑名单({len(losers)}只): {sorted(losers)}')
+    return losers
+
+
+def get_review_summary(days: int = 30) -> Dict:
+    """复盘汇总（API 用）：全量 + 近N天 + 按日明细"""
+    recs = _load_all_recommendations()
+    perf = compute_recommendation_performance(recs)
+    if not perf:
+        return {'available': False}
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    recent = [r for r in perf if r['date'] >= cutoff]
+    by_date: Dict[str, List[Dict]] = {}
+    for r in recent:
+        by_date.setdefault(r['date'], []).append(r)
+    return {
+        'available': True,
+        'total': _aggregate(perf),
+        'recent': _aggregate(recent),
+        'recent_days': days,
+        'by_date': {d: _aggregate(v) for d, v in sorted(by_date.items(), reverse=True)},
+        'worst': sorted(recent, key=lambda x: x.get('r1') or 0)[:5],
+        'best': sorted(recent, key=lambda x: -(x.get('r1') or 0))[:5],
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }

@@ -2,7 +2,7 @@
 import asyncio
 from typing import List, Dict, Optional
 from datetime import date, timedelta
-from app.config import (STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD)
+from app.config import (STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_TREND_STALE_DRIFT, RECOMMEND_TREND_STALE_FACTOR, TREND_GATE_ENABLED, TREND_GATE_LOW_SCORE, TREND_GATE_MIN_CHANGE, DEAD_CAT_BOUNCE_PENALTY)
 from db.database import (get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions)
 from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data, get_kline_data
 from services.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
@@ -201,6 +201,21 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
 
     # 趋势评分（若提供，后续与日内因子混合）
     trend_score = trend_result.get('score', 0) if trend_result else None
+    # 趋势分新鲜度校验（2026-10-12）：趋势分来自"扫描时刻"的快照（checkPrice），
+    # 若当前价已较扫描时明显下跌，说明趋势信号失真（典型案例：万向德农 9:35 触涨停时
+    # 被扫描捕捉到 97.6 分，10:00 已炸板下跌，趋势分不再代表当下），按系数打折，
+    # 防止"最强瞬间的快照分"给已走弱的股票背书。
+    trend_stale = False
+    if trend_score and trend_result:
+        try:
+            details = trend_result.get('details') or {}
+            scan_price = float(details.get('checkPrice') or details.get('latestClose') or 0)
+            cur_price = float(data.get('priceRaw') or data.get('price') or 0)
+            if scan_price > 0 and cur_price > 0 and cur_price < scan_price * (1 - RECOMMEND_TREND_STALE_DRIFT):
+                trend_score = round(trend_score * RECOMMEND_TREND_STALE_FACTOR, 1)
+                trend_stale = True
+        except (TypeError, ValueError):
+            pass
 
     outer_ratio = data.get('outerRatio', 50)
     volume_ratio = data.get('volumeRatio', 0)
@@ -506,7 +521,14 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     # 另修复：趋势分=0（被强制排除的股票）不应直接 50% 融合拖累日内分，
     #         改为仅取日内分的 70%（轻度折价但不过度惩罚）
     intraday_score = total
+    # 死猫反弹门控（2026-10-13）：趋势处于下行区(<TREND_GATE_LOW_SCORE)且当日大涨(≥3%)，
+    # 属"下跌中继反弹"，日内动量分(change_percent/outer_ratio等)不可信，融合前打折，
+    # 避免反弹股凭单日暴涨在纯日内口径下反超趋势良好股。
+    dead_cat_bounce = False
     if trend_score is not None:
+        if TREND_GATE_ENABLED and 0 < trend_score < TREND_GATE_LOW_SCORE and change_percent >= TREND_GATE_MIN_CHANGE:
+            dead_cat_bounce = True
+            intraday_score = round(intraday_score * (1 - DEAD_CAT_BOUNCE_PENALTY))
         if trend_score == 0:
             # 趋势评分=0 意味着股票被强制排除（ST/利空/RSI超买等），
             # 轻度折价而非直接拉到 0
@@ -540,7 +562,9 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
         'predict_direction': predict_direction,
         'base_scores': base_scores,
         'intraday_score': intraday_score,  # V4.1: 日内原始分
-        'trend_score': trend_score,         # V4.1: 趋势分
+        'trend_score': trend_score,         # V4.1: 趋势分（2026-10-12 起为新鲜度校验后的值）
+        'trend_stale': trend_stale,         # 2026-10-12: 趋势分是否因现价低于扫描价被打折
+        'dead_cat_bounce': dead_cat_bounce, # 2026-10-13: 是否触发死猫反弹门控（下跌趋势单日大涨被抑制）
         'factor_values': {
             'outer_ratio': outer_ratio,
             'volume_ratio': volume_ratio,

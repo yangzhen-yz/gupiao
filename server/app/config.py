@@ -644,10 +644,56 @@ HOT_STOCK_POOL = [
 # ========== 定时任务配置 ==========
 SCHEDULE_UPDATE_HOT_SEARCH_TIMES = ['10:00', '14:00']  # 更新热门搜索时间
 SCHEDULE_MA10_CHECK_TIME = '15:05'  # 检查10日均线时间
-POOL_CONSECUTIVE_DOWN_THRESHOLD = 3  # 连跌N天自动移出股票池（0=不启用）
+POOL_CONSECUTIVE_DOWN_THRESHOLD = 2  # 连跌N天自动移出股票池（0=不启用）——用户要求：连跌2天及以上当天删掉
 SCHEDULE_DAILY_REVIEW_TIME = '15:10'  # 每日审核时间
 SCHEDULE_BACKTEST_TIME = '15:20'  # 回测时间
 SCHEDULE_RECOMMENDATION_TIMES = ['09:45', '13:30']  # 智能推荐生成时间（上午开盘后、下午开盘后）
+RECOMMEND_REVIEW_TIME = '16:10'  # 智能推荐复盘任务时间（本地K线库16:00同步后）
+SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME = '14:45'  # 收盘前推荐快照：用最新数据最终生成一次并自动保存（保证"最后一次推荐"落库可复盘）
+
+# ========== 智能推荐：日内轨迹风控过滤（2026-10-12，防"涨停炸板/冲高回落"陷阱） ==========
+# 背景：2026-10-12 万向德农(sh600371)高开+4.2%→触涨停16.47→炸板崩至-6.81%，
+# 而 10:00 的推荐仍以"趋势分97.6+委比88.57%买盘强势"给出71分入选，
+# 根因是趋势分取自盘中扫描快照（捕捉到最强瞬间）+ 无日内轨迹过滤。
+RECOMMEND_INTRADAY_FILTER_ENABLED = True   # 总开关
+RECOMMEND_LIMIT_UP_PCT = 9.8               # 日内高点涨幅≥此值视为"曾触涨停"
+RECOMMEND_BOARD_BREAK_DRAWDOWN = 4.0       # 曾触涨停且自日内高点回落≥此值(%)→炸板，不推荐
+RECOMMEND_MAX_DRAWDOWN_FROM_HIGH = 8.0     # 自日内高点回落≥此值(%)→冲高回落，不推荐（不限是否涨停）
+# 趋势分新鲜度：现价较趋势扫描时价格(checkPrice)下跌超过此比例→趋势分失真，按系数打折
+RECOMMEND_TREND_STALE_DRIFT = 0.03         # 3%
+RECOMMEND_TREND_STALE_FACTOR = 0.4         # 打折系数（97.6分→39分，无法再靠趋势分越过60分推荐线）
+
+# ========== 死猫反弹趋势门控（2026-10-13，修"下跌趋势短暂反弹股评分高于趋势良好股"） ==========
+# 根因：① calc_stock_score_v2 多数调用点(单票评分/持仓/趋势扫描/扫描)未传 trend_result，
+#       趋势因子完全缺席，退化为纯日内分；② 日内动量因子只看当日，下跌趋势股单日大涨
+#       (死猫反弹)被全部点亮，纯日内分反超温和上行的趋势股约30分。
+# 门控：当 trend_result 存在且趋势分处于下行区(<TREND_GATE_LOW_SCORE)且当日涨幅≥
+#       TREND_GATE_MIN_CHANGE，判为"下跌中继反弹"，在融合前对日内分打折，抑制虚高。
+TREND_GATE_ENABLED = True
+TREND_GATE_LOW_SCORE = 45        # 趋势分低于此值视为下行/弱势区（0=被排除/数据不足，走0.7分支不触发门控）
+TREND_GATE_MIN_CHANGE = 3.0      # 当日涨幅≥此值(%)才可能是"反弹"；未大涨不触发，避免误伤横盘弱势股
+DEAD_CAT_BOUNCE_PENALTY = 0.30   # 日内分打折比例：×0.70（反弹股日内分80→56，再融合低趋势分后总分显著下移）
+
+# ========== 智能推荐：半山腰追高惩罚 + 亏损黑名单（2026-10-12，基于132条历史推荐复盘） ==========
+# 复盘数据：推荐时涨幅 4.5%~9.8%（未涨停）T+1胜率仅44%、均值-2.31%（死亡区），
+# 而 2~4.5% 为 72%/+3.80%、涨停为 73%/+3.81%——半山腰追高是"吃面"主因之一。
+RECOMMEND_CHASE_MIN_CHANGE = 4.5      # 死亡区下限（%）
+RECOMMEND_CHASE_MAX_CHANGE = 9.8      # 死亡区上限（%），≥9.8 算涨停不罚
+RECOMMEND_CHASE_PENALTY = 4           # 死亡区罚分
+# 亏损黑名单：近N天被推荐且T+1亏损超过阈值的股票不再推荐（三祥新材连续两亏26%+案例）
+RECOMMEND_LOSER_LOOKBACK_DAYS = 30
+RECOMMEND_LOSER_LOSS_THRESHOLD = 3.0  # T+1亏损超过此值(%)进黑名单
+# 执行诚实化提示（展示在推荐卡片）
+RECOMMEND_EXEC_HINT_ENABLED = True
+RECOMMEND_EXEC_HINT = '复盘132次：现价追入T+1胜率仅45%（均值-1.1%），低吸参考价成交胜率63%（均值+1.5%）——建议低吸或尾盘介入，不追盘中高价'
+
+# ========== 智能推荐：买入时机判定（2026-10-12，区分早盘/尾盘买入） ==========
+# 回答"这只票今天该什么时候买"：涨停→次日竞价；强势情绪股→早盘；
+# 高振幅/冲高回落/高位追高→尾盘确认；低位趋势股→回踩低吸；其余→盘中灵活。
+BUY_TIMING_STRONG_CHANGE_MIN = 5.0    # 强势角色+涨幅≥此值 → 早盘买入
+BUY_TIMING_TAIL_AMPLITUDE_MIN = 5.0   # 振幅≥此值 → 尾盘确认（日内不确定性大）
+BUY_TIMING_TAIL_DRAWDOWN_MIN = 2.0    # 自日内高点回落≥此值 → 尾盘确认
+BUY_TIMING_HIGH_CHASE_CHANGE_MIN = 3.0  # 高位+涨幅≥此值 → 不追高，尾盘或放弃
 
 # 趋势发现自动扫描：交易日 9:00 ~ 15:00 每 30 分钟一次（覆盖盘前/盘中/收盘后）
 # 包含 9:00（盘前预热）、9:30/10:00/10:30/11:00/11:30（上午盘中）、
@@ -729,3 +775,14 @@ EASTMONEY_HEADERS = {
     'Referer': 'https://quote.eastmoney.com/',
     'Origin': 'https://quote.eastmoney.com',
 }
+
+# ========== 多用户账号与认证（2026-10-12） ==========
+# 背景：持仓是每个用户私有的，行情/推荐/收评是公共的 —— 因此只对持仓等私有资源做认证，
+# 公共接口保持免登录，收评定时任务、截图脚本等既有自动化不受影响。
+AUTH_ENABLED = True             # 总开关（置 False 可整体回退到免登录模式，持仓归 user_id=1）
+AUTH_ALLOW_REGISTER = True      # 是否允许自助注册（内部系统；如需邀请制可置 False 后用脚本建号）
+AUTH_SESSION_DAYS = 30          # 会话有效期（天）
+AUTH_MIN_PASSWORD_LEN = 6       # 最短密码长度
+AUTH_PBKDF2_ROUNDS = 120000     # PBKDF2-SHA256 迭代轮数（标准库实现，无额外依赖）
+AUTH_MAX_LOGIN_FAILS = 5        # 同账号连续登录失败上限，超过后临时锁定
+AUTH_LOCK_MINUTES = 5           # 登录失败锁定时长（分钟）

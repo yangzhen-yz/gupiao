@@ -2,7 +2,7 @@
 import asyncio, schedule, time
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
 
 from services.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
@@ -168,6 +168,47 @@ def run_scheduler():
             return
         asyncio.run(auto_generate_recommendations_task())
 
+    def job_recommend_review():
+        """智能推荐复盘（本地K线库计算，无网络依赖，非交易日也可跑）"""
+        try:
+            from services.recommend_review import run_recommendation_review
+            run_recommendation_review()
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 推荐复盘失败: {e}')
+
+    def job_pre_close_snapshot():
+        """收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存。
+
+        用户需求：不管定时生成还是手动生成，收盘前都要把"最后一次推荐"落库便于复盘。
+        任务内部本就会保存（覆盖当日记录），这里额外做落库校验：
+        - 生成成功 → 校验今日记录存在，打印最终推荐名单
+        - 本次无合格候选 → 保留此前最后一份有效推荐（不删旧记录），日志说明
+        - 今日完全无记录 → 打警告（本次与历史生成均未产出）
+        """
+        if not _today_is_trading():
+            return
+        print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前推荐快照：开始最终生成...')
+        try:
+            asyncio.run(auto_generate_recommendations_task())
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照生成异常: {e}')
+        # 落库校验
+        try:
+            from db.database import load_daily_recommendations
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            daily = load_daily_recommendations()
+            today_rec = next((r for r in daily if r.get('date') == today_str), None)
+            recs = (today_rec or {}).get('daily_recommendations') or []
+            if recs:
+                names = '、'.join(f"{s.get('name')}({s.get('symbol')})" for s in recs)
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照完成：今日推荐已保存 → {names}')
+            elif today_rec is not None:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照：今日无合格推荐（沿用当日空记录）')
+            else:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照警告：今日无任何推荐记录（本次与历史生成均未产出）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照校验失败: {e}')
+
     def job_update_holder_num():
         # 股东人数是月度数据，每日更新即可；非交易日也可拉取（上一交易日收盘后发布也有）
         asyncio.run(update_holder_num_task())
@@ -262,6 +303,14 @@ def run_scheduler():
     for t in SCHEDULE_RECOMMENDATION_TIMES:
         schedule.every().day.at(t).do(job_generate_recommendations)
 
+    # 智能推荐复盘闭环（2026-10-12）：本地K线库16:00同步后跑，
+    # 计算全部历史推荐的 T+1/T+3/T+5 胜率与盈亏并持久化，供 API/前端展示 + 黑名单避让
+    schedule.every().day.at(RECOMMEND_REVIEW_TIME).do(job_recommend_review)
+
+    # 收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存，
+    # 保证"最后一次推荐"落库可复盘（用户明确需求）
+    schedule.every().day.at(SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME).do(job_pre_close_snapshot)
+
     # : 每天 18:00 更新股东人数筹码面数据（月度披露，每日刷新最新一期）
     schedule.every().day.at(SHAREHOLDER_UPDATE_TIME).do(job_update_holder_num)
 
@@ -299,6 +348,8 @@ def run_scheduler():
     print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: 趋势评分回测验证（1/3/5日跑赢大盘胜率，仅交易日）')
     print(f'[定时任务]   - 15:35: 自动优化（D1-D4权重+角色门槛+网格搜索，仅交易日，周一含全量搜索）')
     print(f'[定时任务]   - {"/".join(SCHEDULE_RECOMMENDATION_TIMES)}: 自动生成智能推荐股票（仅交易日）')
+    print(f'[定时任务]   - {RECOMMEND_REVIEW_TIME}: 智能推荐复盘（本地K线库算T+1/T+3/T+5胜率）')
+    print(f'[定时任务]   - {SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME}: 收盘前推荐快照（最终生成并自动保存，仅交易日）')
     print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据（月度）')
     print(f'[定时任务]   - {FUNDAMENTAL_UPDATE_TIME}: 更新基本面质量数据（季度）')
     print(f'[定时任务]   - {VALUATION_UPDATE_TIME}: 更新估值分位数据（PE/PB 百分位）')

@@ -97,6 +97,60 @@ def _prepare_ts_migration(cursor):
     if migrated:
         print(f'[数据库迁移] 以下表将重建为北京时间 DEFAULT: {", ".join(migrated)}')
 
+def _migrate_sim_fk(cursor):
+    """确保 sim_* 三表带 user_id 外键级联；缺失则重建（无真实数据时安全）"""
+    try:
+        fks = cursor.execute("PRAGMA foreign_key_list(sim_accounts)").fetchall()
+        if fks:
+            return
+        print('[数据库] 重建 sim 表以添加外键级联…')
+        cursor.execute("DROP TABLE IF EXISTS sim_orders")
+        cursor.execute("DROP TABLE IF EXISTS sim_positions")
+        cursor.execute("DROP TABLE IF EXISTS sim_accounts")
+        cursor.execute('''
+            CREATE TABLE sim_accounts (
+                user_id INTEGER PRIMARY KEY,
+                cash REAL DEFAULT 1000000.0,
+                day_start_value REAL DEFAULT 1000000.0,
+                day_start_date TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        cursor.execute('''
+            CREATE TABLE sim_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                shares INTEGER NOT NULL DEFAULT 0,
+                cost_price REAL NOT NULL DEFAULT 0,
+                buy_date TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                UNIQUE(user_id, symbol),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        cursor.execute('''
+            CREATE TABLE sim_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                side TEXT NOT NULL,
+                proposed_price REAL,
+                proposed_qty INTEGER,
+                filled_price REAL,
+                filled_qty INTEGER,
+                source TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reject_reason TEXT,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                filled_at DATETIME,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+    except Exception as e:
+        print(f'[数据库] sim 表外键迁移跳过: {e}')
+
+
 def _finish_ts_migration(cursor):
     """迁移第 2 步（在 CREATE TABLE / CREATE INDEX 之后调用）：
     将 _old_xxx 表中的数据复制到新建的表（UTC 时间 +8 小时→北京时间），然后删除旧表。
@@ -218,6 +272,10 @@ def init_db():
         # 索引（2026-07-06 A-）：strategy_predict_records 按日期查询 + 未验证筛选是高频路径
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_date ON strategy_predict_records(predict_date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_verified ON strategy_predict_records(verified)')
+        # 复合索引（2026-10-13）：IC权重计算/核销扫描均为 verified+predict_date 组合过滤，
+        # 点查/去重为 predict_date+symbol；IF NOT EXISTS 对存量库自动补齐
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_verified_date ON strategy_predict_records(verified, predict_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_strategy_predict_date_symbol ON strategy_predict_records(predict_date, symbol)')
         # 策略权重表（动态调整的评分权重）
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS strategy_factor_weights (
@@ -288,6 +346,7 @@ def init_db():
                 current_price TEXT DEFAULT '',
                 sell_price TEXT DEFAULT '',
                 reason TEXT,
+                buy_timing TEXT DEFAULT '',
                 sort_order INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(rec_date, symbol))''')
@@ -522,6 +581,121 @@ def init_db():
                 cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} INTEGER')
             except Exception:
                 pass  # 列已存在
+        # 推荐记录表：买入时机（2026-10-12 新增，JSON: {"type","label","note"}）
+        try:
+            cursor.execute("ALTER TABLE daily_recommendations ADD COLUMN buy_timing TEXT DEFAULT ''")
+        except Exception:
+            pass  # 列已存在
+        # 用户持仓表（2026-10-12 新增，持仓管理+仓位配置功能）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL UNIQUE,
+                name TEXT DEFAULT '',
+                cost_price REAL DEFAULT 0,
+                shares INTEGER DEFAULT 0,
+                buy_date TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
+
+        # ===== 多用户账号体系（2026-10-12） =====
+        # 持仓是每个用户私有的，行情/推荐/收评是公共的 —— 只隔离私有数据。
+        # users：账号 + PBKDF2-SHA256 加盐哈希（标准库实现，无额外依赖）
+        # user_sessions：随机 token 会话，可撤销、可过期
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                display_name TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                last_login_at DATETIME DEFAULT '')''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                expires_at DATETIME NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id)')
+
+        # user_positions 增加 user_id。
+        # 存量表 symbol 是「全局 UNIQUE」—— 多用户持有同一只票会直接冲突，
+        # 而 SQLite 不支持 ALTER 唯一约束，故整表重建为 UNIQUE(user_id, symbol)。
+        _pos_cols = {r[1] for r in cursor.execute('PRAGMA table_info(user_positions)').fetchall()}
+        if 'user_id' not in _pos_cols:
+            cursor.execute('''
+                CREATE TABLE user_positions_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    symbol TEXT NOT NULL,
+                    name TEXT DEFAULT '',
+                    cost_price REAL DEFAULT 0,
+                    shares INTEGER DEFAULT 0,
+                    buy_date TEXT DEFAULT '',
+                    note TEXT DEFAULT '',
+                    created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                    updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                    UNIQUE(user_id, symbol))''')
+            # 存量持仓归 1 号用户（首个注册者自增 id 即为 1，天然认领，无需迁移操作）
+            cursor.execute('''
+                INSERT INTO user_positions_v2
+                    (user_id, symbol, name, cost_price, shares, buy_date, note, created_at, updated_at)
+                SELECT 1, symbol, name, cost_price, shares, buy_date, note, created_at, updated_at
+                FROM user_positions''')
+            cursor.execute('DROP TABLE user_positions')
+            cursor.execute('ALTER TABLE user_positions_v2 RENAME TO user_positions')
+            print('[数据库] user_positions 已迁移为按用户隔离 UNIQUE(user_id, symbol)')
+
+        # ========== 模拟交易（2026-10-12，纯模拟盘·不下真单） ==========
+        # 每个 app 用户一个独立模拟账户，与真实券商无关，零真金白银风险。
+        # user_id 外键级联：删除用户时一并清理其模拟账户/持仓/订单。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sim_accounts (
+                user_id INTEGER PRIMARY KEY,
+                cash REAL DEFAULT 1000000.0,
+                day_start_value REAL DEFAULT 1000000.0,
+                day_start_date TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sim_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                shares INTEGER NOT NULL DEFAULT 0,
+                cost_price REAL NOT NULL DEFAULT 0,
+                buy_date TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                UNIQUE(user_id, symbol),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sim_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                side TEXT NOT NULL,
+                proposed_price REAL,
+                proposed_qty INTEGER,
+                filled_price REAL,
+                filled_qty INTEGER,
+                source TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reject_reason TEXT,
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                filled_at DATETIME,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+        # 迁移：若已存在的 sim 表缺少 FK（早期版本），重建（当前无真实数据，安全）
+        _migrate_sim_fk(cursor)
+
+        _migrate_sim_fk(cursor)
 
         _finish_ts_migration(cursor)
         conn.commit()
@@ -563,6 +737,8 @@ def load_daily_recommendations() -> List[Dict]:
         result = []
         current_date = None
         current_group = None
+        # buy_timing 列兼容：旧库尚未执行 ALTER 时keys里没有该列，降级为 None
+        has_buy_timing_col = 'buy_timing' in rows[0].keys()
         for row in rows:
             if row['rec_date'] != current_date:
                 if current_group:
@@ -582,7 +758,10 @@ def load_daily_recommendations() -> List[Dict]:
                 'buySellPoints': {
                     'buy': row['buy_price'] or '',
                     'current': row['current_price'] or '',
-                    'sell': row['sell_price'] or ''
+                    'sell': row['sell_price'] or '',
+                    # 买入时机（2026-10-12）：旧记录无此列/无此值时为 None，前端自动降级隐藏
+                    'buyTiming': (json.loads(row['buy_timing'])
+                                  if has_buy_timing_col and row['buy_timing'] else None),
                 } if row['buy_price'] else None,
                 'reason': row['reason'] or ''
             })
@@ -606,9 +785,12 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
             cursor.execute('DELETE FROM daily_recommendations WHERE rec_date = ?', (rec_date,))
             for sort_order, rec in enumerate(recs):
                 bsp = rec.get('buySellPoints') or {}
+                # 买入时机（2026-10-12）：JSON 持久化，保证刷新后徽章不丢
+                buy_timing = bsp.get('buyTiming')
+                buy_timing_json = json.dumps(buy_timing, ensure_ascii=False) if buy_timing else ''
                 cursor.execute('''
-                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, sort_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, buy_timing, sort_order)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     rec_date,
                     rec.get('symbol', ''),
@@ -621,6 +803,7 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
                     bsp.get('current', ''),
                     bsp.get('sell', ''),
                     rec.get('reason', ''),
+                    buy_timing_json,
                     sort_order
                 ))
         conn.commit()
@@ -629,6 +812,29 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
     except Exception as error:
         print(f'保存推荐记录失败: {str(error)}')
         return False
+
+def delete_daily_recommendations_by_date(rec_date: str) -> bool:
+    """按日期物理删除推荐记录（2026-10-12 新增）
+
+    背景：save_daily_recommendations 只"替换"列表内出现的日期（循环内 DELETE+INSERT），
+    调用方把某日期从列表中过滤掉后再 save，该日期的旧行永远不会被删——
+    DELETE /api/daily_recommendations/{date} 因此返回"删除成功"但记录仍在（既有 bug）。
+    删除类操作必须显式 DELETE，不能依赖 save 的替换语义。
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM daily_recommendations WHERE rec_date = ?', (rec_date,))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if deleted:
+            print(f'删除推荐记录: {rec_date}（{deleted} 行）')
+        return True
+    except Exception as error:
+        print(f'删除推荐记录失败: {str(error)}')
+        return False
+
 def load_trend_scan_results() -> Dict:
     try:
         conn = get_db_conn()
@@ -767,6 +973,11 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
     except Exception as error:
         print(f'[趋势回测] 保存预测记录失败: {str(error)}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def load_trend_backtest_records(predict_date: str = None, symbol: str = None, limit: int = 100) -> List[Dict]:
@@ -997,6 +1208,24 @@ def save_stock_industry(industry_map: Dict[str, str]) -> bool:
     except Exception as error:
         print(f'保存股票行业映射失败: {str(error)}')
         return False
+def add_stock_basic_info(symbol: str, name: str) -> bool:
+    """增量写入单只股票基础信息（远程搜索回写用，2026-10-12）
+
+    与 save_stock_basic_info（全表替换）区分：避免回写时重写整表。
+    """
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO stock_basic_info (symbol, name) VALUES (?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET name=excluded.name''', (symbol.lower(), name))
+        conn.commit()
+        conn.close()
+        _db_cache_invalidate('stock_basic_info')
+        return True
+    except Exception as error:
+        print(f'增量写入股票信息失败: {str(error)}')
+        return False
+
 def load_stock_alias_map() -> Dict:
     """加载名称搜索映射（名称 -> 代码）"""
     try:
@@ -1121,6 +1350,11 @@ def save_fundamental_batch(records: List[Dict]) -> bool:
     except Exception as _e:
         print(f'[数据库] 保存基本面数据失败: {_e}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def load_fundamental_batch(symbols: List[str]) -> Dict[str, Dict]:
@@ -1327,6 +1561,62 @@ def save_user_scan_pool(symbols: List[str]) -> bool:
     except Exception as error:
         print(f'保存自定义扫描池失败: {str(error)}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+# ========== 用户持仓（2026-10-12，持仓管理+仓位配置；2026-10-12 起按用户隔离） ==========
+def load_user_positions(user_id: int = 1) -> List[Dict]:
+    """加载指定用户的全部持仓记录（user_id 缺省为 1，兼容旧调用）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM user_positions WHERE user_id = ? ORDER BY id',
+                       (int(user_id),))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'加载持仓失败: {str(error)}')
+        return []
+
+def save_user_position(pos: Dict, user_id: int = 1) -> bool:
+    """新增/更新一条持仓（按 (user_id, symbol) 去重，不同用户互不覆盖）"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO user_positions (user_id, symbol, name, cost_price, shares, buy_date, note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
+            ON CONFLICT(user_id, symbol) DO UPDATE SET
+                name=excluded.name, cost_price=excluded.cost_price, shares=excluded.shares,
+                buy_date=excluded.buy_date, note=excluded.note,
+                updated_at=datetime('now', '+8 hours')''',
+            (int(user_id), pos.get('symbol', '').lower(), pos.get('name', ''),
+             float(pos.get('cost_price', 0) or 0), int(pos.get('shares', 0) or 0),
+             pos.get('buy_date', ''), pos.get('note', '')))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存持仓失败: {str(error)}')
+        return False
+
+def delete_user_position(symbol: str, user_id: int = 1) -> bool:
+    """按 (user_id, symbol) 删除持仓 —— 只能删自己的"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM user_positions WHERE user_id = ? AND symbol = ?',
+                       (int(user_id), symbol.lower()))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted > 0
+    except Exception as error:
+        print(f'删除持仓失败: {str(error)}')
+        return False
+
 def load_hot_stock_buttons() -> List[Dict]:
     try:
         conn = get_db_conn()
@@ -1582,6 +1872,11 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
         import traceback
         print(f'[收评保存] 错误堆栈: {traceback.format_exc()}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 def add_stock_concept_tags(symbol: str, new_tags: List[str]) -> List[str]:
     """添加标签到指定股票，返回更新后的标签列表"""
     tags = load_stock_concept_tags()
@@ -1808,6 +2103,11 @@ def save_trend_dimension_weights(weights_data: Dict) -> bool:
     except Exception as error:
         print(f'保存趋势维度权重失败: {str(error)}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def load_role_thresholds() -> Dict:
@@ -1977,6 +2277,11 @@ def save_optimization_history(module: str, parameter_set: str = '',
     except Exception as error:
         print(f'保存优化历史失败: {str(error)}')
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def load_optimization_history(module: str = None, limit: int = 50) -> List[Dict]:

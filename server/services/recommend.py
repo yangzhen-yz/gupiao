@@ -2,13 +2,14 @@
 import asyncio, re, requests, time
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE)
+from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_CHASE_MIN_CHANGE, RECOMMEND_CHASE_MAX_CHANGE, RECOMMEND_CHASE_PENALTY, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE)
 from db.database import (load_daily_recommendations, save_daily_recommendations, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry)
 from services.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy import calc_stock_score_v2, apply_industry_neutralization
 from services.utils import to_float as _to_float
 from services.valuation import get_valuation_batch
 from services.risk_control import calc_risk_control
+from services.placement import fetch_recent_placements
 
 
 # 2026-08-31 性能优化：资金流批量拉取结果 20s 内存缓存。
@@ -290,8 +291,92 @@ def _build_expectation_note(role: str, position_label: str, score: float, sell_p
     return note
 
 
+def calc_buy_timing(stock: Dict, change_pct: float, amplitude: float,
+                    role: str, position_label: str,
+                    score: float = 0.0, market_change: float = 0.0) -> Dict:
+    """买入时机判定（2026-10-12）：回答"这只票今天该什么时候买"
+
+    A股实战规则（按优先级）：
+    1. 已涨停封板    → 次日竞价：当日场内基本买不到，次日 9:15-9:25 竞价参与
+    2. 强势情绪股    → 早盘买入：总龙头/板块龙头/情绪先锋 + 涨幅≥5%，情绪溢价最高在早盘
+    3. 高不确定性    → 尾盘买入：振幅≥5% / 自高点回落≥2% / 高位追高，14:30 后确认全天形态再买
+    4. 低位趋势股    → 回踩低吸：中军/补涨龙低位，不追高，等回踩至买入参考价
+    5. 其余          → 盘中灵活：日内均价线附近介入，不追尾盘急拉
+
+    Args:
+        stock: 行情 dict（用 highRaw/priceRaw 算回落幅度）
+        change_pct: 当日涨幅%
+        amplitude: 当日振幅%
+        role: _classify_stock_role 的角色
+        position_label: 位置标签（低位/中低位/中位/高位）
+        score: 综合评分
+        market_change: 大盘涨跌幅%（弱市下强势股也降级为谨慎）
+
+    Returns:
+        {'type': 'auction'|'early'|'tail'|'pullback'|'intraday',
+         'label': '次日竞价'|'早盘买入'|'尾盘买入'|'回踩低吸'|'盘中灵活',
+         'note': '操作说明'}
+    """
+    # 自日内高点回落幅度（缺数据时为 0）
+    drawdown = 0.0
+    try:
+        price = _to_float(stock.get('priceRaw') or stock.get('price'))
+        high = _to_float(stock.get('highRaw') or stock.get('high'))
+        if price > 0 and high > 0:
+            drawdown = (high - price) / high * 100
+    except Exception:
+        pass
+
+    # 1. 已涨停封板 → 次日竞价
+    if change_pct >= TREND_LIMIT_UP_THRESHOLD:
+        return {
+            'type': 'auction', 'label': '次日竞价',
+            'note': '今日已封板场内难买入，排队性价比低；次日 9:15-9:25 竞价参与，高开 5% 以上不追，防一字/T字诱多'
+        }
+
+    # 2. 强势情绪股 → 早盘
+    if role in ('total_leader', 'sector_leader', 'sentiment_vanguard') \
+            and change_pct >= BUY_TIMING_STRONG_CHANGE_MIN:
+        if market_change <= -0.5:
+            return {
+                'type': 'early', 'label': '早盘买入',
+                'note': f'大盘弱({market_change:+.1f}%)，早盘冲高易回落；轻仓试错或改尾盘确认，严格止损'
+            }
+        return {
+            'type': 'early', 'label': '早盘买入',
+            'note': '情绪溢价最高在早盘，尽量 10:00 前决策；只低吸强势回踩，不追直线拉升'
+        }
+
+    # 3. 高不确定性 → 尾盘确认
+    high_chase = position_label == '高位' and change_pct >= BUY_TIMING_HIGH_CHASE_CHANGE_MIN
+    if amplitude >= BUY_TIMING_TAIL_AMPLITUDE_MIN or drawdown >= BUY_TIMING_TAIL_DRAWDOWN_MIN or high_chase:
+        if high_chase:
+            note = '高位票不追高，谨防接力资金断档；14:30 后确认再介入，弱势直接放弃'
+        elif drawdown >= BUY_TIMING_TAIL_DRAWDOWN_MIN:
+            note = f'股价已自日内高点回落{drawdown:.1f}%，方向未定；14:30 后确认全天量价形态再介入'
+        else:
+            note = f'日内振幅{amplitude:.1f}%波动剧烈；14:30 后确认再介入，避开盘中诱多'
+        if market_change <= -0.5:
+            note += '；大盘弱，宁可错过不可做错'
+        return {'type': 'tail', 'label': '尾盘买入', 'note': note}
+
+    # 4. 低位趋势股 → 回踩低吸
+    if position_label in ('低位', '中低位') and role in ('core_trend', 'catch_up'):
+        return {
+            'type': 'pullback', 'label': '回踩低吸',
+            'note': '不追高；挂低单等回踩至买入参考价附近，盘中跌破均价线或涨幅转负放弃'
+        }
+
+    # 5. 其余 → 盘中灵活
+    note = '日内均价线附近介入为宜，避免尾盘急拉时追高'
+    if market_change <= -0.5:
+        note += '；大盘弱，轻仓参与'
+    return {'type': 'intraday', 'label': '盘中灵活', 'note': note}
+
+
 def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
-                         trend_details: Optional[Dict] = None) -> Dict:
+                         trend_details: Optional[Dict] = None,
+                         market_change: float = 0.0) -> Dict:
     """计算买入点、当前价、卖出点（V4.3 6级角色分类版）
 
     V4.1: 基于振幅动态调整买卖比例
@@ -300,11 +385,13 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
           止盈倍率 = 位置倍率 × 角色倍率 × 评分倍率，封顶 15%
           角色判定：按优先级匹配连板高度+涨停次数+市值+换手+位置+涨幅+量比
           位置判定：优先 trend_details.positionPct，fallback base_scores['position']
+    V4.5 (2026-10-12): 新增 buyTiming 买入时机判定（次日竞价/早盘/尾盘/回踩低吸/盘中灵活）
 
     Args:
         stock: 行情数据 dict
         score_result: calc_stock_score_v2 返回值（含 total/base_scores/factor_values）
         trend_details: 趋势扫描 details dict（含 positionPct/maxConsecutiveBoards，可选）
+        market_change: 大盘涨跌幅%，用于买入时机的大盘环境修正（可选）
     """
     try:
         price = float(stock.get('priceRaw') or stock.get('price') or 0)
@@ -382,6 +469,8 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
             'sellPct': round(sell_pct * 100, 1),
             'stockType': stock_type,
             'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
+            'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
+                                         position_label, stock_score, market_change),
         }
 
     # ===== 非涨停板：振幅基础 + 三维修正 =====
@@ -419,6 +508,8 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
         'buyPct': round(buy_pct * 100, 1),
         'stockType': stock_type,
         'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
+        'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
+                                     position_label, stock_score, market_change),
     }
 
 
@@ -443,12 +534,30 @@ def gen_recommend_reason_server(stock: Dict, score_result: Dict) -> str:
         if trend_score is not None:
             reasons.append(f'趋势分{trend_score} + 日内分{intraday_score} → 综合{score_result.get("total", 0)}分')
 
+        # 日内高点回落幅度（2026-10-12）：用于识别急跌途中的误导性信号
+        drawdown = 0.0
+        try:
+            _price = _to_float(stock.get('priceRaw') or stock.get('price'))
+            _high = _to_float(stock.get('highRaw') or stock.get('high'))
+            if _price > 0 and _high > 0:
+                drawdown = (_high - _price) / _high * 100
+        except Exception:
+            pass
+
         if volume_ratio > 1.2:
-            reasons.append(f'量比放大({volume_ratio:.2f})，资金关注')
+            if drawdown >= RECOMMEND_BOARD_BREAK_DRAWDOWN:
+                reasons.append(f'⚠ 放量下跌(量比{volume_ratio:.2f})，自日内高点回落{drawdown:.1f}%，疑似出货')
+            else:
+                reasons.append(f'量比放大({volume_ratio:.2f})，资金关注')
         if 2 < turnover_rate < 8:
             reasons.append(f'换手率适中({turnover_rate:.2f}%)，交投活跃')
-        if weibi > 0:
+        # 2026-10-12 修复：急跌途中委比高多为抄底挂单堆积造成的假象（万向德农案例：
+        # 10:00 炸板下跌中委比仍高达 88.57%，被误读为"买盘强势"），
+        # 自高点回落≥3% 时不再输出正面解读，改为回落警示。
+        if weibi > 0 and drawdown < 3:
             reasons.append(f'委比为正({weibi:.2f}%)，买盘强势')
+        elif weibi > 0:
+            reasons.append(f'⚠ 委比{weibi:.2f}%但股价自日内高点回落{drawdown:.1f}%，谨防诱多')
         if 0 < avg_dev < 2:
             reasons.append('价格位于均价附近，走势稳健')
         if outer_ratio > 55:
@@ -476,6 +585,40 @@ def _load_trend_score_map() -> Dict[str, Dict]:
         return {s['symbol'].lower(): {'score': s['score'], 'details': s.get('details', {})} for s in stocks}
     except Exception:
         return {}
+
+
+def calc_intraday_trajectory(stock: Dict) -> Dict:
+    """计算股票当日日内轨迹指标（2026-10-12 新增，防"涨停炸板/冲高回落"陷阱）
+
+    依赖 parse_tencent_batch_data 解析出的 high/low/prevClose/price 字段。
+
+    Returns:
+        {
+          'high_pct': 日内高点相对昨收涨幅(%),
+          'drawdown': 现价相对日内高点回落幅度(%)，负数表示现价创新高,
+          'board_break': 曾触涨停且自高点回落≥阈值（炸板）,
+          'big_drawdown': 自日内高点回落≥阈值（冲高回落，不限是否涨停）,
+          'valid': 数据是否可用（缺 high/prevClose 时不过滤）,
+        }
+    """
+    result = {'high_pct': 0.0, 'drawdown': 0.0, 'board_break': False,
+              'big_drawdown': False, 'valid': False}
+    try:
+        price = _to_float(stock.get('priceRaw') or stock.get('price'))
+        high = _to_float(stock.get('highRaw') or stock.get('high'))
+        prev_close = _to_float(stock.get('prevCloseRaw') or stock.get('prevClose'))
+        if price <= 0 or high <= 0 or prev_close <= 0:
+            return result
+        result['valid'] = True
+        result['high_pct'] = (high - prev_close) / prev_close * 100
+        result['drawdown'] = (high - price) / high * 100
+        touched_limit_up = result['high_pct'] >= RECOMMEND_LIMIT_UP_PCT
+        result['board_break'] = bool(touched_limit_up
+                                     and result['drawdown'] >= RECOMMEND_BOARD_BREAK_DRAWDOWN)
+        result['big_drawdown'] = result['drawdown'] >= RECOMMEND_MAX_DRAWDOWN_FROM_HIGH
+    except Exception:
+        pass
+    return result
 
 
 async def auto_generate_recommendations_task():
@@ -596,9 +739,25 @@ async def auto_generate_recommendations_task():
                                               [s.get('symbol', '') for s in all_results])
         except Exception as e:
             print(f'[智能推荐] 估值分位预取失败（降级为无数据）: {e}')
+        # : 批量预取近期增发公告（30天窗口），打"近期增发"标签
+        placement_map = {}
+        try:
+            placement_map = await asyncio.to_thread(fetch_recent_placements,
+                                                    [s.get('symbol', '') for s in all_results], 30)
+        except Exception as e:
+            print(f'[智能推荐] 增发公告预取失败（降级为无数据）: {e}')
+        from services.trend import compute_trend_result
         for stock in all_results:
             sym = stock.get('symbol', '').lower()
+            # 近期增发标签：placement_map 的 key 为 6 位纯代码
+            stock['placement_info'] = placement_map.get(sym[-6:])
             trend = trend_map.get(sym)  # 趋势扫描已有的结果
+            if trend is None:
+                # 未进趋势扫描isUp缓存的票（含下跌趋势中的反弹股）现算补齐，
+                # 使其参与 calc_stock_score_v2 的死猫反弹门控，避免纯日内分虚高入选。
+                trend = await asyncio.to_thread(
+                    compute_trend_result, sym,
+                    float(stock.get('priceRaw') or stock.get('price') or 0))
             ff = fund_flow_map.get(sym)
             hd = holder_map.get(sym)
             fd = fund_map.get(sym)
@@ -619,6 +778,21 @@ async def auto_generate_recommendations_task():
             # 预取概念标签用于行业分散
             tags = concept_tags.get(sym)
             stock['primary_tag'] = tags[0] if tags else '其他'
+
+        # ===== 3.5 半山腰追高惩罚（2026-10-12，基于132条历史推荐复盘） =====
+        # 复盘：推荐时涨幅 4.5%~9.8%（未涨停）T+1胜率仅44%、均值-2.31%（死亡区），
+        # 而 2~4.5% 为 72%/+3.80%、涨停为 73%/+3.81%。
+        # 半山腰=已涨一段但未涨停=接力资金最犹豫的位置，罚分压低其入选概率。
+        chase_penalized = 0
+        for s in all_results:
+            chg = abs(float(s.get('changePercent', 0) or 0))
+            if RECOMMEND_CHASE_MIN_CHANGE <= chg < RECOMMEND_CHASE_MAX_CHANGE:
+                s['score']['total'] = max(0, s['score']['total'] - RECOMMEND_CHASE_PENALTY)
+                s['score']['chase_penalty'] = RECOMMEND_CHASE_PENALTY
+                chase_penalized += 1
+        if chase_penalized:
+            print(f'[智能推荐] 半山腰追高惩罚：{chase_penalized} 只涨幅'
+                  f'{RECOMMEND_CHASE_MIN_CHANGE}~{RECOMMEND_CHASE_MAX_CHANGE}%未涨停股票 -{RECOMMEND_CHASE_PENALTY}分')
 
         # 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total（与 routes 路径对齐）
         if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED:
@@ -647,6 +821,54 @@ async def auto_generate_recommendations_task():
         if skipped_overvalued:
             print(f'[智能推荐] 估值分位过滤：跳过 {skipped_overvalued} 只极端高估股')
 
+        # ===== 4.6 日内轨迹风控过滤（2026-10-12，防"涨停炸板/冲高回落"陷阱） =====
+        # 教训案例：2026-10-12 万向德农(sh600371)高开+4.2%→9:35触涨停16.47→炸板，
+        # 10:00推荐时趋势分仍沿用9:30扫描快照的97.6（捕捉到最强瞬间），
+        # 综合分71入选；随后股价崩至-6.81%，较买入参考15.09跌13.6%。
+        # 趋势分是"扫描时刻"的快照，若候选股当日已从高点大幅回落，说明形态已坏，
+        # 无论趋势分/委比多高都不再参与精选推荐（不打炸板股是纪律）。
+        filtered_intraday = 0
+        if RECOMMEND_INTRADAY_FILTER_ENABLED:
+            safe = []
+            for s in candidates:
+                traj = calc_intraday_trajectory(s)
+                if not traj['valid']:
+                    safe.append(s)  # 缺 high/prevClose 数据时不误伤
+                    continue
+                if traj['board_break'] or traj['big_drawdown']:
+                    filtered_intraday += 1
+                    tags = []
+                    if traj['board_break']:
+                        tags.append('炸板')
+                    if traj['big_drawdown']:
+                        tags.append('冲高回落')
+                    print(f'[智能推荐] 日内轨迹过滤: {s["name"]}({s["symbol"]}) '
+                          f'日内高点{traj["high_pct"]:+.1f}%、现价回落{traj["drawdown"]:.1f}%'
+                          f'({"、".join(tags)})，评分{s["score"]["total"]}跳过')
+                    continue
+                safe.append(s)
+            candidates = safe
+            if filtered_intraday:
+                print(f'[智能推荐] 日内轨迹过滤：跳过 {filtered_intraday} 只炸板/冲高回落股')
+
+        # ===== 4.7 亏损黑名单过滤（2026-10-12） =====
+        # 复盘：三祥新材 06-10/06-29 连续两次被推荐、各亏 26%+——同一只票短期内
+        # 推荐失败后不应再次出现。近30天推荐且T+1亏损>3% → 不再推荐。
+        try:
+            from services.recommend_review import get_recent_loser_symbols
+            loser_symbols = get_recent_loser_symbols(RECOMMEND_LOSER_LOOKBACK_DAYS,
+                                                     RECOMMEND_LOSER_LOSS_THRESHOLD)
+        except Exception as e:
+            print(f'[智能推荐] 亏损黑名单加载失败（不阻塞推荐）: {e}')
+            loser_symbols = set()
+        if loser_symbols:
+            before = len(candidates)
+            candidates = [s for s in candidates if s.get('symbol', '').lower() not in loser_symbols]
+            skipped = before - len(candidates)
+            if skipped:
+                print(f'[智能推荐] 亏损黑名单过滤：跳过 {skipped} 只近{RECOMMEND_LOSER_LOOKBACK_DAYS}天'
+                      f'推荐亏损>{RECOMMEND_LOSER_LOSS_THRESHOLD}%的股票')
+
         # 行业分散：每种概念取最高分的一只，最多3只
         top3 = []
         seen_tags = set()
@@ -673,7 +895,13 @@ async def auto_generate_recommendations_task():
             sym = r.get('symbol', '').lower()
             _trend = trend_map.get(sym)
             bsp = calc_buy_sell_points(r, score_result=r.get('score'),
-                                       trend_details=(_trend or {}).get('details'))
+                                       trend_details=(_trend or {}).get('details'),
+                                       market_change=market_change)
+            # 执行诚实化提示（2026-10-12）：复盘证明系统的edge在低吸价口径，
+            # 现价追入会被次日低开吃掉——把真相写在卡片上，管住用户的手。
+            # 放进 buyTiming（已随 buy_timing 列持久化，刷新不丢）。
+            if RECOMMEND_EXEC_HINT_ENABLED and bsp.get('buyTiming'):
+                bsp['buyTiming']['execHint'] = RECOMMEND_EXEC_HINT
             reason = gen_recommend_reason_server(r, {
                 'total': r['score']['total'],
                 'label': r['score']['label'],
@@ -690,6 +918,7 @@ async def auto_generate_recommendations_task():
                 'buySellPoints': bsp,
                 'valuation': r.get('valuation'),
                 'riskControl': r.get('riskControl'),
+                'placement_info': r.get('placement_info'),
                 'reason': reason,
             })
 

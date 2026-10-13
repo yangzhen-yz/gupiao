@@ -107,13 +107,58 @@ export function useNotification() {
   return { notifications, showNotification, TYPE_ICONS }
 }
 
-// API 请求封装
+// ========== 登录态管理（2026-10-12 多用户） ==========
+// token 存 localStorage：关掉浏览器再打开不用重新登录（服务端会话有效期 30 天）
+const TOKEN_KEY = 'gupiao_auth_token'
+const USER_KEY = 'gupiao_auth_user'
+
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY) || ''
+}
+
+export function getAuthUser() {
+  try {
+    return JSON.parse(localStorage.getItem(USER_KEY) || 'null')
+  } catch (e) {
+    return null
+  }
+}
+
+export function saveAuth(token, user) {
+  localStorage.setItem(TOKEN_KEY, token || '')
+  localStorage.setItem(USER_KEY, JSON.stringify(user || null))
+}
+
+export function clearAuth() {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_KEY)
+}
+
+// 会话失效（401）时由 App 注册回调，负责弹回登录页
+let _unauthorizedHandler = null
+export function setUnauthorizedHandler(fn) {
+  _unauthorizedHandler = fn
+}
+
+// API 请求封装：自动附带登录 token；私有接口返回 401 时清理登录态并通知上层
 export async function apiFetch(url, options = {}) {
   try {
-    const resp = await fetch(url, options)
+    const opts = { ...options }
+    const token = getToken()
+    if (token) {
+      opts.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` }
+    }
+    const resp = await fetch(url, opts)
+    if (resp.status === 401 && !url.startsWith('/api/auth/')) {
+      clearAuth()
+      if (_unauthorizedHandler) _unauthorizedHandler()
+      const err = new Error('未登录或登录已过期')
+      err.status = 401
+      throw err
+    }
     return await resp.json()
   } catch (e) {
-    console.error(`API请求失败: ${url}`, e)
+    if (e.status !== 401) console.error(`API请求失败: ${url}`, e)
     throw e
   }
 }

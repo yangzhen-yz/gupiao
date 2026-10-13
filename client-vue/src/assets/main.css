@@ -500,18 +500,25 @@ body {
   display: block;
 }
 
+.top-header {
+  display: flex;
+  align-items: stretch;
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-medium);
+}
+
 .tab-bar {
   display: flex;
   align-items: stretch;
   gap: 0;
+  flex: 1;
+  min-width: 0;
   padding: 0 var(--content-padding);
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-medium);
   overflow-x: auto;
   scrollbar-width: none;
-  position: sticky;
-  top: 0;
-  z-index: 40;
 }
 
 .tab-bar::-webkit-scrollbar {
@@ -1262,7 +1269,7 @@ body {
 
 /* Tab Content Sections */
 .tab-content > div {
-  padding: var(--spacing-lg) var(--content-padding);
+  padding: var(--spacing-lg) var(--content-padding) 52px;
 }
 
 .tab-content .section-title {
@@ -2147,6 +2154,20 @@ body {
   background: #f0fdf4;
   color: #16a34a;
   border: 1px solid #bbf7d0;
+}
+/* 近期增发标签（2026-09-30 新增） */
+.placement-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: var(--radius-xs);
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: #fffbeb;
+  color: #d97706;
+  border: 1px solid #fde68a;
+  white-space: nowrap;
+  cursor: default;
 }
 
 /* Stock Tags */
@@ -3083,6 +3104,7 @@ body {
   .quote-section,
   .tab-content > div {
     padding: var(--spacing-lg);
+    padding-bottom: 52px;
   }
 
   .stock-table-header,

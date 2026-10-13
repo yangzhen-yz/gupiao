@@ -78,7 +78,7 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
     """东方财富 clist 同步请求，返回 diff 列表（失败抛异常由上层 catch）。
 
     fltt=2：价格/涨跌幅已为真实数值（f3 直接是百分比，无需 /100）。
-    东方财富接口偶发返回空 body / 非 JSON（限流或 gzip 异常），此处重试 3 次提高健壮性；
+    东方财富接口偶发返回空 body / 非 JSON（限流或 gzip 异常），此处重试 5 次提高健壮性；
     最后一次失败会在日志里打印 fid/fs 便于定位。
     """
     params = {
@@ -87,10 +87,14 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
         'ut': 'b2884a393a59ad64002292a3e90d46a5',
     }
     last_err = None
-    retries = 3
+    retries = 5
+    # 强制直连东方财富，忽略环境代理（沙箱透明代理 127.0.0.1 偶发断连会导致 ProxyError；
+    # A股数据源国内直连即可，无需代理）。
+    _NO_PROXY = {'http': None, 'https': None}
     for attempt in range(retries):
         try:
-            r = requests.get(_EASTMONEY_CLIST, params=params, headers=EASTMONEY_HEADERS, timeout=12)
+            r = requests.get(_EASTMONEY_CLIST, params=params, headers=EASTMONEY_HEADERS,
+                             timeout=12, proxies=_NO_PROXY)
             r.raise_for_status()
             text = r.text.strip()
             if not text:
@@ -240,12 +244,28 @@ async def get_hidden_gems(
     return result
 
 
-# ========== 内存缓存（按参数 key，避免轮询重复打 Eastmoney） ==========
+# ========== 内存缓存 ==========
+# 三层缓存，共同解决「东财偶发限流/空响应 → 前端 30s 轮询把『暂无数据』闪到页面上」
+# （表现为『切 Tab 后数据没了，需手动刷新』）：
+#   1) _CACHE          组合缓存（按完整参数 key，TTL 命中直接返回，省去每轮重复打 Eastmoney）
+#   2) _LAST_GOOD_*    各区块「最后一次成功数据」，永不过期、只被成功刷新覆盖 —— 核心兜底
+# 设计要点：
+#   - 个股 / 板块区块不依赖 hiddenGems 的参数(change_threshold/hot_top_n)，用独立子 key，
+#     因此切换「非热点上涨股」筛选条件不会令个股 / 板块缓存失效；
+#   - 任一区块本轮拉取失败时，回退到该区块的 _LAST_GOOD_*（永不过期）；只有成功且非空的区块
+#     才写入 _LAST_GOOD_*，故历史数据只会被更新的成功数据覆盖，绝不会因一次失败被清空。
 _CACHE: Dict[str, Dict] = {}
+_LAST_GOOD_STOCK: Dict[str, Dict] = {}
+_LAST_GOOD_SECTOR: Dict[str, Dict] = {}
+_LAST_GOOD_HIDDEN: Dict[str, List[Dict]] = {}
 
 
 def _cache_key(stock_top_n, sector_top_n, change_threshold, hot_top_n, hidden_top_n) -> str:
     return f"{stock_top_n}|{sector_top_n}|{change_threshold}|{hot_top_n}|{hidden_top_n}"
+
+
+def _hidden_key(change_threshold, hot_top_n, hidden_top_n) -> str:
+    return f"{change_threshold}|{hot_top_n}|{hidden_top_n}"
 
 
 async def get_fund_flow_summary(
@@ -255,7 +275,7 @@ async def get_fund_flow_summary(
     hot_top_n: int = FUND_FLOW_HIDDEN_HOT_TOP_N,
     hidden_top_n: int = FUND_FLOW_HIDDEN_TOP_N,
 ) -> Dict:
-    """汇总三块数据，各部分独立 try 互不拖垮；60s 内存缓存。
+    """汇总三块数据，各部分独立拉取互不拖垮；带内存缓存与「历史成功兜底」。
 
     返回结构：
     {
@@ -268,27 +288,51 @@ async def get_fund_flow_summary(
     key = _cache_key(stock_top_n, sector_top_n, change_threshold, hot_top_n, hidden_top_n)
     cached = _CACHE.get(key)
     now = time.time()
+    # 组合缓存命中（未过期）：直接返回，省去三块重拉
     if cached and (now - cached['ts']) < FUND_FLOW_CACHE_TTL:
         return cached['data']
 
-    # 各部分独立 try，互不拖垮；段间轻量休眠规避限流
+    stock_k = str(stock_top_n)
+    sector_k = str(sector_top_n)
+    hidden_k = _hidden_key(change_threshold, hot_top_n, hidden_top_n)
+
+    # 历史成功兜底（永不过期，仅被成功刷新覆盖）
+    lg_stocks = _LAST_GOOD_STOCK.get(stock_k)
+    lg_sectors = _LAST_GOOD_SECTOR.get(sector_k)
+    lg_hidden = _LAST_GOOD_HIDDEN.get(hidden_k)
+
+    # 各部分独立拉取；失败则回退历史成功数据（若从未成功过则留空，由前端 loading 兜底）
     stocks: Dict[str, List[Dict]] = {'inflow': [], 'outflow': []}
     sectors: Dict = {}
     hidden: List[Dict] = []
     try:
         stocks = await get_stock_fund_flow_rankings(stock_top_n)
     except Exception as e:
-        print(f'[资金流向] 个股排名失败: {e}')
+        print(f'[资金流向] 个股排名失败，回退历史数据: {e}')
+        if lg_stocks:
+            stocks = lg_stocks
     await asyncio.sleep(0.25)
     try:
         sectors = await get_sector_fund_flow_rankings(sector_top_n)
     except Exception as e:
-        print(f'[资金流向] 板块排名失败: {e}')
+        print(f'[资金流向] 板块排名失败，回退历史数据: {e}')
+        if lg_sectors:
+            sectors = lg_sectors
     await asyncio.sleep(0.25)
     try:
         hidden = await get_hidden_gems(change_threshold, hot_top_n, hidden_top_n)
     except Exception as e:
-        print(f'[资金流向] 非热点上涨股失败: {e}')
+        print(f'[资金流向] 非热点上涨股失败，回退历史数据: {e}')
+        if lg_hidden:
+            hidden = lg_hidden
+
+    # 仅把「成功且非空」的区块写入历史成功缓存（核心：失败绝不清空历史）
+    if stocks.get('inflow') or stocks.get('outflow'):
+        _LAST_GOOD_STOCK[stock_k] = stocks
+    if sectors.get('industry') or sectors.get('concept'):
+        _LAST_GOOD_SECTOR[sector_k] = sectors
+    if hidden:
+        _LAST_GOOD_HIDDEN[hidden_k] = hidden
 
     data = {
         'stocks': stocks,
@@ -303,5 +347,6 @@ async def get_fund_flow_summary(
             'hiddenTopN': hidden_top_n,
         },
     }
+    # 组合缓存：记录本次（已兜底）结果，供 TTL 内快速返回
     _CACHE[key] = {'ts': now, 'data': data}
     return data

@@ -9,7 +9,7 @@
           <label>股票代码/名称</label>
           <div class="input-row">
             <input type="text" v-model="stockInput" class="stock-input"
-              placeholder="输入6位代码：603985, 600487..." @keyup.enter="onFetch">
+              placeholder="输代码或名称：603985 / 美诺华 / 新乡化纤..." @keyup.enter="onFetch">
             <button class="btn-primary" @click="onFetch">查询</button>
             <button class="btn-secondary" @click="manualRefresh">手动刷新</button>
           </div>
@@ -421,15 +421,35 @@ async function fetchStockQuote(symbol, silent = false) {
 
 async function onFetch() {
   let input = stockInput.value.trim()
-  if (!input) { showNotification('请输入股票代码'); return }
-  // 名称查找
+  if (!input) { showNotification('请输入股票代码或名称'); return }
+  // 名称查找（本地映射）
   const map = stockNameMap.value
   if (map[input]) {
     currentSymbol.value = map[input]
-  } else if (/^\d{6}$/.test(input)) {
-    currentSymbol.value = input.startsWith('6') ? 'sh' + input : 'sz' + input
-  } else {
+  } else if (/^(sh|sz|bj)?\d{6}$/i.test(input)) {
+    // 纯6位或带前缀代码：自动补交易所前缀（6→sh，0/3→sz，4/8→bj）
+    const pure = input.toLowerCase().replace(/^(sh|sz|bj)/, '')
+    if (pure.startsWith('6')) currentSymbol.value = 'sh' + pure
+    else if (pure.startsWith('0') || pure.startsWith('3')) currentSymbol.value = 'sz' + pure
+    else currentSymbol.value = 'bj' + pure
+  } else if (/^(sh|sz|bj)\d{6}$/i.test(input)) {
     currentSymbol.value = input.toLowerCase()
+  } else {
+    // 名称模糊查询（2026-10-12）：走后端搜索接口解析为代码
+    // （本地 stock_basic_info + 腾讯 smartbox 远程回退，本地查不到也能搜）
+    try {
+      const r = await apiFetch(`/api/stock-search?q=${encodeURIComponent(input)}`)
+      if (r.success && r.data && r.data.length > 0) {
+        currentSymbol.value = r.data[0].symbol
+        showNotification(`已匹配：${r.data[0].name}（${r.data[0].symbol.toUpperCase()}）`)
+      } else {
+        showNotification(`未找到「${input}」对应的股票，请换个名称或直接用6位代码`, 'warning')
+        return
+      }
+    } catch (e) {
+      showNotification('名称查询失败，请改用代码', 'error')
+      return
+    }
   }
   stockInput.value = currentSymbol.value
   await fetchStockQuote(currentSymbol.value)
