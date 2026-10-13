@@ -159,7 +159,7 @@
               <span v-if="t.plan.takeProfit">止盈 <b class="danger">{{ t.plan.takeProfit }}</b></span>
               <span v-if="t.plan.stopLoss">止损 <b class="ok">{{ t.plan.stopLoss }}</b></span>
             </div>
-            <p class="plan-veto" v-if="t.plan && t.plan.veto">🚫 {{ t.plan.veto }}</p>
+            <p class="plan-veto" v-if="vetoText(t)">🚫 {{ vetoText(t) }}</p>
           </article>
           <button v-if="data.tomorrowPlan.length > LIST_LIMIT" class="expand-btn" @click="toggleList('tomorrowPlan')">
             {{ expanded.tomorrowPlan
@@ -347,6 +347,15 @@ function riskChipClass(v) {
 }
 function timingIcon(type) {
   return { auction: '🔔', early: '⚡', tail: '🌙', pullback: '📉', intraday: '⏱️' }[type] || '⏱️'
+}
+
+// veto 在 focus_json 里是数组（多条否决条件）。直接 {{ }} 会把整个数组当 JSON 印到卡片上
+// （2026-10-13 手机截图里出现过 ["一字板 / T字板开盘 → 不排队","开盘涨幅...），这里拼成人话。
+function vetoText(t) {
+  const v = t && t.plan && t.plan.veto
+  if (!v) return ''
+  const arr = Array.isArray(v) ? v : [v]
+  return arr.map(x => String(x).trim()).filter(Boolean).join('；')
 }
 
 onMounted(() => {

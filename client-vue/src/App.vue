@@ -21,38 +21,35 @@
           <div v-for="g in tabGroups" :key="g.key" class="tab-group">
             <button
               :class="['tab-bar-item', 'group-chip', { active: g.ids.includes(activeTab) }]"
-              @click="toggleMenu(g.key)"
+              @click="toggleMenu(g.key, $event)"
             >
               <span class="group-label">{{ g.label }}</span>
               <span class="group-current">{{ shortLabel(activeTab, g) }}</span>
               <i class="caret">▾</i>
             </button>
-            <div v-if="openMenu === g.key" class="group-menu">
-              <button
-                v-for="t in g.tabs"
-                :key="t.id"
-                :class="['menu-item', { active: activeTab === t.id }]"
-                @click="activateTab(t.id)"
-              >{{ t.label }}</button>
-            </div>
           </div>
 
           <!-- 窄屏（办公室 500–900px）：合并成一个「明细」菜单 -->
           <div class="tab-group all-group">
-            <button class="tab-bar-item group-chip" @click="toggleMenu('all')">
+            <button class="tab-bar-item group-chip" @click="toggleMenu('all', $event)">
               <span class="group-label">明细</span><i class="caret">▾</i>
             </button>
-            <div v-if="openMenu === 'all'" class="group-menu">
-              <button
-                v-for="t in allTabs"
-                :key="t.id"
-                :class="['menu-item', { active: activeTab === t.id }]"
-                @click="activateTab(t.id)"
-              >{{ t.label }}</button>
-            </div>
           </div>
         </nav>
       </header>
+      <!-- 弹层必须 Teleport 到 body：.tab-bar 为了窄屏横向滚动写了 overflow-x:auto，
+           这会让 overflow-y 的计算值从 visible 变成 auto，绝对定位的下拉菜单被自己裁掉 ——
+           2026-10-13 手机上点「明细」"没反应"就是这个原因（菜单开了，但看不见）。 -->
+      <Teleport to="body">
+        <div v-if="menuItems.length" class="group-menu nav-menu" :style="menuStyle" data-nav-menu>
+          <button
+            v-for="t in menuItems"
+            :key="t.id"
+            :class="['menu-item', { active: activeTab === t.id }]"
+            @click="activateTab(t.id)"
+          >{{ t.label }}</button>
+        </div>
+      </Teleport>
       <div class="app-main">
         <div :class="['tab-content', { active: activeTab === 'tab-desk' }]" v-show="activeTab === 'tab-desk'" v-if="mountedTabs.has('tab-desk')">
           <TabActionDesk :active="activeTab === 'tab-desk'" />
@@ -113,7 +110,7 @@
 </template>
 
 <script setup>
-import { ref, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
+import { ref, computed, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, setUnauthorizedHandler } from './utils/helpers'
 import { useHashRoute, navigate } from './composables/useHashRoute'
 import { usePolling } from './composables/usePolling'
@@ -158,8 +155,41 @@ tabGroups.forEach(g => { g.ids = g.tabs.map(t => t.id) })
 const allTabs = tabGroups.reduce((acc, g) => acc.concat(g.tabs), [])
 
 const openMenu = ref('')
-function toggleMenu(key) { openMenu.value = openMenu.value === key ? '' : key }
-function closeMenu() { openMenu.value = '' }
+const menuAnchorEl = ref(null)
+const MENU_W = 168
+const menuPos = ref({ left: 0, top: 0, maxH: 240 })
+function toggleMenu(key, ev) {
+  if (openMenu.value === key) { closeMenu(); return }
+  menuAnchorEl.value = ev ? ev.currentTarget : null
+  openMenu.value = key
+  nextTick(placeMenu)
+}
+function closeMenu() { openMenu.value = ''; menuAnchorEl.value = null }
+// fixed 定位（元素已 Teleport 到 body）：贴着按钮下沿，并夹在视口内不溢出
+function placeMenu() {
+  const el = menuAnchorEl.value
+  if (!el) return
+  const a = el.getBoundingClientRect()
+  const left = Math.max(8, Math.min(a.left, window.innerWidth - MENU_W - 8))
+  const top = a.bottom + 6
+  menuPos.value = {
+    left: Math.round(left),
+    top: Math.round(top),
+    maxH: Math.max(140, Math.round(window.innerHeight - top - 12)),
+  }
+}
+const menuStyle = computed(() => ({
+  left: `${menuPos.value.left}px`,
+  top: `${menuPos.value.top}px`,
+  width: `${MENU_W}px`,
+  maxHeight: `${menuPos.value.maxH}px`,
+}))
+const menuItems = computed(() => {
+  if (!openMenu.value) return []
+  if (openMenu.value === 'all') return allTabs
+  const g = tabGroups.find(x => x.key === openMenu.value)
+  return g ? g.tabs : []
+})
 // 组胶囊上直接显示当前所在子页，收起后也知道自己在哪
 function shortLabel(id, g) {
   if (!g.ids.includes(id)) return g.tabs[0].label
@@ -170,7 +200,16 @@ function activateTab(id) {
   navigate(id.replace(/^tab-/, ''))
 }
 // 点页面其他地方收起菜单
-function onDocClick() { if (openMenu.value) closeMenu() }
+function onDocClick(e) {
+  if (!openMenu.value) return
+  // 弹层在 body 下，点它自己不该收起（收起由菜单项的 activateTab 负责）
+  if (e && e.target && e.target.closest && e.target.closest('[data-nav-menu]')) return
+  closeMenu()
+}
+// 滚动 / 缩放时让弹层跟着按钮走。
+// 注意：这里**不能**直接收起 —— 数据到达后浏览器会做 scroll anchoring 自动微调
+// scrollTop，收起会把刚点开的菜单立刻关掉（2026-10-13 实测 6 次里 3 次"点了没反应"）。
+function onViewportChange() { if (openMenu.value) placeMenu() }
 
 // 跨Tab导航：其他Tab点击股票 → 走 hash 打开实时行情并定位该票
 const tabQuoteRef = ref(null)
@@ -294,9 +333,13 @@ onMounted(() => {
   checkAuth()
   startAlertPoll()
   document.addEventListener('click', onDocClick)
+  window.addEventListener('scroll', onViewportChange, true)
+  window.addEventListener('resize', onViewportChange)
 })
 onUnmounted(() => {
   document.removeEventListener('click', onDocClick)
+  window.removeEventListener('scroll', onViewportChange, true)
+  window.removeEventListener('resize', onViewportChange)
 })
 
 // K线弹窗
@@ -336,15 +379,16 @@ function openAiDiag(symbol) {
 .caret { font-style: normal; font-size: 0.6875rem; color: var(--text-tertiary); }
 
 .group-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 60;
+  /* fixed：弹层已 Teleport 到 body，坐标按视口算（见 menuStyle） */
+  position: fixed;
+  z-index: 120;
   min-width: 132px;
   padding: 5px;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--bg-elevated);
   border: 1px solid var(--border-medium);
   border-radius: var(--radius-md);
@@ -364,6 +408,10 @@ function openAiDiag(symbol) {
 }
 .menu-item:hover { background: var(--bg-hover); color: var(--text-primary); }
 .menu-item.active { background: var(--bg-tertiary); color: var(--accent-primary); font-weight: 700; }
+/* 触摸设备上 30px 高的菜单项太难点中，手机上加高到 ~44px */
+@media (max-width: 699px) {
+  .menu-item { padding: 12px 14px; font-size: 0.875rem; }
+}
 
 /* 宽屏用组胶囊，窄屏（办公室常见窄窗口/手机）合并成单个「明细」菜单 */
 .all-group { display: none; }

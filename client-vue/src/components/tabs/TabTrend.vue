@@ -288,7 +288,7 @@
         </div>
       </div>
       <div class="pool-table" v-if="poolStocks.length > 0">
-        <div class="stock-table-header">
+        <div class="pool-head">
           <span>名称</span>
           <span class="sortable-header" @click="togglePoolSort('price')">
             最新价<span class="sort-arrow" :class="{ active: poolSortBy === 'price' }">{{ poolSortBy === 'price' ? (poolSortOrder === 'asc' ? '▲' : '▼') : '▽' }}</span>
@@ -299,8 +299,8 @@
           <span>5日线</span>
           <span style="text-align:center;">操作</span>
         </div>
-        <div v-for="s in sortedPoolStocks" :key="s.symbol || s.code" class="stock-table-row">
-          <span class="pool-stock-name">{{ s.name || stockNameMap[s.symbol || s.code] || (s.symbol || s.code) }}</span>
+        <div v-for="s in sortedPoolStocks" :key="s.symbol || s.code" class="pool-row">
+          <span class="pool-stock-name">{{ s.name || stockNameMap[s.symbol || s.code] || (s.symbol || s.code) }}<i class="pool-code-sub">{{ s.symbol || s.code }}</i></span>
           <span class="pool-stock-price" :class="getPriceClass(s)">
             {{ s.latestPrice > 0 ? s.latestPrice.toFixed(2) : '--' }}
           </span>

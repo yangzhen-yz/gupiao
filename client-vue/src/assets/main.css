@@ -1779,42 +1779,122 @@ body {
   overflow-y: auto;
 }
 
-.pool-table .stock-table-header,
-.pool-table .stock-table-row {
+/* 股票池表格：2026-10-13 改用自有 class（pool-head / pool-row）。
+   原先复用 .stock-table-header / .stock-table-row，而这两个全局类在
+   @media (max-width:768px) 和 (max-width:480px) 里挂着 nth-child 隐藏规则 ——
+   它们是为趋势卡列表写的，却顺带把股票池的「5日线」「操作」「连涨/跌」整列藏掉，
+   手机上只剩一串串没有标题的数字。 */
+.pool-head,
+.pool-row {
+  display: grid;
   grid-template-columns: 1.5fr 1fr 1.2fr 1.6fr 1.8fr;
+  gap: var(--spacing-sm);
+  align-items: center;
   text-align: center;
+  padding: var(--spacing-sm) var(--content-padding);
 }
 
-.pool-table .stock-table-header {
+.pool-head {
   position: sticky;
   top: 0;
   z-index: 10;
+  background: var(--bg-tertiary);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
+  border-bottom: 2px solid var(--border-subtle);
   backdrop-filter: blur(10px);
 }
 
-.pool-table .stock-table-row span:first-child {
-  font-family: 'SF Mono', 'Courier New', monospace;
-  font-weight: 700;
-}
-
-.pool-table .stock-table-row span:nth-child(2) {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  padding: 0 var(--spacing-xs);
-}
-
-.pool-table .stock-table-row span:last-child {
+.pool-head > span {
   display: flex;
   justify-content: center;
-  gap: var(--spacing-xs);
+  align-items: center;
 }
 
-.pool-table .stock-table-row span:last-child button {
-  white-space: nowrap;
-  padding: var(--spacing-xs) var(--spacing-sm);
-  font-size: 0.75rem;
-  border-radius: var(--radius-sm);
+.pool-row {
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pool-row:last-child { border-bottom: none; }
+
+.pool-row .pool-stock-price { white-space: nowrap; }
+
+/* 代码副标题：宽屏表格里有位置，手机上收进名称下方 */
+.pool-code-sub { display: none; }
+
+@media (max-width: 900px) {
+  .pool-head,
+  .pool-row {
+    grid-template-columns: 1.4fr 0.9fr 1.05fr 1.35fr 1.6fr;
+    gap: 6px;
+    padding: 8px 10px;
+  }
+  .pool-row { font-size: 0.8125rem; }
+}
+
+/* 手机：整行拆成卡片，五列信息一条都不藏，按钮加高到可点 */
+@media (max-width: 699px) {
+  .pool-head { display: none; }
+  .pool-table { max-height: none; overflow: visible; }
+
+  .pool-row {
+    /* 两行卡片：上行 名称+代码 / 价格，下行 连涨 5日线 + 操作，比三行省一半高度 */
+    grid-template-columns: auto 1fr auto auto;
+    grid-template-areas:
+      "name  name  name  price"
+      "trend ma5   act   act";
+    gap: 6px 8px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+  }
+
+  .pool-row .pool-stock-name {
+    grid-area: name;
+    text-align: left;
+    white-space: normal;
+    padding: 0;
+    font-size: 0.9375rem;
+    font-weight: 700;
+  }
+  .pool-row .pool-code-sub {
+    display: inline;
+    margin-left: 6px;
+    font-family: 'SF Mono', 'Courier New', monospace;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--text-tertiary);
+  }
+  .pool-row .pool-stock-price {
+    grid-area: price;
+    justify-self: end;
+    font-size: 1.0625rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .pool-row .pool-stock-trend { grid-area: trend; justify-self: start; }
+  .pool-row .pool-stock-ma5 { grid-area: ma5; justify-self: start; }
+  .pool-row .pool-stock-actions { grid-area: act; justify-content: flex-end; gap: 8px; }
+  .pool-row .pool-btn { min-height: 38px; padding: 9px 13px; font-size: 0.8125rem; }
+
+  /* 添加股票：输入框与按钮并排，不占用两屏高（覆盖 768px 段的竖排） */
+  .add-stock-wrapper .add-stock-input-group { flex-direction: row; align-items: stretch; }
+  .add-stock-wrapper .add-stock-input-group .form-input {
+    min-width: 0;
+    padding: 10px 12px;
+    font-size: 0.9375rem;
+  }
+  .add-stock-wrapper .add-stock-input-group .btn-secondary {
+    width: auto;
+    flex: 0 0 auto;
+    padding: 10px 16px;
+  }
+  .add-stock-wrapper .form-label { margin-bottom: 6px; font-size: 0.75rem; }
 }
 
 .pool-stock-code {
@@ -1846,14 +1926,7 @@ body {
   transition: color 0.15s;
 }
 
-/* 股票池表格表头所有列统一居中对齐 */
-.pool-table .stock-table-header span,
-.pool-table .stock-table-header .sortable-header {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  text-align: center;
-}
+/* 股票池表格表头所有列统一居中对齐（样式已并入上方 .pool-head > span） */
 
 .sortable-header:hover { color: var(--accent-primary); }
 .sortable-header .sort-arrow { font-size: 0.7rem; opacity: 0.4; }
