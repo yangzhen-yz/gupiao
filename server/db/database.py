@@ -567,11 +567,13 @@ def init_db():
                 cursor.execute(f'ALTER TABLE trend_backtest_records ADD COLUMN {dim_col} REAL DEFAULT NULL')
             except Exception:
                 pass  # 列已存在
-        # 收评表补充字段（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count；2026-09-04 新增 sentiment_cycle_json）
+        # 收评表补充字段（2026-07-30 新增 ai_analysis_json、limit_up_count/limit_down_count；
+        # 2026-09-04 新增 sentiment_cycle_json；2026-10-14 新增 focus_meta_json —— 明日关注的
+        # 整篮子预期胜率与"被过滤掉几只"，不落库的话前端刷新一次就再也算不出 dropped）
         # 只在初始化时执行一次；此前放在 save_daily_market_reviews 内，每次保存都要跑 12 条 DDL
         for col in ['industry_json', 'concept_json', 'limit_up_json', 'limit_down_json',
                     'top_gainers_json', 'top_losers_json', 'focus_json', 'top_funds_json',
-                    'ai_analysis_json', 'sentiment_cycle_json']:
+                    'ai_analysis_json', 'sentiment_cycle_json', 'focus_meta_json']:
             try:
                 cursor.execute(f'ALTER TABLE daily_market_reviews ADD COLUMN {col} TEXT')
             except Exception:
@@ -2030,6 +2032,12 @@ def load_daily_market_reviews() -> List[Dict]:
                 review['tomorrowFocus'] = json.loads(row['focus_json'])
             else:
                 review['tomorrowFocus'] = []
+            # 明日关注的整篮子预期（2026-10-14）：旧数据没这一列，前端按 v-if 自动降级
+            if 'focus_meta_json' in row.keys() and row['focus_meta_json']:
+                try:
+                    review['focusExpect'] = json.loads(row['focus_meta_json'])
+                except Exception:
+                    review['focusExpect'] = None
             if 'top_funds_json' in row.keys() and row['top_funds_json']:
                 review['topFunds'] = json.loads(row['top_funds_json'])
             else:
@@ -2082,6 +2090,10 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             top_gainers_json = json.dumps(review.get('topGainers', []), ensure_ascii=False)
             top_losers_json = json.dumps(review.get('topLosers', []), ensure_ascii=False)
             focus_json = json.dumps(review.get('tomorrowFocus', []), ensure_ascii=False)
+            # 整篮子预期（胜率/平均收益/被过滤掉几只）。不落库的话，前端刷新一次
+            # 就再也算不出 dropped —— 候选总数在选完之后已经不在这份名单里了。
+            _focus_expect = review.get('focusExpect')
+            focus_meta_json = json.dumps(_focus_expect, ensure_ascii=False) if _focus_expect else None
             top_funds_json = json.dumps(review.get('topFunds', []), ensure_ascii=False)
             trend_json = json.dumps(review.get('trendStocks', {}), ensure_ascii=False)
             pool_json = json.dumps(review.get('stockPool', {}), ensure_ascii=False)
@@ -2095,9 +2107,9 @@ def save_daily_market_reviews(reviews: List[Dict]) -> bool:
             if limit_down_count is None:
                 limit_down_count = len(review.get('limitDownStocks', []))
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, limit_up_count, limit_down_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, limit_up_count, limit_down_count))
+                INSERT OR REPLACE INTO daily_market_reviews (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, focus_meta_json, limit_up_count, limit_down_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (review_date, summary, market_json, trend_json, pool_json, industry_json, concept_json, limit_up_json, limit_down_json, top_gainers_json, top_losers_json, focus_json, top_funds_json, ai_analysis_json, sentiment_cycle_json, focus_meta_json, limit_up_count, limit_down_count))
         conn.commit()
         conn.close()
         return True

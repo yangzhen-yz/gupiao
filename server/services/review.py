@@ -41,6 +41,9 @@ def _select_focus_by_winrate(items: List[Dict], source_tags: Dict[str, str]) -> 
     所以统一换算成预期胜率后再排，门槛之下的（含整层负期望的趋势扫描）不进名单。
 
     Returns: (入选列表, 篮子预期统计, 被过滤掉的只数)
+
+    注意 focusExpect 必须随收评一起落库（daily_market_reviews.focus_meta_json）：
+    候选总数在选完之后已经不在这份名单里，光靠 items 只能重算胜率、算不出"过滤掉几只"。
     """
     from services.focus_winrate import basket_expect, estimate
 
