@@ -60,12 +60,11 @@
       <h3 class="sec-title">模拟持仓 <span class="sec-sub">{{ state.positions.length }} 只</span></h3>
       <table class="sim-table" v-if="state.positions.length">
         <thead>
-          <tr><th>代码</th><th>名称</th><th>股数</th><th>成本</th><th>现价</th><th>市值</th><th>盈亏</th><th>占比</th></tr>
+          <tr><th>名称</th><th>股数</th><th>成本</th><th>现价</th><th>市值</th><th>盈亏</th><th>占比</th></tr>
         </thead>
         <tbody>
           <tr v-for="p in state.positions" :key="p.symbol">
-            <td class="mono">{{ p.symbol }}</td>
-            <td>{{ p.name }}</td>
+            <td class="nm"><b>{{ p.name }}</b><small class="mono">{{ p.symbol }}</small></td>
             <td class="num">{{ p.shares }}</td>
             <td class="num">{{ p.costPrice }}</td>
             <td class="num">{{ p.price }}</td>
@@ -83,13 +82,12 @@
       <h3 class="sec-title">待执行建议 <span class="sec-sub">{{ state.pending.length }} 条</span></h3>
       <table class="sim-table" v-if="state.pending.length">
         <thead>
-          <tr><th>方向</th><th>代码</th><th>名称</th><th>建议价</th><th>数量</th><th>来源</th><th>理由</th></tr>
+          <tr><th>方向</th><th>名称</th><th>建议价</th><th>数量</th><th>来源</th><th class="reason">理由</th></tr>
         </thead>
         <tbody>
           <tr v-for="o in state.pending" :key="o.id">
             <td><span class="side" :class="o.side">{{ o.side === 'buy' ? '买入' : '卖出' }}</span></td>
-            <td class="mono">{{ o.symbol }}</td>
-            <td>{{ o.name }}</td>
+            <td class="nm"><b>{{ o.name }}</b><small class="mono">{{ o.symbol }}</small></td>
             <td class="num">{{ o.proposed_price }}</td>
             <td class="num">{{ o.proposed_qty }}</td>
             <td>{{ srcLabel(o.source) }}</td>
@@ -105,18 +103,20 @@
       <h3 class="sec-title">审计日志 <span class="sec-sub">最近 {{ state.audit.length }} 条</span></h3>
       <table class="sim-table log">
         <thead>
-          <tr><th>状态</th><th>方向</th><th>代码</th><th>建议价</th><th>成交价</th><th>数量</th><th>拒绝原因</th></tr>
+          <tr><th>状态</th><th>方向</th><th>名称</th><th class="hide-sm">建议价</th><th>成交价</th><th>数量</th><th class="reason">来源 / 拒绝原因</th></tr>
         </thead>
         <tbody>
           <tr v-for="o in state.audit" :key="o.id">
             <td><span class="st" :class="o.status">{{ stLabel(o.status) }}</span></td>
             <td><span class="side" :class="o.side">{{ o.side === 'buy' ? '买入' : '卖出' }}</span></td>
-            <td class="mono">{{ o.symbol }}</td>
-            <td class="num">{{ o.proposed_price }}</td>
+            <td class="nm"><b>{{ o.name }}</b><small class="mono">{{ o.symbol }}</small></td>
+            <td class="num hide-sm">{{ o.proposed_price }}</td>
             <td class="num">{{ o.filled_price || '-' }}</td>
             <td class="num">{{ o.filled_qty || o.proposed_qty }}</td>
+            <!-- 被拒的单子这列是中文拒因（后端本来就写中文）；成交/待执行的单子这列是来源，
+                 之前直接印 o.source 把 recommend 这种内部枚举名甩给了用户 -->
             <td class="reason" v-if="o.status === 'rejected'">{{ o.reject_reason }}</td>
-            <td class="reason" v-else>{{ o.source }}</td>
+            <td class="reason" v-else>{{ srcLabel(o.source) }}</td>
           </tr>
         </tbody>
       </table>
@@ -233,11 +233,29 @@ onMounted(load)
 .sec-title { font-size: 15px; font-weight: 700; margin: 0 0 8px; }
 .sec-sub { font-size: 12px; font-weight: 400; color: var(--text-secondary, #64748b); margin-left: 6px; }
 .sim-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.sim-table th, .sim-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-subtle, #e5e7eb); text-align: left; }
+/* 对齐治理（2026-10-14）：原来 th/td 一律左对齐、数字列单独右对齐，
+   结果表头在左、数字在右，同一列两个起点看着像错行。现在整表居中，
+   只有"理由/来源"这种长句子保持左对齐（居中排长句更难读）。 */
+.sim-table th, .sim-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-subtle, #e5e7eb); text-align: center; }
 .sim-table th { color: var(--text-secondary, #64748b); font-weight: 600; background: var(--bg-tertiary, #f8fafc); }
-.sim-table .num { text-align: right; }
+.sim-table .num { text-align: center; font-variant-numeric: tabular-nums; }
+/* 名称列：名字在上、代码降成小字灰字 —— 代码不再独占一列，但也没被丢掉 */
+.sim-table .nm b { display: block; font-weight: 600; color: var(--text-primary, #111827); }
+.sim-table .nm small { display: block; font-size: 11px; color: var(--text-tertiary, #94a3b8); margin-top: 1px; }
 .sim-table .mono { font-family: ui-monospace, monospace; }
-.sim-table .reason { color: var(--text-secondary, #64748b); max-width: 320px; }
+.sim-table .reason { text-align: left; color: var(--text-secondary, #64748b); max-width: 320px; }
+/* 手机上 7 列表格会撑破 420px 视口（实测右边界 431px）：收窄内边距，
+   再给容器兜一层横向滚动，避免"内容被屏幕切掉又没滚动条"那种看不全的情况。 */
+@media (max-width: 699px) {
+  .sim-section { overflow-x: auto; }
+  .sim-table { font-size: 12px; }
+  .sim-table th, .sim-table td { padding: 6px 5px; }
+  .sim-table .reason { max-width: 220px; }
+  /* 徽章被挤成竖排（"已成交"三个字一行一个）比宽列更糟：先锁住不换行 */
+  .sim-table .st, .sim-table .side, .sim-table .nm b { white-space: nowrap; }
+  /* 审计日志的"建议价"手机上让位给成交价 —— 拒单原因那句中文里本来就带着建议价 */
+  .sim-table.log .hide-sm { display: none; }
+}
 .side { padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
 .side.buy { background: #fee2e2; color: #dc2626; }
 .side.sell { background: #dcfce7; color: #16a34a; }
