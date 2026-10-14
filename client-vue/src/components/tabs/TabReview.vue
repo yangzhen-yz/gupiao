@@ -338,7 +338,7 @@
             <div class="section-title-small">🎯 明日重点关注</div>
             <span class="section-sub">
               <template v-if="review.focusExpect?.winRate != null">
-                {{ review.tomorrowFocus.length }} 只 · 篮子历史胜率 {{ review.focusExpect.winRate }}%
+                {{ review.tomorrowFocus.length }} 只 · 篮子历史盈利概率 {{ review.focusExpect.winRate }}%
               </template>
               <template v-else>{{ review.tomorrowFocus.length }} 只</template>
             </span>
@@ -347,8 +347,8 @@
             明日(T+1)按各自的「买入条件 + 价格区间」参与，不今日追高。
             每只票给出：什么条件买 · 什么价格买 · 止盈止损 · 什么情况不买（⛔）
             <template v-if="review.focusExpect">
-              <br>名单是按「同来源同分数段的历史 T+1 胜率」挑的，最多 {{ review.focusExpect.maxCount }} 只；
-              胜率不到 {{ review.focusExpect.minWinRate }}%、或历史平均收益为负的
+              <br>名单是按「同来源同分数段的历史 T+1 盈利概率」挑的，最多 {{ review.focusExpect.maxCount }} 只；
+              盈利概率不到 {{ review.focusExpect.minWinRate }}%、或历史平均收益为负的
               <b>{{ review.focusExpect.dropped }}</b> 只没列进来（三个来源的分数量纲不同，直接比分数没意义）。
             </template>
           </div>
@@ -368,7 +368,7 @@
                 <div class="focus-win" v-if="s.expectedWinRate != null"
                      :class="{ thin: s.expectedWinRate < 50 }">
                   <div class="focus-win-val">{{ s.expectedWinRate }}%</div>
-                  <div class="focus-win-lbl">T+1胜率</div>
+                  <div class="focus-win-lbl">T+1盈利概率</div>
                   <div class="focus-win-sub" v-if="s.expectedAvgRet != null">
                     均{{ s.expectedAvgRet >= 0 ? '+' : '' }}{{ s.expectedAvgRet }}%·{{ s.expectedSample }}笔
                   </div>

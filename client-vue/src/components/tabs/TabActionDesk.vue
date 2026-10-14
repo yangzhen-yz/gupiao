@@ -150,7 +150,7 @@
             <div class="plan-top">
               <span class="plan-name">{{ t.name }}<em>{{ (t.symbol || '').toUpperCase() }}</em></span>
               <span class="plan-win" v-if="t.winRate != null"
-                    :title="'同来源同分数段的历史 T+1 胜率'">胜率 {{ t.winRate }}%</span>
+                    :title="'同来源同分数段的历史 T+1 盈利概率'">盈利概率 {{ t.winRate }}%</span>
               <span :class="['timing-badge', 'timing-' + (t.timingType || 'intraday')]" v-if="t.timingLabel">
                 {{ timingIcon(t.timingType) }} {{ t.timingLabel }}
               </span>
