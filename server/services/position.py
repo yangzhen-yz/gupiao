@@ -118,6 +118,44 @@ def _in_active_pools(symbol: str) -> Dict:
     return result
 
 
+# ========== 冲高回落告警（2026-10-14，用户实盘暴露的盲区） ==========
+# 背景：yz 账户的吉华集团当日从 +5.3% 砸到 -5.3%（自高点回落 10.1%、现价在均价线下方 4%），
+# 但因为没跌破"成本 -5%"那条止损线，diagnose_position 一路落到 watch 分支；
+# 而行动台只收 stop_loss / reduce / take_profit —— 于是一只把全天利润吐光的票在系统里一声不响。
+# recommend 侧其实早就算着 big_drawdown（回落≥8%），但那个只用来"不推荐买入"，从没接到持仓侧。
+GIVEBACK_MIN_HIGH_PCT = 3.0    # 当日确实冲高过（相对昨收），否则只是平盘震荡
+GIVEBACK_MIN_DRAWDOWN = 5.0    # 自日内高点回落幅度(%)，比买入侧的 8% 提前一档提醒
+GIVEBACK_KEEP_RATIO = 0.5      # 涨幅保住不到高点的一半 → 视为"没守住"
+
+
+def calc_giveback(traj: Dict, quote: Dict) -> Dict:
+    """冲高回落判定：涨上去过 + 掉回均价线下方 + 涨幅基本没保住。
+
+    四个条件全满足才算，避免把强势票的正常整理误报成风险（比如从 +12% 整理到 +9% 的票，
+    回落幅度够但仍在均价线上方，不该报警）。
+    """
+    empty = {'hit': False, 'high_pct': 0.0, 'drawdown': 0.0, 'avg_dev': 0.0, 'now_pct': 0.0}
+    if not traj or not traj.get('valid'):
+        return empty
+
+    def _f(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    high_pct = _f(traj.get('high_pct'))
+    drawdown = _f(traj.get('drawdown'))
+    avg_dev = _f(quote.get('avgPriceDeviation'))
+    now_pct = _f(quote.get('changePercent'))
+    hit = (high_pct >= GIVEBACK_MIN_HIGH_PCT
+           and drawdown >= GIVEBACK_MIN_DRAWDOWN
+           and avg_dev < 0
+           and now_pct <= high_pct * GIVEBACK_KEEP_RATIO)
+    return {'hit': hit, 'high_pct': round(high_pct, 2), 'drawdown': round(drawdown, 2),
+            'avg_dev': round(avg_dev, 2), 'now_pct': round(now_pct, 2)}
+
+
 def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
                       loser_symbols: set) -> Dict:
     """单票诊断：输出动作、止损/止盈价、原因"""
@@ -184,6 +222,8 @@ def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
     if pools['in_trend_pool']:
         flags.append('趋势池在列')
     out['flags'] = flags
+    gb = calc_giveback(traj, quote)
+    out['giveback'] = gb
 
     # 动作判定（优先级从高到低）
     trailing = calc_trailing_stop(cost, price)
@@ -210,6 +250,14 @@ def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
         out['action'] = 'reduce'
         out['action_label'] = '减仓回避'
         out['detail'] = f'{"、".join(reasons)}，形态已坏，建议至少减半，剩余部分严格止损{stop_price:.2f}'
+    elif gb['hit']:
+        # 排在炸板之后：同样是回落，炸板更严重，那条走"减仓回避"
+        out['action'] = 'giveback'
+        out['action_label'] = '冲高回落'
+        out['detail'] = (f'日内最高{gb["high_pct"]:+.1f}%已回吐至{gb["now_pct"]:+.1f}%'
+                         f'（自高点回落{gb["drawdown"]:.1f}%，现价在均价线下方{abs(gb["avg_dev"]):.1f}%），'
+                         f'浮盈{out["pnl_pct"]:+.1f}%、未破止损{stop_price:.2f}；'
+                         f'尾盘收不回均价线就先减半，别等它变成止损')
     elif trailing['enabled']:
         out['action'] = 'hold_trailing'
         out['action_label'] = '持有（止损上移）'

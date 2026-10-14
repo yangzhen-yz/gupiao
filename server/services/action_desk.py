@@ -79,8 +79,10 @@ _PHASE_SECTIONS = {
     'unknown': ['reviewDigest', 'watchlist'],
 }
 
-_URGENCY = {'stop_loss': 0, 'reduce': 1, 'take_profit': 2, 'trailing': 3}
-_ACTIONABLE_ACTIONS = ('stop_loss', 'reduce', 'take_profit')
+_URGENCY = {'stop_loss': 0, 'reduce': 1, 'take_profit': 2, 'giveback': 3, 'trailing': 4}
+# 需立刻执行的（卡片染红）vs 该出现在待办里的（多一条"冲高回落"，但不抢紧急的视觉权重）
+_URGENT_ACTIONS = ('stop_loss', 'reduce', 'take_profit')
+_ACTIONABLE_ACTIONS = _URGENT_ACTIONS + ('giveback',)
 
 _DESK_CACHE: Dict[str, Dict] = {}
 _DESK_CACHE_TTL = 8  # 秒：合并两个账号多标签页的连续请求
@@ -126,7 +128,7 @@ def _build_position_actions(diag: Dict) -> List[Dict]:
             'pnlAmt': p.get('pnl_amt'),
             'action': action,
             'actionLabel': p.get('action_label'),
-            'urgent': action in _ACTIONABLE_ACTIONS,
+            'urgent': action in _URGENT_ACTIONS,
             'stop': p.get('stop_price'),
             'target': p.get('target_price'),
             'trailingLine': (p.get('trailing') or {}).get('line'),

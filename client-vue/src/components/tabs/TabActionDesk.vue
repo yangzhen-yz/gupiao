@@ -501,7 +501,9 @@ onMounted(() => {
 .badge-stop_loss { background: var(--accent-danger-bg); color: var(--accent-danger); border-color: var(--accent-danger-border); }
 .badge-reduce { background: var(--accent-warning-bg); color: #b45309; border-color: var(--accent-warning-border); }
 .badge-take_profit { background: var(--accent-success-bg); color: var(--accent-success); border-color: var(--accent-success-border); }
-.badge-trailing, .badge-hold { background: var(--bg-tertiary); color: var(--text-secondary); border-color: var(--border-subtle); }
+/* 冲高回落：比"减仓回避"轻一档，用黄而不是橙，避免和形态已坏的票混成一类 */
+.badge-giveback { background: #fef9c3; color: #854d0e; border-color: #fde047; }
+.badge-trailing, .badge-hold_trailing, .badge-hold, .badge-watch { background: var(--bg-tertiary); color: var(--text-secondary); border-color: var(--border-subtle); }
 
 .act-nums, .plan-nums, .env-nums, .buy-price-row {
   display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.375rem;
@@ -638,6 +640,7 @@ onMounted(() => {
 [data-theme="dark"] .hero-info { background: linear-gradient(180deg, #12202b 0%, var(--bg-secondary) 72%); }
 [data-theme="dark"] .calendar-banner { color: #fcd34d; background: #2a2313; border-color: #6b5426; }
 [data-theme="dark"] .buy-note { color: #fbbf24; background: #241d10; border-color: #6b5426; }
+[data-theme="dark"] .badge-giveback { background: #241d10; color: #fbbf24; border-color: #6b5426; }
 [data-theme="dark"] .timing-auction { background: #211b33; color: #c4b5fd; border-color: #4c3d75; }
 [data-theme="dark"] .timing-early { background: #2b1618; color: #fca5a5; border-color: #5d2b2f; }
 [data-theme="dark"] .timing-tail { background: #2a1d12; color: #fdba74; border-color: #5f3d1e; }

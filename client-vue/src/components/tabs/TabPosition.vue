@@ -500,6 +500,8 @@ defineExpose({ loadPositions })
 .action-stop_loss { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
 .action-take_profit { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
 .action-reduce { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
+/* 冲高回落：比「减仓回避」轻一档、比「持有观察」重一档，用琥珀黄，颜色与行动台徽章保持一致 */
+.action-giveback { background: #fef9c3; color: #854d0e; border-color: #fde047; }
 .action-hold_trailing { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
 .action-hold { background: #f8fafc; color: #475569; border-color: #e2e8f0; }
 .action-watch { background: #fefce8; color: #a16207; border-color: #fde68a; }
