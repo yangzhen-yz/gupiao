@@ -647,7 +647,10 @@ SCHEDULE_MA10_CHECK_TIME = '15:05'  # 检查10日均线时间
 POOL_CONSECUTIVE_DOWN_THRESHOLD = 2  # 连跌N天自动移出股票池（0=不启用）——用户要求：连跌2天及以上当天删掉
 SCHEDULE_DAILY_REVIEW_TIME = '15:10'  # 每日审核时间
 SCHEDULE_BACKTEST_TIME = '15:20'  # 回测时间
-SCHEDULE_RECOMMENDATION_TIMES = ['09:45', '13:30']  # 智能推荐生成时间（上午开盘后、下午开盘后）
+SCHEDULE_RECOMMENDATION_TIMES = ['09:45', '13:30', '14:05']  # 智能推荐生成时间（上午开盘后、下午开盘后、尾盘前）
+# 14:05 这次专给"尾盘买入"用（2026-10-14）：尾盘票的依据是当日振幅和自高点回落，全是盘中数据，
+# 13:30 那批离 14:30 还有整整一小时、形态随时变；而 14:45 的收盘快照离窗口关闭只剩 15 分钟，
+# 看到也来不及下单。同一天多次生成是"替换"语义（save_daily_recommendations 先 DELETE 当日）。
 RECOMMEND_REVIEW_TIME = '16:10'  # 智能推荐复盘任务时间（本地K线库16:00同步后）
 SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME = '14:45'  # 收盘前推荐快照：用最新数据最终生成一次并自动保存（保证"最后一次推荐"落库可复盘）
 

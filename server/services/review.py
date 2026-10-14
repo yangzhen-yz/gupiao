@@ -1003,6 +1003,24 @@ async def generate_daily_review() -> Dict:
             print(f'[收评] 明日关注买入时机/计划生成失败: {e}')
             print(traceback.format_exc())
 
+        # 4.8 时序修正（2026-10-14，用户指出）：昨天收盘算不出"今天尾盘该买谁"。
+        # 尾盘买入的依据是当日振幅、自高点回落，全是盘中数据 —— 收评里给一只票挂"尾盘买入"，
+        # 等于拿昨天的走势替明天的尾盘做决定，逻辑上不成立。
+        # 处理：这类票不删（它仍是明日观察对象），但徽章降级为"待盘中确认"并排到名单末尾，
+        # 真正的尾盘名单由当天 14:05 那次实时推荐给出（见 SCHEDULE_RECOMMENDATION_TIMES）。
+        pending_tail = []
+        for f in tomorrow_focus:
+            bt = f.get('buyTiming') or {}
+            if bt.get('type') == 'tail':
+                bt['label'] = '尾盘·待盘中确认'
+                bt['note'] = '尾盘票看当天：14:05 出实时名单，14:30 后按当时形态定'
+                f['buyTiming'] = bt
+                pending_tail.append(id(f))
+        if pending_tail:
+            tomorrow_focus = ([f for f in tomorrow_focus if id(f) not in pending_tail]
+                              + [f for f in tomorrow_focus if id(f) in pending_tail])
+            print(f'[收评] 明日关注：{len(pending_tail)} 只尾盘票降级为"待盘中确认"并排到最后')
+
         # 5. 生成收评
         review = {
             'date': today_str,
