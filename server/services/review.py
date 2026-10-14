@@ -2,7 +2,7 @@
 import asyncio, time, requests as _requests
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, EASTMONEY_HEADERS)
+from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE, REVIEW_TOMORROW_FOCUS_MIN_KEEP, EASTMONEY_HEADERS)
 # 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 from db.database import (get_db_conn, load_daily_recommendations, load_trend_scan_results)
 from services.stock import fetch_stock_data
@@ -29,6 +29,40 @@ _SBT_LIMIT_UP = 9.8      # 涨停阈值 → 次日竞价
 _SBT_STRONG = 5.0        # 强势早盘阈值
 _SBT_TAIL_AMP = 5.0      # 尾盘振幅阈值
 _SBT_TAIL_DD = 2.0       # 尾盘自高点回落阈值
+
+
+def _select_focus_by_winrate(items: List[Dict], source_tags: Dict[str, str]) -> tuple:
+    """明日关注：从「三层来源顺序拼够 10 只」改成「按历史同档 T+1 胜率选最多 6 只」。
+
+    为什么不能直接按分数排：三个来源的分数量纲不同（智能推荐=日内+趋势融合分、
+    策略预测=纯日内分、趋势扫描=趋势分），而且实测分数与 T+1 收益的相关性只有
+    r≈-0.02~0.06 —— 分数本身几乎不解释收益，跨来源比分数更是无意义。
+    真正可比的是「这个来源、这个分数段，历史上 T+1 赚钱的概率」，
+    所以统一换算成预期胜率后再排，门槛之下的（含整层负期望的趋势扫描）不进名单。
+
+    Returns: (入选列表, 篮子预期统计, 被过滤掉的只数)
+    """
+    from services.focus_winrate import basket_expect, estimate
+
+    for f in items:
+        e = estimate(source_tags.get(f.get('code') or '', ''), f.get('score'))
+        f['expectedWinRate'] = e['winRate']
+        f['expectedAvgRet'] = e['avgRet']
+        f['expectedSample'] = e['sample']
+        f['expectedBin'] = e['bin']
+        f['expectedBasis'] = e['basis']
+
+    ranked = sorted(items, key=lambda x: (-(x['expectedWinRate'] or 0),
+                                          -(x['expectedAvgRet'] or 0),
+                                          -(x.get('score') or 0)))
+    keep = [f for f in ranked
+            if (f['expectedWinRate'] or 0) >= REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE
+            and (f['expectedAvgRet'] or 0) > 0][:REVIEW_TOMORROW_FOCUS_COUNT]
+    if len(keep) < REVIEW_TOMORROW_FOCUS_MIN_KEEP:
+        # 弱市可能一只都过不了门槛。宁缺毋滥是对的，但名单空着等于没写收评，按胜率补齐。
+        keep = ranked[:REVIEW_TOMORROW_FOCUS_MIN_KEEP]
+    kept = {id(f) for f in keep}
+    return keep, basket_expect(keep), len([f for f in ranked if id(f) not in kept])
 
 
 def _simple_buy_timing(q: Dict) -> Dict:
@@ -918,8 +952,10 @@ async def generate_daily_review() -> Dict:
         except Exception as e:
             print(f'[收评] 趋势扫描加载失败: {e}')
 
-        # 截取前 N 只
-        tomorrow_focus = tomorrow_focus[:REVIEW_TOMORROW_FOCUS_COUNT]
+        # 按历史同档 T+1 胜率选票（原来只是按来源顺序截前 10 只，谁先入库谁上名单）
+        tomorrow_focus, focus_expect, focus_dropped = _select_focus_by_winrate(tomorrow_focus, source_tags)
+        print(f'[收评] 明日关注入选 {len(tomorrow_focus)} 只（胜率/期望不达标记 {focus_dropped} 只），'
+              f'篮子预期胜率 {focus_expect.get("winRate")}%、平均 T+1 {focus_expect.get("avgRet")}%')
 
         # 标注来源到 reason 中便于前端展示
         for f in tomorrow_focus:
@@ -980,7 +1016,14 @@ async def generate_daily_review() -> Dict:
             'topGainers': top_gainers[:REVIEW_TOP_GAINERS_COUNT],
             'topLosers': top_losers[:REVIEW_TOP_LOSERS_COUNT],
             'topFunds': top_funds[:20],
-            'tomorrowFocus': tomorrow_focus[:10],
+            'tomorrowFocus': tomorrow_focus,
+            # 整篮子的历史预期：每只票都带 expectedWinRate，这里是等权平均 + 最短板
+            'focusExpect': dict(focus_expect or {}, **{
+                'count': len(tomorrow_focus),
+                'dropped': focus_dropped,
+                'minWinRate': REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE,
+                'maxCount': REVIEW_TOMORROW_FOCUS_COUNT,
+            }),
             'sentimentCycle': sentiment_cycle,
             'summary': ''
         }

@@ -421,6 +421,9 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         'tomorrowPlan': [{'symbol': _norm(f.get('code') or f.get('symbol')),
                           'name': f.get('name'),
                           'score': f.get('score'),
+                          # 入选依据（同来源同分数段的历史 T+1 胜率）——名单就是按它排的
+                          'winRate': f.get('expectedWinRate'),
+                          'avgRet': f.get('expectedAvgRet'),
                           'timingLabel': (f.get('buyTiming') or {}).get('label'),
                           'timingType': (f.get('buyTiming') or {}).get('type'),
                           'plan': f.get('tomorrowPlan') or {}}

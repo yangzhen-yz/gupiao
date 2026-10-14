@@ -336,11 +336,21 @@
         <div v-if="(review.tomorrowFocus && review.tomorrowFocus.length)" class="review-section">
           <div class="section-title-row">
             <div class="section-title-small">🎯 明日重点关注</div>
-            <span class="section-sub">{{ review.tomorrowFocus.length }} 只</span>
+            <span class="section-sub">
+              <template v-if="review.focusExpect?.winRate != null">
+                {{ review.tomorrowFocus.length }} 只 · 篮子历史胜率 {{ review.focusExpect.winRate }}%
+              </template>
+              <template v-else>{{ review.tomorrowFocus.length }} 只</template>
+            </span>
           </div>
           <div class="section-note-small">
             明日(T+1)按各自的「买入条件 + 价格区间」参与，不今日追高。
             每只票给出：什么条件买 · 什么价格买 · 止盈止损 · 什么情况不买（⛔）
+            <template v-if="review.focusExpect">
+              <br>名单是按「同来源同分数段的历史 T+1 胜率」挑的，最多 {{ review.focusExpect.maxCount }} 只；
+              胜率不到 {{ review.focusExpect.minWinRate }}%、或历史平均收益为负的
+              <b>{{ review.focusExpect.dropped }}</b> 只没列进来（三个来源的分数量纲不同，直接比分数没意义）。
+            </template>
           </div>
           <div class="focus-grid">
             <div v-for="(s, i) in review.tomorrowFocus" :key="s.code" class="focus-card" @click="openStockKline(s)">
@@ -353,6 +363,15 @@
                 <div class="focus-score" v-if="s.score > 0">
                   <div class="focus-score-val">{{ s.score }}</div>
                   <div class="focus-score-lbl">策略分</div>
+                </div>
+                <!-- 入选依据：同来源同分数段的历史 T+1 胜率（名单就是按它排的，比策略分更有决策意义） -->
+                <div class="focus-win" v-if="s.expectedWinRate != null"
+                     :class="{ thin: s.expectedWinRate < 50 }">
+                  <div class="focus-win-val">{{ s.expectedWinRate }}%</div>
+                  <div class="focus-win-lbl">T+1胜率</div>
+                  <div class="focus-win-sub" v-if="s.expectedAvgRet != null">
+                    均{{ s.expectedAvgRet >= 0 ? '+' : '' }}{{ s.expectedAvgRet }}%·{{ s.expectedSample }}笔
+                  </div>
                 </div>
               </div>
               <div class="focus-reason" v-if="s.reason">{{ s.reason }}</div>
@@ -910,6 +929,12 @@ onMounted(() => {
 .focus-score { text-align: center; padding-left: 8px; border-left: 1px solid var(--border-subtle); }
 .focus-score-val { font-size: 1rem; font-weight: 700; color: #6366f1; font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 .focus-score-lbl { font-size: 0.65rem; color: var(--text-secondary); }
+/* 入选依据：同来源同分数段的历史 T+1 胜率。名单就是按它排的，所以它比"策略分"更该被看见。 */
+.focus-win { text-align: center; padding-left: 8px; border-left: 1px solid var(--border-subtle); flex-shrink: 0; }
+.focus-win-val { font-size: 1rem; font-weight: 700; color: #15803d; font-family: 'SF Mono', 'JetBrains Mono', monospace; }
+.focus-win.thin .focus-win-val { color: #b45309; }
+.focus-win-lbl { font-size: 0.65rem; color: var(--text-secondary); }
+.focus-win-sub { font-size: 0.62rem; color: var(--text-tertiary); font-family: 'SF Mono', 'JetBrains Mono', monospace; }
 
 /* 明日关注：买入时机徽章（2026-10-12，配色与 TabRecommend 对齐） */
 .section-note-small { font-size: 0.72rem; color: var(--text-secondary); margin: 4px 0 8px; line-height: 1.4; }
@@ -1021,5 +1046,8 @@ onMounted(() => {
   .plan-grid { grid-template-columns: repeat(2, 1fr); }
   .plan-item { padding: 6px 8px; }
   .plan-val { font-size: 0.85rem; }
+  /* 手机上一行放不下「策略分 + 胜率」两个数字块。留胜率：它才是这份名单的排序依据，
+     策略分三个来源量纲不同，横着比本来就不成立。 */
+  .focus-score { display: none; }
 }
 </style>

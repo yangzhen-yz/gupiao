@@ -149,6 +149,8 @@
           <article v-for="t in shown('tomorrowPlan', data.tomorrowPlan)" :key="t.symbol" class="plan-card" @click="goQuote(t.symbol)">
             <div class="plan-top">
               <span class="plan-name">{{ t.name }}<em>{{ (t.symbol || '').toUpperCase() }}</em></span>
+              <span class="plan-win" v-if="t.winRate != null"
+                    :title="'同来源同分数段的历史 T+1 胜率'">胜率 {{ t.winRate }}%</span>
               <span :class="['timing-badge', 'timing-' + (t.timingType || 'intraday')]" v-if="t.timingLabel">
                 {{ timingIcon(t.timingType) }} {{ t.timingLabel }}
               </span>
@@ -494,6 +496,12 @@ onMounted(() => {
   font-style: normal; font-size: 0.6875rem; font-weight: 500; color: var(--text-tertiary);
   margin-left: 0.375rem; letter-spacing: .02em;
 }
+/* 入选依据：同来源同分数段的历史 T+1 胜率 —— 明日名单就是按它排的，所以放在卡片头一行 */
+.plan-win {
+  font-size: 0.6875rem; font-weight: 700; color: #15803d;
+  background: #f0fdf4; border: 1px solid #bbf7d0;
+  border-radius: var(--radius-pill); padding: 1px 7px;
+}
 .buy-score { margin-left: auto; font-size: 0.75rem; color: var(--text-tertiary); }
 .buy-score b { color: var(--accent-warning); font-size: 0.875rem; }
 
@@ -640,6 +648,7 @@ onMounted(() => {
 [data-theme="dark"] .hero-info { background: linear-gradient(180deg, #12202b 0%, var(--bg-secondary) 72%); }
 [data-theme="dark"] .calendar-banner { color: #fcd34d; background: #2a2313; border-color: #6b5426; }
 [data-theme="dark"] .buy-note { color: #fbbf24; background: #241d10; border-color: #6b5426; }
+[data-theme="dark"] .plan-win { color: #86efac; background: #052312; border-color: #14532d; }
 [data-theme="dark"] .badge-giveback { background: #241d10; color: #fbbf24; border-color: #6b5426; }
 [data-theme="dark"] .timing-auction { background: #211b33; color: #c4b5fd; border-color: #4c3d75; }
 [data-theme="dark"] .timing-early { background: #2b1618; color: #fca5a5; border-color: #5d2b2f; }

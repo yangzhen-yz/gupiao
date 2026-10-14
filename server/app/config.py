@@ -742,7 +742,14 @@ QUERY_MARKET_REVIEWS_LIMIT = 30  # 市场评论数量限制
 REVIEW_TOP_GAINERS_COUNT = 15  # 顶部涨股票数量限制
 REVIEW_TOP_LOSERS_COUNT = 15  # 顶部跌股票数量限制
 REVIEW_TOP_SECTORS_COUNT = 5  # 顶部行业数量限制
-REVIEW_TOMORROW_FOCUS_COUNT = 10  # 明日关注股票数量限制
+REVIEW_TOMORROW_FOCUS_COUNT = 6  # 明日关注最多几只（2026-10-14：从 10 收到 6，按历史胜率选而非按来源顺序凑）
+# 入选门槛：该来源该分数段的历史 T+1 胜率 ≥ 50% 且平均收益 > 0。
+# 50% 就是抛硬币线 —— 低于它的票进名单只会把整篮子的胜率拉下去（用户明确要"提示整体胜率"）。
+# 实测：趋势扫描各档平均收益全为负（整体 42.1% / -0.40%，n=1335），因此整层被挡在门外。
+REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE = 50.0
+# 弱市里可能一只都过不了门槛，留个下限保证名单不空白（按胜率从高到低补）
+REVIEW_TOMORROW_FOCUS_MIN_KEEP = 3
+
 
 # ========== 大盘指数代码 ==========
 INDEX_SYMBOLS = {
@@ -782,7 +789,7 @@ EASTMONEY_HEADERS = {
 AUTH_ENABLED = True             # 总开关（置 False 可整体回退到免登录模式，持仓归 user_id=1）
 # 2026-10-13：cloudflare 隧道暴露公网期间临时置 False，隧道关闭后恢复 True。
 # 下次若要再次对外分享链接，记得先把它置 False（自助注册 = 任何人都能进来读全量公共数据）。
-AUTH_ALLOW_REGISTER = True      # 是否允许自助注册（内部系统；如需邀请制可置 False 后用脚本建号）
+AUTH_ALLOW_REGISTER = False      # 2026-10-14 隧道暴露公网期间临时关闭自助注册，隧道关闭后恢复 True
 AUTH_SESSION_DAYS = 30          # 会话有效期（天）
 AUTH_MIN_PASSWORD_LEN = 6       # 最短密码长度
 AUTH_PBKDF2_ROUNDS = 120000     # PBKDF2-SHA256 迭代轮数（标准库实现，无额外依赖）
