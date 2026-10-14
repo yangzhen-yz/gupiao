@@ -36,7 +36,7 @@ _LIVE_PHASES = {'auction', 'morning', 'lunch', 'mid', 'tail'}
 _PHASE_TIMINGS = {
     'auction': ('auction',),
     'morning': ('early', 'pullback', 'intraday'),
-    'lunch':   ('pullback', 'intraday', 'tail'),
+    'lunch':   ('pullback', 'intraday'),
     'mid':     ('pullback', 'intraday'),
     'tail':    ('tail', 'intraday'),
     'post':    (),
@@ -44,6 +44,20 @@ _PHASE_TIMINGS = {
     'pre':     (),
     'unknown': (),
 }
+
+# 时段内还要再看分钟：进 buyNow 的唯一标准是"此刻下单不违反它自己徽章上的窗口"，
+# 否则区块标题（此时机可介入）和卡片徽章（尾盘买入）会互相打脸。
+# 2026-10-14 用户就是这么问的：11:57 打开行动台，午休时段里出现了两张"尾盘买入"的卡。
+_MORNING_EARLY_CUTOFF = 10 * 60   # 早盘买入只到 10:00（收评文案里同样写着"10 点后不再新开早盘仓"）
+
+
+def _allowed_timings(phase: str, now: Optional[datetime] = None) -> tuple:
+    allowed = _PHASE_TIMINGS.get(phase, ())
+    if phase == 'morning' and allowed:
+        d = now or datetime.now()
+        if d.hour * 60 + d.minute >= _MORNING_EARLY_CUTOFF:
+            allowed = tuple(t for t in allowed if t != 'early')
+    return allowed
 
 # 前端轮询间隔建议（毫秒）：越靠近决策窗口越密
 _PHASE_POLL_MS = {
@@ -336,7 +350,7 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         quote_map = {}
 
     actions = _build_position_actions(diag)
-    allowed = _PHASE_TIMINGS.get(phase, ())
+    allowed = _allowed_timings(phase)
     # 竞价/盘前看的是上一次生成的推荐（对标记"次日竞价"的票而言即昨日），盘中看当日
     buy_now, deferred = _build_buy_items(group, quote_map, allowed)
     watch_alerts = _build_watchlist(watch_symbols, quote_map) if live else []
