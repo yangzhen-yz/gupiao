@@ -142,7 +142,8 @@
       <div class="pos-table-header">
         <span>名称</span><span>成本/现价</span><span>盈亏</span><span>止损价</span><span>目标价</span><span>信号</span><span>建议</span><span style="text-align:center;">操作</span>
       </div>
-      <div v-for="p in data.positions" :key="p.symbol" class="pos-table-row">
+      <template v-for="p in data.positions" :key="p.symbol">
+      <div class="pos-table-row">
         <span class="pos-name">
           <b>{{ p.name }}</b>
           <small>{{ p.symbol.toUpperCase() }}<template v-if="data.portfolio?.capital_set && p.pos_pct != null"> · 仓位{{ p.pos_pct }}%</template></small>
@@ -161,10 +162,28 @@
           <small class="pos-detail">{{ p.detail }}</small>
         </span>
         <span class="pos-ops">
+          <button class="op-btn" @click="startAdjust(p, 'add')">加仓</button>
+          <button class="op-btn" @click="startAdjust(p, 'reduce')">减仓</button>
           <button class="op-btn" @click="editPosition(p)">编辑</button>
           <button class="op-btn danger" @click="removePosition(p)">删除</button>
         </span>
       </div>
+      <!-- 加减仓：加权成本由后端算，但结果先在这里预览出来 —— 用户点确认前就该看到新成本 -->
+      <div v-if="adj.symbol === p.symbol" class="adj-bar">
+        <span class="adj-title">{{ adj.mode === 'add' ? '➕ 加仓' : '➖ 减仓' }} {{ p.name }}</span>
+        <span class="adj-now">现持 {{ p.shares }} 股 @ {{ p.cost }}</span>
+        <input v-model="adj.shares" type="number" min="100" step="100" class="form-input adj-input"
+               :placeholder="adj.mode === 'add' ? '新增股数' : '卖出股数'" ref="adjSharesInput" @keyup.esc="cancelAdjust">
+        <input v-model="adj.price" type="number" step="0.01" min="0" class="form-input adj-input"
+               placeholder="成交价">
+        <span class="adj-preview" v-if="adjPreview(p)">{{ adjPreview(p) }}</span>
+        <button class="btn-scan" :disabled="adj.saving" @click="submitAdjust(p)">{{ adj.saving ? '提交中...' : '确认' }}</button>
+        <button class="btn-secondary" @click="cancelAdjust">取消</button>
+        <span class="adj-note-line" v-if="adj.mode === 'reduce' && Number(adj.shares) >= p.shares">
+          卖光 {{ p.shares }} 股会把这条持仓从列表移除
+        </span>
+      </div>
+      </template>
     </div>
   </div>
 </template>
@@ -212,6 +231,67 @@ async function loadPositions() {
     const result = await apiFetch('/api/positions')
     if (result.success) data.value = result.data
   } catch (e) { console.error('加载持仓失败:', e) }
+}
+
+// ===== 加仓 / 减仓（2026-10-14）=====
+// 加权成本由服务端算（services/position_adjust 是唯一口径），这里只做一个预览，
+// 目的是让用户点「确认」之前就看到新成本、新股数和本次实现盈亏，而不是事后猜。
+const adj = ref({ symbol: '', mode: 'add', shares: '', price: '', saving: false })
+const adjSharesInput = ref(null)
+
+function startAdjust(p, mode) {
+  adj.value = { symbol: p.symbol, mode, shares: '', price: String(p.price ?? ''), saving: false }
+  nextTick(() => {
+    // v-for 里的同名 ref 会被收集成数组，取第一个；单元素时也可能直接是 DOM 节点
+    const el = Array.isArray(adjSharesInput.value) ? adjSharesInput.value[0] : adjSharesInput.value
+    if (el && el.focus) el.focus()
+  })
+}
+
+function cancelAdjust() {
+  adj.value = { ...adj.value, symbol: '', mode: 'add', shares: '', price: '' }
+}
+
+function adjPreview(p) {
+  const delta = parseInt(adj.value.shares) || 0
+  const price = parseFloat(adj.value.price) || 0
+  const oldShares = Number(p.shares) || 0
+  const oldCost = Number(p.cost) || 0
+  if (!delta || !price || !oldShares || !oldCost) return ''
+  if (adj.value.mode === 'add') {
+    const n = oldShares + delta
+    return `改后 ${n} 股 @ ${((oldCost * oldShares + price * delta) / n).toFixed(3)}`
+  }
+  if (delta > oldShares) return `最多只能卖 ${oldShares} 股`
+  const n = oldShares - delta
+  const realized = (price - oldCost) * delta
+  return `改后 ${n} 股 @ ${oldCost}（减仓不改成本）· 本次实现 ${realized >= 0 ? '+' : ''}${realized.toFixed(2)} 元`
+}
+
+async function submitAdjust(p) {
+  const delta = parseInt(adj.value.shares) || 0
+  const price = parseFloat(adj.value.price) || 0
+  if (!delta) { showNotification('请输入股数', 'warning'); return }
+  if (!price) { showNotification('请输入成交价', 'warning'); return }
+  adj.value.saving = true
+  try {
+    const r = await apiFetch('/api/positions/adjust', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: p.symbol, mode: adj.value.mode, shares: delta, price }),
+    })
+    if (r.success) {
+      showNotification(r.message || '已更新持仓', 'success', 3000)
+      adj.value = { symbol: '', mode: 'add', shares: '', price: '', saving: false }
+      await loadPositions()
+    } else {
+      showNotification(r.detail || '操作失败', 'error', 3000)
+    }
+  } catch (e) {
+    showNotification('操作失败：' + (e?.message || e), 'error', 3000)
+  } finally {
+    adj.value.saving = false
+  }
 }
 
 // ===== 初始本金（2026-10-14）=====
@@ -624,6 +704,25 @@ defineExpose({ loadPositions })
 .op-btn:hover { background: #f1f5f9; }
 .op-btn.danger { color: #b91c1c; border-color: #fecaca; }
 .op-btn.danger:hover { background: #fef2f2; }
+/* 四个按钮在一列里放不下就换行，不靠缩字号硬塞（手机上"加仓/减仓/编辑/删除"各占一行也可点） */
+.pos-ops { flex-wrap: wrap; }
+/* 加减仓展开条：紧跟在对应持仓行下面，用虚线框表示"这是临时输入区" */
+.adj-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.625rem 0.75rem;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+}
+.adj-title { font-size: 0.8125rem; font-weight: 700; color: var(--text-primary); }
+.adj-now { font-size: 0.75rem; color: var(--text-secondary); }
+.adj-input { width: 7rem; }
+/* 预览：确认前就把新成本/新盈亏说出来，省掉"提交完才发现算错" */
+.adj-preview { font-size: 0.75rem; font-weight: 700; color: #1d4ed8; }
+.adj-note-line { flex-basis: 100%; font-size: 0.6875rem; color: #b45309; }
 /* 窄窗口治理（2026-10-13）
    原实现在 ≤900px 时把表头 display:none、把行压成两列 —— 屏幕窄了不等于数据可以没有标题，
    那串无标题数字对上班族是最容易看错的一种（止损价和目标价长得几乎一样）。
@@ -663,6 +762,12 @@ defineExpose({ loadPositions })
   .pos-action::before { content: '建议'; }
   .pos-ops::before { content: '操作'; }
   .pos-name, .pos-action, .pos-ops { grid-column: 1 / -1; }
-  .pos-ops { flex-direction: row; }
+  /* 加仓/减仓/编辑/删除四个按钮在手机上排成 2×2：竖着堆四行会把操作区撑得比票本身还高。
+     选择器必须带 .pos-table-row > 前缀 —— 上面那条 `.pos-table-row > span` 特异性更高，
+     只写 .pos-ops 会被它的 display:flex 压住（第一次就这样，改完才生效）。 */
+  .pos-table-row > .pos-ops { display: grid; grid-template-columns: 1fr 1fr; gap: 0.375rem; }
+  /* 「操作」这个列标题是 ::before 生成的，它也会占一格 —— 不跨行的话按钮就被顶成
+     [空][加仓] / [减仓][编辑] / [删除] 的错位排布。让它单独占一行头。 */
+  .pos-table-row > .pos-ops::before { grid-column: 1 / -1; }
 }
 </style>

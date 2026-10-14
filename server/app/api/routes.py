@@ -843,6 +843,50 @@ async def save_capital_api(body: Dict, user: Dict = Depends(current_user)):
         raise HTTPException(status_code=500, detail=f"保存本金失败: {str(error)}")
 
 
+@router.post("/api/positions/adjust", tags=["持仓管理"])
+async def adjust_position_api(body: Dict, user: Dict = Depends(current_user)):
+    """加仓/减仓：加权成本由服务端算（口径见 services/position_adjust）"""
+    from datetime import datetime
+    from db.database import load_user_positions, save_user_position, delete_user_position
+    from services.position_adjust import apply_adjust, describe
+
+    symbol = (body.get('symbol') or '').strip().lower()
+    if not re.fullmatch(r'(sh|sz|bj)\d{6}', symbol):
+        raise HTTPException(status_code=400, detail="股票代码格式应为 sh600000 / sz000001")
+    try:
+        delta = int(float(body.get('shares', 0) or 0))
+        price = round(float(body.get('price', 0) or 0), 3)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="股数与成交价必须是数字")
+
+    cur = next((p for p in load_user_positions(user_id=user['id'])
+                if (p.get('symbol') or '').lower() == symbol), None)
+    if not cur:
+        raise HTTPException(status_code=404, detail="没有找到这条持仓，请先添加")
+
+    try:
+        res = apply_adjust(cur, (body.get('mode') or '').strip(), delta, price,
+                           datetime.now().strftime('%Y-%m-%d'))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if res['cleared']:
+        if not delete_user_position(symbol, user_id=user['id']):
+            raise HTTPException(status_code=500, detail="清仓失败")
+    else:
+        pos = {'symbol': symbol, 'name': cur.get('name') or symbol,
+               'cost_price': res['cost_price'], 'shares': res['shares'],
+               'buy_date': cur.get('buy_date') or '', 'note': res['note']}
+        if not save_user_position(pos, user_id=user['id']):
+            raise HTTPException(status_code=500, detail="保存失败")
+
+    msg = describe(res, cur.get('name') or symbol)
+    return {"success": True, "message": msg,
+            "data": {"symbol": symbol, 'cleared': res['cleared'],
+                     'cost_price': res['cost_price'], 'shares': res['shares'],
+                     'realized_pnl': res['realized_pnl']}}
+
+
 @router.delete("/api/positions/{symbol}", tags=["持仓管理"])
 async def delete_position_api(symbol: str, user: Dict = Depends(current_user)):
     """删除持仓（只能删自己的）"""
