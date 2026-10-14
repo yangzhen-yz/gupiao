@@ -810,6 +810,39 @@ async def save_position_api(pos: Dict, user: Dict = Depends(current_user)):
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"保存持仓失败: {str(error)}")
 
+@router.post("/api/positions/capital", tags=["持仓管理"])
+async def save_capital_api(body: Dict, user: Dict = Depends(current_user)):
+    """设置本账号初始本金（仓位口径的分母）
+
+    没有本金，"仓位"就只能拿持仓市值自己除自己 —— 只持一只票就永远是 100%，
+    超配告警和建议总仓位也全都失去意义。填一次本金后，单票仓位与总仓位才按真实资金占比算。
+    principal 传 0 表示清除设置，回到旧的"按总成本"口径。
+    """
+    try:
+        raw = body.get('principal', None)
+        if raw is None or str(raw).strip() == '':
+            raise HTTPException(status_code=400, detail="请提供本金金额 principal")
+        try:
+            principal = round(float(raw), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="本金必须是数字")
+        if principal < 0:
+            raise HTTPException(status_code=400, detail="本金不能为负")
+        if principal > 1e12:
+            raise HTTPException(status_code=400, detail="本金数额过大，请确认单位是否为元")
+
+        from db.database import save_user_capital
+        if not save_user_capital(principal, user_id=user['id']):
+            raise HTTPException(status_code=500, detail="保存失败")
+        return {"success": True,
+                "message": ("已清除本金设置" if principal <= 0 else f"初始本金已设为 {principal:,.2f} 元"),
+                "data": {"principal": principal}}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"保存本金失败: {str(error)}")
+
+
 @router.delete("/api/positions/{symbol}", tags=["持仓管理"])
 async def delete_position_api(symbol: str, user: Dict = Depends(current_user)):
     """删除持仓（只能删自己的）"""

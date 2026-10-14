@@ -192,20 +192,40 @@ def _to_float(v) -> float:
         return 0.0
 
 
-def _advice_text(advice) -> str:
+def _advice_text(advice, portfolio=None) -> str:
     """portfolio.advice 是 {advice_pct,label,note} 结构体 —— 行动台只印一句话，
-    直接把 dict 交给前端会把 JSON 显示在卡片上（2026-10-13 暗色截图里出现过）。"""
+    直接把 dict 交给前端会把 JSON 显示在卡片上（2026-10-13 暗色截图里出现过）。
+
+    设了初始本金就把「实际仓位」放在建议前面：只说"建议三成以下"而不说你现在是几成，
+    上班族还得自己心算一遍，那一行就白占了。
+    """
+    p = portfolio or {}
+    prefix = f'仓位 {p.get("position_pct")}% · ' if p.get('capital_set') else ''
     if not advice:
-        return ''
+        return prefix.rstrip(' ·')
     if isinstance(advice, str):
-        return advice
+        return prefix + advice
     pct = advice.get('advice_pct')
     label = advice.get('label') or ''
     if label and pct is not None:
-        return f'建议总仓位 {label}（约 {pct}% 以内）'
+        return f'{prefix}建议总仓位 {label}（约 {pct}% 以内）'
     if label:
-        return f'建议总仓位 {label}'
-    return f'建议总仓位 {pct}%' if pct is not None else ''
+        return f'{prefix}建议总仓位 {label}'
+    return f'{prefix}建议总仓位 {pct}%' if pct is not None else ''
+
+
+def _desk_warnings(portfolio) -> List[str]:
+    """组合告警 + 「没设本金」的引导。
+
+    这条引导放在持仓页等于没放：用户每天第一眼看到的是行动台，
+    而没分母的仓位数字（单票必然 100%）恰恰是在这里被误读的。
+    """
+    p = portfolio or {}
+    out = list(p.get('warnings') or [])
+    hint = p.get('capital_hint')
+    if hint and hint not in out:
+        out.append(hint)
+    return out
 
 
 def _build_watchlist(watch_symbols: List[Dict], quote_map: Dict[str, Dict]) -> List[Dict]:
@@ -386,9 +406,10 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'level': env.get('level'), 'title': env.get('title'), 'detail': env.get('detail'),
             'pct': env.get('pct'), 'marketChange': env.get('marketChange'),
             'urgentSells': env.get('urgentSells'),
-            'suggestedTotal': _advice_text((diag.get('portfolio') or {}).get('advice')),
+            'suggestedTotal': _advice_text((diag.get('portfolio') or {}).get('advice'),
+                                           diag.get('portfolio')),
             'totalPnlPct': (diag.get('portfolio') or {}).get('total_pnl_pct'),
-            'warnings': (diag.get('portfolio') or {}).get('warnings') or [],
+            'warnings': _desk_warnings(diag.get('portfolio')),
         } if env else {},
         'positionActions': actions,
         'holdCount': sum(1 for p in (diag.get('positions') or [])

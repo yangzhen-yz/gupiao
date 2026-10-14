@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from app.config import KLINE_HISTORY_ENABLED, KLINE_HISTORY_DB_PATH, TREND_LIMIT_UP_THRESHOLD
-from db.database import load_user_positions, load_trend_scan_results, load_daily_recommendations, load_daily_market_reviews
+from db.database import load_user_positions, load_trend_scan_results, load_daily_recommendations, load_daily_market_reviews, get_user_capital
 from services.stock import fetch_with_retry, parse_tencent_batch_data
 from services.strategy import calc_stock_score_v2
 from services.risk_control import calc_risk_control
@@ -403,6 +403,9 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
     user_id：按用户隔离持仓（2026-10-12 多用户账号），缺省 1 兼容旧调用
     """
     positions = load_user_positions(user_id=user_id)
+    # 初始本金：仓位口径的分母。没设本金时下面一律回退成"市值/持仓市值"，
+    # 也就是老行为（单票必然接近 100%），并在 warnings 里提醒用户去设。
+    principal = get_user_capital(user_id=user_id)
 
     async def _fetch_market():
         """大盘实时涨跌 + 开盘涨跌（今开/昨收，用于开盘形态修正）"""
@@ -430,8 +433,18 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
         market_change, market_open_change = await _fetch_market()
         env_advice = calc_trading_advice(market_change, open_change=market_open_change,
                                          sentiment=_load_today_sentiment())
+        # 空仓也要把本金带出去：用户往往是先设好本金、再买第一笔，
+        # 若这里返回 portfolio=None，前端就没有地方显示和保存本金。
         return {'has_positions': False, 'market_change': round(market_change, 2),
-                'positions': [], 'portfolio': None, 'envAdvice': env_advice}
+                'positions': [], 'envAdvice': env_advice,
+                'portfolio': {'total_cost': 0, 'total_value': 0, 'total_pnl': 0,
+                              'total_pnl_pct': 0, 'principal': round(principal, 2),
+                              'capital_set': principal > 0,
+                              'base_label': '本金' if principal > 0 else '总成本',
+                              'position_pct': 0.0,
+                              'free_cash': round(principal, 2) if principal > 0 else None,
+                              'advice': _total_position_advice(market_change),
+                              'warnings': [], 'action_counts': {}}}
 
     symbols = [p['symbol'].lower() for p in positions]
 
@@ -467,14 +480,35 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
     total_pnl = total_value - total_cost
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
 
-    warnings = []
+    # 仓位基数：设了本金就按本金算（"这票占我全部资金的几成"才是用户想看的），
+    # 没设就退回总成本 —— 那是老口径，只持一只票时必然接近 100%，超配告警等于废话，
+    # 所以这种情况必须显式提示用户去设本金，而不是悄悄给一个误导性的百分比。
+    base = principal if principal > 0 else total_cost
+    base_label = '本金' if principal > 0 else '总成本'
     for d in diag_list:
-        if total_value > 0 and d['market_value'] / total_value > 0.3:
-            warnings.append(f'{d["name"]}占总市值{d["market_value"]/total_value*100:.0f}%，单票超配（建议≤25%）')
-    if len(diag_list) > 5:
-        warnings.append(f'持仓{len(diag_list)}只较多，过度分散会稀释精力与收益')
+        d['pos_pct'] = round(d['market_value'] / base * 100, 1) if base > 0 else 0.0
+    position_pct = round(total_value / base * 100, 1) if base > 0 else 0.0
+    free_cash = round(principal - total_value, 2) if principal > 0 else None
 
     advice = _total_position_advice(market_change)
+
+    warnings = []
+    # 超配判断只在"有本金"时做：分母换成持仓自己的成本时，单票必然是 ~100%，
+    # 那条告警等于天天喊狼来了，反而把真正的问题淹掉。
+    # 未设本金这件事单独用 capital_hint 说清楚（前端渲染成引导，而不是警告）。
+    capital_hint = ''
+    if principal <= 0:
+        capital_hint = '未设初始本金：仓位是按「总成本」算的，只持一只票必然接近100%（去持仓页设一次即可）'
+    elif base > 0:
+        for d in diag_list:
+            if d['pos_pct'] > 30:
+                warnings.append(f'{d["name"]}占{base_label}{d["pos_pct"]:.0f}%，单票超配（建议≤25%）')
+    if len(diag_list) > 5:
+        warnings.append(f'持仓{len(diag_list)}只较多，过度分散会稀释精力与收益')
+    # 实际仓位 vs 大盘建议档位：只有按本金算出来的仓位才配和"建议总仓位"比
+    if principal > 0 and position_pct > advice['advice_pct'] + 5:
+        warnings.append(f'实际仓位{position_pct:.0f}%已高出当前大盘建议的{advice["advice_pct"]}%（{advice["label"]}），先减再加')
+
     action_counts = {}
     for d in diag_list:
         action_counts[d['action']] = action_counts.get(d['action'], 0) + 1
@@ -488,6 +522,12 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
             'total_value': round(total_value, 2),
             'total_pnl': round(total_pnl, 2),
             'total_pnl_pct': round(total_pnl_pct, 2),
+            'principal': round(principal, 2),
+            'capital_set': principal > 0,
+            'base_label': base_label,
+            'position_pct': position_pct,
+            'free_cash': free_cash,
+            'capital_hint': capital_hint,
             'advice': advice,
             'warnings': warnings,
             'action_counts': action_counts,

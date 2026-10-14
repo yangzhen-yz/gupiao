@@ -53,7 +53,31 @@
     </div>
 
     <!-- 组合总览 -->
-    <div v-if="data.has_positions" class="portfolio-box">
+    <div v-if="data.portfolio" class="portfolio-box">
+      <!-- 初始本金：仓位口径的分母。不设就只能拿持仓市值除自己，只持一只票必然显示 100% -->
+      <div class="capital-row">
+        <span class="capital-label">初始本金</span>
+        <template v-if="!editingCapital">
+          <b class="capital-value" :class="{ unset: !data.portfolio.capital_set }">
+            {{ data.portfolio.capital_set ? fmtMoney(data.portfolio.principal) : '未设置' }}
+          </b>
+          <span class="capital-pct">
+            实际仓位
+            <b v-if="data.portfolio.capital_set">{{ data.portfolio.position_pct }}%</b>
+            <b v-else>--</b>
+            <small>{{ data.portfolio.capital_set ? data.portfolio.base_label + '口径' : '设了本金才按真实资金占比算' }}</small>
+          </span>
+          <span v-if="data.portfolio.capital_set" class="capital-free">可用 {{ fmtMoney(data.portfolio.free_cash) }}</span>
+          <button class="capital-edit" @click="startEditCapital">{{ data.portfolio.capital_set ? '修改' : '设置' }}</button>
+        </template>
+        <div v-else class="capital-edit-wrap">
+          <input ref="capitalInputRef" v-model="capitalInput" type="number" min="0" step="1000"
+                 class="form-input capital-input" placeholder="如 200000">
+          <button class="btn-scan" :disabled="saving" @click="saveCapital">{{ saving ? '保存中...' : '保存' }}</button>
+          <button class="btn-secondary" @click="cancelCapital">取消</button>
+          <span class="capital-hint">只影响仓位百分比的计算基数，不改动任何买卖信号</span>
+        </div>
+      </div>
       <div class="portfolio-row">
         <div class="portfolio-metric">
           <em>大盘涨跌</em>
@@ -121,7 +145,7 @@
       <div v-for="p in data.positions" :key="p.symbol" class="pos-table-row">
         <span class="pos-name">
           <b>{{ p.name }}</b>
-          <small>{{ p.symbol.toUpperCase() }}</small>
+          <small>{{ p.symbol.toUpperCase() }}<template v-if="data.portfolio?.capital_set && p.pos_pct != null"> · 仓位{{ p.pos_pct }}%</template></small>
         </span>
         <span class="pos-price">
           {{ p.cost }}<br><b :style="{ color: p.price >= p.cost ? 'var(--accent-danger)' : 'var(--accent-success)' }">{{ p.price }}</b>
@@ -146,7 +170,7 @@
 </template>
 
 <script setup>
-import { ref, computed, inject, onMounted, onUnmounted } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, nextTick } from 'vue'
 import { apiFetch, isTradingTime, getNextRefreshDelay } from '../../utils/helpers'
 import { usePolling } from '../../composables/usePolling'
 
@@ -188,6 +212,58 @@ async function loadPositions() {
     const result = await apiFetch('/api/positions')
     if (result.success) data.value = result.data
   } catch (e) { console.error('加载持仓失败:', e) }
+}
+
+// ===== 初始本金（2026-10-14）=====
+// 仓位没有分母就没有意义：只持一只票时，"市值/持仓市值"永远是 100%。
+// 本金存在后端 user_capital 表，按账号隔离，只作为百分比的基数，不参与任何买卖信号判定。
+const editingCapital = ref(false)
+const capitalInput = ref('')
+const capitalInputRef = ref(null)
+
+function fmtMoney(v) {
+  const n = Number(v || 0)
+  const abs = Math.abs(n)
+  if (abs >= 1e8) return `${(n / 1e8).toFixed(2)}亿`
+  if (abs >= 1e4) return `${(n / 1e4).toFixed(abs >= 1e5 ? 1 : 2)}万`
+  return `${n.toFixed(0)}元`
+}
+
+function startEditCapital() {
+  capitalInput.value = data.value.portfolio?.capital_set ? String(data.value.portfolio.principal) : ''
+  editingCapital.value = true
+  nextTick(() => capitalInputRef.value && capitalInputRef.value.focus())
+}
+
+function cancelCapital() {
+  editingCapital.value = false
+  capitalInput.value = ''
+}
+
+async function saveCapital() {
+  const raw = String(capitalInput.value || '').trim()
+  if (raw === '') { showNotification('请输入本金金额（填 0 可清除）', 'warning'); return }
+  const v = Number(raw)
+  if (!Number.isFinite(v) || v < 0) { showNotification('本金要是不小于 0 的数字', 'warning'); return }
+  saving.value = true
+  try {
+    const r = await apiFetch('/api/positions/capital', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ principal: v }),
+    })
+    if (r.success) {
+      showNotification(r.message || '本金已保存', 'success')
+      editingCapital.value = false
+      await loadPositions()
+    } else {
+      showNotification(r.detail || '保存失败', 'error')
+    }
+  } catch (e) {
+    showNotification('保存失败：' + (e?.message || e), 'error')
+  } finally {
+    saving.value = false
+  }
 }
 
 function onStockQueryInput() {
@@ -362,6 +438,35 @@ defineExpose({ loadPositions })
   margin-bottom: 1rem;
 }
 .portfolio-row { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+/* 本金行：与下面的组合指标用虚线分隔，视觉上属于同一张卡片但是"设置项"而非"结果项" */
+.capital-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem 0.75rem;
+  padding-bottom: 0.625rem;
+  margin-bottom: 0.625rem;
+  border-bottom: 1px dashed #bfdbfe;
+}
+.capital-label { font-size: 0.75rem; color: #64748b; }
+.capital-value { font-size: 1.125rem; color: #1e40af; }
+.capital-value.unset { font-size: 0.875rem; font-weight: 600; color: #94a3b8; }
+.capital-pct { font-size: 0.75rem; color: #64748b; }
+.capital-pct b { font-size: 1rem; color: #1e40af; margin: 0 0.1875rem; }
+.capital-pct small { font-size: 0.6875rem; color: #94a3b8; }
+.capital-free { font-size: 0.75rem; color: #64748b; }
+.capital-edit {
+  font-size: 0.75rem;
+  padding: 0.1875rem 0.625rem;
+  border-radius: 999px;
+  border: 1px solid #bfdbfe;
+  background: #fff;
+  color: #1e40af;
+  cursor: pointer;
+}
+.capital-edit-wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; width: 100%; }
+.capital-input { width: 9.5rem; }
+.capital-hint { font-size: 0.6875rem; color: #94a3b8; flex-basis: 100%; }
 .portfolio-metric { display: flex; flex-direction: column; }
 .portfolio-metric em { font-style: normal; font-size: 0.75rem; color: #64748b; margin-bottom: 0.125rem; }
 .portfolio-metric b { font-size: 1.125rem; }

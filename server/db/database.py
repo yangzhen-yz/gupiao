@@ -621,6 +621,16 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id)')
 
+        # 每账号的初始本金（2026-10-14）：持仓页要知道"这 10 万是多少钱里的一成"，
+        # 否则只持一只票时，仓位只能按持仓市值自己算 → 永远是 100%，超配告警也就成了废话。
+        # 单独一张表而不往 users 上加列：users 是认证表，且它的角色列已有历史包袱，不碰为妙。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_capital (
+                user_id INTEGER PRIMARY KEY,
+                principal REAL NOT NULL DEFAULT 0,
+                note TEXT DEFAULT '',
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
+
         # user_positions 增加 user_id。
         # 存量表 symbol 是「全局 UNIQUE」—— 多用户持有同一只票会直接冲突，
         # 而 SQLite 不支持 ALTER 唯一约束，故整表重建为 UNIQUE(user_id, symbol)。
@@ -1757,6 +1767,37 @@ def delete_user_position(symbol: str, user_id: int = 1) -> bool:
     except Exception as error:
         print(f'删除持仓失败: {str(error)}')
         return False
+
+
+def get_user_capital(user_id: int = 1) -> float:
+    """读账号初始本金；未设置返回 0（调用方据此回退到旧的"市值/市值"口径）"""
+    try:
+        conn = get_db_conn()
+        row = conn.execute('SELECT principal FROM user_capital WHERE user_id = ?',
+                           (int(user_id),)).fetchone()
+        conn.close()
+        return float(row['principal'] or 0) if row else 0.0
+    except Exception as error:
+        print(f'读取本金失败: {str(error)}')
+        return 0.0
+
+def save_user_capital(principal: float, user_id: int = 1, note: str = '') -> bool:
+    """写入初始本金（每个账号一行，重复保存为更新）"""
+    try:
+        conn = get_db_conn()
+        conn.execute('''INSERT INTO user_capital (user_id, principal, note, updated_at)
+            VALUES (?, ?, ?, datetime('now', '+8 hours'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                principal=excluded.principal, note=excluded.note,
+                updated_at=datetime('now', '+8 hours')''',
+            (int(user_id), float(principal), note))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存本金失败: {str(error)}')
+        return False
+
 
 _DEFAULT_HOT_STOCKS = [
     {'name': '深科技', 'code': 'sz000021'},
