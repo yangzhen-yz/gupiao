@@ -1,7 +1,11 @@
 node_modules/
 *.log
 .env
-data/
+# ⚠️ 必须写成带根路径的 `/server/data/`，不能只写 `data/`：
+# git 的 `data/` 匹配**任意深度**同名目录，2026-10-16 那次分包新增 `server/services/data/` 包之后，
+# 这条规则把 universe.py / market_cap.py / minute_history.py / eod_snapshot.py / liquidity.py
+# 连同 `__init__.py` 一共 6 个源码文件全吞了 —— 提交看着成功，干净检出却起不来。
+/server/data/
 __pycache__/
 .claude/
 .venv/
