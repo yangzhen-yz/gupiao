@@ -12,6 +12,10 @@ __pycache__/
 *.db-shm
 *.db-wal
 server/ai_config.json
+# 企业微信群机器人 webhook（含 key，属凭据，绝不入库）
+server/wecom_webhook.json
+# 企业微信自建应用凭据（corpsecret 属凭据，绝不入库）
+server/wecom_agent.json
 .DS_Store
 Thumbs.db
 .workbuddy/
@@ -20,4 +24,6 @@ Thumbs.db
 *.db.bak_*
 screenshot_*.png
 screenshots/
+# 买法矩阵重跑的输出（可复现的分析产物，不是代码；跑一次几分钟，没必要进版本库）
+server/analysis_out/
 

@@ -44,8 +44,45 @@
 
     <!-- ========== 区块：顺序完全由服务端按当前时段决定 ========== -->
     <template v-for="(sec, i) in sections" :key="sec">
+      <!-- 盘中短线情绪（2026-10-14）：先看周期、再看板块、最后才轮到个股 -->
+      <section v-if="sec === 'sentiment'" :class="['block', 'block-sent', 'sent-' + senti.temp]">
+        <header class="block-head">
+          <h3>🌡️ 短线情绪</h3>
+          <span class="block-meta">
+            <template v-if="senti.stale">数据降级 · 只提示不拦</template>
+            <template v-else>{{ senti.cycle }} {{ senti.cycleScore }} 分</template>
+          </span>
+        </header>
+
+        <div class="sent-nums" v-if="senti.nums.length">
+          <span v-for="n in senti.nums" :key="n.k" class="sent-num">
+            <em>{{ n.k }}</em><b :class="n.cls">{{ n.v }}</b>
+          </span>
+        </div>
+
+        <p class="sent-rule" v-if="senti.rule">
+          <span :class="['rule-tag', { hard: senti.vetoEnabled }]">
+            {{ senti.vetoEnabled ? '纪律·已生效' : '纪律·提示' }}
+          </span>{{ senti.rule }}
+        </p>
+
+        <div class="sent-sectors" v-if="senti.sectors.length">
+          <span class="sent-mini">当日涨停最集中</span>
+          <span v-for="s in senti.sectors" :key="s.sector" class="sector-chip">
+            {{ s.sector }} <b>{{ s.limitUp }}只 · 最高{{ s.maxLianban }}板</b>
+          </span>
+        </div>
+
+        <div v-if="senti.extra.length && expanded.sentiment" class="sent-extra">
+          <div v-for="(x, xi) in senti.extra" :key="xi" class="sent-extra-item">{{ x }}</div>
+        </div>
+        <button v-if="senti.extra.length" class="expand-btn" @click="toggleList('sentiment')">
+          {{ expanded.sentiment ? '收起 ↑' : `另有 ${senti.extra.length} 条转弱信号/缺数 ↓` }}
+        </button>
+      </section>
+
       <!-- 持仓待办 -->
-      <section v-if="sec === 'positionActions'" class="block">
+      <section v-else-if="sec === 'positionActions'" class="block">
         <header class="block-head">
           <h3>📌 持仓待办</h3>
           <span class="block-meta">
@@ -63,6 +100,7 @@
             <div class="act-top">
               <span class="act-name">{{ p.name }}<em>{{ (p.symbol || '').toUpperCase() }}</em></span>
               <span :class="['act-badge', 'badge-' + (p.action || 'hold')]">{{ p.actionLabel || '关注' }}</span>
+              <span v-if="!p.sellable" class="t1-chip" :title="p.lockedReason">T+1 明日可卖</span>
             </div>
             <div class="act-nums">
               <span>现价 <b>{{ p.price ?? '--' }}</b></span>
@@ -127,8 +165,10 @@
         </button>
         <div v-if="data.deferredBuys && data.deferredBuys.length" class="deferred">
           <span class="deferred-label">稍后时机：</span>
-          <button v-for="d in data.deferredBuys" :key="d.symbol" class="deferred-chip" @click="goQuote(d.symbol)">
+          <button v-for="d in data.deferredBuys" :key="d.symbol" :class="['deferred-chip', { vetoed: d.vetoReason }]"
+                  @click="goQuote(d.symbol)">
             {{ d.name }} · {{ d.timingLabel || '待时机' }}
+            <em v-if="d.vetoReason" class="deferred-why">{{ d.vetoReason }}</em>
           </button>
         </div>
         <div class="block-foot">
@@ -260,6 +300,41 @@ const LIVE_PHASES = ['auction', 'morning', 'lunch', 'mid', 'tail']
 const isLive = computed(() => !!data.value && LIVE_PHASES.includes(data.value.phase))
 const sections = computed(() => (data.value && data.value.sections) || [])
 const hero = computed(() => (data.value && data.value.headline) || { level: 'muted', text: '正在汇总…', sub: '' })
+
+// 盘中短线情绪（2026-10-14）：数字全部由服务端算好（services/sentiment.py），
+// 这里只负责"一眼看懂今天该攻还是该守"，不在前端重算任何口径。
+const SENTI_TEMP = { 冰点: 'cold', 退潮: 'cold', 分歧: 'mid', 回暖: 'mid', 发酵: 'hot', 高潮: 'hot' }
+const senti = computed(() => {
+  const s = (data.value && data.value.sentiment) || {}
+  const ind = s.indicators || {}
+  const pct = (v, digits = 1) => (v === null || v === undefined ? null : `${Number(v).toFixed(digits)}%`)
+  const nums = []
+  const push = (k, v, cls = '') => { if (v !== null && v !== undefined) nums.push({ k, v, cls }) }
+  push('涨停', ind.limitUpCount)
+  push('跌停', ind.limitDownCount, Number(ind.limitDownCount) >= 10 ? 'danger' : '')
+  push('炸板率', pct(ind.zhabanRate), Number(ind.zhabanRate) >= 35 ? 'danger' : '')
+  push('最高连板', ind.maxLianban === null || ind.maxLianban === undefined ? null : `${ind.maxLianban}板`)
+  push('涨停晋级', pct(ind.promotionRate), Number(ind.promotionRate) < 25 ? 'danger' : '')
+  push('昨涨停今日', ind.yesterdayPremium === null || ind.yesterdayPremium === undefined
+    ? null : fmtPct(ind.yesterdayPremium),
+  Number(ind.yesterdayPremium) < 0 ? 'down' : (Number(ind.yesterdayPremium) > 0 ? 'up' : ''))
+  const extra = []
+  ;(s.weakSignals || []).forEach(w => extra.push(w))
+  ;(s.failedLeaders || []).forEach(f => extra.push(`${f.name}（${f.lianban}板）今日 ${fmtPct(f.change)} —— 龙头失势`))
+  ;(s.dataGaps || []).forEach(g => extra.push(`缺数：${g}`))
+  if (s.stale) extra.unshift('情绪接口此刻不可用，以下判断仅供留意，不作为拦截依据')
+  return {
+    cycle: s.cycle || '未知',
+    cycleScore: s.cycleScore,
+    temp: SENTI_TEMP[s.cycle] || 'na',
+    stale: !!s.stale,
+    nums,
+    rule: s.rule || s.advice || '',
+    vetoEnabled: !!s.vetoEnabled,
+    sectors: s.leadSectors || [],
+    extra,
+  }
+})
 
 const asOfText = computed(() => {
   const v = data.value && data.value.asOf
@@ -592,6 +667,49 @@ onMounted(() => {
   border: 1px solid var(--border-subtle); border-radius: var(--radius-pill);
 }
 .deferred-chip:hover { border-color: var(--border-strong); color: var(--text-primary); }
+.deferred-chip.vetoed { border-style: dashed; }
+.deferred-why {
+  display: block; margin-top: 1px; font-style: normal; font-size: 0.6875rem;
+  line-height: 1.3; color: var(--accent-warning); white-space: normal;
+}
+
+/* T+1 冻结标记：今天买的今天卖不掉，不写清楚就会变成"系统提醒了却没反应"的误会 */
+.t1-chip {
+  display: inline-block; padding: 1px 7px; border-radius: var(--radius-pill);
+  font-size: 0.6875rem; font-weight: 700; white-space: nowrap;
+  color: var(--text-tertiary); background: var(--bg-tertiary);
+  border: 1px dashed var(--border-strong);
+}
+
+/* ===== 短线情绪（2026-10-14）=====
+   全部走 token，暗色模式自动跟随（本页自带反色块的只有下面几个语义边框）。
+   区块定位是"3 行看完今天该攻还是该守"，所以弱信号明细折叠在一条按钮后面。 */
+.block-sent { border-left: 3px solid var(--border-subtle); }
+.block-sent.sent-hot { border-left-color: var(--accent-danger); }   /* A股配色：红=情绪强 */
+.block-sent.sent-mid { border-left-color: var(--accent-warning); }
+.block-sent.sent-cold { border-left-color: var(--accent-success); } /* 绿=情绪弱 */
+.sent-nums { display: flex; flex-wrap: wrap; gap: 0.3125rem 0.75rem; }
+.sent-num { display: inline-flex; align-items: baseline; gap: 0.25rem; font-size: 0.75rem; color: var(--text-tertiary); }
+.sent-num b { font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.sent-num b.danger { color: var(--accent-danger); }
+.sent-num b.up { color: var(--accent-danger); }
+.sent-num b.down { color: var(--accent-success); }
+.sent-rule { margin: 0.375rem 0 0; font-size: 0.8125rem; line-height: 1.45; color: var(--text-secondary); }
+.rule-tag {
+  display: inline-block; margin-right: 0.375rem; padding: 1px 7px; border-radius: var(--radius-pill);
+  font-size: 0.6875rem; font-weight: 700; color: var(--text-tertiary);
+  background: var(--bg-tertiary); border: 1px solid var(--border-subtle);
+}
+.rule-tag.hard { color: var(--accent-danger); border-color: var(--accent-danger); }
+.sent-sectors { display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem; margin-top: 0.4375rem; }
+.sent-mini { font-size: 0.75rem; color: var(--text-tertiary); }
+.sector-chip {
+  font-size: 0.75rem; padding: 2px 8px; color: var(--text-secondary);
+  background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-pill);
+}
+.sector-chip b { color: var(--text-primary); font-weight: 700; }
+.sent-extra { margin-top: 0.4375rem; display: flex; flex-direction: column; gap: 0.1875rem; }
+.sent-extra-item { font-size: 0.75rem; line-height: 1.45; color: var(--text-tertiary); }
 
 .env-card.env-warning { border-left: 3px solid var(--accent-warning); }
 .env-card.env-danger, .env-card.env-error { border-left: 3px solid var(--accent-danger); }

@@ -2,22 +2,41 @@
 import asyncio, schedule, time
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
+                        KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
 
-from services.stock import fetch_eastmoney_hot_list
+from services.data.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
-from services.trend import (scan_and_remove_below_ma10, scan_trend_task)
-from services.trend_backtest import backtest_trend_predictions
-from services.review import generate_daily_review
-from services.strategy import backtest_yesterday_predictions
-from services.recommend import auto_generate_recommendations_task
-from services.shareholder import update_holder_num_task
-from services.fundamental import update_fundamental_task
-from services.valuation import update_valuation_task
-from services.market import run_scheduled_market_alert
-from services.smartmoney import refresh_smart_money_task
-from services.push import push_candidates_task, push_daily_preview_task
-from services.trading_calendar import is_trading_day
+from services.strategy.trend import (scan_and_remove_below_ma10, scan_trend_task)
+from services.strategy.trend_backtest import backtest_trend_predictions
+from services.ops.review import generate_daily_review
+from services.strategy.strategy import backtest_yesterday_predictions
+from services.pick.recommend import auto_generate_recommendations_task
+from services.data.shareholder import update_holder_num_task
+from services.data.fundamental import update_fundamental_task
+from services.data.valuation import update_valuation_task
+from services.strategy.market import run_scheduled_market_alert
+from services.data.smartmoney import refresh_smart_money_task
+from services.support.push import push_candidates_task, push_daily_preview_task
+from services.data.trading_calendar import is_trading_day
+# 持仓快反推送（2026-10-14）：止损/止盈/炸板不能等用户打开页面才看见
+# 2026-10-15 补 T+1：当天建仓的票当天卖不掉，改成次日竞价推"可卖预案"
+from services.portfolio.position_watch import watch_all_users, push_t1_plan, watch_targets
+# 盘后数据自检的告警出口（按账号发，不再共用全局群）
+from services.support.push_channel import send_to_user
+from services.strategy.sentiment import get_sentiment
+# 盘前全市场海选候选池（2026-10-15）：替代"只看东财人气榜"的窄入口
+from services.pick.candidate_pool import build_pool as build_candidate_pool
+from app.config import CANDIDATE_POOL_TIME
+from app.config import MATRIX_RERUN_ENABLED, MATRIX_RERUN_TIME
+from app.config import (MARKET_CAP_REFRESH_TIME, MARKET_CAP_REFRESH_WEEKDAY,
+                        CANDIDATE_POOL_MAX, KLINE_POOL_MIN_COVERAGE)
+from app.config import (POSITION_WATCH_ENABLED, POSITION_WATCH_INTERVAL_SEC,
+                        POSITION_WATCH_START, POSITION_WATCH_END, PUSH_T1_PLAN_TIME)
+
+
+# 盘后数据自检的告警去重：同一天+同一"库内最新日期"只轰一次，否则每轮重跑都发一条
+_KLINE_ALERTED = set()
 
 
 def _today_is_trading() -> bool:
@@ -102,7 +121,7 @@ async def auto_optimization_task():
     """V4.4：自动优化任务（每日回测后执行）"""
     try:
         print(f'[定时任务 {datetime.now():%H:%M:%S}] 正在执行自动优化...')
-        from services.auto_optimizer import run_auto_optimization
+        from services.ops.auto_optimizer import run_auto_optimization
         # 网格搜索每周一运行一次
         is_monday = datetime.now().weekday() == 0
         result = await run_auto_optimization(run_grid=is_monday)
@@ -139,6 +158,41 @@ def run_scheduler():
             return
         asyncio.run(scan_and_remove_below_ma10())
 
+    def job_build_candidate_pool():
+        """盘前 9:00 全市场海选候选池（2026-10-15）。
+
+        为什么排在 9:00：本地日K由 18:15 同步维护，9:00 已含昨收；而 9:45 是第一次
+        生成推荐，海选必须在那之前落库，让 9:45 / 13:30 / 14:05 三次共用同一份名单。
+        失败不静默：池子为空时打警告，因为"入口静默退化回热搜池"和当年因子权重
+        学习崩 40 天是同一类事故 —— 看起来一切正常，其实是能力悄悄少了大半。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            pool = build_candidate_pool()
+            if not pool:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 盘前海选为空，今日推荐退回热搜池'
+                      f'（请检查 18:15 日K同步是否成功：python scripts/backfill_kline.py --mode sync）')
+            else:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 盘前海选完成：{len(pool)} 只入池')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 盘前海选异常: {e}')
+
+    def job_push_t1_plan():
+        """9:15 集合竞价：推"昨日冻结·今日可卖"预案（2026-10-15）。
+
+        A股 T+1 —— 当天买入的票当天卖不掉，那天推"立即止损"除了让人难受没有别的用处
+        （用户原话：当天买的我怎么卖，推我卖有毛用）。所以信号照记，提醒改到
+        第二天他真正能挂单的 9:15 竞价窗口。
+        """
+        if not _today_is_trading():
+            return
+        for uid in (watch_targets() or [1]):
+            try:
+                asyncio.run(push_t1_plan(user_id=uid))
+            except Exception as e:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] T+1 预案推送异常(账号{uid}): {e}')
+
     def job_generate_review():
         asyncio.run(generate_review_task())
 
@@ -171,7 +225,7 @@ def run_scheduler():
     def job_recommend_review():
         """智能推荐复盘（本地K线库计算，无网络依赖，非交易日也可跑）"""
         try:
-            from services.recommend_review import run_recommendation_review
+            from services.pick.recommend_review import run_recommendation_review
             run_recommendation_review()
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 推荐复盘失败: {e}')
@@ -213,6 +267,18 @@ def run_scheduler():
         # 股东人数是月度数据，每日更新即可；非交易日也可拉取（上一交易日收盘后发布也有）
         asyncio.run(update_holder_num_task())
 
+    def job_refresh_market_cap():
+        """每周刷新总市值表（2026-10-16 防量化操控小微盘）。
+        市值只从东财单只 stock/get 拿（clist/ulist 批量都不返回），按主板+非ST清单逐只拉；
+        默认只补缺失（resumable），被限流下次继续。非交易日也跑（市值与是否交易日无关）。"""
+        try:
+            from services.data.market_cap import refresh as _refresh_cap
+            r = _refresh_cap()
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 市值刷新完成：新入库 {r.get("ok")}，'
+                  f'未取到 {r.get("fail")}（限流则下次续补）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 市值刷新异常: {e}')
+
     def job_update_fundamental():
         # 基本面季度披露，非交易日可拉取
         asyncio.run(update_fundamental_task())
@@ -239,31 +305,194 @@ def run_scheduler():
 
     def job_db_maintenance():
         # 2026-09-18：每周六凌晨清理过期 K线缓存/热搜快照并 VACUUM（非交易日，不锁库）
-        from services.db_maintenance import cleanup_old_cache
+        from services.ops.db_maintenance import cleanup_old_cache
         try:
             cleanup_old_cache()
         except Exception as e:
             print(f'[DB维护] 异常: {e}')
 
+    def _alert_kline_stale(sync_err=None, final=True):
+        """盘后自检：今天该有 K 线，库里却没有 —— 就别让它悄悄过去。
+
+        为什么要专门写这条：2026-10-15 那次同步报 disk I/O error 后，日志只留下一行
+        "本地库同步/RPS刷新异常"，没人注意到后果是 rps_cache 的更新时间还停在
+        **2026-09-28 09:45**（当晚查出来的实测值），也就是评分用的 120 日相对强度已经
+        十几天没换过水，而页面上一切看起来正常。这跟当年因子权重停摆 40 天是同一类事故。
+        """
+        if not _today_is_trading() or not final:
+            return
+        try:
+            from services.data.kline_history import get_engine
+            stats = get_engine().get_db_stats() or {}
+        except Exception as e:
+            print(f'[盘后自检] 读不到本地日K库统计，跳过自检: {e}')
+            return
+        latest = stats.get('latestDate') or ''
+        today = datetime.now().strftime('%Y-%m-%d')
+        # 分母用"选股范围"（主板 + 非ST/退 + 市值≥35亿，实测 2462 只），不用整库 5222：
+        # 范围外的票 2026-10-16 起不再增量同步（存量冻结），拿 5222 当分母会把正常状态永远报成故障。
+        uni_n = stats.get('universeCount') or 0
+        covered = stats.get('latestDayCovered') or 0
+        cov = (covered / uni_n) if uni_n else 1.0
+        if latest >= today and cov >= KLINE_POOL_MIN_COVERAGE:
+            return
+        if latest >= today:
+            why = (f'当天在选股范围里只落了 {covered}/{uni_n} 只 = {cov*100:.1f}%'
+                   f'（< {KLINE_POOL_MIN_COVERAGE*100:.0f}%，同步像跑到一半）')
+        else:
+            why = f'今天（{today}）这根K线没进来' + (f'（同步异常：{sync_err}）' if sync_err else '')
+        print(f'[盘后自检] ⚠️ 本地日K库最新 {latest}，{why}')
+        key = f'{today}|{latest}|{covered}'
+        if key in _KLINE_ALERTED:
+            return
+        _KLINE_ALERTED.add(key)
+        text = (f'⚠️ 盘后数据自检：本地日K库最新 {latest}，{why}。'
+                + (f'\n同步异常：{sync_err}' if sync_err else '')
+                + '\n影响：明早 09:00 盘前海选、RPS、趋势评分都缺最新一天'
+                  '（候选池的覆盖度门槛会自动拒绝出池、退回热搜池，不会拿半截数据选票）。'
+                + f'\n口径：分母＝选股范围（沪深主板·非ST/退·总市值≥35亿）{uni_n} 只，'
+                  '整库 5222 只里范围外的已停止增量同步。'
+                + '\n处理：在办公室电脑 cd D:\\Desktop\\guizhou\\gupiao\\server 后执行 '
+                  'python scripts/backfill_kline.py --mode sync'
+                  f'（补指定某天用 --date {today}；若日志出现「黑名单用户」说明被 baostock 限流，'
+                  '等 1~2 小时再跑，越重试越久）')
+        for uid in watch_targets():
+            try:
+                # 系统健康告警：personal=False 允许未绑通道的账号回落全局群，
+                # 否则真实用户没绑推送时这条最关键的自检会彻底丢失。
+                send_to_user(uid, text, personal=False)
+            except Exception as e:
+                print(f'[盘后自检] 账号{uid} 告警推送失败: {e}')
+
     def job_sync_history():
         """A 级优化：每日盘后增量同步本地历史日K线库 + 同步后向量化刷新 RPS。
 
         本地库由 baostock 前复权数据维护，最新价=实盘价与实时行情无缝；RPS 从此本地库向量化计算（秒级、免东方财富限流）；
-        首次回填需手动跑 `python backfill_kline.py --mode backfill`，之后每日增量即可。
+        首次回填需手动跑 `python scripts/backfill_kline.py --mode backfill`，之后每日增量即可。
+
+        2026-10-16 改动：同步与 RPS 刷新拆成两段 try，并在结尾做一次新鲜度自检。
+        以前两者共用一个 try —— 同步一抛异常（10-15 就是 disk I/O error），RPS 连刷新都被
+        跳过，结果就是"库没更新 + 评分口径也没更新"，而日志只有一行异常摘要。
         """
         if not KLINE_HISTORY_ENABLED:
             return
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        def _cov_now():
+            """(选股范围内已覆盖, 范围总数) —— 判断"今天这根K线到底齐不齐"的唯一依据。"""
+            try:
+                from services.data.kline_history import get_engine as _ge
+                st = _ge().get_db_stats() or {}
+                u = st.get('universeCount') or 0
+                c = st.get('latestDayCovered') or 0
+                if st.get('latestDate') != today_str:
+                    return 0, u or 1
+                return c, u or 1
+            except Exception:
+                return 0, 1
+
+        # 已经等到今天且覆盖度达标才跳过（18:15 成功的话，18:45/19:15 不必再跑一遍全市场）。
+        # 只看 MAX(date) 会被半截的一天骗过去，所以这里问的是"范围内覆盖到几成"。
+        c0, u0 = _cov_now()
+        if c0 / u0 >= KLINE_POOL_MIN_COVERAGE:
+            if datetime.now().strftime('%H:%M') != KLINE_HISTORY_SYNC_TIME:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地日K已是 {today_str}（覆盖 {c0}/{u0}），本轮跳过')
+            return
+
+        # ── 主路：腾讯批量收盘快照（零登录，41 次请求拿全市场） ──
+        # 2026-10-16 换架构的原因：baostock 要会话、逐只查、失败还得重登，
+        # 结果当天被自己拖进 `10001011 黑名单用户`，整晚停在 1109/2462 只。
+        # 收盘快照这条路没有"登录频率"这个概念，被拉黑这件事从此与每日数据无关。
+        sync_err = None
         try:
-            from services.kline_history import get_engine, history_available
-            eng = get_engine()
-            eng.sync_today_bulk()
-            # 同步后若本地库已就绪，立即向量化刷新 RPS（秒级，不依赖东方财富限流）
-            if history_available():
-                from services.rps import refresh_rps
-                asyncio.run(refresh_rps(RPS_PERIOD_DAYS))
-                print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库增量同步 + RPS 向量化刷新完成')
+            from services.data import eod_snapshot
+            st = eod_snapshot.sync_snapshot(today_str)
+            c1, u1 = _cov_now()
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘快照(主路)：拿到 {st.get("got")} 只、'
+                  f'写入 {st.get("written")} 条、停牌跳过 {st.get("stale_stamp", 0) + st.get("zero_vol", 0)} 只、'
+                  f'除权待重算 {st.get("restated")} 只 → 覆盖 {c1}/{u1}'
+                  + (f'｜⚠️ 拒写: {st.get("rejected")}' if st.get('rejected') else ''))
+            if st.get('rejected'):
+                sync_err = f"收盘快照与备路口径不符: {st['rejected']}"
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库同步/RPS刷新异常: {e}')
+            sync_err = e
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 收盘快照(主路)异常: {type(e).__name__}: {e}')
+
+        # ── 备路：baostock 增量同步（仅在主路没把覆盖度喂够时才敲门；内部有封禁冷却门禁） ──
+        c1, u1 = _cov_now()
+        if c1 / u1 < KLINE_POOL_MIN_COVERAGE:
+            left = 0.0
+            try:
+                from services.data.kline_history import ban_cooldown_remaining
+                left = ban_cooldown_remaining()
+            except Exception:
+                pass
+            if left > 0:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 主路覆盖 {c1}/{u1} 不足，'
+                      f'但 baostock 仍在冷却（剩 {int(left)} 分钟）—— 本轮不敲门，'
+                      f'剩余时刻与明早重试会继续补')
+            else:
+                try:
+                    from services.data.kline_history import get_engine
+                    get_engine().sync_today_bulk()
+                except Exception as e:
+                    sync_err = sync_err or e
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 本地日K增量同步(备路)异常: {e}')
+        try:
+            from services.data.kline_history import history_available
+            if history_available():
+                from services.strategy.rps import refresh_rps
+                res = asyncio.run(refresh_rps(RPS_PERIOD_DAYS))
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库同步后 RPS 刷新完成：{res}')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ RPS 向量化刷新异常: {e}')
+        # 名录（代码→名称、在市/退市、ST 标记）每天跟着刷一次：股票范围里"剔除 ST/*ST"
+        # 完全依赖这张表，而 ST 帽子是随时戴随时摘的 —— 名录过期就等于范围失效。
+        # 单独一段 try，且放在新鲜度自检之前：它失败只让范围变旧，不该拖住日K同步的结论。
+        try:
+            from sync_stock_basic import sync as sync_stock_names
+            n = sync_stock_names()
+            if n < 0:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步失败（ST 判定可能过期）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步异常: {e}')
+        # 只有最后一个重试时刻还没等到数据才算真失败（16:05 那种"baostock 还没出当天EOD"
+        # 不是故障，半夜叫警报只会让人以为系统坏了）
+        _alert_kline_stale(sync_err, final=datetime.now().strftime('%H:%M') >= KLINE_HISTORY_SYNC_LAST)
+
+    def job_matrix_rerun():
+        """一次性把买法四张表重跑成"选股范围 2462 只"口径（用户 2026-10-16 选定：冷却结束后自动跑）。
+
+        为什么必须以**脱离进程**跑：四张表要几十分钟，而 `schedule` 是单线程轮询 ——
+        直接在调度线程里等就等于推迟 09:00 海选和 09:45 推荐。
+        为什么现在还要跑：今晚改分母（5222→2462）之后分时那张还没出数，而它要补的 5 分钟线
+        依赖 baostock，本机 IP 又刚被判黑名单，所以排在冷却解除之后（脚本里会先看冷却状态）。
+        幂等由 `analysis_out/.done_matrix_2462` 标记保证：四张都出数就不再重复。
+        """
+        if not MATRIX_RERUN_ENABLED:
+            return
+        import os
+        import subprocess
+        import sys
+        server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(server_dir, 'scripts', 'run_matrix_rerun.py')
+        flag = os.path.join(server_dir, 'analysis_out', '.done_matrix_2462')
+        if os.path.exists(flag):
+            return                      # 已经完成，别每天再拉一次
+        log = os.path.join(server_dir, 'analysis_out', 'rerun.log')
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, 'a', encoding='utf-8') as fh:
+                flags = 0
+                if os.name == 'nt':
+                    flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+                p = subprocess.Popen([sys.executable, '-u', script], cwd=server_dir,
+                                     stdout=fh, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, creationflags=flags)
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 买法矩阵重跑已拉起（pid {p.pid}，'
+                  f'日志 server/analysis_out/rerun.log；脚本会自己等 baostock 冷却解除）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 买法矩阵重跑拉起失败: {e}')
 
     # ---- 注册定时任务 ----
     # 热搜榜：非交易日不跑，没意义
@@ -278,6 +507,12 @@ def run_scheduler():
         schedule.every().day.at(t).do(_warp_trading_only(job_update_hot_search_ranking))
 
     schedule.every().day.at(SCHEDULE_MA10_CHECK_TIME).do(job_scan_ma10)
+
+    # 盘前全市场海选候选池（2026-10-15）：9:00 出池，供 9:45/13:30/14:05 三次生成共用
+    schedule.every().day.at(CANDIDATE_POOL_TIME).do(job_build_candidate_pool)
+
+    # T+1 预案（2026-10-15）：昨天买的今天才能卖，提醒时点放在 9:15 竞价
+    schedule.every().day.at(PUSH_T1_PLAN_TIME).do(job_push_t1_plan)
 
     schedule.every().day.at(SCHEDULE_DAILY_REVIEW_TIME).do(job_generate_review)
 
@@ -327,10 +562,19 @@ def run_scheduler():
     # 交易日后定时拉取最新龙虎榜+北向资金数据，前端无需手动刷新
     schedule.every().day.at(SMART_MONEY_UPDATE_TIME).do(job_update_smart_money)
 
-    # A 级优化：每日 18:15 增量同步本地历史日K线库 + 向量化刷新 RPS（避开估值 18:10 并发）
+    # A 级优化：每日盘后增量同步本地历史日K线库 + 向量化刷新 RPS（避开估值 18:10 并发）
+    # 时刻是一串而不是一个：baostock 当日 EOD 落地时间不固定（2026-10-16 实测 16:00 跑写 0 条），
+    # 所以 18:15 起每 30 分钟重试，谁先等到数据谁做完，后面自动跳过；最后一个时刻仍没有才告警。
     if KLINE_HISTORY_ENABLED:
         # 仅交易日执行：非交易日无新 K 线，跑也是 0 条；且 RPS 重算无意义
-        schedule.every().day.at(KLINE_HISTORY_SYNC_TIME).do(_warp_trading_only(job_sync_history))
+        for _t in KLINE_HISTORY_SYNC_TIMES:
+            schedule.every().day.at(_t).do(_warp_trading_only(job_sync_history))
+
+    # 总市值表每周刷新（2026-10-16）：选票/K线/分时线据此剔除 <35亿 小微盘，防量化操控；非交易日也跑
+    getattr(schedule.every(), MARKET_CAP_REFRESH_WEEKDAY).at(MARKET_CAP_REFRESH_TIME).do(job_refresh_market_cap)
+
+    # 买法矩阵按"选股范围 2462"重跑（一次性，跑成功写标记后自动不再触发）；非交易日也要跑
+    schedule.every().day.at(MATRIX_RERUN_TIME).do(job_matrix_rerun)
 
     # 企业微信选股推送：开盘前 9:25 推送今日关注池预览（仅交易日）
     schedule.every().day.at(WECOM_PUSH_PREVIEW_TIME).do(job_push_daily_preview)
@@ -343,6 +587,9 @@ def run_scheduler():
     print(f'[定时任务]   - {"/".join(SCHEDULE_UPDATE_HOT_SEARCH_TIMES)}: 更新热搜榜（仅交易日）')
     print(f'[定时任务]   - {",".join(trend_scan_times)} (每{SCHEDULE_TREND_SCAN_INTERVAL_MIN}分钟): 自动扫描趋势股（仅交易日）')
     print(f'[定时任务]   - {SCHEDULE_MA10_CHECK_TIME}: 检查10日线+连跌天数并清理股票池（仅交易日）')
+    print(f'[定时任务]   - {CANDIDATE_POOL_TIME}: 盘前海选候选池（范围：沪深主板、剔除ST，'
+          f'上限 {CANDIDATE_POOL_MAX} 只，喂给 9:45/13:30/14:05 的推荐）')
+    print(f'[定时任务]   - {PUSH_T1_PLAN_TIME}: T+1 可卖预案推送（昨日买入当天卖不掉的票，今天竞价提醒）')
     print(f'[定时任务]   - {SCHEDULE_DAILY_REVIEW_TIME}: 自动生成每日收评（仅交易日，含 AI 情绪评分/操作建议）')
     print(f'[定时任务]   - {SCHEDULE_BACKTEST_TIME}: 回测验证昨日预测并调整策略权重（仅交易日）')
     print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: 趋势评分回测验证（1/3/5日跑赢大盘胜率，仅交易日）')
@@ -356,9 +603,15 @@ def run_scheduler():
     print(f'[定时任务]   - {",".join(SCHEDULE_MARKET_ALERT_TIMES)}: 大盘风险预警自动扫描（仅交易日）')
     print(f'[定时任务]   - {SMART_MONEY_UPDATE_TIME}: 刷新龙虎榜+北向资金数据（刷新至最近已收盘交易日）')
     if KLINE_HISTORY_ENABLED:
-        print(f'[定时任务]   - {KLINE_HISTORY_SYNC_TIME}: 增量同步本地历史日K线库 + 向量化刷新 RPS（仅交易日，A 级优化）')
+        _sync_slots = ' / '.join(KLINE_HISTORY_SYNC_TIMES)
+        print(f'[定时任务]   - {_sync_slots}: 增量同步本地历史日K线库 + 向量化刷新 RPS'
+              f'（仅交易日；等到当天数据即停，最后一次仍没有才告警）')
     print(f'[定时任务]   - {WECOM_PUSH_PREVIEW_TIME}: 推送今日关注池预览（企业微信，仅交易日）')
-    print(f'[定时任务]   - 盘中 {WECOM_PUSH_START}~{WECOM_PUSH_END} 每{WECOM_PUSH_INTERVAL_SEC}秒: 达标候选股实时推送企业微信（仅交易日）\n')
+    print(f'[定时任务]   - 盘中 {WECOM_PUSH_START}~{WECOM_PUSH_END} 每{WECOM_PUSH_INTERVAL_SEC}秒: '
+          f'达标候选股实时推送企业微信（仅交易日；范围=用户池∪推荐池，日限 '
+          f'{WECOM_PUSH_DAILY_LIMIT} 只）')
+    print(f'[定时任务]   - 盘中 09:15~15:05 每180秒: 短线情绪温度计刷新（涨停池/炸板池/跌停池/宽度→周期+主线板块，仅交易日）')
+    print(f'[定时任务]   - 盘中 {POSITION_WATCH_START}~{POSITION_WATCH_END} 每{POSITION_WATCH_INTERVAL_SEC}秒: 持仓止损/止盈/炸板快反推送（仅交易日，避开竞价与午休）\n')
 
     # 自愈机制：schedule 库的 .day.at() 可能在 60s 间隔下漏触发（run_pending 恰好跳过目标分钟），
     # 主循环每 30s 额外检查：交易日 15:10 后若今日收评仍缺失则自动补生成，最多重试 3 次
@@ -371,6 +624,10 @@ def run_scheduler():
     _backtest_heal_date_tracker = ''
     # 企业微信选股推送：盘中每 WECOM_PUSH_INTERVAL_SEC 秒扫描一次（1 分钟级准实时）
     _last_push_ts = 0.0
+    # 持仓快反推送：盘中每 POSITION_WATCH_INTERVAL_SEC 秒扫一次持仓（2026-10-14）
+    _last_watch_ts = 0.0
+    # 盘中情绪刷新：主循环预热，避免用户第一次打开页面时现打接口
+    _last_sentiment_ts = 0.0
 
     while True:
         try:
@@ -393,6 +650,30 @@ def run_scheduler():
                         asyncio.run(push_candidates_task())
                     except Exception as push_err:
                         print(f'[定时任务 {_now:%H:%M:%S}] 选股推送异常: {push_err}')
+
+            # ---- 盘中情绪刷新（2026-10-14，仅交易日 9:15~15:05）----
+            # 主循环主动预热：情绪分是选股门槛/环境档位/快反文案的共同上游，
+            # 若等页面请求触发，第一次打开会串行打 4 个东财接口、慢一拍。
+            if (_hm >= '09:15' and _hm <= '15:05' and _today_is_trading()
+                    and time.time() - _last_sentiment_ts >= 180):
+                _last_sentiment_ts = time.time()
+                try:
+                    _s = asyncio.run(get_sentiment())
+                    print(f'[情绪 {_now:%H:%M:%S}] {_s.get("cycle")} {_s.get("cycleScore")}分'
+                          f'｜{_s.get("detail")}')
+                except Exception as _sent_err:
+                    print(f'[情绪 {_now:%H:%M:%S}] 刷新失败: {_sent_err}')
+
+            # ---- 持仓快反推送（2026-10-14，止损/止盈不等用户打开页面）----
+            # 时窗/交易日/午休判定在 watch_all_users 内部再做一次，这里只控频率。
+            if (POSITION_WATCH_ENABLED and _hm >= POSITION_WATCH_START
+                    and _hm <= POSITION_WATCH_END and _today_is_trading()):
+                if time.time() - _last_watch_ts >= POSITION_WATCH_INTERVAL_SEC:
+                    _last_watch_ts = time.time()
+                    try:
+                        asyncio.run(watch_all_users())
+                    except Exception as _watch_err:
+                        print(f'[定时任务 {_now:%H:%M:%S}] 持仓快反异常: {_watch_err}')
 
             # ---- 收评自愈检查（最多重试 3 次，成功后停止）----
             if _hm >= SCHEDULE_DAILY_REVIEW_TIME and is_trading_day(_now.date()):
@@ -473,7 +754,10 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] schedule 循环异常（已捕获继续）: {loop_err}')
             import traceback
             print(f'  堆栈: {traceback.format_exc()[:400]}')
-        time.sleep(30)
+        # 2026-10-14：30s → 10s。原 30s 让"盘中每 20 秒扫持仓"变成一句空话——
+        # 循环本身睡 30 秒，任何小于 30 秒的间隔都取决于运气。
+        # run_pending/自愈都是纯内存与轻量 DB 读，10 秒一轮没有额外成本。
+        time.sleep(10)
 
 
 

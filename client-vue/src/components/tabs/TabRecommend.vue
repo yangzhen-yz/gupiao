@@ -53,7 +53,7 @@
         <span class="section-stats">{{ todayDate }}</span>
       </div>
       <div v-if="todayRecommend.length === 0" style="text-align:center;padding:4rem 2rem;color:#94a3b8;background:#f8fafc;border-radius:16px;border:2px dashed #e2e8f0;margin:1rem 0;">✨ 准备就绪，点击上方按钮生成今日潜力股</div>
-      <div v-for="(r, idx) in todayRecommend" :key="r.symbol" :class="['recommend-card', `top-${idx + 1}`]">
+      <div v-for="(r, idx) in todayRecommend" :key="r.symbol" :class="['recommend-card', `top-${idx + 1}`]" @click="openKlineFor(r, todayDate)" style="cursor:pointer;" title="点击查看K线（标记推荐日）">
         <div class="recommend-header">
           <div class="recommend-rank-badge">{{ idx === 0 ? '🥇' : idx === 1 ? '🥈' : '🥉' }}</div>
           <div class="recommend-info-main">
@@ -62,6 +62,7 @@
               <span v-if="r.placement_info" class="placement-badge"
                     :title="`${r.placement_info.notice_date} ${r.placement_info.title}`">📢 近期增发</span>
               <span class="recommend-code-text">{{ r.symbol.toUpperCase() }}</span>
+              <button class="kline-hint-btn" @click.stop="openKlineFor(r, todayDate)" title="查看K线（标记推荐日）">📈 K线</button>
             </div>
           </div>
           <div class="recommend-price-large" :style="{ color: r.change >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">{{ r.price }}</div>
@@ -118,7 +119,7 @@
       <div v-for="record in pagedHistoryRecommend" :key="record.date" class="history-item">
         <div class="history-date-header">📅 {{ record.date }}</div>
         <div class="history-stock-grid">
-          <div v-for="r in record.daily_recommendations || record.stocks" :key="r.symbol" class="history-stock-card">
+          <div v-for="r in record.daily_recommendations || record.stocks" :key="r.symbol" class="history-stock-card" @click="openKlineFor(r, record.date)" style="cursor:pointer;" :title="`点击查看K线（标记 ${record.date} 推荐日）`">
             <div class="history-stock-name-row">
               <div>
                 <div style="font-weight:700;font-size:0.95rem;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;">{{ r.name }}</div>
@@ -153,8 +154,23 @@ import DataFreshness from '../DataFreshness.vue'
 
 // App 传入当前 Tab 是否可见（2026-10-13 轮询治理的统一接口；本页不轮询，仅声明）
 defineProps({ active: { type: Boolean, default: true } })
+const emit = defineEmits(['open-kline'])
 
 const showNotification = inject('showNotification')
+
+// 2026-10-16：点击股票卡片打开完整 K线弹窗，并带上"推荐日"作标记（不截断，标记线定位推荐日）
+function toISODate(s) {
+  if (!s) return ''
+  const d = String(s).replace(/\//g, '-')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d
+  const dt = new Date(s)
+  if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10)
+  return d
+}
+function openKlineFor(r, dateStr) {
+  if (!r || !r.symbol) return
+  emit('open-kline', r.symbol, toISODate(dateStr))
+}
 const todayRecommend = ref([])
 const historyRecommend = ref([])
 const todayDate = ref('--')
@@ -390,5 +406,21 @@ onMounted(() => {
   font-size: 0.75rem;
   color: #64748b;
   line-height: 1.5;
+}
+/* 看K线入口（2026-10-16）：推荐卡点击看推荐日之前走势 */
+.kline-hint-btn {
+  margin-left: 0.375rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #1d4ed8;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kline-hint-btn:hover {
+  background: #dbeafe;
 }
 </style>

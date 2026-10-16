@@ -78,6 +78,88 @@
           <span class="capital-hint">只影响仓位百分比的计算基数，不改动任何买卖信号</span>
         </div>
       </div>
+      <!-- 企业微信推送：谁的持仓提醒发给谁。绑定即验证 —— 点「绑定」会真的收到一条确认消息，
+           收不到就不算绑上，所以这里不会出现"看着配好了其实从没发出去"的通道。 -->
+      <div class="push-row">
+        <span class="push-label">📲 企业微信推送</span>
+        <template v-if="!editingPush">
+          <b class="push-value" :class="{ unset: !(push.channels && push.channels.length) }">
+            {{ push.channels && push.channels.length
+                ? `已绑定 ${push.channels.length} 条（${push.channels[0].label || '我的群'}）`
+                : '未绑定' }}
+          </b>
+          <span class="push-meta">
+            今日 {{ push.sent_today || 0 }}<small v-if="push.daily_limit">/{{ push.daily_limit }}</small> 条
+            <small v-if="push.using_global_fallback">· 暂走系统默认群</small>
+          </span>
+          <button class="capital-edit" @click="startEditPush">
+            {{ push.channels && push.channels.length ? '管理' : '绑定' }}
+          </button>
+        </template>
+        <div v-else class="push-edit-wrap">
+          <input v-model="pushInput" type="text" class="form-input push-input"
+                 placeholder="粘贴群机器人 Webhook 地址（https://qyapi.weixin.qq.com/…）">
+          <input v-model="pushLabel" type="text" class="form-input push-name-input" placeholder="备注名，如「我的止损群」">
+          <div class="push-btns">
+            <button class="btn-scan" :disabled="savingPush" @click="bindPush">
+              {{ savingPush ? '验证中...' : '绑定并发确认消息' }}
+            </button>
+            <button class="btn-secondary" @click="editingPush = false">收起</button>
+          </div>
+          <ol class="push-steps">
+            <li>企业微信里建一个群（只有你自己也行）</li>
+            <li>群设置 → 群机器人 → 添加「自定义机器人」→ 复制 Webhook 地址</li>
+            <li>整段粘到上面点绑定，手机上收到「推送绑定成功」即生效</li>
+          </ol>
+          <div v-if="push.channels && push.channels.length" class="push-list">
+            <div v-for="c in push.channels" :key="c.id" class="push-item">
+              <span class="push-item-name">{{ c.label || '未命名' }}</span>
+              <code class="push-item-url">{{ c.target_hint }}</code>
+              <button class="push-mini" :disabled="savingPush" @click="testPush(c.id)">测试</button>
+              <button class="push-mini danger" :disabled="savingPush" @click="unbindPush(c.id)">解绑</button>
+            </div>
+          </div>
+          <!-- 企微单聊：走「智能机器人」，授权由腾讯托管页面完成，不需要公网域名、
+               不需要管理员建自建应用。绑定方式按省事排序：
+               发一句话 → 认领会话 → 姓名搜索 → 手填。 -->
+          <div class="push-agent">
+            <span class="push-agent-title">企微单聊（智能机器人）</span>
+            <span :class="['push-agent-state', bot.ok ? 'ok' : '']">
+              {{ bot.checked ? (bot.ok ? '机器人可用，绑定后提醒只发给你本人' : '机器人暂不可用：' + bot.error) : '检测中…' }}
+            </span>
+            <div class="push-btns">
+              <button class="push-mini" :disabled="bot.busy" @click="refreshSessions">
+                {{ bot.busy ? '查询中…' : '① 我给机器人发了消息，刷新会话' }}
+              </button>
+              <input v-model="bot.keyword" type="text" class="form-input push-name-input"
+                     placeholder="② 或按姓名查同事">
+              <button class="push-mini" :disabled="bot.busy" @click="searchBotUser">搜索</button>
+            </div>
+            <div v-if="bot.sessions.length || bot.users.length" class="push-list">
+              <div v-for="s in bot.sessions" :key="'s' + s.chat_id" class="push-item">
+                <span class="push-item-name">{{ s.name || '未命名会话' }}</span>
+                <code class="push-item-url">{{ s.chat_id }}</code>
+                <button class="push-mini" :disabled="bot.busy" @click="bindAibot(s.chat_id, s.name)">绑定</button>
+              </div>
+              <div v-for="u in bot.users" :key="'u' + u.userid" class="push-item">
+                <span class="push-item-name">{{ u.name }}<small v-if="u.dept"> · {{ u.dept }}</small></span>
+                <code class="push-item-url">{{ u.userid }}</code>
+                <button class="push-mini" :disabled="bot.busy" @click="bindAibot(u.userid, u.name)">绑定</button>
+              </div>
+            </div>
+            <div class="push-btns">
+              <input v-model="agentInput" type="text" class="form-input push-name-input"
+                     placeholder="③ 已知会话ID/userid，直接填">
+              <button class="btn-scan" :disabled="savingPush" @click="bindAibotManual">绑定单聊</button>
+            </div>
+            <small v-if="!bot.ok" class="push-agent-hint">
+              机器人权限没开时，上面会直接显示企业微信给的授权链接文案，点开授权后回来刷新即可；
+              单聊绑不上不影响下面的群机器人提醒。
+            </small>
+          </div>
+          <span v-if="pushMsg" :class="['push-msg', pushMsgOk ? 'ok' : 'bad']">{{ pushMsg }}</span>
+        </div>
+      </div>
       <div class="portfolio-row">
         <div class="portfolio-metric">
           <em>大盘涨跌</em>
@@ -231,6 +313,136 @@ async function loadPositions() {
     const result = await apiFetch('/api/positions')
     if (result.success) data.value = result.data
   } catch (e) { console.error('加载持仓失败:', e) }
+}
+
+// ===== 企业微信推送通道（2026-10-14，按账号自助绑定）=====
+// 绑定即验证：后端先往那个群真发一条确认消息，企微没返回 errcode=0 就不落库。
+// 所以列表里出现的通道都是"确实送达过"的 —— 避免出现"看着配好了、其实几个月没发出去"
+// 这种静默失效（本项目真实踩过一次：wecom-cli 不在 PATH，日志全绿但零送达）。
+const push = ref({ channels: [], sent_today: 0, daily_limit: 0, using_global_fallback: false })
+const editingPush = ref(false)
+const savingPush = ref(false)
+const pushInput = ref('')
+const pushLabel = ref('')
+const pushMsg = ref('')
+const pushMsgOk = ref(true)
+// 智能机器人单聊通道（授权走腾讯托管页面，无需公网域名/自建应用）
+const bot = ref({ checked: false, busy: false, ok: false, error: '', sessions: [], users: [], keyword: '' })
+const agentInput = ref('')
+
+async function loadPush() {
+  try {
+    const r = await apiFetch('/api/push-channels')
+    if (r && r.success) push.value = r.data
+  } catch (e) { /* 未登录或服务未就绪时静默：不影响持仓主数据 */ }
+}
+
+function startEditPush() {
+  pushMsg.value = ''
+  editingPush.value = true
+  loadPush()
+  if (!bot.value.checked) refreshSessions()   // 打开编辑器时才探测机器人，别在页面加载时打子进程
+}
+
+async function refreshSessions() {
+  bot.value.busy = true
+  try {
+    const r = await apiFetch('/api/push-channels/discover')
+    bot.value.checked = true
+    bot.value.ok = !!r.success
+    bot.value.error = r.success ? '' : (r.error || r.detail || '查询失败')
+    bot.value.sessions = (r.data && r.data.sessions) || []
+  } catch (e) {
+    bot.value.checked = true; bot.value.ok = false
+    bot.value.error = (e && e.detail) || '机器人查询失败'
+  } finally {
+    bot.value.busy = false
+  }
+}
+
+async function searchBotUser() {
+  const kw = (bot.value.keyword || '').trim()
+  if (!kw) { pushMsgOk.value = false; pushMsg.value = '请输入要搜索的姓名'; return }
+  bot.value.busy = true
+  try {
+    const r = await apiFetch('/api/push-channels/search-user', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keyword: kw }),
+    })
+    bot.value.ok = !!r.success
+    bot.value.error = r.success ? '' : (r.error || r.detail || '搜索失败')
+    bot.value.users = (r.data && r.data.users) || []
+    if (r.success && !bot.value.users.length) {
+      pushMsgOk.value = false; pushMsg.value = '没搜到该姓名，或机器人没有通讯录权限'
+    }
+  } finally {
+    bot.value.busy = false
+  }
+}
+
+async function bindAibot(chatId, label) {
+  if (!chatId) return
+  const r = await pushPost('/api/push-channels/aibot', { chat_id: chatId, label: label || '' })
+  if (r && r.success) {
+    pushMsgOk.value = true
+    pushMsg.value = '单聊确认消息已发出，请在企业微信里查收'
+    agentInput.value = ''
+    await loadPush()
+  }
+}
+
+function bindAibotManual() {
+  return bindAibot((agentInput.value || '').trim(), '')
+}
+
+async function pushPost(url, extra) {
+  savingPush.value = true
+  pushMsg.value = ''
+  try {
+    const r = await apiFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(extra || {}),
+    })
+    if (!r.success) { pushMsgOk.value = false; pushMsg.value = r.detail || r.message || '操作失败' }
+    return r
+  } catch (e) {
+    pushMsgOk.value = false
+    pushMsg.value = (e && e.detail) || '请求失败，请检查服务是否在运行'
+    return null
+  } finally {
+    savingPush.value = false
+  }
+}
+
+async function bindPush() {
+  const url = (pushInput.value || '').trim()
+  if (!url) { pushMsgOk.value = false; pushMsg.value = '请先粘贴群机器人的 Webhook 地址'; return }
+  const r = await pushPost('/api/push-channels', { url, label: pushLabel.value.trim() })
+  if (r && r.success) {
+    pushMsgOk.value = true
+    pushMsg.value = '已发送确认消息，请在企业微信里查收'
+    pushInput.value = ''
+    pushLabel.value = ''
+    await loadPush()
+  }
+}
+
+async function testPush(id) {
+  const r = await pushPost(`/api/push-channels/${id}/test`)
+  if (r && r.success) { pushMsgOk.value = true; pushMsg.value = r.message }
+}
+
+async function unbindPush(id) {  savingPush.value = true
+  pushMsg.value = ''
+  try {
+    const r = await apiFetch(`/api/push-channels/${id}`, { method: 'DELETE' })
+    pushMsgOk.value = !!r.success
+    pushMsg.value = r.success ? '已解绑' : (r.detail || '解绑失败')
+    await loadPush()
+  } finally {
+    savingPush.value = false
+  }
 }
 
 // ===== 加仓 / 减仓（2026-10-14）=====
@@ -432,6 +644,7 @@ async function removePosition(p) {
 
 onMounted(() => {
   loadPositions()
+  loadPush()
   document.addEventListener('click', onDocClick)
   startPositionPolling()
 })
@@ -547,6 +760,53 @@ defineExpose({ loadPositions })
 .capital-edit-wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; width: 100%; }
 .capital-input { width: 9.5rem; }
 .capital-hint { font-size: 0.6875rem; color: #94a3b8; flex-basis: 100%; }
+
+/* ===== 企业微信推送通道（2026-10-14）=====
+   默认只占一行（状态 + 一个按钮），点开才出现输入框和三步说明 ——
+   持仓页要留给持仓本身，设置类东西收起来。 */
+.push-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
+  margin-top: 0.375rem; padding-top: 0.375rem; border-top: 1px dashed var(--border-subtle);
+}
+.push-label { font-size: 0.75rem; color: var(--text-tertiary); }
+.push-value { font-size: 0.8125rem; color: var(--text-primary); }
+.push-value.unset { color: #94a3b8; font-weight: 400; }
+.push-meta { font-size: 0.6875rem; color: var(--text-tertiary); }
+.push-meta small { margin-left: 0.25rem; }
+.push-edit-wrap { display: flex; flex-direction: column; gap: 0.375rem; flex-basis: 100%; }
+.push-input, .push-name-input {
+  width: 100%; box-sizing: border-box; font-size: 0.75rem;
+  padding: 0.375rem 0.5rem; border: 1px solid var(--border-medium);
+  border-radius: var(--radius-sm); background: var(--bg-primary); color: var(--text-primary);
+}
+.push-name-input { max-width: 14rem; }
+.push-btns { display: flex; align-items: center; gap: 0.5rem; }
+.push-steps { margin: 0; padding-left: 1.125rem; font-size: 0.6875rem; line-height: 1.6; color: #94a3b8; }
+.push-list { display: flex; flex-direction: column; gap: 0.25rem; }
+.push-item { display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem; font-size: 0.6875rem; }
+.push-item-name { color: var(--text-primary); font-weight: 600; }
+.push-item-url {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-tertiary); font-size: 0.625rem;
+}
+.push-mini {
+  font-family: inherit; font-size: 0.6875rem; padding: 1px 8px; cursor: pointer;
+  color: var(--text-secondary); background: var(--bg-tertiary);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-pill);
+}
+.push-mini.danger { color: var(--accent-danger); border-color: var(--accent-danger); }
+.push-mini:disabled { opacity: 0.5; cursor: default; }
+.push-msg { font-size: 0.6875rem; }
+.push-msg.ok { color: var(--accent-success); }
+.push-msg.bad { color: var(--accent-danger); }
+.push-agent {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem;
+  margin-top: 0.25rem; padding-top: 0.375rem; border-top: 1px dashed var(--border-subtle);
+}
+.push-agent-title { font-size: 0.6875rem; color: var(--text-secondary); font-weight: 600; }
+.push-agent-state { font-size: 0.6875rem; color: #94a3b8; }
+.push-agent-state.ok { color: var(--accent-success); }
+.push-agent-hint { font-size: 0.625rem; line-height: 1.5; color: #94a3b8; flex-basis: 100%; }
 .portfolio-metric { display: flex; flex-direction: column; }
 .portfolio-metric em { font-style: normal; font-size: 0.75rem; color: #64748b; margin-bottom: 0.125rem; }
 .portfolio-metric b { font-size: 1.125rem; }

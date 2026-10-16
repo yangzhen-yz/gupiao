@@ -16,8 +16,18 @@ export function isHoliday(date = new Date()) {
   return HOLIDAYS_2026.includes(`${y}-${m}-${d}`)
 }
 
-export function isTradingTime() {
-  const now = new Date()
+// 可操作窗口：集合竞价 9:15 起到上午收市、下午开市到 15:00。
+// 与 isTradingTime 的区别是含竞价段 —— 竞价时挂单是有意义的，盘前 7 点不是。
+export function isOrderableNow(date = new Date()) {
+  const day = date.getDay()
+  if (day === 0 || day === 6) return false
+  if (isHoliday(date)) return false
+  const mins = date.getHours() * 60 + date.getMinutes()
+  return (mins >= 9 * 60 + 15 && mins <= 11 * 60 + 30)
+    || (mins >= 13 * 60 && mins <= 15 * 60)
+}
+
+export function isTradingTime() {  const now = new Date()
   const day = now.getDay()
   if (day === 0 || day === 6) return false
   if (isHoliday(now)) return false

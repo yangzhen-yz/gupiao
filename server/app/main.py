@@ -72,7 +72,7 @@ def _reload_config():
                 g[name] = val
         g['TENCENT_API'] = g['TENCENT_QUOTE_API']
         # 同步 reload 业务模块，让它们的 from app.config import 常量重新求值
-        for mod_name in ('services.stock', 'services.trend', 'services.recommend'):
+        for mod_name in ('services.data.stock', 'services.strategy.trend', 'services.pick.recommend'):
             mod = sys.modules.get(mod_name)
             if mod is not None:
                 try:
@@ -89,10 +89,10 @@ def _reload_config():
 
 
 from db.database import init_db, save_hot_search_ranking, load_trend_scan_results, load_daily_market_reviews
-from services.stock import fetch_eastmoney_hot_list
-from services.trend import scan_trend_task
-from services.ai import load_ai_config
-from services.trading_calendar import is_trading_day
+from services.data.stock import fetch_eastmoney_hot_list
+from services.strategy.trend import scan_trend_task
+from services.support.ai import load_ai_config
+from services.data.trading_calendar import is_trading_day
 
 _last_scan_result = None
 _last_scan_date = ''
@@ -137,7 +137,7 @@ async def lifespan(app: FastAPI):
             _has_today_review = any(r.get('date') == _today_str for r in (_existing_reviews or [])[:3])
             if not _has_today_review:
                 print(f'[初始化] 今日({_today_str})收评缺失，后台补生成中...')
-                from services.review import generate_daily_review
+                from services.ops.review import generate_daily_review
                 from db.database import save_daily_market_reviews
                 async def _startup_review():
                     try:
@@ -172,7 +172,7 @@ async def lifespan(app: FastAPI):
             _conn.close()
             if not _row:
                 print(f'[初始化] 最近交易日({_latest_str})回测报告缺失，后台补跑中...')
-                from services.strategy import backtest_yesterday_predictions
+                from services.strategy.strategy import backtest_yesterday_predictions
                 async def _startup_backtest():
                     try:
                         _r = await backtest_yesterday_predictions()

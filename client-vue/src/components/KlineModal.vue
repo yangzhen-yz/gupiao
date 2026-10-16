@@ -22,6 +22,7 @@ import { isTradingTime, getNextRefreshDelay } from '../utils/helpers'
 const props = defineProps({
   visible: Boolean,
   symbol: String,
+  beforeDate: String,   // 2026-10-16：若传入，在「完整」日K上以虚线标记该日期（推荐日），不截断数据
 })
 const emit = defineEmits(['close'])
 const showNotification = inject('showNotification')
@@ -41,6 +42,7 @@ function initChart() {
 async function fetchData(symbol, type) {
   if (!symbol) return
   try {
+    // 始终拉取完整 K 线（含推荐日及之后），beforeDate 仅用于前端标记，不做截断
     const url = type === 'minute' ? `/api/kline/${symbol}/minute` : `/api/kline/${symbol}`
     const resp = await fetch(url)
     const json = await resp.json()
@@ -60,9 +62,26 @@ async function fetchData(symbol, type) {
 
 function renderKlineChart(data) {
   if (!chartInstance) return
-  title.value = `日K线 - ${data.name} (${data.symbol})`
+  const beforeDate = props.beforeDate
+  title.value = beforeDate
+    ? `日K线 - ${data.name} (${data.symbol}) · 推荐日 ${beforeDate}`
+    : `日K线 - ${data.name} (${data.symbol})`
   const upColor = '#f04848', downColor = '#2dc87e'
-  const startPct = data.dates.length > 100 ? Math.max(0, (data.dates.length - 100) * 100 / data.dates.length) : 0
+  // 推荐日标记：优先精确匹配；若其非交易日（不在数据里），取 <= 该日的最近交易日
+  const markDate = (() => {
+    if (!beforeDate || !data.dates.length) return null
+    if (data.dates.includes(beforeDate)) return beforeDate
+    const cand = data.dates.filter(d => d <= beforeDate)
+    return cand.length ? cand[cand.length - 1] : null
+  })()
+  // 视图聚焦：带推荐日时，把推荐日附近纳入可视区（推荐日前约120根 + 至今日），否则默认末100根
+  let startPct, endPct = 100
+  if (markDate) {
+    const idx = data.dates.indexOf(markDate)
+    startPct = Math.max(0, ((idx - 120) / data.dates.length) * 100)
+  } else {
+    startPct = data.dates.length > 100 ? Math.max(0, (data.dates.length - 100) * 100 / data.dates.length) : 0
+  }
 
   chartInstance.setOption({
     backgroundColor: '#13161f', animation: false,
@@ -78,11 +97,18 @@ function renderKlineChart(data) {
       { scale: true, gridIndex: 1, splitNumber: 2, axisLabel: { show: true, color: '#525770' }, splitLine: { lineStyle: { color: '#1e2233' } } }
     ],
     dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: startPct, end: 100 },
-      { show: true, xAxisIndex: [0, 1], type: 'slider', bottom: 10, start: startPct, end: 100, borderColor: '#252a3a', fillerColor: 'rgba(74,144,255,0.15)', handleStyle: { color: '#4a90ff' }, textStyle: { color: '#525770' }, dataBackground: { lineStyle: { color: '#252a3a' }, areaStyle: { color: '#1e2233' } } }
+      { type: 'inside', xAxisIndex: [0, 1], start: startPct, end: endPct },
+      { show: true, xAxisIndex: [0, 1], type: 'slider', bottom: 10, start: startPct, end: endPct, borderColor: '#252a3a', fillerColor: 'rgba(74,144,255,0.15)', handleStyle: { color: '#4a90ff' }, textStyle: { color: '#525770' }, dataBackground: { lineStyle: { color: '#252a3a' }, areaStyle: { color: '#1e2233' } } }
     ],
     series: [
-      { name: '日K', type: 'candlestick', data: data.values, itemStyle: { color: upColor, color0: downColor, borderColor: upColor, borderColor0: downColor } },
+      { name: '日K', type: 'candlestick', data: data.values,
+        markLine: markDate ? {
+          symbol: 'none',
+          lineStyle: { color: '#4a90ff', type: 'dashed', width: 1.5 },
+          label: { show: true, position: 'end', distance: 6, color: '#4a90ff', fontSize: 11, formatter: '推荐日' },
+          data: [{ xAxis: markDate }]
+        } : undefined,
+        itemStyle: { color: upColor, color0: downColor, borderColor: upColor, borderColor0: downColor } },
       { name: 'MA5', type: 'line', data: data.ma5, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#f0a030' },
       { name: 'MA10', type: 'line', data: data.ma10, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#8b5cf6' },
       { name: 'MA20', type: 'line', data: data.ma20, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#06b6d4' },

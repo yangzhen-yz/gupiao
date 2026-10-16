@@ -64,7 +64,7 @@
           <TabTrend :active="activeTab === 'tab-trend'" @open-kline="openKline" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-recommend' }]" v-show="activeTab === 'tab-recommend'" v-if="mountedTabs.has('tab-recommend')">
-          <TabRecommend :active="activeTab === 'tab-recommend'" />
+          <TabRecommend :active="activeTab === 'tab-recommend'" @open-kline="openKline" />
         </div>
         <div :class="['tab-content', { active: activeTab === 'tab-position' }]" v-show="activeTab === 'tab-position'" v-if="mountedTabs.has('tab-position')">
           <TabPosition ref="tabPositionRef" :active="activeTab === 'tab-position'" />
@@ -96,7 +96,7 @@
       {{ isDark ? '☀️' : '🌙' }}
     </button>
     <!-- K线弹窗 -->
-    <KlineModal :visible="klineVisible" :symbol="klineSymbol" @close="klineVisible = false" />
+    <KlineModal :visible="klineVisible" :symbol="klineSymbol" :before-date="klineBeforeDate" @close="onKlineClose" />
     <!-- AI诊断弹窗 -->
     <AiDiagModal :visible="aiDiagVisible" :symbol="aiDiagSymbol" @close="aiDiagVisible = false" />
     <!-- 全局通知 -->
@@ -111,7 +111,7 @@
 
 <script setup>
 import { ref, computed, provide, watch, nextTick, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
-import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, saveRecentUser, setUnauthorizedHandler } from './utils/helpers'
+import { useNotification, apiFetch, getToken, getAuthUser, saveAuth, clearAuth, saveRecentUser, setUnauthorizedHandler, isOrderableNow } from './utils/helpers'
 import { useHashRoute, navigate } from './composables/useHashRoute'
 import { usePolling } from './composables/usePolling'
 import { useTheme } from './composables/useTheme'
@@ -147,9 +147,9 @@ const TAB_LABELS = {
   'tab-desk': '行动台',
 }
 const tabGroups = [
-  { key: 'market', label: '盘面', tabs: ['tab-quote', 'tab-trend', 'tab-flow'].map(id => ({ id, label: TAB_LABELS[id] })) },
+  { key: 'market', label: '盘面', tabs: ['tab-quote', 'tab-scan', 'tab-trend', 'tab-flow'].map(id => ({ id, label: TAB_LABELS[id] })) },
   { key: 'decide', label: '决策', tabs: ['tab-recommend', 'tab-position', 'tab-sim'].map(id => ({ id, label: TAB_LABELS[id] })) },
-  { key: 'review', label: '复盘', tabs: ['tab-review', 'tab-scan', 'tab-optimization'].map(id => ({ id, label: TAB_LABELS[id] })) },
+  { key: 'review', label: '复盘', tabs: ['tab-review', 'tab-optimization'].map(id => ({ id, label: TAB_LABELS[id] })) },
 ]
 tabGroups.forEach(g => { g.ids = g.tabs.map(t => t.id) })
 const allTabs = tabGroups.reduce((acc, g) => acc.concat(g.tabs), [])
@@ -236,9 +236,18 @@ watch([activeTab, () => route.value.param], ([tab, param], old) => {
 
 // ========== 大盘风险预警轮询 ==========
 // 2026-10-13 去掉 isTradingTime() 门禁：上班族常常在收盘后才打开页面，
-// 原逻辑会让"盘中错过就永远没有汇总"。/api/market-alert 只读文件，代价极低，
-// 同一天同一风险分只提示一次（_lastAlertDate 去重）保持不变。
+//   原逻辑会让"盘中错过就永远没有汇总"。
+// 2026-10-15 收回一半：预警**数据**照样随时拉取（行动台/收评里都能看到），
+//   但**弹窗**只在能操作的时间、且预警是当天的时候弹。
+//   起因是早上 7:18 手机弹「紧急警报：主力资金正在疯狂出逃！立即清仓！」——
+//   那是昨天 14:00 扫描留下的快照，盘前既不能挂单也来不及反应，
+//   一条过期的命令式警报只会让人想在开盘前先做点什么，或者整天心神不宁。
 const _lastAlertDate = ref('')
+
+function _todayStr() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 
 async function _checkMarketAlert() {
   try {
@@ -250,8 +259,11 @@ async function _checkMarketAlert() {
     if (alert.riskScore >= 40) {
       _lastAlertDate.value = alert.date
       const pred = alert.prediction || {}
-      const type = alert.riskScore >= 60 ? 'error' : 'warning'
       const msg = `${pred.title || '大盘风险预警'} (风险评分${alert.riskScore}) ${pred.action || ''}`
+      // 过期的快照与非交易时段：不弹，只留在页面里
+      if (alert.date !== _todayStr()) return
+      if (!isOrderableNow()) return
+      const type = alert.riskScore >= 60 ? 'error' : 'warning'
       // 3 秒：这是每天一次的提醒，不是需要读完的正文 —— 详细内容在收评/行动台里都有。
       // 原先写 8000，手机上悬浮在页面顶部会把「行动台」标题和第一张卡压住太久（2026-10-13 反馈）。
       showNotification(msg, type, 3000)
@@ -348,9 +360,15 @@ onUnmounted(() => {
 // K线弹窗
 const klineVisible = ref(false)
 const klineSymbol = ref('')
-function openKline(symbol) {
+const klineBeforeDate = ref('')   // 2026-10-16：推荐日之前复盘视图，空=正常最新全量
+function openKline(symbol, beforeDate) {
   klineSymbol.value = symbol
+  klineBeforeDate.value = beforeDate || ''
   klineVisible.value = true
+}
+function onKlineClose() {
+  klineVisible.value = false
+  klineBeforeDate.value = ''
 }
 
 // AI诊断弹窗

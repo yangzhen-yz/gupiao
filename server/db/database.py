@@ -499,6 +499,13 @@ def init_db():
                 kline_json TEXT NOT NULL,         -- 该交易日收盘后的日线历史 JSON
                 updated_at TEXT,                  -- 更新时间
                 PRIMARY KEY (symbol, trade_date))''')
+        # 资金流向最后成功快照（2026-10-16）：按区块存整包 JSON，服务重启后兜底，
+        # 解决「东财 push2 风控拒连 + 重启清空内存兜底 → 收盘后页面全空」
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS fund_flow_snapshot (
+                snap_key TEXT PRIMARY KEY,       -- 'stocks:<n>' / 'sectors:<n>' / 'hidden:<key>'
+                snap_json TEXT NOT NULL,         -- 该区块最后成功数据的整包 JSON
+                updated_at TEXT)''')
         # 索引（2026-07-20 性能优化 A4）：基本面/估值按 symbol 高频点查
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_symbol ON stock_fundamental(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
@@ -2204,6 +2211,56 @@ def save_kline_cache(symbol: str, trade_date: str, kline: List, updated_at: str 
     except Exception as _e:
         print(f'[数据库] 保存K线缓存失败: {_e}')
         return False
+
+
+def save_fund_flow_snapshot(snap_key: str, data) -> bool:
+    """保存资金流向某区块（个股/板块/非热点上涨股）最后成功快照（UPSERT）。
+
+    用途：服务重启会清空内存兜底 _LAST_GOOD_*，持久化后重启仍可回退到最后成功数据，
+    覆盖「收盘后东财 push2 风控拒连 → 页面全空」的场景（收盘后数据本应保持不变）。
+    """
+    if not data:
+        return False
+    conn = None
+    try:
+        from datetime import datetime
+        conn = get_db_conn()
+        conn.execute('''INSERT INTO fund_flow_snapshot (snap_key, snap_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(snap_key) DO UPDATE SET
+                snap_json=excluded.snap_json, updated_at=excluded.updated_at''',
+            (snap_key, json.dumps(data, ensure_ascii=False),
+             datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        conn.commit()
+        return True
+    except Exception as _e:
+        print(f'[数据库] 保存资金流向快照失败({snap_key}): {_e}')
+        return False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def load_fund_flow_snapshot(snap_key: str):
+    """读取资金流向某区块的最后成功快照，无记录/解析失败返回 None。"""
+    conn = None
+    try:
+        conn = get_db_conn()
+        row = conn.execute(
+            'SELECT snap_json FROM fund_flow_snapshot WHERE snap_key = ?', (snap_key,)).fetchone()
+        return json.loads(row['snap_json']) if row else None
+    except Exception as _e:
+        print(f'[数据库] 读取资金流向快照失败({snap_key}): {_e}')
+        return None
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def load_hot_search_ranking() -> Dict:

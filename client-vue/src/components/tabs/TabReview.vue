@@ -349,7 +349,8 @@
             <template v-if="review.focusExpect">
               <br>名单是按「同来源同分数段的历史 T+1 盈利概率」挑的，最多 {{ review.focusExpect.maxCount }} 只；
               盈利概率不到 {{ review.focusExpect.minWinRate }}%、或历史平均收益为负的
-              <b>{{ review.focusExpect.dropped }}</b> 只没列进来（三个来源的分数量纲不同，直接比分数没意义）。
+              <b>{{ review.focusExpect.dropped }}</b> 只没列进来（三个来源的分数量纲不同，直接比分数没意义）。<template v-if="(review.focusExpect.droppedByCap || 0) > 0">
+              另有 <b>{{ review.focusExpect.droppedByCap }}</b> 只达标了，但因最多 {{ review.focusExpect.maxCount }} 只没列入。</template>
             </template>
           </div>
           <div class="focus-grid">

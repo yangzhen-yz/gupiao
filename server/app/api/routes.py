@@ -6,31 +6,30 @@ import json, asyncio, time, re, inspect
 from datetime import date, datetime
 from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
-from services.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
-from services.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
-from services.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
-from services.trend_backtest import backtest_trend_predictions
-from services.trading_calendar import is_trading_day
-from services.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
-from services.recommend import auto_generate_recommendations_task, calc_buy_sell_points
-from services.review import generate_daily_review
-from services.market import predict_market_risk, check_market_crash, load_market_alert
-from services.fundflow import get_fund_flow_summary
-from services.rps import get_rps_map, get_rps_leaderboard
-from services.kline_history import normalize_local_symbol  # 将带前缀 symbol 规整为本地库纯代码，匹配 RPS 缓存 key
-from services.fundamental import get_fundamental_batch, update_fundamental_task
-from services.smartmoney import get_dragon_tiger, get_northbound_market, get_dragon_tiger_symbol_map
-from services.valuation import get_valuation_batch, update_valuation_task
-from services.risk_control import calc_risk_control
-from services.utils import ensure_today_date
-from services.auth import (current_user, create_user, authenticate, logout as auth_logout,
+from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
+from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
+from services.strategy.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
+from services.strategy.trend_backtest import backtest_trend_predictions
+from services.data.trading_calendar import is_trading_day
+from services.support.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
+from services.pick.recommend import auto_generate_recommendations_task, calc_buy_sell_points
+from services.ops.review import generate_daily_review
+from services.strategy.market import predict_market_risk, check_market_crash, load_market_alert
+from services.data.fundflow import get_fund_flow_summary
+from services.strategy.rps import get_rps_map, get_rps_leaderboard
+from services.data.kline_history import normalize_local_symbol  # 将带前缀 symbol 规整为本地库纯代码，匹配 RPS 缓存 key
+from services.data.fundamental import get_fundamental_batch, update_fundamental_task
+from services.data.smartmoney import get_dragon_tiger, get_northbound_market, get_dragon_tiger_symbol_map
+from services.data.valuation import get_valuation_batch, update_valuation_task
+from services.strategy.risk_control import calc_risk_control
+from services.data.utils import ensure_today_date
+from services.support.auth import (current_user, create_user, authenticate, logout as auth_logout,
                            get_user_by_token, list_users, has_any_user, change_password)
-from services.action_desk import build_action_desk
+from services.ops.action_desk import build_action_desk
 
 router = APIRouter()
 
 TENCENT_API = TENCENT_QUOTE_API
-REQUEST_TIMEOUT = 8.0
 MAX_RETRIES = 2
 
 # ========== 批量扫描结果内存缓存（2026-08-31 性能优化） ==========
@@ -179,7 +178,7 @@ async def get_stock_analysis(symbol: str):
         stock_data = parsed_list[0]
         # 10 因子评分（V2 权威评分，权重由后端统一维护）
         # : 从 DB 缓存查股东人数（月度数据，无需实时拉取）
-        from services.shareholder import get_holder_num_batch
+        from services.data.shareholder import get_holder_num_batch
         holder_map = get_holder_num_batch([sym])
         hd = holder_map.get(sym)
         rps_map = await get_rps_map()
@@ -190,7 +189,7 @@ async def get_stock_analysis(symbol: str):
         sm = dt_map.get(sym)
         sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                    'appearances': (sm or {}).get('appearances', 0)} if sm else None
-        from services.trend import compute_trend_result
+        from services.strategy.trend import compute_trend_result
         _px = float(stock_data.get('priceRaw') or stock_data.get('price') or 0)
         tr = await asyncio.to_thread(compute_trend_result, sym, _px)
         result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
@@ -251,7 +250,7 @@ async def get_stock_full(symbol: str):
     sym = symbol.lower()
     try:
         # 评分缓存（3 秒 TTL，适配 2 秒轮询，偶数次命中缓存）
-        import time as _time; from services.stock import _analysis_cache
+        import time as _time; from services.data.stock import _analysis_cache
         now = _time.time()
         cached = _analysis_cache.get(sym)
         if cached and (now - cached[0]) < 3.0:
@@ -262,7 +261,7 @@ async def get_stock_full(symbol: str):
             if not parsed_list:
                 raise HTTPException(status_code=502, detail="行情数据解析失败")
             stock_data = parsed_list[0]
-            from services.shareholder import get_holder_num_batch
+            from services.data.shareholder import get_holder_num_batch
             # 2026-07-20 A2：低频/重 IO 并行拉取，缩短尾延迟
             # - get_rps_map 为 async（腾讯多股批量）
             # - get_holder_num_batch / get_fundamental_batch / get_dragon_tiger_symbol_map /
@@ -281,7 +280,7 @@ async def get_stock_full(symbol: str):
             sm = dt_map.get(sym)
             sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                        'appearances': (sm or {}).get('appearances', 0)} if sm else None
-            from services.trend import compute_trend_result
+            from services.strategy.trend import compute_trend_result
             _px = float(stock_data.get('priceRaw') or stock_data.get('price') or 0)
             tr = await asyncio.to_thread(compute_trend_result, sym, _px)
             result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
@@ -455,7 +454,7 @@ async def get_daily_recommendations():
 async def get_recommend_review_api(days: int = 30):
     """智能推荐复盘汇总（2026-10-12）：全量+近N天 T+1/T+3/T+5 胜率与盈亏、最好最差案例"""
     try:
-        from services.recommend_review import get_review_summary
+        from services.pick.recommend_review import get_review_summary
         return {"success": True, "data": get_review_summary(days)}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
@@ -736,7 +735,7 @@ async def api_change_password(payload: Dict, user: Dict = Depends(current_user))
 async def get_positions_api(user: Dict = Depends(current_user)):
     """持仓诊断：实时盈亏 + 单票动作（止损/止盈/减仓/持有）+ 组合仓位建议（按登录用户隔离）"""
     try:
-        from services.position import get_portfolio_diagnosis
+        from services.portfolio.position import get_portfolio_diagnosis
         return {"success": True, "data": await get_portfolio_diagnosis(user_id=user['id'])}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取持仓诊断失败: {str(error)}")
@@ -843,12 +842,115 @@ async def save_capital_api(body: Dict, user: Dict = Depends(current_user)):
         raise HTTPException(status_code=500, detail=f"保存本金失败: {str(error)}")
 
 
+# ========== 企业微信推送通道（按账号自助绑定，2026-10-14） ==========
+# 别人注册后要接推送，只需要在自己手机上建个群、加个自定义机器人、把地址贴进来点绑定；
+# 不需要改代码、不需要重启服务。绑定动作会真的发一条确认消息，发不出去就不算绑定成功。
+
+@router.get("/api/push-channels", tags=["推送设置"])
+async def list_push_channels_api(user: Dict = Depends(current_user)):
+    from services.support.push_channel import list_channels, sent_today
+    from app.config import PUSH_DAILY_LIMIT_PER_USER
+    import services.support.push_channel as pc
+    return {"success": True, "data": {
+        "channels": list_channels(user['id']),
+        "sent_today": sent_today(user['id']),
+        "daily_limit": PUSH_DAILY_LIMIT_PER_USER,
+        # 一条都没绑时消息会落到运维者的全局群；把这件事摆在明面上，不藏着
+        "using_global_fallback": bool(pc._global_fallback_url()) and not list_channels(user['id']),
+    }}
+
+
+@router.post("/api/push-channels", tags=["推送设置"])
+async def bind_push_channel_api(body: Dict, user: Dict = Depends(current_user)):
+    from services.support.push_channel import bind_webhook
+    url = str(body.get('url') or '').strip()
+    label = str(body.get('label') or '').strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="请粘贴群机器人的 Webhook 地址")
+    ok, msg, cid = bind_webhook(user['id'], url, label)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg, "data": {"id": cid}}
+
+
+@router.get("/api/push-channels/discover", tags=["推送设置"])
+async def discover_push_sessions_api(user: Dict = Depends(current_user)):
+    """列出机器人最近的会话：给机器人发一句话，再刷新这里，认领自己那条即可绑定单聊。
+
+    不需要公网域名、不需要管理员建应用 —— 智能机器人的授权走腾讯托管页面，
+    本地 CLI 轮询取结果，所以回调和域名都没关系。
+    """
+    from services.support.push_channel import discover_sessions
+    ok, err, items = discover_sessions()
+    return {"success": ok, "data": {"sessions": items},
+            **({} if ok else {"error": err, "detail": err})}
+
+
+@router.post("/api/push-channels/search-user", tags=["推送设置"])
+async def search_push_user_api(body: Dict, user: Dict = Depends(current_user)):
+    """按姓名查企微成员 userid（需机器人「通讯录」权限；没授权时返回带授权链接的错误）"""
+    from services.support.push_channel import search_users
+    ok, err, items = search_users(str(body.get('keyword') or ''))
+    return {"success": ok, "data": {"users": items},
+            **({} if ok else {"error": err, "detail": err})}
+
+
+@router.post("/api/push-channels/aibot", tags=["推送设置"])
+async def bind_push_aibot_api(body: Dict, user: Dict = Depends(current_user)):
+    """绑定智能机器人单聊（chat_id 来自 discover 列表或手填），实发确认消息成功才落库"""
+    from services.support.push_channel import bind_aibot
+    chat_id = str(body.get('chat_id') or '').strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="请先给机器人发一句话，再在列表里认领会话")
+    ok, msg, cid = bind_aibot(user['id'], chat_id, str(body.get('label') or '').strip())
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg, "data": {"id": cid}}
+
+
+@router.get("/api/push-channels/agent/status", tags=["推送设置"])
+async def push_agent_status_api(user: Dict = Depends(current_user)):
+    """自建应用（单聊）通道的就绪自检：缺哪个参数、token 取不取得到、还差管理员哪一步"""
+    from services.support.push_channel import agent_status
+    return {"success": True, "data": agent_status()}
+
+
+@router.post("/api/push-channels/agent", tags=["推送设置"])
+async def bind_push_agent_api(body: Dict, user: Dict = Depends(current_user)):
+    """绑定企业微信「自建应用」单聊：填自己的企微账号ID，服务端实发一条确认消息才算成功"""
+    from services.support.push_channel import bind_userid
+    userid = str(body.get('userid') or '').strip()
+    if not userid:
+        raise HTTPException(status_code=400, detail="请填写企业微信通讯录里的「账号」(userid)")
+    ok, msg, cid = bind_userid(user['id'], userid, str(body.get('label') or '').strip())
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg, "data": {"id": cid}}
+
+
+@router.post("/api/push-channels/{ch_id}/test", tags=["推送设置"])
+async def test_push_channel_api(ch_id: int, user: Dict = Depends(current_user)):
+    from services.support.push_channel import test_channel
+    ok, msg = test_channel(user['id'], ch_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg or '发送失败')
+    return {"success": True, "message": "测试消息已发出，请到企业微信查看"}
+
+
+@router.delete("/api/push-channels/{ch_id}", tags=["推送设置"])
+async def unbind_push_channel_api(ch_id: int, user: Dict = Depends(current_user)):
+    from services.support.push_channel import unbind
+    if not unbind(user['id'], ch_id):
+        raise HTTPException(status_code=404, detail="通道不存在或不属于本账号")
+    return {"success": True, "message": "已解绑"}
+
+
 @router.post("/api/positions/adjust", tags=["持仓管理"])
 async def adjust_position_api(body: Dict, user: Dict = Depends(current_user)):
     """加仓/减仓：加权成本由服务端算（口径见 services/position_adjust）"""
     from datetime import datetime
     from db.database import load_user_positions, save_user_position, delete_user_position
-    from services.position_adjust import apply_adjust, describe
+    from services.portfolio.position_adjust import apply_adjust, describe
 
     symbol = (body.get('symbol') or '').strip().lower()
     if not re.fullmatch(r'(sh|sz|bj)\d{6}', symbol):
@@ -905,7 +1007,7 @@ async def delete_position_api(symbol: str, user: Dict = Depends(current_user)):
 async def sim_state_api(user: Dict = Depends(current_user)):
     """获取模拟账户 + 持仓 + 待执行建议 + 审计日志"""
     try:
-        from services.trade_sim import get_sim_state
+        from services.portfolio.trade_sim import get_sim_state
         return await get_sim_state(user['id'])
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取模拟账户失败: {str(error)}")
@@ -914,7 +1016,7 @@ async def sim_state_api(user: Dict = Depends(current_user)):
 async def sim_generate_api(payload: Dict, user: Dict = Depends(current_user)):
     """从信号源生成建议订单。body: {sources:[...], symbols:[...]}"""
     try:
-        from services.trade_sim import generate_proposals
+        from services.portfolio.trade_sim import generate_proposals
         sources = payload.get('sources') or ['tomorrow_plan', 'diagnosis', 'screener']
         symbols = payload.get('symbols') or None
         return await generate_proposals(user['id'], sources, symbols)
@@ -925,7 +1027,7 @@ async def sim_generate_api(payload: Dict, user: Dict = Depends(current_user)):
 async def sim_execute_api(user: Dict = Depends(current_user)):
     """执行模拟成交（按实时价撮合 pending 建议，仅在模拟账户记账）"""
     try:
-        from services.trade_sim import execute_sim
+        from services.portfolio.trade_sim import execute_sim
         return await execute_sim(user['id'])
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"模拟成交失败: {str(error)}")
@@ -934,7 +1036,7 @@ async def sim_execute_api(user: Dict = Depends(current_user)):
 async def sim_reset_api(user: Dict = Depends(current_user)):
     """重置模拟账户（清空持仓/订单/现金回到初始）"""
     try:
-        from services.trade_sim import reset_sim
+        from services.portfolio.trade_sim import reset_sim
         return reset_sim(user['id'])
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"重置失败: {str(error)}")
@@ -1282,7 +1384,7 @@ async def get_stock_basic_info_api():
 
 @router.post("/api/update-stock-map", tags=["股票映射"])
 async def update_stock_basic_info_api(data: Dict):
-    import services.stock
+    import services.data.stock
     try:
         symbol = data.get('symbol')
         name = data.get('name')
@@ -1472,6 +1574,17 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # 传 pool_only=1 仅扫用户池。需在缓存检查前构建，保证缓存覆盖完整宇宙。
         codes_list = _build_scan_universe(codes_list, pool_only)
 
+        # 选股范围（主板 + 非ST/退 + 总市值≥35亿），放在缓存 key 之前，缓存即过滤后范围。
+        # 2026-10-16：以前这里只过市值，创业板/科创/ST 仍能进批量扫描结果 —— 与海选口径不一致。
+        try:
+            from services.data import universe
+            _cb = len(codes_list)
+            codes_list = universe.selectable_prefixed(codes_list)
+            if _cb != len(codes_list):
+                print(f'[批量扫描] 股票范围 {universe.describe_selectable()}：{_cb} → {len(codes_list)} 只')
+        except Exception as e:
+            print(f'[批量扫描] 股票范围过滤失败(不过滤): {e}')
+
         # 2026-08-31 性能优化：15s 内存缓存，覆盖前端 30s 轮询的重复请求。
         # 命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
         cache_key = ','.join(sorted(set(codes_list)))
@@ -1524,7 +1637,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
 
         async def _fetch_fund_flow() -> Dict:
             try:
-                from services.recommend import fetch_batch_fund_flow
+                from services.pick.recommend import fetch_batch_fund_flow
                 return await fetch_batch_fund_flow([s.get('symbol', '') for s in all_results])
             except Exception as e:
                 print(f'[批量扫描] 资金流向获取失败: {e}')
@@ -1533,7 +1646,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # : 从 DB 批量查股东人数（月度数据，同步 DB 查询用 to_thread 包装避免阻塞事件循环）
         async def _fetch_holder_num() -> Dict:
             try:
-                from services.shareholder import get_holder_num_batch
+                from services.data.shareholder import get_holder_num_batch
                 symbols = [s.get('symbol', '') for s in all_results]
                 return await asyncio.to_thread(get_holder_num_batch, symbols)
             except Exception as e:
@@ -1550,7 +1663,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # : 从 DB 批量查基本面质量（季度数据，同步 DB 查询用 to_thread 包装避免阻塞）
         async def _fetch_fundamental() -> Dict:
             try:
-                from services.fundamental import get_fundamental_batch
+                from services.data.fundamental import get_fundamental_batch
                 symbols = [s.get('symbol', '') for s in all_results]
                 return await asyncio.to_thread(get_fundamental_batch, symbols)
             except Exception as e:
@@ -1588,7 +1701,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # 趋势分复用今日趋势扫描缓存（isUp 票）；全市场逐票现算 is_up_trend 成本过高，
         # 反弹股抑制已在单票评分/持仓/推荐/趋势扫描路径覆盖，此处作为明确边界。
         try:
-            from services.trend import load_trend_scan_results
+            from services.strategy.trend import load_trend_scan_results
             _scan_trend = load_trend_scan_results().get('stocks', [])
             scan_trend_map = {s['symbol'].lower(): {'score': s.get('score'), 'details': s.get('details', {})}
                               for s in _scan_trend if s.get('symbol') is not None}
@@ -1932,21 +2045,21 @@ async def get_action_desk_api(phase: str = '', user: Dict = Depends(current_user
 async def get_kline(symbol: str):
     if not re.match(r'^(sh|sz)\d{6}$', symbol.lower()):
         raise HTTPException(status_code=400, detail="无效的股票代码格式")
-    
+
     try:
         kline_data = await get_kline_data(symbol.lower())
         if not kline_data:
             return {"success": False, "error": "获取K线数据失败或数据不足"}
-        
+
         dates = [k[0] for k in kline_data]
         values = [[float(k[1]), float(k[2]), float(k[4]), float(k[3])] for k in kline_data]
         vols = [float(k[5]) if len(k) > 5 and k[5] else 0 for k in kline_data]
         ma5 = calculate_ma(kline_data, 5)
         ma10 = calculate_ma(kline_data, 10)
         ma20 = calculate_ma(kline_data, 20)
-        
+
         name = await get_stock_name(symbol) or symbol
-        
+
         return {
             "success": True,
             "data": {
@@ -2214,7 +2327,7 @@ async def refresh_rps_api(period_days: int = RPS_PERIOD_DAYS, limit_codes: int =
     耗时较长（拉全市场 K 线），立即返回 accepted，结果写入 rps_cache 表；
     盘中扫描/分析读取缓存。可选 limit_codes 用于小范围验证。
     """
-    from services.rps import refresh_rps
+    from services.strategy.rps import refresh_rps
     async def _bg():
         try:
             res = await refresh_rps(period_days, limit_codes)
@@ -2230,10 +2343,10 @@ async def kline_history_stats_api():
     """查看本地历史日K线库统计（股票数/K线行数/数据区间）。
 
     A 级优化：RPS/趋势/评分的区间涨幅从此本地库向量化计算，绕开东方财富限流。
-    若 symbolCount=0 表示尚未回填，需先执行 `python backfill_kline.py --mode backfill`。
+    若 symbolCount=0 表示尚未回填，需先执行 `python scripts/backfill_kline.py --mode backfill`。
     """
     try:
-        from services.kline_history import get_engine, history_available
+        from services.data.kline_history import get_engine, history_available
         eng = get_engine()
         stats = eng.get_db_stats()
         stats["available"] = history_available()
@@ -2250,11 +2363,11 @@ async def kline_history_sync_api():
     """
     async def _bg():
         try:
-            from services.kline_history import get_engine, history_available
+            from services.data.kline_history import get_engine, history_available
             eng = get_engine()
             eng.sync_today_bulk()
             if history_available():
-                from services.rps import refresh_rps
+                from services.strategy.rps import refresh_rps
                 await refresh_rps(RPS_PERIOD_DAYS)
             print("[历史K线] 增量同步 + RPS 刷新完成")
         except Exception as e:
@@ -2271,7 +2384,7 @@ async def kline_history_backfill_api(start_date: str = None, limit: int = 0):
     """
     async def _bg():
         try:
-            from services.kline_history import get_engine
+            from services.data.kline_history import get_engine
             eng = get_engine()
             from app.config import KLINE_HISTORY_START_DATE
             symbols = eng.get_all_symbols()
@@ -2504,7 +2617,7 @@ async def get_optimization_status():
 @router.post("/api/optimization/trigger", tags=["自动优化"])
 async def trigger_optimization(run_grid: bool = False):
     """手动触发自动优化"""
-    from services.auto_optimizer import run_auto_optimization
+    from services.ops.auto_optimizer import run_auto_optimization
     result = await run_auto_optimization(run_grid=run_grid)
     return {"success": True, "data": result}
 

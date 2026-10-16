@@ -1,4 +1,6 @@
+import json
 import os
+from datetime import datetime
 
 # ========== 数据库配置 ==========
 SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'gupiao.db')
@@ -96,8 +98,6 @@ TREND_D3_RATIO_TIERS = [(1.5, 10), (1.3, 8), (1.0, 5)]  # [(20日均量/60日均
 TREND_D3_SLOPE_TIERS = [(0.3, 5), (0.15, 3), (0, 2)]   # [(归一化斜率≥, 得分)] — 量能趋势子维度
 TREND_D3_STABILITY_TIERS = [(0.3, 5), (0.5, 3), (0.8, 2)]  # [(CV≤, 得分)] — 量能稳定性子维度（CV越小越健康）
 
-# 维度 4：风险回撤（20 分，5 档）
-TREND_D4_DRAWDOWN_TIERS = [(8, 20), (12, 15), (15, 10), (20, 5)]  # [(<回撤%, 得分)]
 
 # 扣分项（12 项，分 3 组做互斥/衰减）
 TREND_DEDUCT_POSITION_HIGH = 10  # 现价位于250日分位 ≥ 80%（新高突破可豁免）
@@ -106,11 +106,9 @@ TREND_DEDUCT_POSITION_MID = 5  # 60% ≤ 分位 < 80% 或 MA60向下/MA120向上
 TREND_DEDUCT_MA20_BROKEN = 6  # 近 5 日内跌破 MA20 且 3 日未收回
 TREND_DEDUCT_LIMIT_DOWN = 15  # 近 20 日出现单日跌停
 TREND_DEDUCT_SHRINK_VOL = 10  # 持续缩量阴跌
-TREND_DEDUCT_VOLUME_SPIKE = 10  # 单日成交量创20日新高，股价无力上涨（-1%~1%）→ 放量滞涨
 TREND_DEDUCT_VOLUME_DIVERGENCE = 6  # 近5日股价小幅抬升但20日均量逐级放大超30%
 TREND_DEDUCT_EXTREME_VOLATILITY = 8  # 近20日振幅≥15%且收跌
 TREND_DEDUCT_SINGLE_DAY_CRASH = 8  # 单日大跌超-7%且次日未修复
-TREND_DEDUCT_AMPLITUDE_FLAT = 10  # 近20日振幅<5%（完全横盘，高位扣满/低位豁免）
 TREND_DEDUCT_NON_MAIN_BOARD = 5  # 非主板（创业板/科创板）
 # 扣分项分组（同组取最大值，防止同类风险重复惩罚）
 TREND_DEDUCT_GROUPS = {
@@ -144,8 +142,6 @@ TREND_BONUS_ACCELERATING = 1      # 加速拉升：近5日涨幅≥15% + 量比�
 # 板块动量因子（环境修正：±5% 权重，叠加到总分）
 # 2026-06-30 实现：基于个股概念标签(stock_concept_tags)的同题材平均涨幅做环境修正
 # 数据源：扫描时统计每个概念标签下所有股票的平均涨幅，个股取其标签的平均涨幅作为 sector_change
-TREND_SECTOR_MOMENTUM_WEIGHT = 0.20  # 板块动量占整体评分的权重（保留，用于未来扩展）
-TREND_SECTOR_HOT_RANK_MIN = 5       # 板块排名前N视为热门板块
 # 板块涨幅 → 修正系数映射（[(涨幅%≥, 修正系数)]，从高到低匹配，命中即停）
 # 热门题材 +5%，偏热 +3%，中性 0%，偏冷 -3%，冷门 -5%
 TREND_SECTOR_FACTOR_TIERS = [
@@ -241,7 +237,6 @@ STRATEGY_INDUSTRY_P80_BONUS = 2            # 行业内总分 ≥ P80 → +2
 STRATEGY_INDUSTRY_P20_PENALTY = -2         # 行业内总分 ≤ P20 → -2
 
 # 强制排除阈值
-TREND_EXCLUDE_CONSECUTIVE_LIMIT_DOWN = 3  # 近20日出现连续N个跌停 → 直接剔除
 TREND_EXCLUDE_MARKET_CAP_MIN = 20  # 总市值 < N亿 直接剔除（可配置）
 TREND_RANGE_20D_FLAT_MIN = 5  # 近 20 日振幅 < 5% 视为"完全横盘"（转入扣分项，不再直接排除）
 
@@ -299,23 +294,17 @@ USE_INTRADAY_BREAK_CHECK = True
 # 数据来源：东方财富 clist + k1/k2/k3=1（区间涨跌幅），一次请求拿全市场，本地算百分位。
 RPS_ENABLED = True
 RPS_PERIOD_DAYS = 120            # 主评分周期（欧奈尔常用 120 日），calc_stock_score_v2 默认用此周期
-RPS_PERIODS = [50, 120, 250]     # 多周期（前端展示/未来组合用），分别对应月/季/年相对强度
-RPS_CACHE_TTL = 3600             # RPS 全市场映射缓存（秒），盘前算一次即可，盘中复用
 RPS_MIN_SAMPLES = 300            # 全市场样本不足时跳过计算（避免误算 RPS）
 RPS_TOP_N = 100                  # /api/rps 强势股榜默认返回数量
 
 # ========== 基本面质量因子（P1a，2026-07-16 新增）==========
 # 数据源：东方财富 datacenter RPT_LICO_FN_CPD（核心财务指标，季度披露）
 # 取最新一期(ISNEW=1)：WEIGHTAVG_ROE(ROE%)+SJLTZ(归母净利润同比%)，每日18:05盘后更新
-FUNDAMENTAL_ENABLED = True
 FUNDAMENTAL_UPDATE_TIME = '18:05'  # 与股东人数(18:00)错开，避免并发拉取
 
 # ========== 聪明钱因子（P1b，2026-07-16 新增）==========
 # 龙虎榜净买入额 + 北向资金净流入，作为"聪明钱"个股/市场级信号
-SMART_MONEY_ENABLED = True
 SMART_MONEY_DRAGON_TIGER_DAYS = 5       # 龙虎榜聚合近 N 个交易日
-SMART_MONEY_NET_AMT_HIGH = 500_000_000   # 龙虎榜净买入 ≥5亿 → high（机构/游资重仓介入）
-SMART_MONEY_NET_AMT_MID = 100_000_000    # 龙虎榜净买入 ≥1亿 → mid（游资介入）
 SMART_MONEY_UPDATE_TIME = '17:30'        # 交易日后定时拉取龙虎榜+北向最新数据（盘后约17:30发布）
 
 # ========== 估值分位过滤（P2c，2026-07-16 新增）==========
@@ -584,6 +573,15 @@ DELISTING_KEYWORDS = ['ST', '*ST', 'SST', 'S*ST', 'NST', 'PT', '退', '退市', 
 # 退市/ST 等风险词由独立的 DELISTING_KEYWORDS + has_delisting_risk() 处理。
 # 2026-07-08 精简：移除单字/泛义词（'酒'、'太平洋'、'光明'、'太平'、'华泰'、'前海'、'天安'），
 # 这些词会误伤大量无关股票。用更精确的关键词替代。
+# 按**股票名称 substring** 做的行业黑名单（银行/地产/白酒/券商…）。
+# 2026-10-16 默认关掉，原因是它 90% 的活已经被流动性三条替代了：实测在选票范围 1094 只里，
+# 这张 94 词的表只拦掉 24 只（2.2%），而其中明显误伤的有 平安电工（云母绝缘材料，被"平安"
+# 当保险公司拦）、洪都航空（军工整机，被"航空"拦）、时代出版/中国出版/出版传媒（被"出版"拦）、
+# 吉林化纤/新乡化纤（被"化纤"拦）—— 用名字当行业判据，连坐是必然的。
+# 想恢复硬排除就把这条打开；真要按行业排除，正确做法是用行业字段
+# （本地 `stock_basic_info.industry` 目前只覆盖 756 只，撑不起全市场判定）。
+# 注意：DELISTING_KEYWORDS（ST/退市风险）不受本开关影响，那是风险不是行业偏好。
+SECTOR_NAME_EXCLUDE_ENABLED = False
 FORBIDDEN_KEYWORDS = [
     # 金融行业
     '银行', '证券', '保险', '信托', '金控',
@@ -721,7 +719,32 @@ MARKET_ALERT_RISK_THRESHOLD = 40  # 风险评分 >= 此值时触发预警推送
 # 盘中准实时推送：满足条件的候选股实时推送到企业微信（wecom-cli message aibot send）。
 # chat_id 为授权真人用户的内部 ID（机器人"杨珍的机器人"的授权人），仅内部调用，不对外展示。
 WECOM_PUSH_ENABLED = True
+# 智能机器人（aibot 单聊）总开关。2026-10-14 用户决定：**先只用企业微信群聊推送，
+# 单人单聊后做**。关掉它的实际意义不只是"少一条通道"——aibot 权限目前过期，
+# 每轮推送都要白等一次子进程往返才知道失败；关掉后日志与耗时都干净。
+# 将来点了腾讯托管的授权链接、确认 `message aibot send` 能送达，再把这里改 True。
+WECOM_AIBOT_ENABLED = False
 WECOM_CLI_CHAT_ID = os.environ.get('WECOM_CLI_CHAT_ID', 'woo0QVPAAAiTuUXPTA8qH_kjcnk1YCSA')   # 授权人 chat_id（内部，优先环境变量 WECOM_CLI_CHAT_ID）
+# wecom-cli 不在系统 PATH（它装在企微连接器的 connector_runtime/artifacts 下）。
+# 留空则由 services/push.py 自动探测：PATH → %LOCALAPPDATA%/*/User Data/Default/
+# connector_runtime/artifacts/wecom-cli.exe。连接器换目录/换宿主应用时，
+# 用环境变量 WECOM_CLI_BIN 指定 exe 绝对路径最稳妥。
+WECOM_CLI_BIN = os.environ.get('WECOM_CLI_BIN', '')
+# ========== 企业微信群机器人 Webhook（2026-10-14 兜底通道） ==========
+# 背景：智能机器人(aibot)的「消息」权限会在企微服务端过期（实测 errcode 850003），
+# 每次都要人点链接或扫码续期 —— 对"止损必须按时叫醒我"这种用途不可靠。
+# 群机器人 webhook 是纯 HTTP POST，不过期、不依赖连接器进程，因此作为兜底：
+# aibot 发失败时自动改走 webhook，日志写清走的哪条通道。
+# 凭据（URL 里带 key）放本地文件 server/wecom_webhook.json，已加进 .gitignore 不入库。
+WECOM_WEBHOOK_ENABLED = True
+# 消息类型：**默认 text**。2026-10-14 实测：这个群是「微信↔企业微信」互通群，
+# 用户在**个人微信**里看它 —— markdown 消息在微信侧整条渲染成
+# 「暂不支持此消息类型，点击前往企业微信查看」，等于推送发出去了但人看不见。
+# text 类型在微信/企业微信两端都能正常显示，代价是没有加粗和颜色。
+WECOM_WEBHOOK_MSGTYPE = os.environ.get('WECOM_WEBHOOK_MSGTYPE', 'text')
+WECOM_WEBHOOK_URL = os.environ.get('WECOM_WEBHOOK_URL', '')           # 优先环境变量
+WECOM_WEBHOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'wecom_webhook.json')          # 其次本地文件
 WECOM_PUSH_INTERVAL_SEC = 60        # 盘中轮询间隔（秒），1 分钟级准实时
 WECOM_PUSH_START = '09:31'          # 盘中推送开始时间（连续竞价后）
 WECOM_PUSH_END = '14:57'            # 盘中推送结束时间（收盘前）
@@ -732,9 +755,232 @@ WECOM_PUSH_MIN_GAIN = 3.0           # 预期涨幅 >= 此值（%）
 WECOM_PUSH_MIN_VOL_RATIO = 1.0      # 量比 >= 此值
 WECOM_PUSH_MAX_CHANGE = 9.8         # 涨幅 < 此值（未涨停，保留买入空间）
 WECOM_PUSH_EXCLUDE_ROLES = ('跟风', '杂毛')  # 排除的角色关键词（stockType 中命中即排除）
+
+# ---- 盘中连续扫描的股票范围（2026-10-16 用户要求："把推荐池也塞进每 60 秒的连续扫描里"）----
+# 改造前这条链路只扫用户自选池（8~10 只），于是"9:45 那批推荐"生成后就再没人看了：
+# 快照那一刻涨 1.1% 的票，10:05 涨到 7% 也不会再提醒 —— 用户看到的永远是过期的时机判断。
+WECOM_PUSH_SCAN_RECOMMEND_POOL = True   # False 就退回"只扫用户池"的老行为
+WECOM_PUSH_POOL_TOP_N = 60              # 海选池按 20 日强度取前 N 只并入（控制单轮耗时）
+WECOM_PUSH_REC_TOP_N = 5                # 再把当日已生成推荐的前 N 只一起盯（它们可能还在涨）
+WECOM_PUSH_DAILY_LIMIT = 6              # 达标推送每天最多几只票（与持仓快反的额度分开算）
+# 命中这些矩阵档位就不推（2026-10-16 分钟矩阵实测的明确负期望档）；
+# "当天不追/不接力"只做标注不删，避免又变成一个没人知道的黑箱否决。
+WECOM_PUSH_MATRIX_VETO = ('排除', '减仓日')
+WECOM_PUSH_MATRIX_LABEL = True          # 推送文案里带上"这个位置历史什么胜率"
 TREND_BACKTEST_KLINE_CONCURRENCY = 5                # 批量拉 K 线并发度
 TREND_BACKTEST_MARKET_SYMBOL = 'sh000001'           # 大盘基准（上证指数）
 TREND_BACKTEST_SCORE_SEGMENTS = [(60, 70), (70, 80), (80, 101)]  # 分数段（左闭右开，80+ 用 101 兜顶）
+
+# ========== 企业微信「自建应用」单聊通道（2026-10-14，待凭据启用） ==========
+# 群机器人 webhook 能用，但它是"群"；要给每个注册用户推**单聊**、并且让他点一下链接
+# 就完成绑定，需要企业微信自建应用的三个参数（由企微管理员在「管理后台 → 应用管理 →
+# 自建应用」里创建后提供）：
+#   WECOM_AGENT_CORP_ID   企业 ID（详情页顶部）
+#   WECOM_AGENT_ID        应用 AgentId
+#   WECOM_AGENT_SECRET    应用 Secret（点「查看」发到管理员企微）
+# 另外两件事必须由管理员做，代码替代不了：
+#   1) 「企业可信 IP」加上本机出口 IP（错误提示里会直接写出当前 IP）；
+#   2) 「网页授权及 JS-SDK 可信域名」——只有配了可信域名，才能走 OAuth 点链接自助绑定；
+#      没有公网域名时退一步：用户手填自己的企微 账号ID(userid)，一样能推单聊。
+# 三个参数任一为空 → 本通道整体视为"未启用"，绑定接口会明确报缺哪个，
+# 绝不静默降级成"看起来绑上了其实发不出"。
+_WECOM_AGENT_KEYS = {
+    'WECOM_AGENT_CORP_ID': 'corp_id',
+    'WECOM_AGENT_ID': 'agent_id',
+    'WECOM_AGENT_SECRET': 'secret',
+    'WECOM_AGENT_REDIRECT_BASE': 'redirect_base',
+}
+
+
+def _wecom_agent_cred(name: str, default: str = '') -> str:
+    """自建应用凭据取值顺序：环境变量 → 本地文件 server/wecom_agent.json → 默认值。
+
+    为什么不要求管理员把三个值配成 Windows 环境变量：这台机器上服务是用
+    `python run.py` 直接起的，环境变量得改系统设置并重启终端才生效，容易配错也难核对；
+    本地 json 与 webhook 凭据同等待遇 —— 已加进 .gitignore，不入库。
+    """
+    v = (os.environ.get(name) or '').strip()
+    if v:
+        return v
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                               'wecom_agent.json'), encoding='utf-8') as f:
+            data = json.load(f)
+        return str(data.get(_WECOM_AGENT_KEYS.get(name, name.lower())) or '').strip()
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        print(f'[Config] 读取 wecom_agent.json 失败（忽略）: {e}')
+        return default
+
+
+WECOM_AGENT_CORP_ID = _wecom_agent_cred('WECOM_AGENT_CORP_ID')
+WECOM_AGENT_ID = _wecom_agent_cred('WECOM_AGENT_ID')
+WECOM_AGENT_SECRET = _wecom_agent_cred('WECOM_AGENT_SECRET')
+# OAuth 回调用的可信域名（如 https://your-domain.com）；留空 = 不启用扫码/链接绑定，只支持手填 userid
+WECOM_AGENT_REDIRECT_BASE = _wecom_agent_cred('WECOM_AGENT_REDIRECT_BASE')
+
+
+def wecom_agent_missing():
+    """返回自建应用还缺哪些参数（全齐则空列表）"""
+    miss = []
+    if not (WECOM_AGENT_CORP_ID or '').strip():
+        miss.append('WECOM_AGENT_CORP_ID（企业 ID）')
+    if not (WECOM_AGENT_ID or '').strip():
+        miss.append('WECOM_AGENT_ID（应用 AgentId）')
+    if not (WECOM_AGENT_SECRET or '').strip():
+        miss.append('WECOM_AGENT_SECRET（应用 Secret）')
+    return miss
+
+
+def wecom_agent_ready() -> bool:
+    return not wecom_agent_missing()
+
+
+# ========== 股票范围（universe）——用户口径 2026-10-16 ==========
+# 用户原话："目前我暂时只针对沪深主板的股票，而且要排除掉 ST 和 *ST"。
+# 这不只是偏好问题：主板涨跌停 10%、创业板/科创板 20%、北交所 30%、ST 5%，
+# 而海选/复盘里"封板、炸板、准涨停"全按百分比阈值判定 —— 混板等于混口径。
+UNIVERSE_MAIN_BOARD_ONLY = True   # 只做 600/601/603/605 + 000/001/002/003
+UNIVERSE_EXCLUDE_ST = True        # 剔除 ST/*ST/退市整理（名称含 ST 或"退"）
+# 名称与状态表：需要先在办公室电脑执行 `python scripts/sync_stock_basic.py`
+# （baostock 全量名录 → history_kline.db 的 stock_basic_full；那张表之前是空的，ST 根本判不了）
+
+# ========== 总市值下限（2026-10-16，防量化操控小微盘） ==========
+# 用户口径：剔除总市值 < 35 亿的票。小盘股流通盘小、易被少量资金拉抬/砸盘做出形态，
+# 评分与推荐里混进来等于把"被做出来"的信号当趋势。落点覆盖全链路：
+# 选票（候选池/智能推荐/趋势扫描/策略扫描）+ 同步K线 + 分时线。
+# 取数约束（2026-10-16 实测）：东财 clist 批量、ulist 批量都不返回市值（f116='-'/0），
+# 只有单只 push2 stock/get 可靠返回 f116(总市值,元)/f117(流通市值,元)/f84(总股本)，
+# 故后台按本地日K库清单逐只拉取灌本地表 stock_market_cap，盘前只读本地表不外联。
+# 数据层与过滤逻辑见 services/market_cap.py。
+MARKET_CAP_FILTER_ENABLED = True
+MIN_TOTAL_MARKET_CAP = 35e8        # 总市值下限（元），35 亿
+
+# ========== 流动性/价位下限（2026-10-16 用户追加，"减少无效的筛选"） ==========
+# 用户原话："近20个交易日日均成交额大于8000万，近20个交易日平均换手率大于1.5%，股价大于3元"。
+# 这三条都在筛"今天能不能买得进去、卖得出来"：成交额与换手不够的票，形态再好也只是账面收益，
+# 实际挂单会滑；3 元以下票集中在被边缘化的老股/庄股，跳空与单日异动的概率明显更高。
+# 实测三条同时通过的只数：沪深主板非ST 且 市值≥35亿（2462 只）里 **1094 只**通过，
+# 其中收口最紧的是换手率（只有 1234 只 >1.5%），成交额 1882 只、价格 2340 只。
+LIQUIDITY_FILTER_ENABLED = True    # 总开关（关掉=三条一起不生效）
+# 三条各自独立开关：想单独试某一条的作用，只关它这一行即可。
+# 三条全关时 `liquidity.passes()` 一律放行（连"窗口内没K线就剔除"也不生效），
+# 这样"关开关"是真的回到改造前，而不是留下一个隐蔽的剔除规则。
+LIQ_AMOUNT_ENABLED = True          # 日均成交额
+LIQ_TURNOVER_ENABLED = True        # 日均换手率
+LIQ_PRICE_ENABLED = True           # 最低股价
+LIQ_STATS_WINDOW = 20              # 统计窗口：近 20 个交易日（与用户口径一致）
+LIQ_MIN_AVG_AMOUNT = 8e7           # 日均成交额下限（元）= 8000 万
+LIQ_MIN_AVG_TURNOVER_PCT = 1.5     # 日均换手率下限（%）
+LIQ_MIN_PRICE = 3.0                # 最新收盘价下限（元）；前复权最后一根 = 实盘价
+# 换手率分母用**流通股本**（= 流通市值 / 最新价），不用流通市值本身：
+# 窗口内涨过一波的票，用当前市值当分母会把过去的换手算轻（实测 603200 市值法 7.55% vs 股本法 8.84%）。
+MARKET_CAP_WORKERS = 4             # 刷新线程数：实测 12 线程猛拉约 1100 次后被东财限流，降到 4 线程才稳
+MARKET_CAP_REQUEST_DELAY = 0.5     # 每个请求前小睡（秒），配合低并发避开限流；周刷新慢几分钟无所谓
+MARKET_CAP_REFRESH_WEEKDAY = 'sunday'  # 每周刷新星期（schedule 库：monday..sunday）
+MARKET_CAP_REFRESH_TIME = '18:30'  # 刷新时刻（盘后，错开 16:00 K线同步 / 18:05 基本面）
+
+# ========== 盘前全市场海选候选池（2026-10-15） ==========
+# 替代"只看东财人气榜 444 只"的入口：用本地日K库向量化海选，把没上热搜但已走主升的票捞进来。
+# 回放验证：九阳股份 09-11 命中（其后 +81.6%）、澳弘电子 09-14 命中（+74.9%），
+# 而旧入口对九阳从头到尾无感。
+CANDIDATE_POOL_ENABLED = True
+CANDIDATE_POOL_MAX = 250          # 每天最多喂给评分链路多少只（控制 9:45 那批的耗时）
+CANDIDATE_POOL_MIN_BARS = 80      # 上市不足 80 根日K的不参与（MA60/60日高点要算得出来）
+CANDIDATE_POOL_RPS_TOP = 80       # 20 日涨幅需排进当天全市场前 20%（≥80 百分位）
+CANDIDATE_POOL_NEAR_HIGH = 0.92   # 收盘需在 60 日最高点的 8% 以内（强势未破位）
+CANDIDATE_POOL_TIME = '09:00'     # 盘前海选时刻（本地日K由 18:15 同步，9:00 已含昨收）
+# 出池前要求的本地日K覆盖度：当天有K线的股票数 / 全库股票数。
+# 只看 MAX(date) 会被半截的一天骗过去（盘后同步是逐只写入的），
+# 覆盖度不足就当数据不新 —— 宁可用老池子并告警，也不要拿"只有一刻钟的市场"去海选。
+KLINE_POOL_MIN_COVERAGE = 0.90
+
+# 手动静音的日期列表（当天所有企业微信推送都不发，含 T+1 预案/情绪提醒/买入候选）。
+PUSH_MUTE_DATES = ('2026-10-15',)
+
+
+def push_muted_today() -> bool:
+    """当天是否静音所有企业微信推送（2026-10-15 用户要求：今天别推了）。
+
+    用日期列表而不是布尔总开关：布尔容易忘了关回来，第二天该止损时反而没提醒。
+    列里的日期一过，推送自动恢复。
+    """
+    return datetime.now().strftime('%Y-%m-%d') in PUSH_MUTE_DATES
+
+
+# ========== 盘中短线情绪温度计（2026-10-14 新增） ==========
+# 背景：五维情绪周期（涨停家数/炸板率/连板高度/昨日涨停溢价/涨跌家数）原来只在 15:10
+# 收评算一次，选股链路（recommend/strategy）从头到尾只看得到上证指数涨跌幅。
+# 结果是冰点日和高潮日，同一只票同一套阈值算出同一个分、同样进 Top3。
+# 本模块把同一套口径搬进盘中，并作为"门槛/否决"参与决策——不改 13 因子权重，
+# 避免污染 15:35 auto_optimizer 学到的 strategy_factor_weights。
+SENTIMENT_ENABLED = True
+SENTIMENT_REFRESH_TTL_SEC = 180       # 盘中情绪刷新间隔（秒）：3~5 分钟，压住东财限流风险
+SENTIMENT_SNAPSHOT_SAVE_SEC = 300     # 情绪快照落库间隔（秒），供影子回测/复盘对照
+SENTIMENT_ZT_POOL_PAGESIZE = 600      # 涨停池单页拉取上限（全市场涨停极少超过此数）
+SENTIMENT_PREMIUM_MAX_CODES = 200     # 昨日涨停溢价最多查多少只（与 review 口径一致）
+# 情绪周期 → 精选推荐最低分：改门槛而非改扣分，纪律不该被其他因子平均掉
+SENTIMENT_MIN_SCORE = {'冰点': 72, '退潮': 68, '分歧': 65, '回暖': 60, '发酵': 60, '高潮': 64}
+# 情绪周期 → 操作纪律。env_shift 是在"大盘涨跌幅档位"上的升降档；
+# allow_chase=是否允许追高（涨幅已过 5% 的票）；allow_relay=是否允许接力高位连板；
+# veto_roles=硬否决角色（命中即不进"此时机可介入"，移入"稍后时机"并写原因）。
+# 高潮期 allow_chase=False 是"卖在一致"：越是人人赚钱越不追第一，防接最后一棒。
+CYCLE_RULES = {
+    '冰点': {'env_shift': -2, 'allow_chase': False, 'allow_relay': False,
+             'veto_roles': ('跟风', '杂毛', '补涨龙'), 'note': '情绪冰点：严禁接力，只做超跌低吸或空仓等待'},
+    '退潮': {'env_shift': -1, 'allow_chase': False, 'allow_relay': False,
+             'veto_roles': ('跟风', '杂毛'), 'note': '亏钱效应扩散：规避高位股，有利润即刻走，不补仓不格局'},
+    '分歧': {'env_shift': 0, 'allow_chase': False, 'allow_relay': False,
+             'veto_roles': ('杂毛',), 'note': '多空拉锯：降低操作频率，等方向明确'},
+    '回暖': {'env_shift': 0, 'allow_chase': True, 'allow_relay': False,
+             'veto_roles': ('杂毛',), 'note': '情绪修复：积极低吸主流题材低位股'},
+    '发酵': {'env_shift': 1, 'allow_chase': True, 'allow_relay': True,
+             'veto_roles': ('杂毛',), 'note': '情绪主升：可跟随主线龙头，注意仓位节奏'},
+    '高潮': {'env_shift': 0, 'allow_chase': False, 'allow_relay': True,
+             'veto_roles': ('跟风', '杂毛'), 'note': '一致看多：不追第一，逐步兑现，谨防高位分歧'},
+}
+# 硬否决的确认条件：单指标假信号多（炸板率高但涨停数也高 = 分歧而非退潮），
+# 要求至少 2 个弱信号同向，且过 10:00 才启用（9:35 涨停数天然少，会把回暖日误判成冰点）
+SENTIMENT_VETO_MIN_WEAK_SIGNALS = 2
+SENTIMENT_VETO_AFTER_MIN = 10 * 60    # 当日分钟数，10:00
+# 梯队崩塌 / 龙头失势：昨日 3 板以上个股今日晋级率 ≤ 此值（且昨日基数≥3只）→ 梯队崩塌；
+# 昨日高位股今日跌幅 ≤ 此值 → 龙头失势（养家式无条件离场信号）
+SENTIMENT_LADDER_COLLAPSE_RATE = 0.5
+SENTIMENT_LEADER_FAIL_CHANGE = -5.0
+SENTIMENT_LADDER_MIN_BASE = 3
+
+# ========== 因子权重学习开关（2026-10-14） ==========
+# 背景：strategy._adjust_weights 自 2026-09-04 起每次抛 AttributeError
+# （sqlite3.Row 没有 .get()，IC 引擎第一行就崩），崩在外层 try 里 → 回测报告不落库、
+# 权重不落库，**strategy_factor_weights 冻结在 2026-09-04 15:20:12 至今 40 天没动过**。
+# 已实测近 30 天核销样本仅 98 行，凑不出"≥10 样本 × ≥5 截面日"的 IC，会回退区分度兜底；
+# 近 90 天才有稳定 IC：change_percent IC_IR +0.34（方向一致 69%，该增权）、
+# amplitude IC_IR -0.40（方向一致 38%，该降权）、main_capital_inflow +0.30（该增权）。
+# 结论：修 bug 恢复的是"策略能自我纠错 + 回测可观测"，不等于胜率立刻提升——
+# 所以先影子运行（调整明细照样写进回测报告的 weight_adjustments，但不落权重），
+# 攒几天对照后把本开关改 True 才真正让线上评分吃到权重学习。
+FACTOR_WEIGHT_LEARNING_ENABLED = False
+
+# ========== 持仓快反推送（2026-10-14 新增） ==========
+# 原状态：push.py 只推"买入候选"，持仓跌破止损/到止盈全靠前端轮询，
+# 最快 60s 轮询 + 8s 行动台缓存 + 5s 行情缓存 ≈ 73 秒才可能被看见，
+# 用户不在电脑前（办公室窄屏/手机）时等于看不见。
+POSITION_WATCH_ENABLED = True
+POSITION_WATCH_INTERVAL_SEC = 20      # 盘中扫描间隔（秒）
+POSITION_WATCH_START = '09:30'
+POSITION_WATCH_END = '15:00'
+POSITION_WATCH_REPUSH_DROP_PCT = 2.0  # 已推过止损后，价格再跌此幅度允许重推一次
+# 每人每天最多发多少条持仓类提醒（防轰炸：异常行情下一轮扫出多只票会连着响）。
+# 超出后信号仍然照常记入行动台页面，只是不再发消息。0 或留空 = 不限。
+PUSH_DAILY_LIMIT_PER_USER = 10
+# 监控哪些账号的持仓。**留空 = 全部账号**（2026-10-14 改）。
+# 原来硬编码 (1,)，而 id=1 是调试账号 sim_dbg、真实用户 yz 是 id=2 ——
+# 结果是"扫了没人看的仓，真正在跑的仓一条都不推"。写死 id 迟早再踩一次，默认全扫。
+POSITION_WATCH_USERS = ()
+# 次日竞价推送"昨日冻结·今日可卖"预案的时刻。A股 T+1：当天买的当天卖不掉，
+# 所以那天买的票触发的信号，正确的提醒时点是第二天 9:15 集合竞价（能挂单了）。
+PUSH_T1_PLAN_TIME = '09:15'
 
 # ========== 数据查询限制 ==========
 QUERY_DAILY_RECOMMENDATIONS_LIMIT = 300  # 历史推荐记录保留天数（load 取最新 N 天 / save 截断到 N 天，均按天数语义）
@@ -773,7 +1019,41 @@ KLINE_DISPLAY_MA_POINTS = 10  # 显示移动平均线点数
 KLINE_HISTORY_ENABLED = True
 KLINE_HISTORY_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'history_kline.db')
 KLINE_HISTORY_START_DATE = '2024-01-01'  # 回填起点（约 2.5 年，覆盖 250 日 RPS 所需窗口）
-KLINE_HISTORY_SYNC_TIME = '16:00'  # 每日盘后增量同步（收盘 15:00 后 K 线已定，16:00 留足 baostock 当日数据落地缓冲；仅交易日执行）
+KLINE_HISTORY_SYNC_TIMES = ['18:15', '18:45', '19:15', '19:45', '20:15']
+# ↑ 为什么是一串时刻而不是一个：2026-10-16 实测 16:00 那次同步**写入 0 条**、
+#   跑完后 `stock_daily` 里当天(10-16)仍是 0 行 —— baostock 的当日 EOD 没这么早出。
+#   原来 16:00 一个点跑完就算今天完了：数据没到 = 当天白跑，还连 RPS 一起变成旧账。
+#   现在从 18:15 起每 30 分钟重试，谁先等到数据谁就把今天的账做完，后面的时刻自动跳过；
+#   最后一个时刻(20:15)仍拿不到数据，才由盘后自检真的告警（避免 16:05 就叫假警报）。
+KLINE_HISTORY_SYNC_TIME = KLINE_HISTORY_SYNC_TIMES[0]   # 兼容旧引用
+KLINE_HISTORY_SYNC_LAST = KLINE_HISTORY_SYNC_TIMES[-1]  # 过了这个点还没数据，才算真失败
+
+# 日K同步的范围是否只跟"选股范围"（主板 + 非ST/退 + 总市值≥下限）。
+# 2026-10-16 用户原话："目前我不是增加了限制默认所有的选股条件：沪深主板、非ST和*ST、市值大于35亿"。
+# 实测这条把同步清单从 5222（整库）压到 2462 —— 原来每晚有 ~2160 次 baostock 查询花在
+# 创业板/科创板/北交所/ST 上，那些票选票环节 100% 会被剔除，等于纯浪费配额；
+# 更糟的是多出来的那部分登录次数正是 19:40 被 baostock 判定"黑名单用户"的诱因之一。
+# 关掉它 = 恢复整库同步（历史存量本来就在库里，不受影响）。
+KLINE_SYNC_UNIVERSE_ONLY = True
+# 连续失败多少只就判定"被限流/拉黑"并终止本次（不再逐只 login/logout 加深封禁）。
+KLINE_MAX_CONSECUTIVE_FAILS = 20
+KLINE_RECONNECT_EVERY = 800      # 主动重连间隔：长连接确实会僵，但每 200 只重登一次太激进
+
+# ========== 收盘日K主路：腾讯批量快照（2026-10-16，被 baostock 拉黑后改架构） ==========
+# 每天补"今天这一根K线"，本来不需要登录任何服务：腾讯 qt.gtimg.cn 一条请求带 ~60 只的
+# 收盘快照（今开/最高/最低/收盘/成交量/成交额），2462 只 ≈ 41 次请求、几秒钟，且没有会话概念。
+# baostock 从此退为**备路**：只在主路失败、补历史某天、或重算除权票前复权序列时才登录。
+TENCENT_SNAPSHOT_ENABLED = True
+TENCENT_SNAPSHOT_BATCH_SIZE = 60     # 单次请求带多少只（腾讯这条接口实测 60~80 稳定）
+TENCENT_SNAPSHOT_MAX_DIFF = 0.02     # 与 baostock 同日数据比对的容差；超过就拒绝写库（防字段改版）
+# 一旦确认拉黑（10001011），本机所有进程都停止敲门的冷却时长（分钟）
+BAOSTOCK_BAN_COOLDOWN_MIN = 360
+
+# 买法矩阵按新分母重跑（一次性任务）：02:10 拉起脱离进程，脚本自己等 baostock 冷却解除。
+# 为什么放在凌晨：前三张只吃本地日K（几分钟），第四张要补 5 分钟线 = 依赖 baostock，
+# 而它今晚刚把我们的 IP 判成黑名单；凌晨那次登录竞争最少，也不会挤占 09:00 海选的窗口。
+MATRIX_RERUN_ENABLED = True
+MATRIX_RERUN_TIME = '02:10'
 
 # ========== 东方财富请求头（统一常量） ==========
 # 2026-07-02 优化：从 review.py/ai.py/routes.py 三处分散定义统一到此处
