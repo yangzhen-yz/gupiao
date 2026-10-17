@@ -185,24 +185,98 @@ def run_recommendation_review() -> Dict:
     return summary
 
 
-def get_recent_loser_symbols(days: int = 30, loss_threshold: float = 3.0) -> Set[str]:
+_LOSER_CACHE = {'ts': 0.0, 'map': {}}
+
+
+def get_loser_map(days: int = None, loss_threshold: float = None) -> Dict[str, Dict]:
+    """当前仍在禁推期内的票 → {关多少天, 到期日, 最差收益, 推荐日, 判据}
+
+    2026-10-17 重写（用户确认的三点优化）：
+      · 判据可选 `t1`（老行为，只看 T+1 一根）或 `t1_or_t3`（T+1 或 T+3 任一亏超阈值）——
+        只看 T+1 会被一根噪声左右：金安国纪 10-09 推荐 T+1 −7.22% 但 T+3 已回到 −2.47%，
+        而利通电子 T+1 只 −3.52%、真正该警惕的是 T+5 的 −8.97%；
+      · 可分级：轻亏（阈值~重亏线）只关 10 天、重亏（>5%）关 30 天，避免"−3.1% 和 −10.5%
+        同罪"；
+      · 结果按 `RECOMMEND_LOSER_CACHE_SEC` 缓存 —— 这张表要对全量推荐算 T+1/3/5，
+        而盘中 60 秒扫描现在也要查它，不能每轮重算。
+    默认配置（`criterion='t1'` + `graded=False`）与 2026-10-12 的老行为逐值一致。
+    """
+    import time as _t
+    from app.config import (RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD,
+                            RECOMMEND_LOSER_CRITERION, RECOMMEND_LOSER_GRADED,
+                            RECOMMEND_LOSER_HEAVY_LOSS, RECOMMEND_LOSER_HEAVY_DAYS,
+                            RECOMMEND_LOSER_LIGHT_DAYS, RECOMMEND_LOSER_CACHE_SEC)
+    days = days if days is not None else _setting('loser_lookback_days', RECOMMEND_LOSER_LOOKBACK_DAYS)
+    loss_threshold = (loss_threshold if loss_threshold is not None
+                      else _setting('loser_loss_threshold', RECOMMEND_LOSER_LOSS_THRESHOLD))
+    criterion = str(_setting('loser_criterion', RECOMMEND_LOSER_CRITERION))
+    graded = bool(_setting('loser_graded', RECOMMEND_LOSER_GRADED))
+    heavy = float(_setting('loser_heavy_loss', RECOMMEND_LOSER_HEAVY_LOSS))
+    heavy_days = int(_setting('loser_heavy_days', RECOMMEND_LOSER_HEAVY_DAYS))
+    light_days = int(_setting('loser_light_days', RECOMMEND_LOSER_LIGHT_DAYS))
+
+    key = (days, loss_threshold, criterion, graded, heavy, heavy_days, light_days)
+    if (_LOSER_CACHE.get('key') == key
+            and _t.time() - _LOSER_CACHE['ts'] < RECOMMEND_LOSER_CACHE_SEC):
+        return _LOSER_CACHE['map']
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    recs = [r for r in _load_all_recommendations() if r['date'] >= cutoff]
+    out: Dict[str, Dict] = {}
+    if not recs:
+        _LOSER_CACHE.update(ts=_t.time(), map=out, key=key)
+        return out
+    perf = compute_recommendation_performance(recs)
+    today = datetime.now().date()
+    for r in perf:
+        r1 = r.get('r1')
+        r3 = r.get('r3')
+        worst, basis = None, ''
+        if r1 is not None and r1 < -loss_threshold:
+            worst, basis = r1, 'T+1'
+        if criterion == 't1_or_t3' and r3 is not None and r3 < -loss_threshold:
+            if worst is None or r3 < worst:
+                worst, basis = r3, 'T+3'
+        if worst is None:
+            continue
+        ban = (heavy_days if (graded and worst <= -heavy) else
+               (light_days if graded else days))
+        try:
+            until = (datetime.strptime(r['date'], '%Y-%m-%d').date() + timedelta(days=ban)).isoformat()
+        except ValueError:
+            continue
+        if until < today.isoformat():
+            continue                       # 已过禁推期
+        prev = out.get(r['symbol'])
+        if not prev or (prev['until'] < until):   # 同一只票被推荐多次，取关得最久的那次
+            out[r['symbol']] = {'ban_days': ban, 'until': until, 'worst': round(worst, 2),
+                                'rec_date': r['date'], 'basis': basis}
+    _LOSER_CACHE.update(ts=_t.time(), map=out, key=key)
+    print(f"[推荐复盘] 亏损黑名单 {len(out)} 只（判据 {criterion}、{'分级' if graded else '一视同仁'}、"
+          f"阈值 {loss_threshold}%、窗口 {days} 天）：" +
+          ', '.join(f"{s}({v['basis']}{v['worst']:+.1f}% 至 {v['until']})" for s, v in sorted(out.items())))
+    return out
+
+
+def _setting(key: str, default):
+    """覆盖表里能改的就现读（复盘子页"口径与开关"），读不到退回 config 默认值。"""
+    try:
+        from services.support import app_settings
+        if key in [s['key'] for s in app_settings.SPEC]:
+            return app_settings.value(key)
+    except Exception:
+        pass
+    return default
+
+
+def get_recent_loser_symbols(days: int = None, loss_threshold: float = None) -> Set[str]:
     """近N天被推荐过且 T+1 亏损超过阈值的股票代码集合（选股避让黑名单）
 
     背景：三祥新材 2026-06-10 / 06-29 连续两次被推荐、各亏 26%+——
-    同一只票短期内推荐失败后不应再次出现。
+    同一只票短期内推荐失败后不应再次出现。判据/分级见 `get_loser_map()`。
+    返回集合是为了兼容老调用点（`in` 判断）；要看关到哪天用 `get_loser_map()`。
     """
-    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    recs = [r for r in _load_all_recommendations() if r['date'] >= cutoff]
-    if not recs:
-        return set()
-    perf = compute_recommendation_performance(recs)
-    losers = set()
-    for r in perf:
-        if (r.get('r1') or 0) < -loss_threshold:
-            losers.add(r['symbol'])
-    if losers:
-        print(f'[推荐复盘] 近{days}天亏损黑名单({len(losers)}只): {sorted(losers)}')
-    return losers
+    return set(get_loser_map(days, loss_threshold).keys())
 
 
 def get_review_summary(days: int = 30) -> Dict:

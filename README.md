@@ -1,137 +1,134 @@
-# A股实时行情查询系统
+# A股短线交易台（行情 · 选股 · 推荐 · 持仓 · 复盘 · 推送）
 
-专门针对A股优化的实时行情查询工具，支持股票代码和名称查询，显示实时价格、买卖量等信息。
+最初它是个"A股实时行情查询"，现在是一整套围绕短线决策的工作台：盘中出信号、盘后做复盘、
+选票口径可以在界面上改、每天的决策现场会落库供以后回放。
+后端 FastAPI + SQLite（单机自托管，无外部数据库），前端 Vue 3 + Vite，企业微信推送。
+
+## 一页速览
+
+| 分组 | 页面 | 回答的问题 |
+|------|------|------------|
+| 首页 | **行动台** (`tab-desk`) | 现在这个时刻该做什么：买入区/持仓处理/环境否决，情绪周期直接参与硬拦 |
+| 盘面 | 实时行情 · 股票筛选 · 趋势发现 · 资金流向 | 价、量、形态、板块资金在说什么 |
+| 决策 | 智能推荐 · 持仓管理 · 模拟交易 | 推哪 3 只（含买卖点与买入时机）、手里的怎么处理、不改真钱先验证想法 |
+| 复盘 | 每日收评 · 自动优化 · **口径与开关** | 昨天推得对不对、权重该怎么调、六条选股口径与各项阈值现场改 |
+
+**选股口径（所有入口共用，2026-10-16 收口成两层）**
+
+- **数据范围 2462** = 沪深主板（600/601/603/605/000/001/002/003）+ 非 ST/\*ST/退市整理 + 总市值 ≥ 35 亿
+  —— 它决定"日K同步清单"和一切覆盖率的分母。
+- **选票范围 1094** = 在数据范围之上再叠 近 20 交易日日均成交额 > 0.8 亿、日均换手率 > 1.5%、股价 > 3 元
+  —— 它决定海选百分位排名、智能推荐入口、趋势扫描、盘中扫描与推送。
+- 唯一出处 [`server/services/data/universe.py`](server/services/data/universe.py) 与
+  [`server/services/data/liquidity.py`](server/services/data/liquidity.py)；六条各有独立开关，
+  关掉任何一条都会在页面上实时报"放回多少只"。**别让流动性条件去管同步清单**——
+  缩量票今天进清单明天出清单，历史序列就会挖洞，MA60 / 60 日高点 / RPS 全被洞污染。
 
 ## 项目结构
 
 ```
 gupiao/
-├── client-vue/                  # 前端 (Vue 3 + Vite)
-│   ├── index.html               # Vite 入口
-│   ├── package.json             # 依赖
-│   ├── package-lock.json        # 依赖锁定
-│   ├── vite.config.js           # 构建配置（dev 代理到后端 3003）
-│   └── src/
-│       ├── main.js              # Vue 启动入口
-│       ├── App.vue              # 根组件
-│       ├── components/
-│       │   ├── tabs/
-│       │   │   ├── TabQuote.vue      # 实时行情
-│       │   │   ├── TabTrend.vue      # 趋势发现
-│       │   │   ├── TabScan.vue       # 股票筛选
-│       │   │   ├── TabRecommend.vue  # 智能推荐
-│       │   │   ├── TabReview.vue     # 每日收评
-│       │   │   └── TabFlow.vue       # 资金流向
-│       │   ├── KlineModal.vue        # K线查看弹窗
-│       │   ├── AiDiagModal.vue       # AI 诊断弹窗
-│       │   └── IndexBar.vue          # 大盘指数栏
-│       ├── composables/
-│       │   └── useStockData.js       # 行情数据 composable
-│       ├── utils/
-│       │   ├── score.js              # 统一评级 getRating + 综合评分透传薄壳（权重由后端统一维护）
-│       │   └── helpers.js            # 通用工具
-│       └── assets/
-│           └── main.css              # 全局样式
+├── client-vue/                       # 前端 (Vue 3 + Vite，构建产物输出到 ../server/static)
+│   ├── src/
+│   │   ├── App.vue                   # 根组件：分组导航、tab 注册（懒加载 + 只挂载访问过的页）
+│   │   ├── components/
+│   │   │   ├── tabs/                 # TabActionDesk · TabRecommend · TabPosition · TabSimTrade
+│   │   │   │   │                     # TabQuote · TabScan · TabTrend · TabFlow
+│   │   │   │   └── ...               # TabReview（每日收评 + 推荐复盘）· TabOptimization · TabSettings
+│   │   │   ├── KlineModal.vue        # K线/分时弹窗（echarts 按需引入，独立 chunk）
+│   │   │   ├── AiDiagModal.vue · IndexBar.vue · LoginPage.vue
+│   │   │   └── DataFreshness.vue · Pagination.vue
+│   │   ├── composables/              # useHashRoute（hash 路由与 tab 白名单）· useStockData
+│   │   │   └── usePolling.js · useTheme.js（亮/暗主题令牌）
+│   │   ├── utils/                    # helpers（apiFetch + 超时）· score · format · timing
+│   │   │   └── mainline · navigation
+│   │   └── assets/main.css           # 主题令牌（:root 与 :root[data-theme="dark"]）
 │
-├── server/                      # FastAPI 后端
-│   ├── run.py                   # 服务启动入口（uvicorn 启动 app.main:app）
-│   ├── start.py                 # 跨平台统一启动入口（2026-06-18 新增）
-│   ├── start.bat                # Windows 启动脚本（薄壳，调用 start.py）
-│   ├── requirements.txt         # Python 依赖
-│   ├── ai_config.json           # AI 诊断配置（字节方舟/豆包，OpenAI 兼容格式）
-│   ├── gupiao.db                # SQLite 数据库文件（运行时生成，已从 MySQL 迁移）
-│   ├── migrate_mysql_to_sqlite.py  # MySQL → SQLite 一次性迁移脚本
+├── server/
+│   ├── run.py                        # uvicorn 入口（reload=True，监视 app/services/db）
+│   ├── start.py · start.bat          # 先构建前端再启动的统一入口
+│   ├── requirements.txt
 │   ├── app/
-│   │   ├── main.py              # FastAPI 应用实例 & 启动生命周期 & /eastmoney 代理路由
-│   │   ├── config.py            # 集中配置（所有硬编码参数 + 热加载）
-│   │   ├── api/
-│   │   │   └── routes.py        # 全部 HTTP 路由（详见 Swagger /docs）
-│   ├── core/
-│   │   └── scheduler.py         # 定时任务注册（基于 schedule 库）
-│   ├── services/                # 业务逻辑层
-│   │   ├── auth.py               # 多用户账号与会话（PBKDF2 加盐哈希 + token 会话 + FastAPI 依赖 current_user）
-│   │   ├── trade_sim.py          # 模拟交易引擎（纯模拟盘：信号→建议→护栏→撮合→审计，不连券商）
-│   │   ├── position.py           # 持仓诊断 + 交易环境闸门（按登录用户隔离）
-│   │   ├── stock.py             # 行情/K线/热搜榜（数据源）
-│   │   ├── trend.py             # 趋势扫描 + 股票池指标 + P0/P2/P3 乘性修正系数族 + 早期信号层
-│   │   ├── early_signals.py     # 早期信号层（第5维度：NR7/VCP/RSI底背离/底部首板/缩量后首放）
-│   │   ├── trading_calendar.py   # A股交易日历（排除周末+法定节假日，用于市场温度计过滤）
-│   │   ├── strategy.py          # 10 因子 AI 选股评分（calc_stock_score_v2）+ 行业中性化
-│   │   ├── recommend.py         # 智能推荐
-│   │   ├── market.py            # 大盘/板块数据
-│   │   ├── review.py            # 每日收评生成（含 AI 智能分析：情绪评分/操作建议/明日展望/风险提示/亮点摘要 + 明日关注买入计划 _build_tomorrow_plan）
-│   │   ├── ai.py                # AI 诊断（字节方舟/豆包）
-│   │   ├── pattern.py           # 量价 6 形态分类（±4% 乘性修正）
-│   │   ├── trend_backtest.py    # 趋势评分回测验证（1/3/5 日跑赢大盘胜率）
-│   │   ├── shareholder.py       # 股东人数筹码面数据（东方财富 RPT_F10_EH_HOLDERNUM 月度）
-│   │   └── utils.py             # 服务层共享工具
-│   ├── db/
-│   │   └── database.py          # SQLite 连接 + 持久化（trend_scan_results / hot_search_daily_snapshot / trend_backtest_* 等）
-│   └── static/                  # 前端构建产物（生产环境直接挂载到 /）
-│       ├── index.html
-│       └── assets/
+│   │   ├── config.py                 # 全部默认值（口径/阈值/时刻/凭据文件位置）
+│   │   └── api/routes.py             # 所有 HTTP 路由（Swagger: /docs）
+│   ├── core/scheduler.py             # 定时任务注册 + 主循环（单 job 抛错不带崩线程）
+│   ├── db/database.py                # SQLite 连接、建表迁移、日K/推荐等读写
+│   ├── services/
+│   │   ├── data/                     # 数据层：universe · liquidity · kline_history · eod_snapshot
+│   │   │   └── ...                   # minute_history · market_cap · fundamental · valuation
+│   │   │                             # shareholder · smartmoney · placement · stock · rps 依赖
+│   │   ├── pick/                     # 选股：candidate_pool（盘前海选）· recommend（13 因子评分）
+│   │   │   └── ...                   # recommend_review（T+1/3/5 复盘 + 黑名单）· strategy_snapshot
+│   │   ├── strategy/                 # 策略：sentiment（情绪周期）· buy_rules（买法矩阵）· trend
+│   │   │   └── ...                   # rps · risk_control · market（大盘预警）· pattern · factor_ic
+│   │   ├── portfolio/                # 持仓：position · position_watch（止损止盈盯盘）· trade_sim
+│   │   ├── support/                  # 支撑：auth（多用户）· push/push_channel（企微）
+│   │   │   └── ...                   # app_settings（配置覆盖表）· settings_preview · ai
+│   │   └── ops/                      # 运维：action_desk · auto_optimizer · db_maintenance · review
+│   ├── scripts/                      # 分析与补数脚本（命令行跑，见下"研究脚本"）
+│   ├── static/                       # 前端构建产物（由 Vite 输出，随代码一起提交）
+│   ├── data/                         # 本地库：history_kline.db（日K）· history_minute.db（5分钟）
+│   │                                 # ⚠️ 不入库（.gitignore /server/data/），需要自己同步或用脚本重建
+│   └── gupiao.db                     # 应用库（业务数据 + 配置覆盖表 + 快照表）
 │
+├── docs/短线买法-2026-10.md          # 买法矩阵研究文档（形态 × 时点的实测期望）
 └── README.md
 ```
 
-> **历史变更提示**：
-> - `client-vue/src/utils/stocks-config.js` 与 `forbidden-keywords.js` 已于 2026-07-02 清理时删除（用户自选/热点池改由后端 API 拉取，关键词过滤集中在 `config.py` 的 `FORBIDDEN_KEYWORDS`）
-> - 数据库已从 MySQL 迁移到 SQLite（`server/gupiao.db`），`migrate_mysql_to_sqlite.py` 为一次性迁移脚本
-> - 东方财富 HTTP 请求统一改为 `requests + asyncio.to_thread`，不再使用 `httpx.AsyncClient`（避免 Server disconnected）
+> 凭据一律不进仓库：`server/wecom_webhook.json`（群机器人 webhook，URL 里带 key）、
+> `server/wecom_agent.json`（自建应用 corpid/agentid/corpsecret）、`server/ai_config.json`（AI 诊断 key）
+> 都写在 `.gitignore` 里，仓库只提供 `*.example.json` 模板。本地库与运行时产物同样不入库。
 
 ## 快速开始
 
-### 启动服务（端口 3003）
-
-双击 `server/start.bat` 或：
 ```bash
 cd server
-sh start.bat   # Windows 直接双击即可
+start.bat            # Windows 双击即可：构建前端 → 装依赖 → 起 FastAPI（端口 3003）
 ```
 
-`start.bat` 启动顺序：
-1. **构建前端**（自动 cd 到 `client-vue`，首次会执行 `pnpm install`，之后增量 `pnpm run build`）
-2. 检查 Python 环境（自动识别 `python3` / `python`）
-3. 安装/更新 Python 依赖（`requirements.txt`，清华源失败时回退到默认源）
-4. 启动 FastAPI（`run.py`）
+`start.bat` → `start.py` 的顺序是：① 构建前端（首次 `pnpm install`，之后增量 `pnpm run build`）
+② 检查 Python（`python3` / `python`）③ 装/更新 `requirements.txt`（清华源失败自动回退默认源）
+④ 启动 `run.py`（uvicorn，`reload=True` 监视 `app/`、`services/`、`db/`，改这些目录下的 .py 会自动重载）。
 
-访问 http://localhost:3003 使用应用（生产环境由后端直接挂载 `static/` 下的前端构建产物）
-
-访问 http://localhost:3003/docs 查看 API 文档
+访问 <http://localhost:3003> 使用应用；API 文档在 <http://localhost:3003/docs>。
 
 ### 首次使用：注册账号
 
-系统启用多用户账号（持仓按账号隔离），**首次打开会进入登录页**：
+系统是多用户（持仓、股票池、推送绑定都按账号隔离），**首次打开会进登录页**：
 
-1. 直接在登录页切到「注册」填用户名 + 密码（≥6 位）即可
-2. **第一个注册的账号会自动认领系统里已有的历史持仓**（当前为美诺华、吉林化纤）
-3. 之后注册的账号从零开始，各自的持仓互不可见
-4. 登录页下方会列出已有账号，点一下即可自动填入用户名
-5. 登录后标签栏最右侧显示当前账号，点「切换账号」可换人
+1. 在登录页切到「注册」，填用户名 + 密码（≥6 位）
+2. **第一个注册的账号会天然继承库里已有的历史持仓**——存量持仓迁移时被挂在 `user_id=1`，
+   而首个注册者的自增 id 正好是 1（顺序约束写在 `services/support/auth.py`：先迁库后注册会让
+   存量持仓变成无主孤儿）。之后注册的账号从零开始，彼此看不到对方的持仓
+3. 登录页下方会列出已有账号，点一下即自动填用户名
+4. 「口径与开关」子页里能改配置的是**最早注册的那个账号**（`users` 表没有角色列，
+   只能这样定管理员；想指定别人就改 `SETTINGS_WRITE_USER_IDS`）
 
-> 不想开放自助注册（如需邀请制）：把 `server/app/config.py` 的 `AUTH_ALLOW_REGISTER` 改为 `False`；想整体关闭登录（回退到单用户模式）：`AUTH_ENABLED = False`。
+不想开放自助注册 → `AUTH_ALLOW_REGISTER = False`；想整体关掉登录（回到单用户）→ `AUTH_ENABLED = False`。
 
 ### 前端开发模式（可选）
 
-如果需要热更新开发，可单独起前端 dev server：
 ```bash
 cd client-vue
-pnpm install
-pnpm run dev
+pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 ```
 
-Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也会代理 `/eastmoney/*` 到东方财富推送接口（[vite.config.js](file:///d:/Desktop/guizhou/gupiao/client-vue/vite.config.js)）。生产环境由 FastAPI 统一代理，避免跨域问题。
+生产环境不需要它：FastAPI 直接挂载 `server/static/`。
+
+### 手机访问
+
+本机是内网机器，手机在外面打不开 3003。做法是用 cloudflared quick tunnel 把 3003
+映射成公网地址，并由守护脚本在隧道断开时自动重建（**重建必然换网址**，换址会通过企微推送，
+每天限 3 条以免网络抖动时刷屏）。守护与冷却策略在仓库外（`D:\tools\cf\tunnel_watch.py`），
+后端只负责把"后端没起来"和"公网不通"分开判断，避免误换址。
 
 ## 使用说明
 
 ### 查询股票
 
-- 沪市：sh600519（贵州茅台）
-- 深市：sz002384（东山精密）
-- 创业板：sz300750（宁德时代）
-- 科创板：sh688981（中芯国际）
-
----
+- 沪市：sh600519（贵州茅台）· 深市：sz002384（东山精密）
+- 创业板 sz300750 / 科创板 sh688981 —— **默认不在选股范围内**（20% 涨跌幅口径不同），
+  但可以查询与看K线；要放开就在「口径与开关」里关掉"只做沪深主板"。
 
 ## 趋势发现 - 完整逻辑说明（核心）
 
@@ -322,8 +319,8 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | 条件 | 说明 | 代码位置 |
 |------|------|----------|
 | K线数据不足 | K线天数 < 60 天 | `TREND_MIN_KLINE_DAYS` |
-| 强制排除（ST / 主板 / 利空 / 横盘） | 见 §2.5 | [services/trend.py `is_up_trend`](file:///d:/Desktop/guizhou/gupiao/server/services/trend.py) |
-| 退市风险 | 名称含 `ST`/`*ST`/`退市` 等关键词 | [services/stock.py `has_delisting_risk`](file:///d:/Desktop/guizhou/gupiao/server/services/stock.py) |
+| 强制排除（ST / 主板 / 利空 / 横盘） | 见 §2.5 | [services/trend.py `is_up_trend`](server/services/trend.py) |
+| 退市风险 | 名称含 `ST`/`*ST`/`退市` 等关键词 | [services/stock.py `has_delisting_risk`](server/services/stock.py) |
 | 趋势评分不够 | 总分 < 65 分 | `TREND_MIN_SCORE` |
 
 > **非沪深主板**（创业板/科创板）不直接排除，改为在评分中扣 `TREND_DEDUCT_NON_MAIN_BOARD`（默认 -5）分，见 §2.2 扣分项表末行。
@@ -407,7 +404,7 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 
 **节假日处理**：非交易日不触发自动刷新；前端检测到非交易日时，直接使用缓存数据并显示"休市"。
 
-### 7. 关键配置项（`server/config.py`）
+### 7. 关键配置项（`server/app/config.py`）
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -448,33 +445,50 @@ Vite dev server 会代理 `/api/*` 到后端 `http://localhost:3003`，同时也
 | `BUY_SELL_STOP_LEADER_MULT` | 1.1 | 龙头止损略宽 10% |
 | `BUY_SELL_STOP_FOLLOWER_MULT` | 0.9 | 跟风止损收紧 10% |
 
-### 8. 定时任务总览
+### 8. 定时任务总览（与 `server/core/scheduler.py` 的注册一一对应）
 
-| 时间 | 任务 | 作用对象 |
-|------|------|----------|
-| 10:00 | 更新东方财富热搜榜 | `hot_search_daily_snapshot` 表（用于趋势扫描的"热搜连续性检查"） |
-| 14:00 | 更新东方财富热搜榜 | 同上 |
-| **09:00 / 09:30 / 10:00 / 10:30 / 11:00 / 11:30 / 12:00 / 12:30 / 13:00 / 13:30 / 14:00 / 14:30 / 15:00** | **自动扫描趋势股** | **趋势池（全量替换，每 30 分钟一次，覆盖盘前预热/盘中实时价校准/收盘）** |
-| **09:45 / 13:30** | **自动生成智能推荐** | `daily_recommendations` 表（早盘 + 午盘各一次，硬性过滤+≥60分+行业分散，每次最多3只） |
-| 15:05 | 检查10日线，删除跌破股票 | **用户股票池**（非趋势池；趋势池的全量替换已覆盖该逻辑，此处为用户自选股的兜底检查） |
-| 15:10 | 自动生成每日收评 | `daily_market_reviews` 表 |
-| 15:20 | 回测验证昨日预测并调整策略权重 | 策略权重表（仅当启用机器学习权重时生效） |
-| **15:30** | **趋势评分回测验证** | `trend_backtest_records` / `trend_backtest_reports` 表（1/3/5 日跑赢大盘胜率） |
-| **18:00** | **更新股东人数筹码面数据** | `stock_holder_num` 表（全市场最新一期股东户数/户均持股，月度披露每日刷新） |
+**盘中循环（交易日，主循环里按秒计数，不进 schedule 表）**
 
-> **交易日判断（2026-08-03 加固）**：以上所有盘中定时任务（热搜榜/趋势扫描/智能推荐/MA10 检查/每日收评/回测/趋势回测/大盘预警）均在 scheduler 入口通过 `services.trading_calendar.is_trading_day(today)` 过滤，**非交易日（周末/法定节假日）直接跳过不执行**，避免用拉取到的 0 条空数据覆盖前一交易日的真数据（典型场景：周六 15:10 生成的空收评会把周五收盘时的真实收评顶掉）。股东人数/基本面/估值/聪明钱这 4 个"上一交易日数据也有价值"的任务不会被该判断拦截，周末也可补拉。
+| 频率 | 任务 | 说明 |
+|------|------|------|
+| 每 180 秒（09:15~15:05） | 短线情绪温度计刷新 | 涨停池/炸板池/跌停池/宽度 → 周期档位与弱信号，落 `market_sentiment_snapshots` |
+| 每 60 秒（09:31~14:57） | 达标候选股推送企微 | 范围 = 用户池 ∪ 当日推荐 ∪ 海选前 N；日限额 `WECOM_PUSH_DAILY_LIMIT`；查亏损黑名单 |
+| 每 20 秒（09:30~15:00） | 持仓止损/止盈快反 | 只盯自己的持仓，触发才推（`POSITION_WATCH_*`） |
+
+**定点任务**
+
+| 时刻 | 任务 | 落点 |
+|------|------|------|
+| 02:10 | 买法矩阵按新口径重跑（一次性，成功写标记后不再触发） | `scripts/run_matrix_rerun.py` → `analysis_out/` |
+| 09:00 | 盘前海选（本地日K算 RPS/接近高点，出候选池） | `daily_candidate_pool`（只留最近 2 天） |
+| 09:15 | 推送「明日计划 / T+1 卖出提示」 | 企微 |
+| 09:25 | 推送今日关注池预览 | 企微 |
+| 09:35 / 10:00 / 10:30 / 13:05 / 14:00 | 大盘风险预警扫描 | `server/market_alert.json`（前端轮询，不入库） |
+| 09:45 / 13:30 / 14:05 / **14:45** | 生成智能推荐（14:45 是收盘前最终快照） | `daily_recommendations` + `recommend_shadow_log` + **`strategy_snapshot`** |
+| 09:00~15:00 每 30 分钟 | 趋势股扫描（全量替换趋势池） | `trend_scan_results` |
+| 10:00 / 14:00 | 更新东方财富热搜榜 | `hot_search_daily_snapshot` |
+| 15:05 | 用户池 MA10/连跌检查删除 | 用户股票池 |
+| 15:10 | 生成每日收评（含情绪五维） | `daily_market_reviews` |
+| 15:20 | 回测昨日预测并调整策略权重 | `strategy_factor_weights` |
+| 15:30 | 趋势评分 1/3/5 日回测 | `trend_backtest_records` / `reports` |
+| 15:35 | 自动优化（权重 + 角色门槛 + 周一网格搜索） | `optimization_history` |
+| 16:10 | 推荐复盘：全部历史推荐 T+1/T+3/T+5 与黑名单 | `recommendation_review` |
+| 17:30 / 18:00 / 18:05 / 18:10 | 龙虎榜+北向 / 股东户数 / 基本面 / 估值分位 | 各自缓存表 |
+| 18:15 / 18:45 / 19:15 / 19:45 / 20:15 | **当日日K同步**（主路腾讯收盘快照，备路 baostock）+ RPS 刷新 + 名录刷新；谁先等到数据谁做完，之后自动跳过 | `history_kline.db` |
+| 每周日 18:30 | 总市值/流通市值刷新（选票范围据此剔小微盘） | `stock_market_cap` |
+| 每周六 03:00 | 清过期缓存 + VACUUM | 防 SQLite 膨胀 |
+
+> **非交易日一律跳过盘中与当日任务**（`services/data/trading_calendar.is_trading_day`）——
+> 否则周六 15:10 那份"空收评"会把周五的真实收评顶掉。股东人数/基本面/估值/聪明钱这 4 个
+> "上一交易日数据仍然有价值"的任务不受此限制，周末也能补拉。市值周刷新与 02:10 矩阵重跑同样照跑。
 >
-> **调度稳健性（2026-08-03 加固）**：`run_scheduler()` 主循环包 try-except，单个 job 抛错（比如东方财富 503、某段逻辑 RuntimeError）不会把整个调度线程带崩，当日后续任务照常执行；每处任务日志均带精确时间戳 + 异常堆栈前 400~500 字符，排查失败时一眼可见根因（东方财富限流/DB 锁/空 body 等）。
+> **调度稳健性**：`run_scheduler()` 主循环包 try-except，单个 job 抛错不会带崩整条线程；
+> 日志带时间戳与异常堆栈前 400~500 字符。schedule 库的 `.day.at()` 在 60 秒粒度下可能漏触发，
+> 因此主循环每 30 秒额外自检一次（例如 15:10 之后今日收评仍缺失就自动补生成，最多 3 次）。
+> 盘后数据新鲜度另有 `_alert_kline_stale()` 自检，按**范围内覆盖度**告警（文案是 `X/2462` 那种分母）。
 >
-> 趋势扫描时点可通过 `config.py` 的 `SCHEDULE_TREND_SCAN_START` / `SCHEDULE_TREND_SCAN_END` / `SCHEDULE_TREND_SCAN_INTERVAL_MIN` 调整，修改后热加载即生效。
-
-> 智能推荐生成时间可通过 `config.py` 的 `SCHEDULE_RECOMMENDATION_TIMES` 调整（默认 `['09:45', '13:30']`）。
-
-> 趋势回测时间可通过 `config.py` 的 `SCHEDULE_TREND_BACKTEST_TIME` 调整（默认 15:30）。
-
-> 股东人数数据更新时间可通过 `config.py` 的 `SHAREHOLDER_UPDATE_TIME` 调整（默认 18:00，收盘后拉取月度披露的最新一期）。
-
-> **说明**：所有定时任务在 [server/core/scheduler.py](file:///d:/Desktop/guizhou/gupiao/server/core/scheduler.py) 的 `run_scheduler()` 中注册（[server/app/main.py:L87-L120](file:///d:/Desktop/guizhou/gupiao/server/app/main.py#L87-L120) 启动），通过 `schedule` 库在进程内直接调用异步函数，**不走 HTTP 接口**。
+> 时刻都能改，但改的是**默认值**：`app/config.py` 里的 `SCHEDULE_*_TIME` / `KLINE_HISTORY_SYNC_TIMES`
+> 等属于重启才生效的一类；界面「口径与开关」里能热改的是已经做成"用的时候现读"的那几项。
 
 ### 9. AI 选股推荐策略（2026-06-30 优化）
 
@@ -816,9 +830,16 @@ const r = getRating(stock.score)   // { label, short, color }
 
 | 日期 | 模块 | 变更 |
 |------|------|------|
+| 2026-10-17 | 策略快照/回测底座 | **新增决策快照表：从今天起“为什么推它 / 为什么挡它”可以被回放**：用户提“加个快照表吧，后续可随时根据历史数据进行复盘、优化”。动机是此前所有回测只能**事后重建近似口径**（`pool_backtest.py` 拿 20 日涨幅代理海选），因为盘后没有任何地方留下“那一刻的决策”——`daily_candidate_pool` 只留 2 天、`daily_recommendations` 每天被 4 个批次覆盖成最后一次、`recommend_shadow_log` 一天一行 JSON 没法按分数做 SQL 统计。① 新增 `services/pick/strategy_snapshot.py`，两张表：`strategy_snapshot`（每批次每只票一行——13 因子得分与输入值 JSON、日内分/趋势分、现价与涨幅/量比/换手/委比/外盘/振幅、`stage` 记最深走到 scored / candidate / recommended 哪一步、`blocked_by` 记被哪条规则挡下（估值极端高估 / 炸板 / 冲高回落 / 亏损黑名单 / 未进精选 / 低于门槛）、入口 `source`（热搜+海选+趋势 可叠加）、海选 r20 与百分位、角色与线上时机标签、矩阵判定与理由、**影子判定 `shadow_note`**（影子放行 / 影子挡:原因 / NULL=没进影子前 15 只））+ `strategy_snapshot_batch`（批次头：情绪周期与分值、涨停/跌停/炸板家数、晋级率、大盘涨跌、线上门槛与影子建议门槛、当日 `scope_desc`+`scope_size` 分母、矩阵版本）。② 写入点挂在 `recommend.auto_generate_recommendations_task` 的影子精选之后（`_log_shadow_selection` 改为返回 payload，角色/时机/矩阵标签直接复用不重算，payload 新增 `kept` 用来区分“影子放行”与“未评估”），**0 只入选的批次也照样落库**——否则以后按快照算的胜率会因缺空仓日而系统性偏高；整段包 try/except，快照写不进去只打日志、绝不影响推荐。③ 三个配置项进覆盖表新增的“策略快照”分组（`snapshot_enabled`、`snapshot_max_rows=900`：候选与精选必留、长尾按分数截；`snapshot_retention_days=730`），全部热读，关掉当天就停写不用重启。④ 读端 `scripts/snapshot_report.py`：主口径＝批次价→次日收盘（那是人真能成交的价），对照＝收盘→收盘（比值全在前复权序列内部，不受复权漂移影响），附＝开盘即走与 T+3；**除权日会同时暴露在这两套口径的差里**，故按 涨停幅度+1% 判定“两个尺度对不上”并从主口径剔除、单独计数报出；当天日K缺失 / 样本未成熟 也分别剔除（绝不把数据缺口当 0% 或当亏损）。按 stage / 分数带 / 情绪 / 入口 / 时机 / 矩阵 / 角色 / 影子判定 / 被挡原因 九个维度各出一表。⑤ 两套自测进 `scripts/`：`snapshot_selftest.py`（30 项：分层与原因、同批次重跑不翻倍、空入选也落库、截断时候选必留、保留期裁剪、覆盖表开关立刻生效）与 `recommend_flow_selftest.py`（临时库＋假行情把整条推荐任务跑通，验证 `blocked`/`src_map`/影子 payload 这些现场变量真凑得齐，21 项）；收益算术另用真实日K手算核对（sh600519 2025-12-31 → T+1 +3.54%、开盘 +0.57%、T+3 +3.35%，与脚本逐值一致，模拟除权的行被正确踢出主口径）。⑥ **历史无法回填**：13 因子吃的是盘中的委比/外盘/量比/现价 vs 扫描价，日K库里没有这些列，所以第一批真实快照要等下一个交易日 09:45（10-17/10-18 是周末）。服务以 `python run.py`（uvicorn `reload=True`，监视 app/services/db）运行，本次实测 touch `.py` 后子进程换新 PID、首页与健康 200、`/api/settings` 未登录 401 |
+| 2026-10-17 | 前端/工程化 | **重复函数抽 utils + main.css 死规则清零 + ESLint/Prettier 落地**：承接前端审查遗留清单三项。① **utils 抽取**：新建 `src/utils/timing.js`（合并 3 处等价 timingIcon）、`navigation.js`（统一 goQuote 走 useHashRoute，删掉 TabFlow 的 inject 中转）、`format.js`（round2 四舍五入 / fmtNum 千分位——**TabSettings 与 TabSimTrade 的同名 fmt 语义不同，抽离时区分命名而非强行合并**），改造 6 个组件；同时修正审查两处误判：getTop5×3 是同文件内三个不同语义函数（Gainers/Losers/Funds），不构成跨文件重复。② **main.css 瘦身**：4424→4115 行、104231→97020 字节（-6.9%），class 选择器 433→388；用新工具 `client-vue/scripts/scan-dead-css.cjs`（class 选择器 × 全 src 语料交叉比对 + **动态拼接源检测**：模板字符串 `top-${x}`、连字符结尾字面 'top-' 均提取为拼接源，类名 startsWith 即判活，避免误删 top-2/timing-auction/level-*）终扫**死规则候选 0**；删除 collapsible-hint 整套、rps-table、flash-update、btn-small 系列、predict-signal 整块、text-up/warn/muted、mt-*/divider 等（全部经 grep 确认 0 引用）；遗留 95 个动态生成类保守保留。③ **ESLint + Prettier**：`eslint@8.57` 经典 eslintrc（`eslint:recommended` + `plugin:vue/vue3-recommended` + `@vue/eslint-config-prettier` 收尾消冲突），`no-console` 放行 warn/error；`.prettierrc.json`（semi:false / singleQuote / printWidth 120 / **endOfLine:auto**——配 lf 会在 CRLF 仓库刷出 484 行假 warning，git core.autocrlf=true 会规范化所以不写死 lf）；新增 `lint`/`lint:fix`/`format`/`format:check` 四个 npm scripts。**踩坑**：prettier 会把 Vue 模板多语句 inline handler `@click="a(); b()"` 重排成换行且丢分号 → 模板表达式解析报错、build 失败（TabReview 530 行中招），修复模式是抽成方法 `onSectorStockClick(s)`；另 eslint-plugin-prettier 只格式化 script，**Vue 模板格式必须 prettier CLI 处理**，两者互补。全量格式化 + eslint --fix 后 0 errors / prettier --check 全绿 / vite build 通过，全页面回归正常 |
+| 2026-10-17 | 前端/性能 | **echarts 按需引入 + K线弹窗全链路验证 + 补齐移动端统计行降级**：① `KlineModal.vue` 原是 `import * as echarts from 'echarts'`，单 chunk **1017KB（占全部产物 63%）**；改为 `echarts/core` + `use([Grid/Tooltip/DataZoom/MarkLine + Candlestick/Line/Bar + CanvasRenderer])`，chunk 降到 **549KB（gzip 183KB，省 46%）**；`renderMinuteChart` 里的 `echarts.graphic.LinearGradient` 在 core 模式下不存在，换成等价普通对象 `{type:'linear',x,y,x2,y2,colorStops}`（渲染结果视觉一致）。② 全项目排查确认仅此一处全量引入。③ 浏览器端全链路实测（登录→盘面组→实时行情→K线图按钮）：日K（蜡烛+MA5/10/20+成交量+dataZoom）、分时（价格线+渐变面积+昨收虚线）、推荐日 markLine（mock 一条今日推荐走 `beforeDate` 路径，"推荐日"蓝色虚线标记在顶部不遮挡K线）三条路径全部渲染正常，console 零错误。④ 修正此前审查的两处误判：TabQuote `.decision-grid` 与 TabReview `.plan-grid` **本就带** 768px 降 2 列；真正缺降级的只有 TabOptimization `.opt-stats-row`（该文件此前全文无 `@media`），已补 768px→2 列 + 480px 收紧内边距，375px 视口实测 2×2 排布正常。vite build 已重新构建 |
+| 2026-10-17 | 推荐避让黑名单 | **判据可含 T+3、按亏损分级、并补上"盘中推送不查黑名单"的漏口**：用户问"进了黑名单的票短期就不推荐了吗"，答是（硬排除、按推荐日滚 30 天），但顺着查出四个问题一并处理。① 老判据只看 T+1 一根，噪声大——实测 12 条近期推荐里，`金安国纪` T+1 −7.22% 但 T+3 已回到 −2.47%（被关 30 天偏严），而 `sz001309` T+1 没到 −3%、**T+3 才跌出 −10.23%**，老判据完全看不见它；新增 `RECOMMEND_LOSER_CRITERION='t1_or_t3'` 后名单从 4 只变 5 只（多抓的就是这只）。② 老规则一视同仁，−3.1% 和 −10.5% 同罪关 30 天；新增 `RECOMMEND_LOSER_GRADED` 分级（阈值~重亏线关 `LIGHT_DAYS=10`、超 `HEAVY_LOSS=5%` 关 30 天），开启后红豆股份（−4.11%）到期日从 11-13 提前到 10-24。**两项默认都关**（`criterion='t1'`+`graded=False`），实测默认输出与 2026-10-12 的老逻辑逐值一致，切换与复原都当场生效（缓存键含全部参数，改判据立刻重算）。③ 真正的漏口：这张表以前**只有智能推荐读**（`recommend.py` 4.7），而盘中 60 秒连续扫描的推送链路 `push.py::_pass_filter` 不查，被拉黑的票照样能从推送里回来——现已接上（独立开关 `WECOM_PUSH_APPLY_LOSER_BLACKLIST=True`，读失败时不否决以免打断推送，关掉可对照）。④ 顺带发现名单里的 `*ST威领`（10-15 推荐、T+1 −10.5%）本身就是 ST 股——那是 10-16 范围层上线之前的历史遗留，现在范围过滤已把它永久挡在门外，这条黑名单实际被更强的规则覆盖。`get_loser_map()` 返回每只的判据/最差收益/关禁天数/到期日，日志一行列全；结果按 `RECOMMEND_LOSER_CACHE_SEC=600` 缓存（它要对全量推荐算 T+1/3/5，而扫描 60 秒一轮）。⑤ 这些项全部进复盘子页"口径与开关"新增的**推荐避让黑名单**分组（25 项、4 组），并为下拉型配置加了 `kind='enum'` 支持（选项由后端下发、非法值 400 回显"只能是 t1/t1_or_t3 之一"） |
+| 2026-10-17 | 配置页/性能 | **口径与开关子页 + 首屏与接口提速**：① 用户提"好多配置写死在代码里，放到复盘子页"，并选定粒度"开关+阈值+实时影响预览"。新增 `services/support/app_settings.py`（覆盖表 `app_settings(key,value,updated_at,updated_by)`，17 项白名单：主板/ST/市值开关与 35 亿下限、流动性三条开关与三个阈值、覆盖率门槛、海选百分位与接近高点、池上限、推送日限额与纳入扫描只数；`value()` 一律返回**界面单位**）+ `settings_preview.py`（以参数为准直接算范围只数，并每次与 `universe.selectable_count()` 做**一致性对照**，不一致就在接口与页面显式报警）。关键设计：`from app.config import X` 是导入时绑定，UI 改了不生效，所以把热生效项改成"用的时候现读"（`universe._flag/_num`、`market_cap.enabled_flag/min_cap`、`liquidity._flag/_num`、`candidate_pool.min_coverage/pool_max/rps_top_pct/near_high_ratio`、`push.push_daily_limit/push_pool_top_n`），不热的项在界面标"改完要重启"，**不假装生效**。`set_value` 遇到"改回等于默认值"会删掉覆盖行而不是留一行同样的值（实测留过一条 0.5 亿的测试行，把线上基线从 1094 只悄悄改成 1168 只）。接口 `GET /api/settings`、`GET /api/settings/preview`、`POST /api/settings/{key}`、`POST .../reset`：读=登录，写=`SETTINGS_WRITE_USER_IDS=(1,)`（users 表没有角色列，先用 id 白名单，改动人记进 updated_by）；未登录实测 401、非管理员写实测 403、越界值 400 回显中文原因。前端 `components/tabs/TabSettings.vue` 注册进复盘组第三个子页，布尔项展示**反方预览**（"若关掉这一条：1094→1792 +698 只"），数值项边输边预览，改动后自动重读后端真值。还查出一个会被误读成"这条没作用"的真相：**市值下限 35→20 亿放回 0 只**，因为那 532 只（20~35 亿）从昨晚起就不在日K同步范围内、最后一条K线停在 10-15 —— 判成"买不到"是对的，于是给预览加了 hint 文案与 `summary.staleOutOfSync`，而不是把口径放宽去迁就预览。② 性能：`/api/rps` 50.3s→**0.16s**（原为榜上 100 只逐只现拉腾讯日K算"近1月回调"，改成本地日K一条 SQL，六只票回撤值与旧实现逐值一致，名称改走 `stock_basic_full`，加 5 分钟结果缓存）；`/api/scan-trend-stocks` 60.0s→**18.7s**、二次 0.0s（`history_available()` 被逐只调用 280 次 × 1.3~1.9 秒同步查询压在 asyncio 主循环上，等于"一扫描全站卡"；这里要认：是我前一天给 `get_db_stats()` 加范围/覆盖层把一个廉价标志改成了重查询 —— 现改成 `with_scope` 显式开启 + 可用性 5 分钟缓存）。首屏下载 1.19MB→**180KB**（`KlineModal`/`AiDiagModal` 在模板里缺 `v-if`，异步组件一渲染就拉 1MB echarts chunk，懒加载白做；补 v-if 后两个组件的 `visible` watcher 都加 `immediate: true`，条件挂载仍能取数，清理本就在 `onUnmounted`）；`apiFetch` 加 10 秒超时 + AbortController（以前无超时，一个 50 秒接口能把整页 loading 挂死）并提供 `apiFetchText`；顶部指数条从每 5 秒 3 个请求改为 1 个 `/api/market-index`，删掉随之失效的 `parseTencentData`。③ 顺带发现 `trend.py` 里解析结果没有 `marketCap` 键、"市值<20亿强制排除"从未生效（现由范围层统一管，待用户决定删或补）；④ 隧道守护一个死锁 bug：cloudflared 进程已不在却因 30 分钟重建冷却连续 15 轮不肯重启，等于"冷却把进程死亡也拦了"，改为冷却只拦"进程活着但公网不通"，实测恢复（quick tunnel 必然换址）。未做：趋势扫描的批量行情复用（预计 18.7s→1~3s，碰盘中实时价口径需单独验）、`/api/daily-reviews` 561KB 瘦身、echarts 按需引入 |
 | 2026-10-16 | 推送/盘中扫描 | **推荐池并入每 60 秒的连续扫描（用户要求："把推荐池也塞进那条每 60 秒的连续扫描里"）**：改造前 `services/push.py::_load_pool_symbols` 只返回用户自选池（8~10 只），于是 9:45 那批推荐生成后再没人看 —— 快照那一刻涨 1.1% 的票涨到 7% 也不会提醒，页面永远显示过期的时机判断。现在扫描范围 = **用户池 ∪ 盘前海选前 60 只 ∪ 当日已生成推荐前 5 只**（实测 64 只、单轮 2.1 秒，60 秒周期够用；规模封顶是故意的，全塞进去会把腾讯批量接口打爆 —— 今天 13:39 那批推荐就是它连不上而整批失败的）。配套三件事：① 新增 `WECOM_PUSH_DAILY_LIMIT=6` 额度（用满只记不推）与 `pushed_today()`，避免范围变大后刷屏；② 推送文案每只票加一行**矩阵判定**（`services/buy_rules.py`，带该位置的历史胜率与尾部风险），并新增 `sqlite3` 直连本地日K取"上一交易日涨幅/是否封板"（矩阵里"不接力/可竞价低吸"两档要看昨天，而推荐链路手里只有今天）；③ 只否决明确负期望档 `WECOM_PUSH_MATRIX_VETO=(排除, 减仓日)`（过热/天量/巨量拉升/极热日），"当天不追""不接力"仍然推、只在文案标注 —— 全做成硬否决就又成了没人看得懂的黑箱，两周后没法验证。**同时修掉一个会天天叫假警报的坑**：`KLINE_HISTORY_SYNC_TIME` 原为单点 16:00，而实测 16:00 那次同步**写入 0 条**、跑完 `stock_daily` 里当天仍是 0 行（baostock 当日 EOD 没那么早出），意味着"16:00 跑过"≠"今天有数据"，而我刚加的盘后新鲜度自检会在 16:05 就推一条告警。改为 `KLINE_HISTORY_SYNC_TIMES=[18:15,18:45,19:15,19:45,20:15]` 重试窗口：任务开头先查库，当天数据已在就直接跳过后续时刻；只有最后一个时刻还没等到才真告警（`_alert_kline_stale(final=...)`） |
 | 2026-10-16 | 数据层/运维 | **总市值表每周自动刷新接入调度 + 限流修复（防量化操控小微盘）**：`services/market_cap.py` 的 `refresh()` 此前 12 线程猛拉单只 `push2 stock/get`，约 1100 次后被东财限流，之后 ~1900 只全失败（顺序慢拉却 12/12 成功→是限流非数据问题）。三处修复：① 并发降到 **4 线程** + 每请求前 `time.sleep(MARKET_CAP_REQUEST_DELAY=0.5s)`；② 默认**断点续传（only_missing）**，重跑只补缺失、`INSERT OR REPLACE` 不丢进度；③ **连续失败≥15 次自适应退避 3s**（疑似限流才退避，正常不拖慢）。新增 `core/scheduler.py::job_refresh_market_cap`，**每周日 18:30** 自动跑（非交易日也跑，市值与交易日无关；`config.MARKET_CAP_REFRESH_WEEKDAY/TIME`），异常兜底不中断调度；配套手动脚本 `server/sync_market_cap.py`（--full 全量 / --stats 查看）。手动首灌实测：全量 ~3051 只（主板+非ST 口径）分三批补齐，最终 **universe 3051 只 100% 入库、缺失 0**，下限 35 亿剔除 589 只小市值；`is_active()=True`，选票/K线同步/分时线过滤实时生效 |
 | 2026-10-16 | 智能推荐/前端 | **推荐页股票卡片点击看K线（标记推荐日，不截断）**：`TabRecommend.vue` 今日推荐卡与历史记录卡均可点击（带 `📈 K线` 入口），点击经 `open-kline` 事件把 `symbol + 推荐日` 传给全局 `KlineModal`；`KlineModal` 新增 `beforeDate` 属性——**完整 K 线照常显示（不截断）**，仅在该推荐日画一条"推荐日"蓝色虚线标记，非交易日自动落到前一根交易日，打开时视图自动聚焦到推荐日附近便于定位。后端 `/api/kline/{symbol}` 不改动（返回全量历史）。vite build 已重新构建 |
+| 2026-10-17 | 趋势扫描/重构收尾 | **修复"趋势扫描定时任务每次执行都崩溃"（重构遗留旧路径引用）**：`services/stock.py` 搬到 `services/data/stock.py` 后，两处代码仍写 `import services.data.stock` + `services.stock._x = ...`，抛 `AttributeError: module 'services' has no attribute 'stock'`。后果是该任务**在设置热搜榜缓存那一行立刻中断**，等于趋势扫描这个功能全线失效（启动即报错、盘中每 30 分钟一次全废，但不影响其他模块，所以长期没被发现）。改为 `from services.data import stock as _stock_data` + `_stock_data._x`，涉及 `services/strategy/trend.py`（扫描主流程）与 `app/api/routes.py`（`/api/update-stock-map`）。全量排查确认仅此两处真实引用（其余匹配均在注释中）。重启后验证：0 条 Traceback，扫描端到端完成并发现 12 只趋势股、自动入池 2 只 |
+| 2026-10-17 | 资金流向/韧性 | **clist 熔断 + 快照持久化（修复"资金流向页面长期空白"）**：根因是东财 `clist/get` 对本机 IP 偶发限流/封禁（403 / `RemoteDisconnected`），后台 30s 轮询硬重试反而越封越重，且 `fund_flow_snapshot` 表从没存成功过兜底数据。给 `services/data/fundflow.py` 的 `get_fund_flow_summary` 加**连续失败熔断**（连续 3 次失败进入 5 分钟冷却，期间直接走快照兜底、不再打东财），成功即复位并 `save_fund_flow_snapshot` 落盘（解封后首次成功即缓存、收盘后也有数据）；响应新增 `cooling` 字段，前端 `TabFlow.vue` 顶部加"数据源冷却中·显示缓存"橙色徽章。注：supervised 实际以 `reload=False` 拉起（沙箱 watchdog 不生效），改 .py 需杀旧进程由 tunnel_watch 守护自动重启才能加载新代码 |
 | 2026-10-16 | 选股/时机 | **买入时机改成"影子双标签"先跑两周（用户选：先影子，别直接换线上）**：新增 `services/buy_rules.py`（把当天实测出的"形态 × 时点"矩阵写成纯函数，阈值全部带样本量注释，`MATRIX_VERSION=2026-10-16`），`recommend._log_shadow_selection` 里给每只票的 live/shadow/excluded 三条清单各附一个 `matrix` 标签，与线上 `timing` 并存写入 `recommend_shadow_log.payload`（**线上文案一字未改**，两周后拿两套标签各自对 T+1 实际结果比较再决定换不换）。矩阵六档判定：可打板（当日封板，次日开盘即卖 +1.99%/62.9%）、不接力（昨日封板今天买，六个真实分钟时点全负 -0.11%~-0.53%）、当天不追（半山腰 4.5~9.8% 未封板，当天追 -2.70%/22.3% vs 次日竞价买 +0.36%/51.1%）、可竞价低吸（昨日大面，越早越赚 +0.84% 但别挂单等更低 -0.11%）、可低吸（横盘缩量，六时点全正、亏超5% 仅 0.5~1.0%）、排除/减仓日（20日涨幅>60%、天量、巨量拉升、涨停>120 家极热）。首条对照已在库里：14:34 那行 新华文轩 线上「次日竞价」vs 矩阵「不接力」（它是二板）、上工申贝 线上「次日竞价」vs 矩阵「可打板」（首板）、平高电气 两边一致「中性」。踩过的坑记录：矩阵标签必须挂在 INSERT **之前**，挂晚了 payload 落库时字段是空的，对照数据就白攒了（第一次就是这么错过去，已修正并复验）。 |
 | 2026-10-16 | 股票范围/数据层 | **收口成"只做沪深主板、剔除 ST/\*ST"，并第一次让"早盘买"有真数**：① 新增 `services/universe.py`（唯一范围口径：600/601/603/605 + 000/001/002/003，名称含 ST 或"退"一律排除）+ `app/config.py` 的 `UNIVERSE_MAIN_BOARD_ONLY` / `UNIVERSE_EXCLUDE_ST`；入口收在 `candidate_pool.build_pool`（排在百分位排名**之前**，否则名额会被他根本买不了的板挤掉）与 `recommend` 里 codes_list 汇总之后那一处（热搜池∪海选池∪趋势池共用一个出口，分散过滤迟早口径不一致）；② 新增 `sync_stock_basic.py`（baostock `query_stock_basic` 全量名录 9,006 条 → `history_kline.db.stock_basic_full`，含名称/在市/退市）—— 原先 `stock_basic` 表**只有建表语句从没填过**，所以"这只票是不是 ST"根本没有数据可判，而 ST 是 5% 板、混在 10% 阈值里连封板判定都会错；实测在市股票 5,224、沪深主板 3,195、其中 ST/退市整理 145 → **可做范围 3,051 只**，今日海选池由 87 只收缩到 **59 只**；名录跟随 16:00 日K同步一起刷（ST 帽子随时戴随时摘，名录过期=范围失效）；③ 新增 `services/minute_history.py` + 本地分钟库 `data/history_minute.db`（baostock **5 分钟前复权**，实测与日K逐价对齐：末根收盘==日K收盘、首根开盘==日K开盘，差价 0.0000），配套 `intraday_matrix.py` 把每种形态按 9:25竞价 / 9:30~9:35 / 9:35~10:00 / 10:00~11:30 / 13:00~14:00 / 14:30~15:00 六个**真实成交均价**各买一次称重（每形态 420 事件）。顺带纠正一个自己踩的坑：`成交额/成交量` 是**未复权**均价、与前复权 OHLC 不同尺度（仅 71.5% 的行落在当日最高最低之间），绝不能当买入成本；段均价一律用 `sum(价格×成交量)/sum(成交量)`。**早盘结论第一次有数**：昨日封板的接力票**六个时点全是负期望**（-0.11% ~ -0.53%，越晚买"亏超5%"概率从 24.6% 降到 15.8%）→ 接力的钱只在前一天封板那一刻；昨日半山腰**当天追**= -2.70%/胜率 22.3%，而**次日竞价买**= +0.36%/51.1%（同一个形态差 3 个点，闽东电力 10-15 就是当天追）；抄大面回调**越早越赚**（竞价 +0.84% vs 尾盘 +0.68%）但**越晚尾部越小**（亏超5% 13.4%→6.4%），而挂 -2% 等更低是 -0.11%（能跌到你价位的都在继续跌）；横盘缩量票六个时点**全正**且亏超 5% 只有 0.5%~1.0% → 何时买不重要，别在它涨起来之后追。全部数字已重跑在主板非ST 口径（`crash_profile.py` / `buy_rule_stats.py` / `timing_matrix.py` 新增 `--all-market` 开关，默认筛范围；市场层涨停家数/炸板率仍按全市场算，情绪口径不跟着缩小），文档重写为 `docs/短线买法-2026-10.md` |
 | 2026-10-16 | 选股/买法研究 | **低吸/打板/波段 × 竞价/尾盘/挂单低吸 的完整称重矩阵（回答"为什么我买的老是大跳水"）**：新增 `server/kline_forward.py`（本地日K + 未来窗口统计的**唯一可信实现**，带 `--selftest`：与朴素下标循环逐值比对 13 个口径、5 万行 0 处不一致）、`crash_profile.py`（按买入时可见特征分组的形态—尾部风险表）、`buy_rule_stats.py`（买法逐条称重量 + 连板梯队 + 竞价溢价分档 + 2025/2026 稳健性 + 情绪闸门）、`timing_matrix.py`（同一批形态按 竞价/尾盘/追最高/买最低/挂单低吸 五种成本算收益）、`rule_filter_check.py`（只用系统自己推过的 219 条推荐复盘，避免拿全市场平均骗自己）。**踩掉的两个数据坑**：① `groupby().transform(lambda s: s.shift(-1).rolling(5)...)` 算"未来5日最低/最差单日"会**索引错位**（与朴素循环 90% 行不一致，把封板票"5日内破 -4%"算成 100.0%/中位 -15.7%，真值 65.0%/-6.37%），凡"用未来数据算结果"必须按股票分组显式切片；② `turnover/volume` 是**未复权**均价，与前复权 OHLC 不同尺度（仅 71.5% 的行落在当日最高最低之间），不能当盘中买入成本用 —— 早盘口径只能用"介于竞价与追最高之间"界定。**核心结论（详见 `docs/短线买法-2026-10.md`）**：跳水集中在四种当天看得出的形态——半山腰未封板（T+1 胜率 44.9%、5日内大面 30.3%）、炸板票（39.4%、均值 -0.68%、大面 47.2%）、20日涨幅>60%（大面 **69.0%**、5日最低中位 -9.71%）、巨量拉升（量比>3且涨>5%，大面 35.4%）；平盘/微跌票大面只有 9.4%。涨停次日**竞价高开>5% 追入**胜率 30.0%、每笔 -1.60%、当日亏超5% 概率 23.0%。唯一胜率与期望都站得住的动作是"**当日封板（剔一字板）+ 首板/二板 + 20日≤40% + 量比≤3**，尾盘买入、**次日开盘即卖**"：2025 +2.06%/胜率65.5%、2026 +1.40%/60.7%、扣双边费用合并 +1.59%/61.2%、亏超5% 仅 1.4%；同一批票改成持有到次日收盘 → 胜率 55.3%、亏超5% 10.4%（尾部风险 ×3.7），持有到第 5/10 日转负（-0.55%/-0.87%）→ **接力票不能隔夜以上**。胜率最高的一档其实是**低吸**：横盘缩量票挂昨收 -2%/-4% 的单（只有触及才算成交）+1.26%/66.2% 与 +3.26%/79.9%、亏超5% 仅 2.3%，但成交率 20%/2% —— 是等出来的钱；而同一挂单法用在半山腰/大面票上期望归零甚至转负（跌到你价位的强势票本身就弱）。情绪闸门：涨停 120~250 家当天所有买入最差（41.4%/-0.28%），涨停 ≤50 家反而最好（52.7%/+0.23%）。局限：日线收盘判定封板、排板成交量无法建模（乐观偏差）、竞价成交未计滑点 |

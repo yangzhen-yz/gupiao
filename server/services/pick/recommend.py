@@ -774,6 +774,7 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
         'live': [_shadow_item(s, bsp_by_sym.get((s.get('symbol') or '').lower()))
                  for s in live_top3],
         'shadow': shadow_top,
+        'kept': kept,          # 影子会放行名单（快照要区分"放行"与"没评估"）
         'excluded': excluded,
     }
     # 矩阵标签只挂到影子里（线上 timing 一字未改）：先并行两周攒对照。
@@ -802,6 +803,9 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
     diff = '、'.join(x['name'] for x in payload['excluded']) or '无'
     print(f'[智能推荐] 影子精选（{cycle}·门槛{min_score}）：'
           f'线上{len(live_top3)}只 / 影子{len(shadow_top)}只，被挡 {diff}')
+    # 返回 payload 给决策快照用：role/timing/matrix 标签在这里才算得出来，
+    # 快照再自己跑一遍 buy_sell_points 既费时间又可能和影子口径对不上。
+    return payload
 
 
 async def auto_generate_recommendations_task():
@@ -825,6 +829,10 @@ async def auto_generate_recommendations_task():
         pool = load_hot_stock_buttons()
         codes_list = [s['code'].lower() for s in pool if s.get('code')]
         codes_list = [c for c in codes_list if re.match(r'^(sh|sz)\d{6}$', c)]
+        # 快照用：每只票是从哪个入口进来的（可叠加）。复盘时"热搜入口"和"海选入口"
+        # 的胜率本来就不该混在一个数里看 —— 这是 2026-10 那轮回测最想说清的一件事。
+        src_map = {c: '热搜' for c in codes_list}
+        pool_info: Dict[str, Dict] = {}
 
         # 盘前海选（2026-10-15）：热搜榜是"散户在搜什么"的滞后指标，会系统性漏掉
         # 没进热榜的主升票（九阳股份 20 日 +103% 从未被扫到）。这里并入本地日K海选池，
@@ -835,9 +843,13 @@ async def auto_generate_recommendations_task():
             _cp_new = 0
             for p in _cp:
                 sym = (p.get('symbol') or '').lower()
-                if re.match(r'^(sh|sz)\d{6}$', sym) and sym not in codes_list:
+                if not re.match(r'^(sh|sz)\d{6}$', sym):
+                    continue
+                pool_info[sym] = p
+                if sym not in codes_list:
                     codes_list.append(sym)
                     _cp_new += 1
+                src_map[sym] = f"{src_map.get(sym, '')}+海选".lstrip('+')
             print(f'[智能推荐] 盘前海选并入 {len(_cp)} 只（新增 {_cp_new} 只），'
                   f'扫描宇宙 {len(codes_list)} 只')
         except Exception as e:
@@ -849,6 +861,7 @@ async def auto_generate_recommendations_task():
         for sym in trend_map:
             if sym not in codes_list:
                 codes_list.append(sym)
+            src_map[sym] = f"{src_map.get(sym, '')}+趋势".lstrip('+')
         if trend_map:
             added = len(codes_list) - before_merge
             print(f'[智能推荐] 合并趋势池 {len(trend_map)} 只（新增 {added} 只），股票池共 {len(codes_list)} 只')
@@ -856,11 +869,14 @@ async def auto_generate_recommendations_task():
         # 股票范围（2026-10-16 用户口径："所有的选股条件默认：沪深主板、非ST和*ST、市值大于35亿"）
         # 三个入口（热搜按钮、盘前海选、趋势池）都在这一处收口 —— 分散在各处过滤，
         # 迟早会出现"某一入口漏了 300/688"这种口径不一致。filter_prefixed 现在三条件一次过。
+        _scope_desc, _scope_n = '', None
         try:
             from services.data import universe
             _before = len(codes_list)
             codes_list = universe.selectable_prefixed(codes_list)
-            print(f'[智能推荐] 股票范围 {universe.describe_selectable()}：{_before} → {len(codes_list)} 只')
+            _scope_desc = universe.describe_selectable()
+            _scope_n = universe.selectable_count()
+            print(f'[智能推荐] 股票范围 {_scope_desc}：{_before} → {len(codes_list)} 只')
         except Exception as e:
             print(f'[智能推荐] 股票范围过滤失败（不阻塞，按原池继续）: {type(e).__name__}: {e}')
 
@@ -1018,6 +1034,17 @@ async def auto_generate_recommendations_task():
 
         # ===== 5. 行业分散 + 过滤取前3（P2） =====
         MIN_RECOMMEND_SCORE = 60
+        # 快照用：每只票"没往下走的那一步"是被哪条规则挡的。
+        # 门槛之下的（score<60）不进这里 —— 快照读的时候按 min_score 一筛就有，
+        # 给几百只都写一句"低于门槛"只会把真正有意思的拦截原因淹掉。
+        blocked: Dict[str, List[str]] = {}
+
+        def _blk(sym, why):
+            if sym:
+                lst = blocked.setdefault(sym, [])
+                if why not in lst:
+                    lst.append(why)
+
         above_threshold = [s for s in all_results if s['score']['total'] >= MIN_RECOMMEND_SCORE]
 
         # P2c: 估值分位过滤 —— 极端高估(PE&PB 百分位双高)且非强多(>=80)的票不参与精选推荐
@@ -1027,6 +1054,7 @@ async def auto_generate_recommendations_task():
             val = s.get('valuation')
             if val and val.get('overvalued') and s['score']['total'] < 80:
                 skipped_overvalued += 1
+                _blk((s.get('symbol') or '').lower(), '估值极端高估')
                 continue
             candidates.append(s)
         if skipped_overvalued:
@@ -1053,6 +1081,7 @@ async def auto_generate_recommendations_task():
                         tags.append('炸板')
                     if traj['big_drawdown']:
                         tags.append('冲高回落')
+                    _blk((s.get('symbol') or '').lower(), '、'.join(tags))
                     print(f'[智能推荐] 日内轨迹过滤: {s["name"]}({s["symbol"]}) '
                           f'日内高点{traj["high_pct"]:+.1f}%、现价回落{traj["drawdown"]:.1f}%'
                           f'({"、".join(tags)})，评分{s["score"]["total"]}跳过')
@@ -1067,14 +1096,21 @@ async def auto_generate_recommendations_task():
         # 推荐失败后不应再次出现。近30天推荐且T+1亏损>3% → 不再推荐。
         try:
             from services.pick.recommend_review import get_recent_loser_symbols
-            loser_symbols = get_recent_loser_symbols(RECOMMEND_LOSER_LOOKBACK_DAYS,
-                                                     RECOMMEND_LOSER_LOSS_THRESHOLD)
+            # 不传参：判据/阈值/分级都由覆盖表(复盘子页)现读，config 只是默认值
+            loser_symbols = get_recent_loser_symbols()
         except Exception as e:
             print(f'[智能推荐] 亏损黑名单加载失败（不阻塞推荐）: {e}')
             loser_symbols = set()
         if loser_symbols:
             before = len(candidates)
-            candidates = [s for s in candidates if s.get('symbol', '').lower() not in loser_symbols]
+            _safe2 = []
+            for s in candidates:
+                _sym = (s.get('symbol') or '').lower()
+                if _sym in loser_symbols:
+                    _blk(_sym, f'亏损黑名单(近{RECOMMEND_LOSER_LOOKBACK_DAYS}天)')
+                else:
+                    _safe2.append(s)
+            candidates = _safe2
             skipped = before - len(candidates)
             if skipped:
                 print(f'[智能推荐] 亏损黑名单过滤：跳过 {skipped} 只近{RECOMMEND_LOSER_LOOKBACK_DAYS}天'
@@ -1102,8 +1138,74 @@ async def auto_generate_recommendations_task():
             remaining = [s for s in candidates if s not in top3]
             top3.extend(remaining[:3 - len(top3)])
 
+        # 快照用：过了全部门槛却没进精选的，原因就是"概念分散/名额只有 3 个"
+        _top3_syms = {(s.get('symbol') or '').lower() for s in top3}
+        for s in candidates:
+            _sym = (s.get('symbol') or '').lower()
+            if _sym and _sym not in _top3_syms:
+                _blk(_sym, '未进精选(概念分散/名额3只)')
+
+        async def _capture_snapshot(shadow_payload: Optional[Dict] = None):
+            """把本批次的决策现场落库。任何失败只打日志，绝不冒泡影响推荐。
+
+            放在这里而不是 section 7 之后：`if not top3` 那条"今天一只都不推"的分支
+            也是决策，缺了它，以后按快照算的胜率会因为少掉空仓日而系统性偏高。
+            """
+            try:
+                from services.pick.strategy_snapshot import write_snapshot
+                from services.strategy.sentiment import get_sentiment, cycle_gate
+                _sent = await get_sentiment()
+                _gate = cycle_gate(_sent)
+                _labs: Dict[str, Dict] = {}
+                if shadow_payload:
+                    def _lab(_sym):
+                        return _labs.setdefault(_sym, {}) if _sym else {}
+
+                    for it in (shadow_payload.get('kept') or []):
+                        _lab((it.get('symbol') or '').lower())['shadow'] = '影子放行'
+                    for it in (shadow_payload.get('excluded') or []):
+                        _lab((it.get('symbol') or '').lower())['shadow'] = \
+                            '影子挡:' + '；'.join(it.get('reasons') or [])
+                    for _key in ('live', 'shadow'):
+                        for it in (shadow_payload.get(_key) or []):
+                            _cur = _lab((it.get('symbol') or '').lower())
+                            for _k in ('role', 'timing'):
+                                if it.get(_k):
+                                    _cur[_k] = it[_k]
+                            _mx = it.get('matrix') or {}
+                            if _mx:
+                                _cur['matrix'] = _mx.get('verdict')
+                                _cur['matrix_why'] = _mx.get('why')
+                _n = write_snapshot({
+                    'date_key': now.date().isoformat(),
+                    'batch': now.strftime('%H:%M'),
+                    'generated_at': now.isoformat(timespec='seconds'),
+                    'scored': all_results,
+                    'candidates': candidates,
+                    'top3': top3,
+                    'blocked': blocked,
+                    'sources': src_map,
+                    'pool_info': pool_info,
+                    'labels': _labs,
+                    'market_change': market_change,
+                    'sent': _sent,
+                    'gate': _gate,
+                    'live_min_score': MIN_RECOMMEND_SCORE,
+                    'scope_desc': _scope_desc,
+                    'scope_size': _scope_n,
+                    'matrix_version': shadow_payload.get('matrixVersion') if shadow_payload else None,
+                })
+                _st = {'recommended': len(_top3_syms), 'candidate': len(candidates),
+                       'scored': len(all_results)}
+                print(f'[策略快照] {now:%H:%M} 落库 {_n} 行：'
+                      f'扫描{_st["scored"]}只 / 过门槛{_st["candidate"]}只 / 精选{_st["recommended"]}只，'
+                      f'情绪{_sent.get("cycle")}·涨停{_sent.get("indicators", {}).get("limitUpCount")}')
+            except Exception as e:
+                print(f'[策略快照] 落库失败（不影响本次推荐）: {type(e).__name__}: {e}')
+
         if not top3:
             print(f'[智能推荐] 无评分>={MIN_RECOMMEND_SCORE}的股票，跳过')
+            await _capture_snapshot()
             return
 
         # ===== 6. 计算买卖点 + 推荐理由 =====
@@ -1158,10 +1260,17 @@ async def auto_generate_recommendations_task():
         # 影子每天多存一份"如果按周期门槛会推谁/会挡掉谁"，攒够 ≥10 个交易日后
         # 用 recommend_review 的 T+1 胜率与 backtest_recommend 的分组口径对比再决定切换。
         try:
-            await _log_shadow_selection(now, date_key, candidates, top3, trend_map,
-                                        market_change, MIN_RECOMMEND_SCORE)
+            _shadow_payload = await _log_shadow_selection(now, date_key, candidates, top3,
+                                                          trend_map, market_change,
+                                                          MIN_RECOMMEND_SCORE)
         except Exception as e:
             print(f'[智能推荐] 影子精选落库失败（不影响线上推荐）: {e}')
+            _shadow_payload = None
+
+        # ===== 7.6 策略决策快照（2026-10-17）=====
+        # 影子给的是"某天选了谁"，快照给的是"那天每一只为什么被选/被挡"。
+        # 有了后者，以后的回测才不用拿 r20 近似口径重建海选。
+        await _capture_snapshot(_shadow_payload)
 
         if saved:
             symbols_str = '、'.join([f'{r["name"]}({r["symbol"]})' for r in rec_items])

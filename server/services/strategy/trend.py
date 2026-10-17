@@ -1672,9 +1672,12 @@ async def scan_trend_scan_results(force: bool = False):
         
         t0 = time.time()
         hot_search_ranking_data = load_hot_search_ranking()
-        import services.data.stock
-        services.stock._hot_search_ranking_cache = hot_search_ranking_data
-        services.stock._stock_basic_info_cache = None
+        # 2026-10-17 修复：services/stock.py 已搬到 services/data/stock.py，
+        # 旧写法 `import services.data.stock` + `services.stock.x` 会抛
+        # AttributeError: module 'services' has no attribute 'stock'，导致趋势扫描定时任务每次都失败。
+        from services.data import stock as _stock_data
+        _stock_data._hot_search_ranking_cache = hot_search_ranking_data
+        _stock_data._stock_basic_info_cache = None
         
         scan_pool = []
         source = ''

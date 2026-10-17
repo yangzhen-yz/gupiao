@@ -53,9 +53,41 @@ def enabled() -> bool:
 
     三条子开关全关时一律放行 —— 包括"窗口内没K线就剔除"那条也一起关掉。
     这样"把开关关掉"确实等于回到加这三条之前，而不是留下一个看不见的剔除规则。
+
+    2026-10-17 起走覆盖表热读（复盘子页"口径与开关"拨一下就生效），
+    覆盖表读不到就退回 `app/config.py` 的默认值。
     """
-    return bool(LIQUIDITY_FILTER_ENABLED) and (LIQ_AMOUNT_ENABLED or LIQ_TURNOVER_ENABLED
-                                               or LIQ_PRICE_ENABLED)
+    return (bool(_flag('liquidity_enabled', 'LIQUIDITY_FILTER_ENABLED'))
+            and (_flag('liq_amount_enabled', 'LIQ_AMOUNT_ENABLED')
+                 or _flag('liq_turnover_enabled', 'LIQ_TURNOVER_ENABLED')
+                 or _flag('liq_price_enabled', 'LIQ_PRICE_ENABLED')))
+
+
+def _flag(key: str, cfg_name: str) -> bool:
+    try:
+        from services.support import app_settings
+        return bool(app_settings.value(key))
+    except Exception:
+        return bool(getattr(sys_cfg, cfg_name))
+
+
+def _num(key: str, cfg_name: str) -> float:
+    """取阈值并换算回 config 单位（覆盖表里 `value()` 给的是界面单位：万元 / % / 元）。"""
+    try:
+        from services.support import app_settings
+        v = float(app_settings.value(key))
+        s = app_settings.spec(key)
+        if s.get('scale'):
+            v = v * s['scale'] if s['scale'] != 100 else v / 100.0
+        return v
+    except Exception:
+        return float(getattr(sys_cfg, cfg_name))
+
+
+def invalidate_cache() -> None:
+    """配置改动后让统计重算（阈值变了，通过名单就得重新算）。"""
+    global _STATS_TS
+    _STATS_TS = 0.0
 
 _STATS: Optional[Dict[str, Dict[str, float]]] = None
 _STATS_TS = 0.0
@@ -85,11 +117,14 @@ def stats_map(force: bool = False) -> Dict[str, Dict[str, float]]:
             if not dates:
                 return {}
             ph = ','.join('?' * len(dates))
-            for code, amt, vol in conn.execute(
-                    f'SELECT symbol, AVG(turnover), AVG(volume) FROM stock_daily '
+            # as_of = 该票在窗口内**自己**最后一根K线的日期。用它区分"这只票还在同步"
+            # 和"早就被排除在同步范围外（数据停在几天前）"，后者不能当可买的票。
+            for code, amt, vol, as_of in conn.execute(
+                    f'SELECT symbol, AVG(turnover), AVG(volume), MAX(date) FROM stock_daily '
                     f'WHERE date IN ({ph}) GROUP BY symbol', dates):
                 if code:
-                    out[code] = {'amount': amt or 0.0, 'volume': vol or 0.0, 'price': 0.0}
+                    out[code] = {'amount': amt or 0.0, 'volume': vol or 0.0, 'price': 0.0,
+                                 'as_of': as_of or ''}
             latest = dates[0]
             for code, close in conn.execute(
                     'SELECT symbol, close FROM stock_daily WHERE date=?', (latest,)):
@@ -131,12 +166,12 @@ def passes(code: str) -> bool:
     m = metrics(code)
     if m is None:
         return False                              # 窗口内没K线 = 停牌/退市/没数据，本来也买不到
-    if LIQ_PRICE_ENABLED and m['price'] <= LIQ_MIN_PRICE:
+    if _flag('liq_price_enabled', 'LIQ_PRICE_ENABLED') and m['price'] <= _num('liq_min_price', 'LIQ_MIN_PRICE'):
         return False
-    if LIQ_AMOUNT_ENABLED and m['amount'] <= LIQ_MIN_AVG_AMOUNT:
+    if _flag('liq_amount_enabled', 'LIQ_AMOUNT_ENABLED') and m['amount'] <= _num('liq_min_avg_amount_wan', 'LIQ_MIN_AVG_AMOUNT'):
         return False
-    if LIQ_TURNOVER_ENABLED and m['turnover_pct'] is not None \
-            and m['turnover_pct'] <= LIQ_MIN_AVG_TURNOVER_PCT:
+    if _flag('liq_turnover_enabled', 'LIQ_TURNOVER_ENABLED') and m['turnover_pct'] is not None \
+            and m['turnover_pct'] <= _num('liq_min_avg_turnover_pct', 'LIQ_MIN_AVG_TURNOVER_PCT'):
         return False
     return True                                   # 换手算不出（市值表缺）→ fail-open 放行
 
@@ -186,14 +221,16 @@ def describe() -> str:
     if not enabled():
         return '流动性下限：未生效' if not LIQUIDITY_FILTER_ENABLED else '流动性下限：三条子开关全关'
     parts = []
-    if LIQ_AMOUNT_ENABLED:
-        parts.append(f'近{LIQ_STATS_WINDOW}日日均成交额>{LIQ_MIN_AVG_AMOUNT / 1e8:.1f}亿')
-    if LIQ_TURNOVER_ENABLED:
-        parts.append(f'日均换手率>{LIQ_MIN_AVG_TURNOVER_PCT}%')
-    if LIQ_PRICE_ENABLED:
-        parts.append(f'股价>{LIQ_MIN_PRICE}元')
-    return '、'.join(parts) + ('（其余条已关）' if (LIQ_AMOUNT_ENABLED, LIQ_TURNOVER_ENABLED,
-                                                    LIQ_PRICE_ENABLED).count(False) else '')
+    if _flag('liq_amount_enabled', 'LIQ_AMOUNT_ENABLED'):
+        parts.append(f'近{LIQ_STATS_WINDOW}日日均成交额>{_num("liq_min_avg_amount_wan", "LIQ_MIN_AVG_AMOUNT") / 1e8:.1f}亿')
+    if _flag('liq_turnover_enabled', 'LIQ_TURNOVER_ENABLED'):
+        parts.append(f'日均换手率>{_num("liq_min_avg_turnover_pct", "LIQ_MIN_AVG_TURNOVER_PCT")}%')
+    if _flag('liq_price_enabled', 'LIQ_PRICE_ENABLED'):
+        parts.append(f'股价>{_num("liq_min_price", "LIQ_MIN_PRICE")}元')
+    offs = [_flag('liq_amount_enabled', 'LIQ_AMOUNT_ENABLED'),
+            _flag('liq_turnover_enabled', 'LIQ_TURNOVER_ENABLED'),
+            _flag('liq_price_enabled', 'LIQ_PRICE_ENABLED')].count(False)
+    return '、'.join(parts) + (f'（另有 {offs} 条已关）' if offs else '')
 
 
 def stats() -> Dict:
@@ -207,15 +244,19 @@ def stats() -> Dict:
         scope = set(m)
         print(f'[流动性] 读不到选股范围，按整库统计: {e}')
 
+    min_price = _num('liq_min_price', 'LIQ_MIN_PRICE')
+    min_amount = _num('liq_min_avg_amount_wan', 'LIQ_MIN_AVG_AMOUNT')
+    min_turn = _num('liq_min_avg_turnover_pct', 'LIQ_MIN_AVG_TURNOVER_PCT')
+
     def _ok(d, amount=True, turnover=True, price=True):
         if not d or not d.get('price'):
             return False
-        if price and d['price'] <= LIQ_MIN_PRICE:
+        if price and d['price'] <= min_price:
             return False
-        if amount and d['amount'] <= LIQ_MIN_AVG_AMOUNT:
+        if amount and d['amount'] <= min_amount:
             return False
         shares = d.get('float_shares')
-        if turnover and shares and d['volume'] / shares * 100 <= LIQ_MIN_AVG_TURNOVER_PCT:
+        if turnover and shares and d['volume'] / shares * 100 <= min_turn:
             return False
         return True
 

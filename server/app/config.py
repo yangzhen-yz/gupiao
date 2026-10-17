@@ -296,6 +296,11 @@ RPS_ENABLED = True
 RPS_PERIOD_DAYS = 120            # 主评分周期（欧奈尔常用 120 日），calc_stock_score_v2 默认用此周期
 RPS_MIN_SAMPLES = 300            # 全市场样本不足时跳过计算（避免误算 RPS）
 RPS_TOP_N = 100                  # /api/rps 强势股榜默认返回数量
+# 榜单接口性能（2026-10-17）：旧实现为榜上 100 只票逐只现拉腾讯日K/名称，/api/rps 要 38~50 秒，
+# 前端 fetch 又没超时，一进去整页就挂住。现在默认全部走本地日K库与本地名录。
+RPS_PULLBACK_FROM_LOCAL = True   # False = 退回逐只现拉（老行为，用于对照）
+RPS_NAME_LIVE_MAX = 10           # 本地名录补不上时，最多还允许现拉几只的名字（封顶，别再放大）
+RPS_LEADERBOARD_TTL = 300        # 榜单结果内存缓存秒数：RPS 本来就是一天算一次，没必要每次重算
 
 # ========== 基本面质量因子（P1a，2026-07-16 新增）==========
 # 数据源：东方财富 datacenter RPT_LICO_FN_CPD（核心财务指标，季度披露）
@@ -684,6 +689,16 @@ RECOMMEND_CHASE_PENALTY = 4           # 死亡区罚分
 # 亏损黑名单：近N天被推荐且T+1亏损超过阈值的股票不再推荐（三祥新材连续两亏26%+案例）
 RECOMMEND_LOSER_LOOKBACK_DAYS = 30
 RECOMMEND_LOSER_LOSS_THRESHOLD = 3.0  # T+1亏损超过此值(%)进黑名单
+# ── 2026-10-17 优化：判据与分级都可调，默认保持 2026-10-12 的老行为 ──
+# 老规则有两个毛病（用户确认要改）：① 只看 T+1 一根，噪声大 —— 金安国纪 10-09 推荐
+#    T+1 −7.22% 但 T+3 已回到 −2.47%，而利通电子 T+1 只 −3.52%、真正难看的是 T+5 −8.97%；
+# ② 一视同仁 —— −3.1% 和 −10.5% 都关 30 天。
+RECOMMEND_LOSER_CRITERION = 't1'      # 't1'=现状；'t1_or_t3'=T+1 或 T+3 任一亏超阈值才算
+RECOMMEND_LOSER_GRADED = False        # False=统一关 LOOKBACK 天（现状）；True=按下表分级
+RECOMMEND_LOSER_HEAVY_LOSS = 5.0      # 重亏线（%）：超过它按 HEAVY_DAYS 关
+RECOMMEND_LOSER_HEAVY_DAYS = 30
+RECOMMEND_LOSER_LIGHT_DAYS = 10       # 阈值~重亏之间只关这么多天（轻亏早点放回来）
+RECOMMEND_LOSER_CACHE_SEC = 600       # 这张表要算全量推荐的 T+1/3/5，盘中扫描 60 秒一次不能每轮重算
 # 执行诚实化提示（展示在推荐卡片）
 RECOMMEND_EXEC_HINT_ENABLED = True
 RECOMMEND_EXEC_HINT = '复盘132次：现价追入T+1胜率仅45%（均值-1.1%），低吸参考价成交胜率63%（均值+1.5%）——建议低吸或尾盘介入，不追盘中高价'
@@ -767,9 +782,21 @@ WECOM_PUSH_DAILY_LIMIT = 6              # 达标推送每天最多几只票（�
 # "当天不追/不接力"只做标注不删，避免又变成一个没人知道的黑箱否决。
 WECOM_PUSH_MATRIX_VETO = ('排除', '减仓日')
 WECOM_PUSH_MATRIX_LABEL = True          # 推送文案里带上"这个位置历史什么胜率"
+# 盘中 60 秒扫描是否也查亏损黑名单（2026-10-17 补的漏口：以前只有智能推荐查它，
+# 被拉黑的票仍会从推送里回来）。关掉=恢复旧行为，仅用于对照。
+WECOM_PUSH_APPLY_LOSER_BLACKLIST = True
 TREND_BACKTEST_KLINE_CONCURRENCY = 5                # 批量拉 K 线并发度
 TREND_BACKTEST_MARKET_SYMBOL = 'sh000001'           # 大盘基准（上证指数）
 TREND_BACKTEST_SCORE_SEGMENTS = [(60, 70), (70, 80), (80, 101)]  # 分数段（左闭右开，80+ 用 101 兜顶）
+
+# ========== 策略决策快照（2026-10-17）==========
+# 每批次把"扫了谁、每只评多少分、走到哪一步、为什么被挡、当天什么情绪档"落库，
+# 目的只有一个：以后能用**真实决策**回测，而不是拿 r20 代理口径重建。
+# 为什么不能回填历史：13 因子吃的是一盘中的实时字段（委比/外盘/量比/现价 vs 扫描价），
+# 日K库里根本没有这些列，历史每一天只能近似、不能还原。所以从今天开始攒。
+STRATEGY_SNAPSHOT_ENABLED = True        # 关掉=停写，推荐链路一字不动
+STRATEGY_SNAPSHOT_MAX_ROWS = 900        # 每批次最多写多少只（候选与精选必留，长尾按分数截）
+STRATEGY_SNAPSHOT_RETENTION_DAYS = 730  # 保留天数，0=永久（实测 900 行/批 × 4 批 × 250 交易日 ≈ 25 万行/年）
 
 # ========== 企业微信「自建应用」单聊通道（2026-10-14，待凭据启用） ==========
 # 群机器人 webhook 能用，但它是"群"；要给每个注册用户推**单聊**、并且让他点一下链接
@@ -876,6 +903,12 @@ LIQ_MIN_AVG_TURNOVER_PCT = 1.5     # 日均换手率下限（%）
 LIQ_MIN_PRICE = 3.0                # 最新收盘价下限（元）；前复权最后一根 = 实盘价
 # 换手率分母用**流通股本**（= 流通市值 / 最新价），不用流通市值本身：
 # 窗口内涨过一波的票，用当前市值当分母会把过去的换手算轻（实测 603200 市值法 7.55% vs 股本法 8.84%）。
+# 复盘子页"口径与开关"的写权限：这些开关一改就影响**所有账号**的选票范围，
+# 而多账号是自注册体系、users 表没有角色列 —— 所以读=登录即可，写=只允许白名单账号。
+# 留空 () = 自动取**最早注册的账号**（id 最小那个）当管理员。
+# ⚠️ 别写死 id：2026-10-17 第一版填的是 (1,)，而本机唯一账号其实是 id=2 的 yz
+#    （AUTH 关闭时"视为 1 号用户"那句注释不等于真实 id），结果谁登录都只能看不能改。
+SETTINGS_WRITE_USER_IDS = ()
 MARKET_CAP_WORKERS = 4             # 刷新线程数：实测 12 线程猛拉约 1100 次后被东财限流，降到 4 线程才稳
 MARKET_CAP_REQUEST_DELAY = 0.5     # 每个请求前小睡（秒），配合低并发避开限流；周刷新慢几分钟无所谓
 MARKET_CAP_REFRESH_WEEKDAY = 'sunday'  # 每周刷新星期（schedule 库：monday..sunday）

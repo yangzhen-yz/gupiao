@@ -546,12 +546,28 @@ class HistoryKlineEngine:
         row = self._get_conn().execute("SELECT MAX(date) FROM stock_daily").fetchone()
         return row[0] if row and row[0] else None
 
-    def get_db_stats(self) -> Dict:
+    def get_db_stats(self, with_scope: bool = False) -> Dict:
+        """库的基本盘（只数/行数/日期区间）。
+
+        ⚠️ `with_scope` 默认 False：算"选股范围内有多少只 + 当天覆盖几只"要扫一遍
+        `stock_daily` 的去重符号并过市值/流动性表，实测 **1.3~1.9 秒**。
+        2026-10-17 的事故就是把这两层塞进了默认路径，而 `history_available()` 又在趋势扫描里
+        被逐只调用 280 次 —— 同步查询压在 asyncio 主循环上，全量扫描 420 秒、所有页面一起卡。
+        需要范围/覆盖的是盘后自检与 `kline-history/stats`，它们显式传 True。
+        """
         symbols = self._get_conn().execute("SELECT COUNT(DISTINCT symbol) FROM stock_daily").fetchone()[0] or 0
         bars = self._get_conn().execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0] or 0
         latest = self.get_latest_trade_date()
         earliest = self._get_conn().execute("SELECT MIN(date) FROM stock_daily").fetchone()[0] or None
-        # universeCount = 选股范围内该有数据的只数（= 覆盖率分母，2026-10-16 起统一口径）
+        stats = {
+            "dbPath": self.db_path,
+            "symbolCount": symbols,
+            "barCount": bars,
+            "latestDate": latest,
+            "earliestDate": earliest,
+        }
+        if not with_scope:
+            return stats
         universe_n = None
         day_covered = None
         try:
@@ -564,15 +580,8 @@ class HistoryKlineEngine:
                 day_covered = len(day & scope)
         except Exception:
             pass
-        return {
-            "dbPath": self.db_path,
-            "symbolCount": symbols,
-            "universeCount": universe_n,
-            "latestDate": latest,
-            "latestDayCovered": day_covered,
-            "barCount": bars,
-            "earliestDate": earliest,
-        }
+        stats.update(universeCount=universe_n, latestDayCovered=day_covered)
+        return stats
 
     def load_recent_closes(self, period_days: int) -> Tuple[Optional[str], Dict[str, List[Tuple[str, float]]]]:
         """返回 (最新交易日, {symbol: [(date, close), ...]})，仅取最近 period_days+45 天窗口。
@@ -636,11 +645,25 @@ def get_engine() -> HistoryKlineEngine:
     return _engine_singleton
 
 
+_AVAILABLE_CACHE = {'ts': 0.0, 'value': None}
+_AVAILABLE_TTL = 300.0      # 本地库"有没有回填好"这种事实，5 分钟内不会变
+
+
 def history_available() -> bool:
-    """本地历史库是否已回填（有数据）。"""
+    """本地历史库是否已回填（有数据）。
+
+    必须缓存：它在趋势扫描里被**逐只**调用（池子 280 只就是 280 次），
+    而同步 SQLite 查询压在 asyncio 主循环上会拖慢整个服务（2026-10-17 实测 1.3~1.9 秒/次
+    × 280 ≈ 420 秒）。按进程记 5 分钟，一天真正会变的时间点只有盘后同步那一下。
+    """
+    now = time.time()
+    if _AVAILABLE_CACHE['value'] is not None and now - _AVAILABLE_CACHE['ts'] < _AVAILABLE_TTL:
+        return _AVAILABLE_CACHE['value']
     try:
         eng = get_engine()
         stats = eng.get_db_stats()
-        return stats["symbolCount"] > 0 and stats["barCount"] > 0
+        value = bool(stats["symbolCount"] > 0 and stats["barCount"] > 0)
     except Exception:
-        return False
+        value = False
+    _AVAILABLE_CACHE.update(ts=now, value=value)
+    return value

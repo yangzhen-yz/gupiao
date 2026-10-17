@@ -19,7 +19,35 @@ import sqlite3
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set
 
-from app.config import KLINE_HISTORY_DB_PATH, UNIVERSE_EXCLUDE_ST, UNIVERSE_MAIN_BOARD_ONLY
+from app.config import KLINE_HISTORY_DB_PATH
+
+# 这两个开关 2026-10-17 起改成**用的时候现读**（`_flag`）：界面在复盘子页拨一下就要立刻影响
+# 选票范围，不能再依赖 `from app.config import X` 那种导入时绑定。
+# config.py 里的值仍然是默认值 —— 覆盖表没记录时走它。
+
+
+def _flag(key: str) -> bool:
+    try:
+        from services.support import app_settings
+        return bool(app_settings.value(key))
+    except Exception as e:
+        # 覆盖表读不到就退回 config 默认值，绝不能让"范围判断"把选票链路整个打断
+        print(f'[股票范围] 读覆盖表失败(退回默认值): {type(e).__name__}: {e}')
+        import app.config as cfg
+        return bool(getattr(cfg, _FLAG_TO_CFG[key]))
+
+
+_FLAG_TO_CFG = {'universe_main_board_only': 'UNIVERSE_MAIN_BOARD_ONLY',
+                'universe_exclude_st': 'UNIVERSE_EXCLUDE_ST'}
+
+
+def invalidate_cache() -> None:
+    """配置改动后打掉本进程缓存（范围清单 + ST 名录）。"""
+    _SCOPE_CACHE['value'] = []
+    try:
+        excluded_symbols.cache_clear()
+    except Exception:
+        pass
 
 MAIN_BOARD_PREFIXES = ('600', '601', '603', '605',        # 沪市主板
                        '000', '001', '002', '003')        # 深市主板（含并入的中小板）
@@ -44,7 +72,7 @@ def is_st_name(name: str) -> bool:
 @lru_cache(maxsize=1)
 def excluded_symbols() -> Set[str]:
     """当前该排除的裸 6 位码（ST/*ST/退市整理）。名录缺失时返回空集并提示去同步。"""
-    if not UNIVERSE_EXCLUDE_ST:
+    if not _flag('universe_exclude_st'):
         return set()
     try:
         conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=30)
@@ -63,9 +91,9 @@ def excluded_symbols() -> Set[str]:
 def in_universe(symbol: str, name: str = '') -> bool:
     """单只票是否在可做范围内（name 传了就用，省一次查库）。"""
     code = _pure(symbol)
-    if UNIVERSE_MAIN_BOARD_ONLY and not code.startswith(MAIN_BOARD_PREFIXES):
+    if _flag('universe_main_board_only') and not code.startswith(MAIN_BOARD_PREFIXES):
         return False
-    if UNIVERSE_EXCLUDE_ST:
+    if _flag('universe_exclude_st'):
         if name:
             return not is_st_name(name)
         return code not in excluded_symbols()
@@ -75,7 +103,7 @@ def in_universe(symbol: str, name: str = '') -> bool:
 def filter_symbols(symbols: Iterable[str]) -> Set[str]:
     """批量筛（一次查库，别在循环里逐只查）。返回裸码集合。"""
     codes = {_pure(s) for s in symbols}
-    if UNIVERSE_MAIN_BOARD_ONLY:
+    if _flag('universe_main_board_only'):
         codes = {c for c in codes if c.startswith(MAIN_BOARD_PREFIXES)}
     return codes - excluded_symbols()
 
@@ -123,7 +151,7 @@ def _compute_eligible(symbols: Iterable[str]) -> list:
     codes = sorted(filter_symbols(symbols))
     try:
         from services.data import market_cap
-        if market_cap.MARKET_CAP_FILTER_ENABLED:
+        if market_cap.enabled_flag():
             codes = sorted(market_cap.filter_symbols(codes))
     except Exception as e:                                  # 市值表读不到时按主板+非ST放行
         print(f'[股票范围] 市值下限这层没接上(按不含市值处理): {e}')
@@ -179,8 +207,8 @@ def describe_selectable() -> str:
 def describe_full() -> str:
     """带市值下限的完整口径文案，用于日志与告警（describe() 只讲本模块负责的两条）。"""
     try:
-        from app.config import MIN_TOTAL_MARKET_CAP
-        return f'{describe()}、总市值≥{MIN_TOTAL_MARKET_CAP / 1e8:.0f}亿'
+        from services.data import market_cap
+        return f'{describe()}、总市值≥{market_cap.min_cap() / 1e8:.0f}亿'
     except Exception:
         return describe()
 
@@ -197,7 +225,7 @@ def filter_prefixed(symbols: Iterable[str]) -> list:
     """
     try:
         from services.data import market_cap
-        cap_on = bool(market_cap.MARKET_CAP_FILTER_ENABLED) and bool(market_cap.cap_map())
+        cap_on = market_cap.enabled_flag() and bool(market_cap.cap_map())
     except Exception:
         cap_on = False
     seen, out = set(), []
@@ -215,9 +243,9 @@ def filter_prefixed(symbols: Iterable[str]) -> list:
 
 
 def describe() -> str:
-    parts = ['仅沪深主板(600/601/603/605/000/001/002/003)' if UNIVERSE_MAIN_BOARD_ONLY
+    parts = ['仅沪深主板(600/601/603/605/000/001/002/003)' if _flag('universe_main_board_only')
              else '全市场(含创业/科创/北交所)',
-             '剔除 ST/*ST/退市整理' if UNIVERSE_EXCLUDE_ST else '含 ST']
+             '剔除 ST/*ST/退市整理' if _flag('universe_exclude_st') else '含 ST']
     return '、'.join(parts)
 
 
@@ -226,9 +254,9 @@ def apply_to_frame(df, symbol_col: str = 'symbol'):
     import pandas as pd
     codes = df[symbol_col].astype(str).str.lower().str.replace(r'^(sh|sz|bj)', '', regex=True)
     keep = pd.Series(True, index=df.index)
-    if UNIVERSE_MAIN_BOARD_ONLY:
+    if _flag('universe_main_board_only'):
         keep &= codes.str.match(MAIN_BOARD_RE)
     ex = excluded_symbols()
-    if UNIVERSE_EXCLUDE_ST and ex:
+    if _flag('universe_exclude_st') and ex:
         keep &= ~codes.isin(ex)
     return df[keep]

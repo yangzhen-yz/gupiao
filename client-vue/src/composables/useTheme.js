@@ -13,13 +13,14 @@ import { ref, computed } from 'vue'
 const THEME_KEY = 'gupiao_theme'
 
 function systemPrefersDark() {
-  return typeof window !== 'undefined' && !!window.matchMedia
-    && window.matchMedia('(prefers-color-scheme: dark)').matches
+  return (
+    typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+  )
 }
 
 export function currentTheme() {
   const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(THEME_KEY) : null
-  return saved === 'dark' || saved === 'light' ? saved : (systemPrefersDark() ? 'dark' : 'light')
+  return saved === 'dark' || saved === 'light' ? saved : systemPrefersDark() ? 'dark' : 'light'
 }
 
 export function applyTheme(theme) {
@@ -34,14 +35,14 @@ export function useTheme() {
   // 未手动选择时跟随系统切换
   if (typeof window !== 'undefined' && window.matchMedia) {
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const onChange = (e) => {
+    const onChange = e => {
       const saved = localStorage.getItem(THEME_KEY)
       if (saved === 'dark' || saved === 'light') return
       theme.value = e.matches ? 'dark' : 'light'
       applyTheme(theme.value)
     }
     if (mq.addEventListener) mq.addEventListener('change', onChange)
-    else if (mq.addListener) mq.addListener(onChange)   // 兼容旧版 Edge/Chrome
+    else if (mq.addListener) mq.addListener(onChange) // 兼容旧版 Edge/Chrome
   }
 
   function toggleTheme() {

@@ -1,11 +1,13 @@
 <template>
-  <div class="modal" v-if="visible" style="display:flex;">
+  <div class="modal" v-if="visible" style="display: flex">
     <div class="modal-content">
       <div class="modal-header">
         <span class="modal-title">{{ title }}</span>
         <div class="kline-type-switch">
           <button :class="['kline-type-btn', { active: klineType === 'day' }]" @click="switchType('day')">日K</button>
-          <button :class="['kline-type-btn', { active: klineType === 'minute' }]" @click="switchType('minute')">分时</button>
+          <button :class="['kline-type-btn', { active: klineType === 'minute' }]" @click="switchType('minute')">
+            分时
+          </button>
         </div>
         <button class="close-btn" @click="close">&times;</button>
       </div>
@@ -15,181 +17,396 @@
 </template>
 
 <script setup>
-import { ref, watch, onUnmounted, nextTick, inject } from 'vue'
-import * as echarts from 'echarts'
-import { isTradingTime, getNextRefreshDelay } from '../utils/helpers'
+  import { ref, watch, onUnmounted, nextTick, inject } from 'vue'
+  // 2026-10-17：echarts 按需引入（原来是 `import * as echarts from 'echarts'`，单 chunk 1017KB 占全部产物 63%）
+  import * as echarts from 'echarts/core'
+  import { GridComponent, TooltipComponent, DataZoomComponent, MarkLineComponent } from 'echarts/components'
+  import { CandlestickChart, LineChart, BarChart } from 'echarts/charts'
+  import { CanvasRenderer } from 'echarts/renderers'
 
-const props = defineProps({
-  visible: Boolean,
-  symbol: String,
-  beforeDate: String,   // 2026-10-16：若传入，在「完整」日K上以虚线标记该日期（推荐日），不截断数据
-})
-const emit = defineEmits(['close'])
-const showNotification = inject('showNotification')
+  echarts.use([
+    GridComponent,
+    TooltipComponent,
+    DataZoomComponent,
+    MarkLineComponent,
+    CandlestickChart,
+    LineChart,
+    BarChart,
+    CanvasRenderer,
+  ])
+  import { isTradingTime, getNextRefreshDelay } from '../utils/helpers'
 
-const chartDom = ref(null)
-const title = ref('日K线')
-const klineType = ref('day')
-let chartInstance = null
-let refreshTimer = null
+  const props = defineProps({
+    visible: Boolean,
+    symbol: String,
+    beforeDate: String, // 2026-10-16：若传入，在「完整」日K上以虚线标记该日期（推荐日），不截断数据
+  })
+  const emit = defineEmits(['close'])
+  const showNotification = inject('showNotification')
 
-function initChart() {
-  if (!chartDom.value) return
-  if (chartInstance) chartInstance.dispose()
-  chartInstance = echarts.init(chartDom.value)
-}
+  const chartDom = ref(null)
+  const title = ref('日K线')
+  const klineType = ref('day')
+  let chartInstance = null
+  let refreshTimer = null
 
-async function fetchData(symbol, type) {
-  if (!symbol) return
-  try {
-    // 始终拉取完整 K 线（含推荐日及之后），beforeDate 仅用于前端标记，不做截断
-    const url = type === 'minute' ? `/api/kline/${symbol}/minute` : `/api/kline/${symbol}`
-    const resp = await fetch(url)
-    const json = await resp.json()
-    if (json.success && json.data) {
-      if (type === 'minute') {
-        renderMinuteChart(json.data)
+  function initChart() {
+    if (!chartDom.value) return
+    if (chartInstance) chartInstance.dispose()
+    chartInstance = echarts.init(chartDom.value)
+  }
+
+  async function fetchData(symbol, type) {
+    if (!symbol) return
+    try {
+      // 始终拉取完整 K 线（含推荐日及之后），beforeDate 仅用于前端标记，不做截断
+      const url = type === 'minute' ? `/api/kline/${symbol}/minute` : `/api/kline/${symbol}`
+      const resp = await fetch(url)
+      const json = await resp.json()
+      if (json.success && json.data) {
+        if (type === 'minute') {
+          renderMinuteChart(json.data)
+        } else {
+          renderKlineChart(json.data)
+        }
       } else {
-        renderKlineChart(json.data)
+        showNotification(json.error || '获取K线数据失败')
       }
-    } else {
-      showNotification(json.error || '获取K线数据失败')
+    } catch (e) {
+      showNotification('获取K线数据失败')
     }
-  } catch (e) {
-    showNotification('获取K线数据失败')
-  }
-}
-
-function renderKlineChart(data) {
-  if (!chartInstance) return
-  const beforeDate = props.beforeDate
-  title.value = beforeDate
-    ? `日K线 - ${data.name} (${data.symbol}) · 推荐日 ${beforeDate}`
-    : `日K线 - ${data.name} (${data.symbol})`
-  const upColor = '#f04848', downColor = '#2dc87e'
-  // 推荐日标记：优先精确匹配；若其非交易日（不在数据里），取 <= 该日的最近交易日
-  const markDate = (() => {
-    if (!beforeDate || !data.dates.length) return null
-    if (data.dates.includes(beforeDate)) return beforeDate
-    const cand = data.dates.filter(d => d <= beforeDate)
-    return cand.length ? cand[cand.length - 1] : null
-  })()
-  // 视图聚焦：带推荐日时，把推荐日附近纳入可视区（推荐日前约120根 + 至今日），否则默认末100根
-  let startPct, endPct = 100
-  if (markDate) {
-    const idx = data.dates.indexOf(markDate)
-    startPct = Math.max(0, ((idx - 120) / data.dates.length) * 100)
-  } else {
-    startPct = data.dates.length > 100 ? Math.max(0, (data.dates.length - 100) * 100 / data.dates.length) : 0
   }
 
-  chartInstance.setOption({
-    backgroundColor: '#13161f', animation: false,
-    legend: { top: 10, data: ['日K', 'MA5', 'MA10', 'MA20'], left: 'center', textStyle: { color: '#8b90a5' } },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, backgroundColor: 'rgba(26,30,43,0.95)', borderColor: '#252a3a', borderWidth: 1, textStyle: { color: '#e8eaf0' } },
-    grid: [{ left: '10%', right: '8%', top: 70, height: '50%' }, { left: '10%', right: '8%', top: '63%', height: '16%' }],
-    xAxis: [
-      { type: 'category', data: data.dates, axisLine: { onZero: false, lineStyle: { color: '#252a3a' } }, boundaryGap: true, axisLabel: { formatter: v => v.slice(5), color: '#525770' } },
-      { type: 'category', gridIndex: 1, data: data.dates, axisLine: { onZero: false, lineStyle: { color: '#252a3a' } }, boundaryGap: true, axisLabel: { show: false } }
-    ],
-    yAxis: [
-      { scale: true, splitArea: { show: false }, splitLine: { lineStyle: { color: '#1e2233' } }, axisLabel: { color: '#525770' } },
-      { scale: true, gridIndex: 1, splitNumber: 2, axisLabel: { show: true, color: '#525770' }, splitLine: { lineStyle: { color: '#1e2233' } } }
-    ],
-    dataZoom: [
-      { type: 'inside', xAxisIndex: [0, 1], start: startPct, end: endPct },
-      { show: true, xAxisIndex: [0, 1], type: 'slider', bottom: 10, start: startPct, end: endPct, borderColor: '#252a3a', fillerColor: 'rgba(74,144,255,0.15)', handleStyle: { color: '#4a90ff' }, textStyle: { color: '#525770' }, dataBackground: { lineStyle: { color: '#252a3a' }, areaStyle: { color: '#1e2233' } } }
-    ],
-    series: [
-      { name: '日K', type: 'candlestick', data: data.values,
-        markLine: markDate ? {
-          symbol: 'none',
-          lineStyle: { color: '#4a90ff', type: 'dashed', width: 1.5 },
-          label: { show: true, position: 'end', distance: 6, color: '#4a90ff', fontSize: 11, formatter: '推荐日' },
-          data: [{ xAxis: markDate }]
-        } : undefined,
-        itemStyle: { color: upColor, color0: downColor, borderColor: upColor, borderColor0: downColor } },
-      { name: 'MA5', type: 'line', data: data.ma5, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#f0a030' },
-      { name: 'MA10', type: 'line', data: data.ma10, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#8b5cf6' },
-      { name: 'MA20', type: 'line', data: data.ma20, smooth: true, symbol: 'none', lineStyle: { width: 1 }, color: '#06b6d4' },
-      { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: data.vols, itemStyle: { color: p => { const v = data.values[p.dataIndex]; return v[1] > v[0] ? upColor : downColor } } }
-    ]
-  }, true)
-}
+  function renderKlineChart(data) {
+    if (!chartInstance) return
+    const beforeDate = props.beforeDate
+    title.value = beforeDate
+      ? `日K线 - ${data.name} (${data.symbol}) · 推荐日 ${beforeDate}`
+      : `日K线 - ${data.name} (${data.symbol})`
+    const upColor = '#f04848',
+      downColor = '#2dc87e'
+    // 推荐日标记：优先精确匹配；若其非交易日（不在数据里），取 <= 该日的最近交易日
+    const markDate = (() => {
+      if (!beforeDate || !data.dates.length) return null
+      if (data.dates.includes(beforeDate)) return beforeDate
+      const cand = data.dates.filter(d => d <= beforeDate)
+      return cand.length ? cand[cand.length - 1] : null
+    })()
+    // 视图聚焦：带推荐日时，把推荐日附近纳入可视区（推荐日前约120根 + 至今日），否则默认末100根
+    let startPct,
+      endPct = 100
+    if (markDate) {
+      const idx = data.dates.indexOf(markDate)
+      startPct = Math.max(0, ((idx - 120) / data.dates.length) * 100)
+    } else {
+      startPct = data.dates.length > 100 ? Math.max(0, ((data.dates.length - 100) * 100) / data.dates.length) : 0
+    }
 
-function renderMinuteChart(data) {
-  if (!chartInstance) return
-  title.value = `分时图 - ${data.name} (${data.symbol})`
-  const upColor = '#f04848', downColor = '#2dc87e'
-
-  chartInstance.setOption({
-    backgroundColor: '#13161f', animation: false,
-    legend: { top: 10, data: ['价格', '昨收'], left: 'center', textStyle: { color: '#8b90a5' } },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, backgroundColor: 'rgba(26,30,43,0.95)', borderColor: '#252a3a', borderWidth: 1, textStyle: { color: '#e8eaf0' } },
-    grid: [{ left: '10%', right: '8%', top: 70, height: '55%' }, { left: '10%', right: '8%', top: '68%', height: '14%' }],
-    xAxis: [
-      { type: 'category', data: data.times, axisLine: { onZero: false, lineStyle: { color: '#252a3a' } }, boundaryGap: false, axisLabel: { rotate: 45, fontSize: 10, color: '#525770' } },
-      { type: 'category', gridIndex: 1, data: data.times, axisLine: { onZero: false, lineStyle: { color: '#252a3a' } }, axisLabel: { show: false }, boundaryGap: false }
-    ],
-    yAxis: [
-      { scale: true, splitArea: { show: false }, splitLine: { lineStyle: { color: '#1e2233' } }, axisLabel: { color: '#525770' }, min: v => (v.min - (v.max - v.min) * 0.05).toFixed(2), max: v => (v.max + (v.max - v.min) * 0.05).toFixed(2) },
-      { scale: true, gridIndex: 1, splitNumber: 3, axisLabel: { show: true, color: '#525770' }, splitLine: { lineStyle: { color: '#1e2233' } } }
-    ],
-    series: [
-      { name: '价格', type: 'line', data: data.prices, smooth: false, symbol: 'none', lineStyle: { width: 1.5, color: '#4a90ff' }, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(74,144,255,0.25)' }, { offset: 1, color: 'rgba(74,144,255,0.02)' }]) } },
-      { name: '昨收', type: 'line', data: new Array(data.times.length).fill(data.prevClose), symbol: 'none', lineStyle: { width: 1, color: '#525770', type: 'dashed' } },
-      { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: data.vols, itemStyle: { color: p => { const i = p.dataIndex; return i === 0 ? upColor : data.prices[i] >= data.prices[i - 1] ? upColor : downColor } } }
-    ]
-  }, true)
-}
-
-function switchType(type) {
-  klineType.value = type
-  if (props.symbol) fetchData(props.symbol, type)
-  scheduleRefresh()
-}
-
-function scheduleRefresh() {
-  stopRefresh()
-  const tick = async () => {
-    if (props.symbol) await fetchData(props.symbol, klineType.value)
-    // 2026-07-20 A3：分时图实时变化 → 5秒；日K历史一天不变 → 15秒（后端已做 SQLite 缓存，历史不必高频重拉）
-    const interval = klineType.value === 'minute'
-      ? (isTradingTime() ? 5000 : getNextRefreshDelay())
-      : (isTradingTime() ? 15000 : getNextRefreshDelay())
-    refreshTimer = setTimeout(tick, interval)
+    chartInstance.setOption(
+      {
+        backgroundColor: '#13161f',
+        animation: false,
+        legend: { top: 10, data: ['日K', 'MA5', 'MA10', 'MA20'], left: 'center', textStyle: { color: '#8b90a5' } },
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'cross' },
+          backgroundColor: 'rgba(26,30,43,0.95)',
+          borderColor: '#252a3a',
+          borderWidth: 1,
+          textStyle: { color: '#e8eaf0' },
+        },
+        grid: [
+          { left: '10%', right: '8%', top: 70, height: '50%' },
+          { left: '10%', right: '8%', top: '63%', height: '16%' },
+        ],
+        xAxis: [
+          {
+            type: 'category',
+            data: data.dates,
+            axisLine: { onZero: false, lineStyle: { color: '#252a3a' } },
+            boundaryGap: true,
+            axisLabel: { formatter: v => v.slice(5), color: '#525770' },
+          },
+          {
+            type: 'category',
+            gridIndex: 1,
+            data: data.dates,
+            axisLine: { onZero: false, lineStyle: { color: '#252a3a' } },
+            boundaryGap: true,
+            axisLabel: { show: false },
+          },
+        ],
+        yAxis: [
+          {
+            scale: true,
+            splitArea: { show: false },
+            splitLine: { lineStyle: { color: '#1e2233' } },
+            axisLabel: { color: '#525770' },
+          },
+          {
+            scale: true,
+            gridIndex: 1,
+            splitNumber: 2,
+            axisLabel: { show: true, color: '#525770' },
+            splitLine: { lineStyle: { color: '#1e2233' } },
+          },
+        ],
+        dataZoom: [
+          { type: 'inside', xAxisIndex: [0, 1], start: startPct, end: endPct },
+          {
+            show: true,
+            xAxisIndex: [0, 1],
+            type: 'slider',
+            bottom: 10,
+            start: startPct,
+            end: endPct,
+            borderColor: '#252a3a',
+            fillerColor: 'rgba(74,144,255,0.15)',
+            handleStyle: { color: '#4a90ff' },
+            textStyle: { color: '#525770' },
+            dataBackground: { lineStyle: { color: '#252a3a' }, areaStyle: { color: '#1e2233' } },
+          },
+        ],
+        series: [
+          {
+            name: '日K',
+            type: 'candlestick',
+            data: data.values,
+            markLine: markDate
+              ? {
+                  symbol: 'none',
+                  lineStyle: { color: '#4a90ff', type: 'dashed', width: 1.5 },
+                  label: {
+                    show: true,
+                    position: 'end',
+                    distance: 6,
+                    color: '#4a90ff',
+                    fontSize: 11,
+                    formatter: '推荐日',
+                  },
+                  data: [{ xAxis: markDate }],
+                }
+              : undefined,
+            itemStyle: { color: upColor, color0: downColor, borderColor: upColor, borderColor0: downColor },
+          },
+          {
+            name: 'MA5',
+            type: 'line',
+            data: data.ma5,
+            smooth: true,
+            symbol: 'none',
+            lineStyle: { width: 1 },
+            color: '#f0a030',
+          },
+          {
+            name: 'MA10',
+            type: 'line',
+            data: data.ma10,
+            smooth: true,
+            symbol: 'none',
+            lineStyle: { width: 1 },
+            color: '#8b5cf6',
+          },
+          {
+            name: 'MA20',
+            type: 'line',
+            data: data.ma20,
+            smooth: true,
+            symbol: 'none',
+            lineStyle: { width: 1 },
+            color: '#06b6d4',
+          },
+          {
+            name: '成交量',
+            type: 'bar',
+            xAxisIndex: 1,
+            yAxisIndex: 1,
+            data: data.vols,
+            itemStyle: {
+              color: p => {
+                const v = data.values[p.dataIndex]
+                return v[1] > v[0] ? upColor : downColor
+              },
+            },
+          },
+        ],
+      },
+      true
+    )
   }
-  if (isTradingTime()) tick()
-}
 
-function stopRefresh() {
-  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
-}
+  function renderMinuteChart(data) {
+    if (!chartInstance) return
+    title.value = `分时图 - ${data.name} (${data.symbol})`
+    const upColor = '#f04848',
+      downColor = '#2dc87e'
 
-function close() {
-  stopRefresh()
-  emit('close')
-}
+    chartInstance.setOption(
+      {
+        backgroundColor: '#13161f',
+        animation: false,
+        legend: { top: 10, data: ['价格', '昨收'], left: 'center', textStyle: { color: '#8b90a5' } },
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'cross' },
+          backgroundColor: 'rgba(26,30,43,0.95)',
+          borderColor: '#252a3a',
+          borderWidth: 1,
+          textStyle: { color: '#e8eaf0' },
+        },
+        grid: [
+          { left: '10%', right: '8%', top: 70, height: '55%' },
+          { left: '10%', right: '8%', top: '68%', height: '14%' },
+        ],
+        xAxis: [
+          {
+            type: 'category',
+            data: data.times,
+            axisLine: { onZero: false, lineStyle: { color: '#252a3a' } },
+            boundaryGap: false,
+            axisLabel: { rotate: 45, fontSize: 10, color: '#525770' },
+          },
+          {
+            type: 'category',
+            gridIndex: 1,
+            data: data.times,
+            axisLine: { onZero: false, lineStyle: { color: '#252a3a' } },
+            axisLabel: { show: false },
+            boundaryGap: false,
+          },
+        ],
+        yAxis: [
+          {
+            scale: true,
+            splitArea: { show: false },
+            splitLine: { lineStyle: { color: '#1e2233' } },
+            axisLabel: { color: '#525770' },
+            min: v => (v.min - (v.max - v.min) * 0.05).toFixed(2),
+            max: v => (v.max + (v.max - v.min) * 0.05).toFixed(2),
+          },
+          {
+            scale: true,
+            gridIndex: 1,
+            splitNumber: 3,
+            axisLabel: { show: true, color: '#525770' },
+            splitLine: { lineStyle: { color: '#1e2233' } },
+          },
+        ],
+        series: [
+          {
+            name: '价格',
+            type: 'line',
+            data: data.prices,
+            smooth: false,
+            symbol: 'none',
+            lineStyle: { width: 1.5, color: '#4a90ff' },
+            areaStyle: {
+              color: {
+                type: 'linear',
+                x: 0,
+                y: 0,
+                x2: 0,
+                y2: 1,
+                colorStops: [
+                  { offset: 0, color: 'rgba(74,144,255,0.25)' },
+                  { offset: 1, color: 'rgba(74,144,255,0.02)' },
+                ],
+              },
+            },
+          },
+          {
+            name: '昨收',
+            type: 'line',
+            data: new Array(data.times.length).fill(data.prevClose),
+            symbol: 'none',
+            lineStyle: { width: 1, color: '#525770', type: 'dashed' },
+          },
+          {
+            name: '成交量',
+            type: 'bar',
+            xAxisIndex: 1,
+            yAxisIndex: 1,
+            data: data.vols,
+            itemStyle: {
+              color: p => {
+                const i = p.dataIndex
+                return i === 0 ? upColor : data.prices[i] >= data.prices[i - 1] ? upColor : downColor
+              },
+            },
+          },
+        ],
+      },
+      true
+    )
+  }
 
-function handleResize() { chartInstance?.resize() }
-
-watch(() => props.visible, async (val) => {
-  if (val) {
-    await nextTick()
-    initChart()
-    klineType.value = 'day'
-    if (props.symbol) fetchData(props.symbol, 'day')
+  function switchType(type) {
+    klineType.value = type
+    if (props.symbol) fetchData(props.symbol, type)
     scheduleRefresh()
-    window.addEventListener('resize', handleResize)
-  } else {
-    stopRefresh()
-    window.removeEventListener('resize', handleResize)
   }
-})
 
-onUnmounted(() => {
-  stopRefresh()
-  if (chartInstance) { chartInstance.dispose(); chartInstance = null }
-  window.removeEventListener('resize', handleResize)
-})
+  function scheduleRefresh() {
+    stopRefresh()
+    const tick = async () => {
+      if (props.symbol) await fetchData(props.symbol, klineType.value)
+      // 2026-07-20 A3：分时图实时变化 → 5秒；日K历史一天不变 → 15秒（后端已做 SQLite 缓存，历史不必高频重拉）
+      const interval =
+        klineType.value === 'minute'
+          ? isTradingTime()
+            ? 5000
+            : getNextRefreshDelay()
+          : isTradingTime()
+            ? 15000
+            : getNextRefreshDelay()
+      refreshTimer = setTimeout(tick, interval)
+    }
+    if (isTradingTime()) tick()
+  }
+
+  function stopRefresh() {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
+  }
+
+  function close() {
+    stopRefresh()
+    emit('close')
+  }
+
+  function handleResize() {
+    chartInstance?.resize()
+  }
+
+  // immediate: true 是给 App.vue 的 `v-if` 兜底的：改成条件挂载之后，组件是在"已经要显示"
+  // 的时候才被创建，此时 visible 已经是 true、watch 不会再触发；下面的 onUnmounted 本来
+  // 就做了 stopRefresh + dispose + removeEventListener，所以卸载即清理，不会漏定时器。
+  watch(
+    () => props.visible,
+    async val => {
+      if (val) {
+        await nextTick()
+        initChart()
+        klineType.value = 'day'
+        if (props.symbol) fetchData(props.symbol, 'day')
+        scheduleRefresh()
+        window.addEventListener('resize', handleResize)
+      } else {
+        stopRefresh()
+        window.removeEventListener('resize', handleResize)
+      }
+    },
+    { immediate: true }
+  )
+
+  onUnmounted(() => {
+    stopRefresh()
+    if (chartInstance) {
+      chartInstance.dispose()
+      chartInstance = null
+    }
+    window.removeEventListener('resize', handleResize)
+  })
 </script>

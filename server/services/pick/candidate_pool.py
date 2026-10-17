@@ -51,6 +51,37 @@ _DDL = '''CREATE TABLE IF NOT EXISTS daily_candidate_pool (
 )'''
 
 
+def _set(key: str, cfg_name: str, default: float) -> float:
+    """配置项现读：覆盖表(app_settings) 优先，读不到退回 app/config.py 的默认值。
+
+    2026-10-17：这些门槛以前是导入时绑定的常量，界面改了不生效；
+    复盘子页"口径与开关"要能当场改当场见效，所以取用时才读。
+    """
+    try:
+        from services.support import app_settings
+        v = app_settings.value(key)
+        return v if v is not None else default
+    except Exception:
+        import app.config as _cfg
+        return float(getattr(_cfg, cfg_name, default))
+
+
+def min_coverage() -> float:
+    return float(_set('kline_pool_min_coverage', 'KLINE_POOL_MIN_COVERAGE', 0.9)) / 100.0
+
+
+def pool_max() -> int:
+    return int(_set('candidate_pool_max', 'CANDIDATE_POOL_MAX', 250))
+
+
+def rps_top_pct() -> float:
+    return float(_set('candidate_rps_top_pct', 'CANDIDATE_POOL_RPS_TOP', 80))
+
+
+def near_high_ratio() -> float:
+    return float(_set('candidate_near_high_pct', 'CANDIDATE_POOL_NEAR_HIGH', 0.92)) / 100.0
+
+
 def _prefixed(code: str) -> str:
     """本地日K库用裸 6 位码，推荐链路用 sh/sz 前缀码。北交所一律排除
     （下游 `^(sh|sz)\\d{6}$` 的正则本来也不认 bj）。"""
@@ -125,7 +156,7 @@ def pool_is_fresh() -> Dict:
     latest = _latest_bar_date()
     expected = _expected_trade_date()
     covered, universe_n, cov = _coverage_of(latest) if latest else (0, 0, 0.0)
-    ok = bool(latest) and bool(expected) and latest >= expected and cov >= KLINE_POOL_MIN_COVERAGE
+    ok = bool(latest) and bool(expected) and latest >= expected and cov >= min_coverage()
     return {'ok': ok, 'latest': latest, 'expected': expected, 'coverage': round(cov, 3),
             'covered': covered, 'universe': universe_n}
 
@@ -140,7 +171,7 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
                 if not (fresh['latest'] and fresh['expected'] and fresh['latest'] >= fresh['expected'])
                 else f"最新 {fresh['latest']} 在选股范围里只覆盖 "
                      f"{fresh['covered']}/{fresh['universe']} 只 = {fresh['coverage']*100:.1f}% "
-                     f"（< {KLINE_POOL_MIN_COVERAGE*100:.0f}%，同步像跑到一半）")
+                     f"（< {min_coverage()*100:.0f}%，同步像跑到一半）")
         print(f'[候选池] ⚠️ 本地日K不可用：{_why}，本次不出池（退回热搜池）。'
               f'请先补同步：python scripts/backfill_kline.py --mode sync')
         return []
@@ -191,10 +222,10 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
         sel = full[full['date'] == fresh['latest']]
         n_base = len(sel)          # 当天指标齐全、进入海选的只数（= 选股范围内当天有K线的）
         sel = sel[(sel.close > sel.ma20) & (sel.ma20 > sel.ma60)
-                  & (sel.close >= CANDIDATE_POOL_NEAR_HIGH * sel.hi60)
+                  & (sel.close >= near_high_ratio() * sel.hi60)
                   & (sel.chg > 0) & (sel.volume >= sel.v5)
-                  & (sel.rank_pct >= CANDIDATE_POOL_RPS_TOP)]
-        sel = sel.sort_values('r20', ascending=False).head(CANDIDATE_POOL_MAX)
+                  & (sel.rank_pct >= rps_top_pct())]
+        sel = sel.sort_values('r20', ascending=False).head(pool_max())
         pool = []
         for row in sel.itertuples():
             sym = _prefixed(str(row.symbol))
@@ -203,7 +234,7 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
             pool.append({'symbol': sym, 'source': 'pool',
                          'r20': round(float(row.r20), 2), 'rank_pct': round(float(row.rank_pct), 1)})
         print(f"[候选池] {fresh['latest']} 海选 {len(pool)} 只：选股范围 {n_scope} 只 → "
-              f"当天指标齐全 {n_base} 只 → 过趋势/量能/RPS 阈值 {len(sel)} 只（上限 {CANDIDATE_POOL_MAX}）")
+              f"当天指标齐全 {n_base} 只 → 过趋势/量能/RPS 阈值 {len(sel)} 只（上限 {pool_max()}）")
         if persist and pool:
             _save_pool(fresh['latest'], pool)
         return pool
@@ -227,7 +258,8 @@ def _save_pool(pool_date: str, pool: List[Dict]):
         conn.close()
 
 
-def load_pool(limit: int = CANDIDATE_POOL_MAX) -> List[Dict]:
+def load_pool(limit: Optional[int] = None) -> List[Dict]:
+    limit = limit or pool_max()      # 默认值不能写在签名里：那是导入时绑定的旧值
     """读最近一次海选结果（供 9:45/13:30/14:05 三次生成共用，避免重复计算）。
 
     只认"最近交易日"的池子：超过 5 个自然日没更新说明盘前任务又静默失败了，

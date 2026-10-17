@@ -13,7 +13,7 @@ export default defineConfig({
       '/eastmoney': {
         target: 'https://push2.eastmoney.com',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/eastmoney/, ''),
+        rewrite: path => path.replace(/^\/eastmoney/, ''),
       },
     },
   },

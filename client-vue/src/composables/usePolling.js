@@ -24,9 +24,12 @@ export function usePolling(fn, opts = {}) {
   const minGapMs = opts.minGapMs ?? 5000
 
   function readInterval() {
-    const raw = typeof opts.interval === 'function'
-      ? opts.interval()
-      : (opts.interval && typeof opts.interval === 'object' ? opts.interval.value : opts.interval)
+    const raw =
+      typeof opts.interval === 'function'
+        ? opts.interval()
+        : opts.interval && typeof opts.interval === 'object'
+          ? opts.interval.value
+          : opts.interval
     const ms = Number(raw)
     return Number.isFinite(ms) && ms > 0 ? ms : 60000
   }
@@ -47,7 +50,10 @@ export function usePolling(fn, opts = {}) {
   let lastAt = 0
 
   function clear() {
-    if (timer) { clearTimeout(timer); timer = null }
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
   }
 
   function schedule(ms) {
@@ -79,7 +85,10 @@ export function usePolling(fn, opts = {}) {
   /** 手动刷新（够新则跳过，避免点 Tab 就重复请求） */
   async function refresh(force = true) {
     if (!started) return
-    if (!force && Date.now() - lastAt < readInterval()) { schedule(); return }
+    if (!force && Date.now() - lastAt < readInterval()) {
+      schedule()
+      return
+    }
     await tick()
   }
 
@@ -97,11 +106,14 @@ export function usePolling(fn, opts = {}) {
 
   // 切回该 Tab：立刻补一次（超过 minGapMs 才算过期），否则只重新排程
   if (typeof opts.active === 'function' || (opts.active && typeof opts.active === 'object')) {
-    watch(() => readActive(), (on) => {
-      if (!started) return
-      if (on && Date.now() - lastAt > minGapMs) tick()
-      else schedule()
-    })
+    watch(
+      () => readActive(),
+      on => {
+        if (!started) return
+        if (on && Date.now() - lastAt > minGapMs) tick()
+        else schedule()
+      }
+    )
   }
 
   const onVisibility = () => {

@@ -4,7 +4,7 @@ from fastapi.responses import Response
 from typing import List, Dict, Optional
 import json, asyncio, time, re, inspect
 from datetime import date, datetime
-from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
+from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
 from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
 from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
@@ -1384,7 +1384,10 @@ async def get_stock_basic_info_api():
 
 @router.post("/api/update-stock-map", tags=["股票映射"])
 async def update_stock_basic_info_api(data: Dict):
-    import services.data.stock
+    # 2026-10-17 修复：services/stock.py 已搬到 services/data/stock.py，
+    # 旧写法 `import services.data.stock` + `services.stock.x` 会抛
+    # AttributeError: module 'services' has no attribute 'stock'。
+    from services.data import stock as _stock_data
     try:
         symbol = data.get('symbol')
         name = data.get('name')
@@ -1397,7 +1400,7 @@ async def update_stock_basic_info_api(data: Dict):
         stock_basic_info = load_stock_basic_info()
         stock_basic_info[symbol.lower()] = name
         save_stock_basic_info(stock_basic_info)
-        services.stock._stock_basic_info_cache = stock_basic_info
+        _stock_data._stock_basic_info_cache = stock_basic_info
         
         return {"success": True}
     except HTTPException:
@@ -2348,11 +2351,84 @@ async def kline_history_stats_api():
     try:
         from services.data.kline_history import get_engine, history_available
         eng = get_engine()
-        stats = eng.get_db_stats()
+        stats = eng.get_db_stats(with_scope=True)
         stats["available"] = history_available()
         return {"success": True, "data": stats}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取历史库统计失败: {str(error)}")
+
+
+# ========== 运行时配置覆盖（复盘子页"口径与开关"，2026-10-17） ==========
+# 为什么读和写的权限不一样：这些开关一拨就改变**所有账号**的选票范围与推送量，
+# 而 users 表没有角色列（自注册体系）—— 所以读=登录即可，写=只允许
+# `SETTINGS_WRITE_USER_IDS` 里的账号 id，改动人会记进 app_settings.updated_by 便于回溯。
+@router.get("/api/settings", tags=["配置"])
+async def get_settings_api(user: Dict = Depends(current_user)):
+    """列出可改项（当前值/默认值/是否被覆盖/生效方式）+ 口径摘要与改动记录。"""
+    from services.support import app_settings as A
+    items = A.list_items()
+    try:
+        from services.data import universe
+        summary = {
+            'dataScope': len(universe.eligible_symbols()),
+            'selectableScope': universe.selectable_count(),
+            'scopeText': universe.describe_selectable(),
+        }
+    except Exception as e:
+        summary = {'scopeError': str(e)[:120]}
+    try:
+        from services.support import settings_preview as P
+        p = P.parity_check()
+        summary['previewParity'] = p
+        if not p.get('ok'):
+            print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
+                  f" —— settings_preview 漏了条件，得补")
+        summary['staleOutOfSync'] = P.stale_no_sync_count()
+    except Exception as e:
+        summary['previewError'] = f'{type(e).__name__}: {str(e)[:120]}'
+    return {"success": True, "data": {'items': items, 'summary': summary,
+                                      'history': A.history(15),
+                                      'canWrite': A.can_write(user),
+                                      'writeIds': list(A.write_ids())}}
+
+
+@router.get("/api/settings/preview", tags=["配置"])
+async def preview_setting_api(key: str, value: str, user: Dict = Depends(current_user)):
+    """"改成这个值会怎样" —— 界面切换/改数时按需调一次（约 0.3~0.8 秒，不做全量预取）。"""
+    from services.support import app_settings as A, settings_preview as P
+    if key not in [s['key'] for s in A.SPEC]:
+        raise HTTPException(status_code=404, detail=f'不允许修改的配置项: {key}')
+    incoming = (value.lower() in ('1', 'true', 'on', 'yes', '开')) if A.spec(key)['kind'] == 'bool' else value
+    ok, val = A.coerce(key, incoming)
+    if not ok:
+        raise HTTPException(status_code=400, detail=val)
+    return {"success": True, "data": P.preview_for(key, val)}
+
+
+@router.post("/api/settings/{key}", tags=["配置"])
+async def set_setting_api(key: str, body: Dict, user: Dict = Depends(current_user)):
+    from services.support import app_settings as A
+    if not A.can_write(user):
+        raise HTTPException(status_code=403, detail=(
+            f'当前账号无权修改口径（可改账号 id={A.write_ids()}，默认是最早注册的账号）；'
+            '这些开关一改就影响所有账号的选票范围'))
+    res = A.set_value(key, body.get('value'), user=str(user.get('username') or user.get('id')))
+    if not res.get('ok'):
+        raise HTTPException(status_code=400, detail=res.get('error') or '写入失败')
+    print(f"[配置] {user.get('username') or user.get('id')} 改了 {key} = {res['value']}"
+          f"（{'即时生效' if res['live'] else '需重启才生效'}）")
+    return {"success": True, "data": res}
+
+
+@router.post("/api/settings/{key}/reset", tags=["配置"])
+async def reset_setting_api(key: str, user: Dict = Depends(current_user)):
+    from services.support import app_settings as A
+    if not A.can_write(user):
+        raise HTTPException(status_code=403, detail='当前账号无权修改口径（默认只有最早注册的账号能改）')
+    res = A.reset_value(key, user=str(user.get('username') or user.get('id')))
+    if not res.get('ok'):
+        raise HTTPException(status_code=400, detail=res.get('error') or '清除失败')
+    return {"success": True, "data": res}
 
 
 @router.post("/api/kline-history/sync", tags=["本地历史K线库"])

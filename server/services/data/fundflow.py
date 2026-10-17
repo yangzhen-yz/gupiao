@@ -11,8 +11,9 @@
 """
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import (Dict, List)
+from typing import (Dict, List, Optional)
 
 import requests
 from app.config import (
@@ -87,7 +88,10 @@ def _clist(fid: str, po: int, fs: str, fields: str, pz: int, pn: int = 1) -> Lis
         'ut': 'b2884a393a59ad64002292a3e90d46a5',
     }
     last_err = None
-    retries = 5
+    # 2026-10-17：5 次重试在东财「整体封锁」时是纯浪费（每次都要跑满 timeout+退避，
+    # 三个区块串行下来能把接口拖到 30s+）。东财要么一次就通、要么被封（重试也没用），
+    # 且已有熔断 + 新浪兜底接盘，所以降到 2 次：既保留对偶发抖动的重试，又不拖慢响应。
+    retries = 2
     # 强制直连东方财富，忽略环境代理（沙箱透明代理 127.0.0.1 偶发断连会导致 ProxyError；
     # A股数据源国内直连即可，无需代理）。
     _NO_PROXY = {'http': None, 'https': None}
@@ -262,6 +266,199 @@ _LAST_GOOD_STOCK: Dict[str, Dict] = {}
 _LAST_GOOD_SECTOR: Dict[str, Dict] = {}
 _LAST_GOOD_HIDDEN: Dict[str, List[Dict]] = {}
 
+# ========== clist 熔断（2026-10-17）：东财对 clist 接口偶发 IP 级限流/封禁，
+# 表现为 403 / 连接被重置(RemoteDisconnected)。前端 30s 轮询若每次都硬重试，
+# 反而会越重试越被封。连续失败达阈值即进入冷却窗口，期间直接走快照兜底、不再打东财，
+# 既降低被封概率，也避免无谓重试拖垮响应。解封后首次成功即复位并落盘快照。 ==========
+_CLIST_FAIL_STREAK = 0
+_CLIST_COOLDOWN_UNTIL = 0.0
+_CLIST_FAIL_THRESHOLD = 3          # 连续失败 3 次（≈3 轮轮询）即熔断
+_CLIST_COOLDOWN_SEC = 300          # 冷却 5 分钟
+
+
+def _clist_circuit_open() -> bool:
+    return time.time() < _CLIST_COOLDOWN_UNTIL
+
+
+def _clist_on_success() -> None:
+    global _CLIST_FAIL_STREAK, _CLIST_COOLDOWN_UNTIL
+    _CLIST_FAIL_STREAK = 0
+    _CLIST_COOLDOWN_UNTIL = 0.0
+
+
+def _clist_on_failure() -> None:
+    global _CLIST_FAIL_STREAK, _CLIST_COOLDOWN_UNTIL
+    _CLIST_FAIL_STREAK += 1
+    if _CLIST_FAIL_STREAK >= _CLIST_FAIL_THRESHOLD and time.time() >= _CLIST_COOLDOWN_UNTIL:
+        _CLIST_COOLDOWN_UNTIL = time.time() + _CLIST_COOLDOWN_SEC
+        print(f'[资金流向] clist 连续失败 {_CLIST_FAIL_STREAK} 次，进入冷却 {_CLIST_COOLDOWN_SEC}s'
+              f'（期间使用快照兜底，不再请求东财）')
+
+
+# ========== 新浪兜底（2026-10-17）：东财 clist 被封锁期间的替代资金流来源 ==========
+# 背景：东财 push2/push2delay 的 API 路径会对高频来源做 IP 级封锁（403 / 连接被重置），
+# 一锁往往数小时，资金流向页会长期空白。新浪 MoneyFlow 接口（逐票）实测可用，
+#   主力净流入 = 超大单(r0) 净额 + 大单(r1) 净额
+# 代价是要逐票拉取，所以一次性算好全市场快照并缓存，排名/非热点都从这份快照派生。
+_SINA_MONEY_FLOW_URL = ('https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php'
+                        '/MoneyFlow.ssi_ssfx_flzjtj')
+_SINA_SNAPSHOT_CACHE: Dict[str, object] = {}   # {'ts': float, 'rows': List[Dict]}
+_SINA_SNAPSHOT_TTL = 600                       # 全市场快照缓存 10 分钟（逐票拉取代价高）
+_SINA_WAIT_TIMEOUT = 20                        # 首轮最多等 20s，超时让后台继续算
+_SINA_WORKERS = 10
+_SINA_COMPUTING = False                        # 是否正在计算（防并发重复触发）
+
+
+def _prefixed(code: str) -> str:
+    """纯代码 → 带市场前缀（新浪 daima 与腾讯批量行情都要带前缀的代码）。"""
+    c = str(code)
+    if c.startswith(('sh', 'sz')):
+        return c
+    return ('sh' + c) if c.startswith('6') else ('sz' + c)
+
+
+def _fetch_sina_money_flow(symbol: str) -> Optional[float]:
+    """单只主力净流入（元）= 超大单(r0)+大单(r1) 的净额；取不到返回 None。"""
+    try:
+        r = requests.get(f'{_SINA_MONEY_FLOW_URL}?daima={symbol}',
+                         headers={'User-Agent': 'Mozilla/5.0',
+                                  'Referer': 'https://finance.sina.com.cn'},
+                         timeout=8, proxies={'http': None, 'https': None})
+        r.raise_for_status()
+        d = r.json() or {}
+
+        def _f(k):
+            try:
+                return float(d.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        return (_f('r0_in') - _f('r0_out')) + (_f('r1_in') - _f('r1_out'))
+    except Exception:
+        return None
+
+
+async def _sina_compute_snapshot() -> Optional[List[Dict]]:
+    """真正干活：逐票拉新浪资金流 + 批量补腾讯行情，结果写入缓存。"""
+    global _SINA_COMPUTING
+    try:
+        try:
+            from services.data.universe import selectable_symbols
+            codes = [c for c in selectable_symbols() if len(str(c)) == 6 and str(c).isdigit()]
+        except Exception as e:
+            print(f'[资金流向] 新浪兜底：取可选股清单失败 {e}')
+            return None
+        if not codes:
+            return None
+        symbols = [_prefixed(c) for c in codes]
+
+        def _sync_flows():
+            out = {}
+            with ThreadPoolExecutor(max_workers=_SINA_WORKERS) as ex:
+                futs = {ex.submit(_fetch_sina_money_flow, s): s for s in symbols}
+                for fut in as_completed(futs):
+                    s = futs[fut]
+                    try:
+                        v = fut.result()
+                    except Exception:
+                        v = None
+                    if v is not None:
+                        out[s] = v
+            return out
+
+        flows = await asyncio.to_thread(_sync_flows)
+        if not flows:
+            print('[资金流向] 新浪兜底：资金流一只都没取到，本轮放弃')
+            return None
+
+        # 批量补行情（名称/价格/涨跌幅）—— 腾讯行情源正常，与东财互不影响
+        try:
+            from services.data.stock import fetch_with_retry, parse_tencent_batch_data
+            quotes: Dict[str, Dict] = {}
+            for i in range(0, len(symbols), 60):
+                try:
+                    data = await fetch_with_retry(','.join(symbols[i:i + 60]))
+                    for row in parse_tencent_batch_data(data):
+                        quotes[row.get('symbol')] = row
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f'[资金流向] 新浪兜底：补行情失败(仍返回资金流) {e}')
+            quotes = {}
+
+        rows = []
+        for sym, net in flows.items():
+            q = quotes.get(sym) or {}
+            rows.append({
+                'symbol': sym,
+                'code': q.get('code') or sym[2:],
+                'name': q.get('name') or '',
+                'price': _to_float(q.get('priceRaw') or q.get('price')),
+                'changePercent': _to_float(q.get('changePercent')),
+                'mainNetInflow': net,
+                'industry': '',
+            })
+        print(f'[资金流向] 新浪兜底快照完成：{len(rows)} 只')
+        _SINA_SNAPSHOT_CACHE['ts'] = time.time()
+        _SINA_SNAPSHOT_CACHE['rows'] = rows
+        return rows
+    finally:
+        _SINA_COMPUTING = False
+
+
+async def _sina_market_snapshot() -> Optional[List[Dict]]:
+    """取全市场「行情 + 主力净流入」快照（东财不可用时的兜底数据源）。
+
+    一次计算约千级请求、实测约 2 分钟，绝不能跟着 30s 轮询重复跑，所以：
+      · 有新鲜缓存 → 直接返回；
+      · 正在计算中 → 本轮不等、直接返回 None（下轮来取）；
+      · 否则后台起算，本轮最多等 _SINA_WAIT_TIMEOUT 秒；超时先返回 None，
+        后台继续算完入缓存，下一轮轮询即可拿到数据（避免接口干等两分钟）。
+    """
+    now = time.time()
+    cached = _SINA_SNAPSHOT_CACHE.get('rows')
+    if cached and (now - float(_SINA_SNAPSHOT_CACHE.get('ts') or 0)) < _SINA_SNAPSHOT_TTL:
+        return cached
+    global _SINA_COMPUTING
+    if _SINA_COMPUTING:
+        return None
+    _SINA_COMPUTING = True
+    task = asyncio.create_task(_sina_compute_snapshot())
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_SINA_WAIT_TIMEOUT)
+    except Exception:
+        return None
+
+
+async def _sina_stock_rankings(top_n: int) -> Optional[Dict[str, List[Dict]]]:
+    """从新浪快照派生个股主力净流入 / 净流出排名。"""
+    rows = await _sina_market_snapshot()
+    if not rows:
+        return None
+    ranked = sorted(rows, key=lambda r: r['mainNetInflow'], reverse=True)
+    return {
+        'inflow': [r for r in ranked[:top_n] if r['mainNetInflow'] > 0],
+        'outflow': [r for r in ranked[-top_n:][::-1] if r['mainNetInflow'] < 0],
+    }
+
+
+async def _sina_hidden_gems(change_threshold: float, hot_top_n: int,
+                            top_n: int) -> List[Dict]:
+    """从新浪快照派生「非热点上涨股」：涨幅达标且不在热搜榜前 N。"""
+    rows = await _sina_market_snapshot()
+    if not rows:
+        return []
+    try:
+        hot = load_hot_search_ranking() or {}
+        hot_syms = {_prefixed(s.get('symbol')) for s in (hot.get('stocks') or [])[:hot_top_n]
+                    if s.get('symbol')}
+    except Exception:
+        hot_syms = set()
+    gems = [r for r in rows
+            if r['changePercent'] >= change_threshold and r['symbol'] not in hot_syms]
+    gems.sort(key=lambda r: r['changePercent'], reverse=True)
+    return gems[:top_n]
+
 
 def _in_trading_window() -> bool:
     """粗判盘中（周一~周五 9:15-15:05）。收盘后已有快照的区块不再请求东财。"""
@@ -330,56 +527,95 @@ async def get_fund_flow_summary(
     stocks: Dict[str, List[Dict]] = {'inflow': [], 'outflow': []}
     sectors: Dict = {}
     hidden: List[Dict] = []
+    cooling = _clist_circuit_open()
 
+    if cooling:
+        print('[资金流向] clist 冷却中，本轮跳过东财、改走新浪兜底/快照')
+    # 个股排名三级回退：东财（最优）→ 新浪兜底（新鲜）→ 历史快照（陈旧但不空）
+    src_stocks = 'none'
     if closed and lg_stocks:
         stocks = lg_stocks
+        src_stocks = 'snapshot'
     else:
-        try:
-            stocks = await get_stock_fund_flow_rankings(stock_top_n)
-        except Exception as e:
-            print(f'[资金流向] 个股排名拉取失败: {e}')
-        if not (stocks.get('inflow') or stocks.get('outflow')):
-            if lg_stocks:
-                stocks = lg_stocks
+        if not cooling:
+            try:
+                _r = await get_stock_fund_flow_rankings(stock_top_n)
+                if _r.get('inflow') or _r.get('outflow'):
+                    stocks, src_stocks = _r, 'eastmoney'
+                    _clist_on_success()
+                    _LAST_GOOD_STOCK[stock_k] = stocks
+                    save_fund_flow_snapshot(f'stocks:{stock_k}', stocks)
+            except Exception as e:
+                print(f'[资金流向] 个股排名拉取失败: {e}')
+                _clist_on_failure()
+        if src_stocks == 'none':
+            # 东财不可用（异常 / 空 / 冷却）→ 新浪逐票资金流兜底
+            _fb = await _sina_stock_rankings(stock_top_n)
+            if _fb and (_fb.get('inflow') or _fb.get('outflow')):
+                stocks, src_stocks = _fb, 'sina'
+                print('[资金流向] 个股排名使用新浪兜底（东财不可用）')
+                _LAST_GOOD_STOCK[stock_k] = stocks
+                save_fund_flow_snapshot(f'stocks:{stock_k}', stocks)
+            elif lg_stocks:
+                stocks, src_stocks = lg_stocks, 'snapshot'
                 print('[资金流向] 个股排名使用最后成功快照兜底')
-        else:
-            _LAST_GOOD_STOCK[stock_k] = stocks
-            save_fund_flow_snapshot(f'stocks:{stock_k}', stocks)
     await asyncio.sleep(0.25)
     if closed and lg_sectors:
         sectors = lg_sectors
+    elif cooling:
+        sectors = lg_sectors or {}
     else:
         try:
             sectors = await get_sector_fund_flow_rankings(sector_top_n)
+            if sectors.get('industry') or sectors.get('concept'):
+                _clist_on_success()
+                _LAST_GOOD_SECTOR[sector_k] = sectors
+                save_fund_flow_snapshot(f'sectors:{sector_k}', sectors)
+            else:
+                if lg_sectors:
+                    sectors = lg_sectors
+                    print('[资金流向] 板块排名使用最后成功快照兜底')
         except Exception as e:
             print(f'[资金流向] 板块排名拉取失败: {e}')
-        if not (sectors.get('industry') or sectors.get('concept')):
+            _clist_on_failure()
             if lg_sectors:
                 sectors = lg_sectors
                 print('[资金流向] 板块排名使用最后成功快照兜底')
-        else:
-            _LAST_GOOD_SECTOR[sector_k] = sectors
-            save_fund_flow_snapshot(f'sectors:{sector_k}', sectors)
     await asyncio.sleep(0.25)
+    # 非热点上涨股三级回退：东财 → 新浪兜底 → 历史快照
+    src_hidden = 'none'
     if closed and lg_hidden:
         hidden = lg_hidden
+        src_hidden = 'snapshot'
     else:
-        try:
-            hidden = await get_hidden_gems(change_threshold, hot_top_n, hidden_top_n)
-        except Exception as e:
-            print(f'[资金流向] 非热点上涨股拉取失败: {e}')
-        if not hidden:
-            if lg_hidden:
-                hidden = lg_hidden
+        if not cooling:
+            try:
+                _h = await get_hidden_gems(change_threshold, hot_top_n, hidden_top_n)
+                if _h:
+                    hidden, src_hidden = _h, 'eastmoney'
+                    _clist_on_success()
+                    _LAST_GOOD_HIDDEN[hidden_k] = hidden
+                    save_fund_flow_snapshot(f'hidden:{hidden_k}', hidden)
+            except Exception as e:
+                print(f'[资金流向] 非热点上涨股拉取失败: {e}')
+                _clist_on_failure()
+        if src_hidden == 'none':
+            _hg = await _sina_hidden_gems(change_threshold, hot_top_n, hidden_top_n)
+            if _hg:
+                hidden, src_hidden = _hg, 'sina'
+                print('[资金流向] 非热点上涨股使用新浪兜底（东财不可用）')
+                _LAST_GOOD_HIDDEN[hidden_k] = hidden
+                save_fund_flow_snapshot(f'hidden:{hidden_k}', hidden)
+            elif lg_hidden:
+                hidden, src_hidden = lg_hidden, 'snapshot'
                 print('[资金流向] 非热点上涨股使用最后成功快照兜底')
-        else:
-            _LAST_GOOD_HIDDEN[hidden_k] = hidden
-            save_fund_flow_snapshot(f'hidden:{hidden_k}', hidden)
 
     data = {
         'stocks': stocks,
         'sectors': sectors,
         'hiddenGems': hidden,
+        'cooling': cooling,
+        'dataSource': {'stocks': src_stocks, 'hidden': src_hidden},
         'updateTime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'params': {
             'stockTopN': stock_top_n,

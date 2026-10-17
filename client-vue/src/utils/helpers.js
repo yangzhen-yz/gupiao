@@ -1,18 +1,32 @@
-import { ref, onUnmounted } from 'vue'
+import { ref } from 'vue'
 
 // 判断是否为交易日（2026年A股休市日历，来源：沪深北交易所公告）
 const HOLIDAYS_2026 = [
-  '2026-01-01','2026-01-02',                                    // 元旦
-  '2026-02-16','2026-02-17','2026-02-18','2026-02-19','2026-02-20','2026-02-23', // 春节
-  '2026-04-06',                                                  // 清明节
-  '2026-05-01','2026-05-04','2026-05-05',                        // 劳动节
-  '2026-06-19',                                                  // 端午节
-  '2026-09-25',                                                  // 中秋节
-  '2026-10-01','2026-10-02','2026-10-05','2026-10-06','2026-10-07', // 国庆节
+  '2026-01-01',
+  '2026-01-02', // 元旦
+  '2026-02-16',
+  '2026-02-17',
+  '2026-02-18',
+  '2026-02-19',
+  '2026-02-20',
+  '2026-02-23', // 春节
+  '2026-04-06', // 清明节
+  '2026-05-01',
+  '2026-05-04',
+  '2026-05-05', // 劳动节
+  '2026-06-19', // 端午节
+  '2026-09-25', // 中秋节
+  '2026-10-01',
+  '2026-10-02',
+  '2026-10-05',
+  '2026-10-06',
+  '2026-10-07', // 国庆节
 ]
 
 export function isHoliday(date = new Date()) {
-  const y = date.getFullYear(), m = String(date.getMonth()+1).padStart(2,'0'), d = String(date.getDate()).padStart(2,'0')
+  const y = date.getFullYear(),
+    m = String(date.getMonth() + 1).padStart(2, '0'),
+    d = String(date.getDate()).padStart(2, '0')
   return HOLIDAYS_2026.includes(`${y}-${m}-${d}`)
 }
 
@@ -23,16 +37,17 @@ export function isOrderableNow(date = new Date()) {
   if (day === 0 || day === 6) return false
   if (isHoliday(date)) return false
   const mins = date.getHours() * 60 + date.getMinutes()
-  return (mins >= 9 * 60 + 15 && mins <= 11 * 60 + 30)
-    || (mins >= 13 * 60 && mins <= 15 * 60)
+  return (mins >= 9 * 60 + 15 && mins <= 11 * 60 + 30) || (mins >= 13 * 60 && mins <= 15 * 60)
 }
 
-export function isTradingTime() {  const now = new Date()
+export function isTradingTime() {
+  const now = new Date()
   const day = now.getDay()
   if (day === 0 || day === 6) return false
   if (isHoliday(now)) return false
-  const h = now.getHours(), m = now.getMinutes()
-  if ((h === 9 && m >= 30) || (h === 10) || (h === 11 && m <= 30)) return true
+  const h = now.getHours(),
+    m = now.getMinutes()
+  if ((h === 9 && m >= 30) || h === 10 || (h === 11 && m <= 30)) return true
   if ((h >= 13 && h < 15) || (h === 15 && m === 0)) return true
   return false
 }
@@ -40,7 +55,8 @@ export function isTradingTime() {  const now = new Date()
 export function getNextRefreshDelay() {
   if (isTradingTime()) return 1000
   const now = new Date()
-  const day = now.getDay(), h = now.getHours(), m = now.getMinutes()
+  const day = now.getDay(),
+    h = now.getHours()
   let next = new Date(now)
   if (day === 0 || day === 6) {
     next.setDate(now.getDate() + (day === 0 ? 1 : 2))
@@ -89,9 +105,9 @@ let notifId = 0
 
 const TYPE_ICONS = {
   success: '✓',
-  error:   '✕',
+  error: '✕',
   warning: '!',
-  info:    'i'
+  info: 'i',
 }
 
 export function useNotification() {
@@ -103,10 +119,10 @@ export function useNotification() {
     }
     // 未指定类型时，从消息内容自动推断
     if (!type) {
-      if (/失败|错误/.test(message))      type = 'error'
+      if (/失败|错误/.test(message)) type = 'error'
       else if (/成功|完成|已添加|已移出|已保存/.test(message)) type = 'success'
       else if (/请输入|请先/.test(message)) type = 'warning'
-      else                               type = 'info'
+      else type = 'info'
     }
     const id = ++notifId
     notifications.value.unshift({ id, message, type })
@@ -171,10 +187,18 @@ export function setUnauthorizedHandler(fn) {
   _unauthorizedHandler = fn
 }
 
+// API 请求默认超时（毫秒）。2026-10-17：之前所有请求都没有超时，
+// 后端 `/api/rps` 那种"一个接口 50 秒"的情况会直接把整页 loading 无限挂住，
+// 用户看到的就是"每个页面都很慢、而且卡住不动"。超时后快速失败，页面其余部分照常可用。
+export const API_TIMEOUT_MS = 10000
+
 // API 请求封装：自动附带登录 token；私有接口返回 401 时清理登录态并通知上层
 export async function apiFetch(url, options = {}) {
+  const { timeout = API_TIMEOUT_MS, expectText = false, ...rest } = options
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeout)
   try {
-    const opts = { ...options }
+    const opts = { ...rest, signal: ctrl.signal }
     const token = getToken()
     if (token) {
       opts.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` }
@@ -187,11 +211,25 @@ export async function apiFetch(url, options = {}) {
       err.status = 401
       throw err
     }
-    return await resp.json()
+    // 腾讯行情那类接口返回的是文本不是 JSON，用 expectText 走同一条超时逻辑
+    return expectText ? await resp.text() : await resp.json()
   } catch (e) {
+    if (e.name === 'AbortError') {
+      const err = new Error(`请求超时（${Math.round(timeout / 1000)}s）: ${url}`)
+      err.timedOut = true
+      console.warn(err.message)
+      throw err
+    }
     if (e.status !== 401) console.error(`API请求失败: ${url}`, e)
     throw e
+  } finally {
+    clearTimeout(timer)
   }
+}
+
+// 取纯文本响应（腾讯行情 `qt.gtimg.cn` 风格接口），同样带超时
+export async function apiFetchText(url, options = {}) {
+  return apiFetch(url, { ...options, expectText: true })
 }
 
 // 风险等级标签与样式（TabRecommend / TabScan 共用）

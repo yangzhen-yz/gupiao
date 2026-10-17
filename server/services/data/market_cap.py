@@ -51,6 +51,29 @@ _DDL = '''CREATE TABLE IF NOT EXISTS stock_market_cap (
 _CAP_CACHE: Optional[Dict[str, float]] = None
 
 
+def enabled_flag() -> bool:
+    """总市值下限这一层是否生效（2026-10-17 起走覆盖表热读，读不到退回 config 默认值）。"""
+    try:
+        from services.support import app_settings
+        return bool(app_settings.value('market_cap_enabled'))
+    except Exception:
+        return bool(MARKET_CAP_FILTER_ENABLED)
+
+
+def min_cap() -> float:
+    try:
+        from services.support import app_settings
+        return float(app_settings.value('min_market_cap_yi')) * 1e8    # 界面单位是亿元
+    except Exception:
+        return float(MIN_TOTAL_MARKET_CAP)
+
+
+def invalidate_cache() -> None:
+    """覆盖表变了要让下限判断重来；市值表本身不必重拉，这里只清"是否生效"的短路。"""
+    global _CAP_CACHE
+    _CAP_CACHE = None if _CAP_CACHE is not None else None
+
+
 def _pure(symbol: str) -> str:
     s = (symbol or '').strip().lower()
     return s[2:] if s[:2] in ('sh', 'sz', 'bj') else s
@@ -202,12 +225,12 @@ def cap_map() -> Dict[str, float]:
 
 def passes(symbol: str) -> bool:
     """该票是否过市值下限。未知/未启用一律放行（fail-open）。"""
-    if not MARKET_CAP_FILTER_ENABLED:
+    if not enabled_flag():
         return True
     cap = cap_map().get(_pure(symbol))
     if cap is None:
         return True
-    return cap >= MIN_TOTAL_MARKET_CAP
+    return cap >= min_cap()
 
 
 def filter_symbols(symbols: Iterable[str]) -> List:
@@ -225,27 +248,27 @@ def filter_symbols(symbols: Iterable[str]) -> List:
 
 def apply_to_frame(df, symbol_col: str = 'symbol'):
     """按市值下限过滤 DataFrame（symbol 列裸码/带前缀均可）。未启用时原样返回。"""
-    if not MARKET_CAP_FILTER_ENABLED or df is None or df.empty:
+    if not enabled_flag() or df is None or df.empty:
         return df
     cmap = cap_map()
     if not cmap:
         return df
     caps = df[symbol_col].astype(str).str.lower().map(
         lambda s: cmap.get(_pure(s)))
-    keep = caps.isna() | (caps >= MIN_TOTAL_MARKET_CAP)   # 未知放行
+    keep = caps.isna() | (caps >= min_cap())   # 未知放行
     return df[keep]
 
 
 def count_below() -> int:
-    return sum(1 for c in cap_map().values() if c < MIN_TOTAL_MARKET_CAP)
+    return sum(1 for c in cap_map().values() if c < min_cap())
 
 
 def describe() -> str:
-    if not MARKET_CAP_FILTER_ENABLED:
+    if not enabled_flag():
         return '市值下限：关'
     if not cap_map():
-        return f'市值下限≥{MIN_TOTAL_MARKET_CAP/1e8:.0f}亿（表空，暂未生效，先跑 python market_cap.py --refresh）'
-    return f'总市值≥{MIN_TOTAL_MARKET_CAP/1e8:.0f}亿（已排除{count_below()}只小市值）'
+        return f'市值下限≥{min_cap()/1e8:.0f}亿（表空，暂未生效，先跑 python -m services.data.market_cap --refresh）'
+    return f'总市值≥{min_cap()/1e8:.0f}亿（已排除{count_below()}只小市值）'
 
 
 if __name__ == '__main__':

@@ -33,7 +33,8 @@ from app.config import (WECOM_PUSH_ENABLED, WECOM_AIBOT_ENABLED, WECOM_CLI_CHAT_
                         WECOM_PUSH_MIN_GAIN, WECOM_PUSH_MIN_VOL_RATIO, WECOM_PUSH_MAX_CHANGE,
                         WECOM_PUSH_EXCLUDE_ROLES,
                         WECOM_PUSH_SCAN_RECOMMEND_POOL, WECOM_PUSH_POOL_TOP_N, WECOM_PUSH_REC_TOP_N,
-                        WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_MATRIX_VETO, WECOM_PUSH_MATRIX_LABEL)
+                        WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_MATRIX_VETO, WECOM_PUSH_MATRIX_LABEL,
+                        WECOM_PUSH_APPLY_LOSER_BLACKLIST)
 from db.database import load_user_scan_pool, get_db_conn
 
 SCAN_API_BASE = 'http://127.0.0.1:3003/api/hot-stocks-scan'
@@ -329,6 +330,24 @@ def _truncate_utf8(s: str, max_bytes: int) -> str:
 
 # ---------- 扫描与过滤 ----------
 
+def _set(key: str, cfg_name: str, default):
+    try:
+        from services.support import app_settings
+        v = app_settings.value(key)
+        return v if v is not None else default
+    except Exception:
+        import app.config as _cfg
+        return getattr(_cfg, cfg_name, default)
+
+
+def push_daily_limit() -> int:
+    return int(_set('push_daily_limit', 'WECOM_PUSH_DAILY_LIMIT', 6))
+
+
+def push_pool_top_n() -> int:
+    return int(_set('push_pool_top_n', 'WECOM_PUSH_POOL_TOP_N', 60))
+
+
 def _load_pool_symbols() -> list:
     """本轮连续扫描的股票范围 = 用户自选池 ∪ 推荐池（盘前海选 + 当日已生成的推荐）。
 
@@ -356,7 +375,7 @@ def _load_pool_symbols() -> list:
         return out
     try:
         from services.pick.candidate_pool import load_pool
-        _add([p.get('symbol') for p in load_pool(limit=WECOM_PUSH_POOL_TOP_N)])
+        _add([p.get('symbol') for p in load_pool(limit=push_pool_top_n())])
     except Exception as e:
         print(f'[推送] 海选池并入失败（本轮只扫用户池）: {e}')
     try:
@@ -448,7 +467,29 @@ def _pass_filter(stock) -> bool:
     if m.get('verdict') in WECOM_PUSH_MATRIX_VETO:
         print(f"[推送] 矩阵否决 {stock.get('name')}: {m.get('verdict')}（{m.get('why')}）")
         return False
+    # 亏损黑名单（2026-10-17 补的漏口）：这张表以前**只有智能推荐**读它，
+    # 盘中 60 秒扫描不查，于是被拉黑的票还能从推送里回来 —— 同一只票一边"避让"一边"推荐你买"。
+    sym = (stock.get('symbol') or stock.get('code') or '').lower()
+    if sym and sym in _loser_blacklist():
+        print(f'[推送] 亏损黑名单否决 {stock.get("name") or sym}（近30天推荐后 T+1/T+3 亏超阈值）')
+        return False
     return True
+
+
+_LOSER_BL_CACHE = {'ts': 0.0, 'set': set()}
+
+
+def _loser_blacklist() -> set:
+    """当前禁推的票（带 60 秒级缓存，实际 TTL 由 recommend_review 那侧统一控）。"""
+    if not WECOM_PUSH_APPLY_LOSER_BLACKLIST:
+        return set()
+    try:
+        from services.pick.recommend_review import get_recent_loser_symbols
+        return get_recent_loser_symbols()
+    except Exception as e:
+        # 读不到就不否决：避让是"少推一只"的保守措施，不该把整条推送链路打断
+        print(f'[推送] 亏损黑名单读取失败(本轮不否决): {type(e).__name__}: {e}')
+        return set()
 
 
 # ---------- 矩阵判定（推送侧只读，不改评分） ----------
@@ -616,9 +657,9 @@ async def push_candidates_task():
 
         today = datetime.now().strftime('%Y-%m-%d')
         _ensure_table()
-        left = WECOM_PUSH_DAILY_LIMIT - pushed_today(today)
+        left = push_daily_limit() - pushed_today(today)
         if left <= 0:
-            print(f'[推送 {datetime.now():%H:%M:%S}] 今日达标推送已用满 {WECOM_PUSH_DAILY_LIMIT} 只额度，'
+            print(f'[推送 {datetime.now():%H:%M:%S}] 今日达标推送已用满 {push_daily_limit()} 只额度，'
                   f'本轮只记不推')
             return
         hits = []

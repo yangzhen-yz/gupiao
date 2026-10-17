@@ -58,8 +58,14 @@ export function useStockData() {
   }
 
   return {
-    stockNameMap, stockCodeMap, quickStocks, scanStockPool,
-    loadStockMap, loadQuickStocks, loadScanPool,
-    getStockName, getStockCode,
+    stockNameMap,
+    stockCodeMap,
+    quickStocks,
+    scanStockPool,
+    loadStockMap,
+    loadQuickStocks,
+    loadScanPool,
+    getStockName,
+    getStockCode,
   }
 }

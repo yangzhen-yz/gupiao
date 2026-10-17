@@ -24,6 +24,10 @@ const TAB_BY_SEG = {
   review: 'tab-review',
   sim: 'tab-sim',
   optimization: 'tab-optimization',
+  // 2026-10-17 新增子页必须同时登记这里：菜单用的是 tabGroups，而这段白名单决定
+  // hash 能不能被认出来 —— 漏了它，点「口径与开关」会解析失败并落回 DEFAULT_TAB（行动台），
+  // 表现为"点了没反应、跳回首页"。
+  settings: 'tab-settings',
 }
 const SEG_BY_TAB = Object.fromEntries(Object.entries(TAB_BY_SEG).map(([k, v]) => [v, k]))
 
@@ -47,7 +51,7 @@ let _lastSource = 'nav'
 
 export function hashPath(tab, param = '') {
   // 同时接受 Tab id（'tab-position'）与 hash 段名（'position'），调用方不必记两套命名
-  const seg = TAB_BY_SEG[tab] ? tab : (SEG_BY_TAB[tab] || 'desk')
+  const seg = TAB_BY_SEG[tab] ? tab : SEG_BY_TAB[tab] || 'desk'
   return param ? `#/${seg}/${encodeURIComponent(param)}` : `#/${seg}`
 }
 

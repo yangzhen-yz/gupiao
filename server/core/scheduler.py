@@ -323,7 +323,7 @@ def run_scheduler():
             return
         try:
             from services.data.kline_history import get_engine
-            stats = get_engine().get_db_stats() or {}
+            stats = get_engine().get_db_stats(with_scope=True) or {}
         except Exception as e:
             print(f'[盘后自检] 读不到本地日K库统计，跳过自检: {e}')
             return
@@ -382,7 +382,7 @@ def run_scheduler():
             """(选股范围内已覆盖, 范围总数) —— 判断"今天这根K线到底齐不齐"的唯一依据。"""
             try:
                 from services.data.kline_history import get_engine as _ge
-                st = _ge().get_db_stats() or {}
+                st = _ge().get_db_stats(with_scope=True) or {}
                 u = st.get('universeCount') or 0
                 c = st.get('latestDayCovered') or 0
                 if st.get('latestDate') != today_str:

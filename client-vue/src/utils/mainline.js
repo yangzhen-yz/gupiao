@@ -13,21 +13,39 @@
 
 export const MAINLINE_SECTORS = [
   // —— 进攻 / 题材主线 ——
-  { name: '粮食种业', key: 'agri', kind: 'attack',
-    keywords: ['种业', '种苗', '米业', '农发', '粮食', '北大荒', '登海', '荃银', '隆平', '农垦', '农化', '金健'] },
-  { name: '家电', key: 'appliance', kind: 'attack',
-    keywords: ['美的', '格力', '海尔', '海信', '石头', '九阳', '苏泊尔', '老板电器', '小天鹅'] },
-  { name: '医药商业', key: 'pharma', kind: 'attack',
-    keywords: ['药房', '人民同泰', '大参林', '一心堂'] },
-  { name: '半导体存储', key: 'semi', kind: 'attack',
-    keywords: ['半导体', '芯片', '集成电路', '存储', '中芯', '长电', '兆易', '北方华创', '韦尔'] },
+  {
+    name: '粮食种业',
+    key: 'agri',
+    kind: 'attack',
+    keywords: ['种业', '种苗', '米业', '农发', '粮食', '北大荒', '登海', '荃银', '隆平', '农垦', '农化', '金健'],
+  },
+  {
+    name: '家电',
+    key: 'appliance',
+    kind: 'attack',
+    keywords: ['美的', '格力', '海尔', '海信', '石头', '九阳', '苏泊尔', '老板电器', '小天鹅'],
+  },
+  { name: '医药商业', key: 'pharma', kind: 'attack', keywords: ['药房', '人民同泰', '大参林', '一心堂'] },
+  {
+    name: '半导体存储',
+    key: 'semi',
+    kind: 'attack',
+    keywords: ['半导体', '芯片', '集成电路', '存储', '中芯', '长电', '兆易', '北方华创', '韦尔'],
+  },
   // —— 防守 / 避险主线 ——
-  { name: '黄金贵金属', key: 'gold', kind: 'defense',
-    keywords: ['黄金', '白银', '贵金属', '金矿', '紫金', '银业', '铜业', '金业', '珠宝'] },
-  { name: '煤炭', key: 'coal', kind: 'defense',
-    keywords: ['煤炭', '煤业', '焦煤', '神华', '平煤', '新集', '潞安', '兖矿', '上海能源', '山煤'] },
-  { name: '银行', key: 'bank', kind: 'defense',
-    keywords: ['银行'] },
+  {
+    name: '黄金贵金属',
+    key: 'gold',
+    kind: 'defense',
+    keywords: ['黄金', '白银', '贵金属', '金矿', '紫金', '银业', '铜业', '金业', '珠宝'],
+  },
+  {
+    name: '煤炭',
+    key: 'coal',
+    kind: 'defense',
+    keywords: ['煤炭', '煤业', '焦煤', '神华', '平煤', '新集', '潞安', '兖矿', '上海能源', '山煤'],
+  },
+  { name: '银行', key: 'bank', kind: 'defense', keywords: ['银行'] },
 ]
 
 /**

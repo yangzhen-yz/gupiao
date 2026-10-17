@@ -16,9 +16,13 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API, KLINE_HISTORY_ENABLED)
+from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API, KLINE_HISTORY_ENABLED,
+                        RPS_PULLBACK_FROM_LOCAL, RPS_NAME_LIVE_MAX, RPS_LEADERBOARD_TTL)
 from db.database import get_db_conn
 from services.data.stock import _sync_get
+
+_LB_CACHE: Dict = {}    # 榜单结果内存缓存 {(period_days, top_n): (时间戳, 结果)}
+
 
 # 全市场 A 股代码列表的 fs 候选（按优先级尝试，合并去重）。
 # 注意：push2delay 在该 ut token 下，标准写法 `m:0+t:2,m:1+t:2` 仅返回沪A；
@@ -212,6 +216,81 @@ def _save_rps(period_days: int, rps_map: Dict[str, float], gains: Dict[str, floa
     conn.close()
 
 
+def _pullback_local(symbols: List[str], bars: int = 22) -> Dict[str, Optional[float]]:
+    """近 `bars` 根日K的"最新收盘相对期间最高价的回撤"，**全部从本地日K库算**。
+
+    为什么要换掉原来的写法（2026-10-17 性能实测）：旧实现对榜上 100 只票**逐只**调
+    `get_kline_data()` 去拉腾讯日K，`/api/rps` 因此要 38~50 秒 —— 而它真正需要的数据量
+    只是 100 行 × 22 根，本地 `stock_daily` 一条 SQL 就够。"页面整体都很慢"的体感，
+    很大一部分来自这个接口：它没有超时，前端一进去就把整页的 loading 挂住几十秒。
+
+    口径与旧实现逐值对齐：旧代码是 `kline[-22:]` 里取 `[-1][2]`（最新收盘）与 `max(k[3])`
+    （期间最高），本函数用 `ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC)`
+    取**该票自己的**最近 22 根，效果一致；不足 22 根返回 None（旧实现是 len<22 直接给 None）。
+
+    唯一的差别要说清楚：旧实现会在盘中把腾讯实时价拼成"今天这根"再算，本函数算到
+    **最后一根已收盘的日K**（收盘快照 18:15 后更新）。榜上的 `updateTime` 就是这个数据的日期。
+    """
+    if not symbols:
+        return {}
+    import sqlite3
+    from app.config import KLINE_HISTORY_DB_PATH
+    ph = ','.join('?' * len(symbols))
+    sql = f'''WITH ranked AS (
+        SELECT symbol, high, close,
+               ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) rn
+        FROM stock_daily WHERE symbol IN ({ph})
+    )
+    SELECT symbol,
+           MAX(CASE WHEN rn=1 THEN close END),
+           MAX(high),
+           COUNT(CASE WHEN rn<=22 THEN 1 END)
+    FROM ranked WHERE rn<=22 GROUP BY symbol'''
+    out: Dict[str, Optional[float]] = {}
+    try:
+        conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=30)
+        try:
+            rows = conn.execute(sql, [s[-6:] for s in symbols]).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f'[RPS] 本地回撤计算失败(本字段留空): {e}')
+        return {s: None for s in symbols}
+    got = {}
+    for sym, close, high, n in rows:
+        if close and high and n and n >= bars:
+            got[sym] = round((close / high - 1) * 100, 2)
+        else:
+            got[sym] = None
+    for s in symbols:
+        out[s] = got.get(s[-6:])
+    return out
+
+
+def _names_local(symbols: List[str]) -> Dict[str, str]:
+    """名称也从本地名录取（`stock_basic_full`，8871 条，日K同步时一起刷）。
+
+    旧实现是"名称缺失就逐只现拉行情"，同样是把外部请求塞进榜单接口里。
+    """
+    if not symbols:
+        return {}
+    import sqlite3
+    from app.config import KLINE_HISTORY_DB_PATH
+    ph = ','.join('?' * len(symbols))
+    try:
+        conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=30)
+        try:
+            rows = conn.execute(
+                f'SELECT symbol, name FROM stock_basic_full WHERE symbol IN ({ph})',
+                [s[-6:] for s in symbols]).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f'[RPS] 本地名录读取失败(名称退回代码): {e}')
+        return {}
+    return {(s if len(s) == 6 else s)[-6:]: (n or '') for s, n in rows if n}
+
+
 def _load_rps(period_days: int):
     conn = get_db_conn()
     _ensure_schema(conn)
@@ -252,11 +331,28 @@ async def refresh_rps(period_days: int = RPS_PERIOD_DAYS, limit_codes: Optional[
         source = 'tencent'
     if rps_map:
         await asyncio.to_thread(_save_rps, period_days, rps_map, gains)
+        _LB_CACHE.clear()      # 重算完让下一次请求拿到新榜，而不是继续吃 5 分钟旧缓存
     return {'periodDays': period_days, 'count': len(rps_map), 'source': source}
 
 
 async def get_rps_leaderboard(period_days: int = RPS_PERIOD_DAYS, top_n: int = RPS_TOP_N) -> Dict:
-    """RPS 强势股榜（降序前 top_n），供前端 /api/rps 展示。"""
+    """RPS 强势股榜（降序前 top_n），供前端 /api/rps 展示。
+
+    榜单结果按 (周期, 数量) 做 `RPS_LEADERBOARD_TTL` 秒内存缓存：RPS 本身一天只重算一次，
+    每次请求都重新组装纯属浪费（`/api/rps/refresh` 会主动清缓存，重算后立刻可见）。
+    """
+    key = (period_days, top_n)
+    hit = _LB_CACHE.get(key)
+    if hit and time.time() - hit[0] < RPS_LEADERBOARD_TTL:
+        return dict(hit[1], cached=True)
+    result = await _build_leaderboard(period_days, top_n)
+    if result.get('stocks'):
+        _LB_CACHE[key] = (time.time(), result)
+    return result
+
+
+async def _build_leaderboard(period_days: int = RPS_PERIOD_DAYS, top_n: int = RPS_TOP_N) -> Dict:
+    """真正组装榜单：读 rps_cache + 本地日K算回撤 + 本地名录补名称（全程不外联）。"""
     rps_map, gains, _ts = await asyncio.to_thread(_load_rps, period_days)
 
     if not rps_map:
@@ -267,6 +363,11 @@ async def get_rps_leaderboard(period_days: int = RPS_PERIOD_DAYS, top_n: int = R
             'error': 'RPS 缓存为空，请先触发 /api/rps/refresh 预计算',
         }
 
+    top = sorted(rps_map.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    syms = [s for s, _ in top]
+
+    # 名称：本地名录（stock_basic_full）优先，实在补不上的少数才去现拉，并且**封顶**。
+    # 旧写法是"缺名字就 100 只一起 gather 行情接口"，那是榜单慢的第二处外部依赖。
     name_map: Dict[str, str] = {}
     try:
         from db.database import load_stock_basic_info
@@ -276,43 +377,47 @@ async def get_rps_leaderboard(period_days: int = RPS_PERIOD_DAYS, top_n: int = R
                 name_map[sym.lower()] = val
     except Exception:
         pass
-
-    # 缺失/无效名称兜底：实时从行情接口补名称（次新股、未扫描股常见）
-    top = sorted(rps_map.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    missing = [sym for sym, _ in top if not name_map.get(sym) or name_map.get(sym) == sym]
+    for sym, nm in _names_local(syms).items():
+        name_map.setdefault(f'sh{sym}' if sym.startswith('6') else f'sz{sym}', nm)
+        name_map.setdefault(sym, nm)
+    missing = [s for s in syms if not name_map.get(s) or name_map.get(s) == s]
     if missing:
         try:
             from services.data.stock import get_stock_name
-            names = await asyncio.gather(*[get_stock_name(s) for s in missing], return_exceptions=True)
-            for sym, nm in zip(missing, names):
+            names = await asyncio.gather(*[get_stock_name(s) for s in missing[:RPS_NAME_LIVE_MAX]],
+                                         return_exceptions=True)
+            for sym, nm in zip(missing[:RPS_NAME_LIVE_MAX], names):
                 if isinstance(nm, str) and nm and nm.lower() != sym:
                     name_map[sym] = nm
         except Exception:
             pass
 
-    # 近1月回调（约22个交易日）：当前收盘价相对近1月最高价的回撤幅度
+    # 近1月回调：默认走本地日K（一次 SQL），RPS_PULLBACK_FROM_LOCAL=False 才退回逐只现拉
     pullback_map: Dict[str, Optional[float]] = {}
-    try:
-        from services.data.stock import get_kline_data
+    if RPS_PULLBACK_FROM_LOCAL:
+        pullback_map = await asyncio.to_thread(_pullback_local, syms)
+    else:
+        try:
+            from services.data.stock import get_kline_data
 
-        async def _calc_pullback(sym: str) -> Tuple[str, Optional[float]]:
-            try:
-                kline = await get_kline_data(sym)
-                if not kline or len(kline) < 22:
-                    return sym, None
-                recent = kline[-22:]
-                current = float(recent[-1][2])
-                high = max(float(k[3]) for k in recent)
-                if high > 0:
-                    return sym, round((current / high - 1) * 100, 2)
-            except Exception:
-                pass
-            return sym, None
+            async def _calc_pullback(sym: str) -> Tuple[str, Optional[float]]:
+                try:
+                    kline = await get_kline_data(sym)
+                    if not kline or len(kline) < 22:
+                        return sym, None
+                    recent = kline[-22:]
+                    current = float(recent[-1][2])
+                    high = max(float(k[3]) for k in recent)
+                    if high > 0:
+                        return sym, round((current / high - 1) * 100, 2)
+                except Exception:
+                    pass
+                return sym, None
 
-        pullbacks = await asyncio.gather(*[_calc_pullback(sym) for sym, _ in top])
-        pullback_map = {sym: pb for sym, pb in pullbacks}
-    except Exception:
-        pass
+            pullbacks = await asyncio.gather(*[_calc_pullback(s) for s in syms])
+            pullback_map = {sym: pb for sym, pb in pullbacks}
+        except Exception:
+            pass
 
     stocks = [{
         'symbol': sym,
