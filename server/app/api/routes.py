@@ -353,6 +353,18 @@ async def get_stocks(symbols: str):
 
 @router.get("/api/daily_recommendations", tags=["推荐记录"])
 async def get_daily_recommendations():
+    """历史推荐记录 + 实时盈亏
+
+    2026-10-17：整档响应加 30s 缓存。原实现每次请求都对全部历史推荐票批量拉腾讯行情
+    （实测 0.9~1.3s），而"历史推荐现在赚多少"是分钟级信息量，TabRecommend 又无轮询
+    （只 onMounted 一次），30 秒缓存对可见性无感、对重复打开/切 Tab 是数量级提升。
+    保存/删除推荐后由写接口负责清缓存。
+    """
+    global _DAILY_RECS_CACHE
+    import time as _t
+    now = _t.time()
+    if _DAILY_RECS_CACHE.get('payload') and now - _DAILY_RECS_CACHE['ts'] < 30:
+        return _DAILY_RECS_CACHE['payload']
     try:
         daily_recommendations = load_daily_recommendations()
         # 实时计算历史推荐盈利
@@ -446,9 +458,13 @@ async def get_daily_recommendations():
                     if buy_price > 0:
                         s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
 
-        return {"success": True, "data": daily_recommendations}
+        _payload = {"success": True, "data": daily_recommendations}
+        _DAILY_RECS_CACHE.update(ts=now, payload=_payload)
+        return _payload
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐记录失败: {str(error)}")
+
+_DAILY_RECS_CACHE: Dict = {'ts': 0.0, 'payload': None}   # 30s TTL，写接口负责清
 
 @router.get("/api/recommend-review", tags=["推荐记录"])
 async def get_recommend_review_api(days: int = 30):
@@ -1065,6 +1081,7 @@ async def post_daily_recommendations(record: Dict):
         saved = save_daily_recommendations(daily_recommendations)
         
         if saved:
+            _DAILY_RECS_CACHE['payload'] = None      # 写后清 30s 缓存，避免旧档多显示一轮
             return {"success": True, "message": "推荐记录保存成功"}
         else:
             raise HTTPException(status_code=500, detail="保存推荐记录失败: save_daily_recommendations 返回 False（详见服务端日志）")
@@ -1087,6 +1104,7 @@ async def delete_recommendation(date: str):
         # 被过滤掉的日期必须显式 DELETE，否则旧行残留（端点曾返回"删除成功"但记录仍在）。
         save_daily_recommendations(daily_recommendations)
         delete_daily_recommendations_by_date(date)
+        _DAILY_RECS_CACHE['payload'] = None          # 写后清 30s 缓存
         
         return {"success": True, "message": "推荐记录删除成功"}
     except HTTPException:
@@ -1248,7 +1266,23 @@ async def ai_diagnose(symbol: str):
     symbol = symbol.lower()
 
     try:
-        raw_data = await fetch_with_retry(symbol)
+        # 2026-10-17：三路数据 gather 并行（个股行情/K线/三大指数互不依赖），
+        # 省掉原来 ~1-1.5s 的串行 RTT 叠加，给 20s 前端预算留头。
+        _idx_syms = ','.join(info['symbol'] for info in INDEX_SYMBOLS.values())
+        _quote_task = asyncio.create_task(fetch_with_retry(symbol))
+        _kline_task = asyncio.create_task(asyncio.wait_for(get_kline_data(symbol), timeout=6.0))
+        _idx_task = asyncio.create_task(fetch_with_retry(_idx_syms))
+        raw_data, kline_data, idx_raw = await asyncio.gather(
+            _quote_task, _kline_task, _idx_task, return_exceptions=True
+        )
+        if isinstance(raw_data, BaseException) or not raw_data:
+            raise HTTPException(status_code=404, detail="获取股票数据失败")
+        if isinstance(kline_data, BaseException):
+            print(f'[AI诊断] K线获取失败: {kline_data}')
+            kline_data = []
+        if isinstance(idx_raw, BaseException):
+            print(f'[AI诊断] 大盘指数获取失败: {idx_raw}')
+            idx_raw = ''
         parsed_list = parse_tencent_batch_data(raw_data)
         if not parsed_list or len(parsed_list) == 0:
             raise HTTPException(status_code=404, detail="获取股票数据失败")
@@ -1306,21 +1340,19 @@ async def ai_diagnose(symbol: str):
             'ask1Vol': ask1_vol,
         }
 
-        kline_data = await asyncio.wait_for(get_kline_data(symbol), timeout=12.0)
-
+        # 指数数据已在上面与行情/K线并行拉取（idx_raw），此处只做解析拆分
         market_data = {}
-        for key, info in INDEX_SYMBOLS.items():
-            try:
-                idx_raw = await fetch_with_retry(info['symbol'])
-                idx_parsed = parse_tencent_batch_data(idx_raw)
-                if idx_parsed and len(idx_parsed) > 0:
-                    market_data[key] = {
-                        'name': info['name'],
-                        'price': idx_parsed[0].get('price', 0),
-                        'changePercent': idx_parsed[0].get('changePercent', 0)
-                    }
-            except Exception as _e:
-                print(f'[AI诊断] 大盘指数 {key} 获取失败: {_e}')
+        try:
+            _by_sym = {p['symbol'].lower(): p for p in parse_tencent_batch_data(idx_raw)} if idx_raw else {}
+            for key, info in INDEX_SYMBOLS.items():
+                p = _by_sym.get(info['symbol'].lower())
+                market_data[key] = ({'name': info['name'],
+                                     'price': p.get('priceRaw', 0),
+                                     'changePercent': p.get('changePercent', 0)}
+                                    if p else {'name': info['name'], 'price': 0, 'changePercent': 0})
+        except Exception as _e:
+            print(f'[AI诊断] 大盘指数解析失败: {_e}')
+            for key, info in INDEX_SYMBOLS.items():
                 market_data[key] = {'name': info['name'], 'price': 0, 'changePercent': 0}
 
         # 获取个股概念标签
@@ -2364,28 +2396,47 @@ async def kline_history_stats_api():
 # `SETTINGS_WRITE_USER_IDS` 里的账号 id，改动人会记进 app_settings.updated_by 便于回溯。
 @router.get("/api/settings", tags=["配置"])
 async def get_settings_api(user: Dict = Depends(current_user)):
-    """列出可改项（当前值/默认值/是否被覆盖/生效方式）+ 口径摘要与改动记录。"""
+    """列出可改项（当前值/默认值/是否被覆盖/生效方式）+ 口径摘要与改动记录。
+
+    2026-10-17 提速：口径摘要四项（范围/选票/预览一致性/陈旧数）原本在事件循环里
+    串行跑，冷路径合计 6.3s（selectable 流动性聚合一项就 5s）——改为两个 to_thread
+    并行（范围与预览互不依赖），叠加 universe 选票范围 10 分钟结果缓存，
+   热路径全命中时 <50ms。
+    """
     from services.support import app_settings as A
     items = A.list_items()
-    try:
-        from services.data import universe
-        summary = {
-            'dataScope': len(universe.eligible_symbols()),
-            'selectableScope': universe.selectable_count(),
-            'scopeText': universe.describe_selectable(),
-        }
-    except Exception as e:
-        summary = {'scopeError': str(e)[:120]}
-    try:
-        from services.support import settings_preview as P
-        p = P.parity_check()
-        summary['previewParity'] = p
-        if not p.get('ok'):
-            print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
-                  f" —— settings_preview 漏了条件，得补")
-        summary['staleOutOfSync'] = P.stale_no_sync_count()
-    except Exception as e:
-        summary['previewError'] = f'{type(e).__name__}: {str(e)[:120]}'
+
+    def _scope_summary():
+        try:
+            from services.data import universe
+            return {
+                'dataScope': len(universe.eligible_symbols()),
+                'selectableScope': universe.selectable_count(),
+                'scopeText': universe.describe_selectable(),
+            }
+        except Exception as e:
+            return {'scopeError': str(e)[:120]}
+
+    def _preview_summary():
+        out = {}
+        try:
+            from services.support import settings_preview as P
+            p = P.parity_check()
+            out['previewParity'] = p
+            if not p.get('ok'):
+                print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
+                      f" —— settings_preview 漏了条件，得补")
+            out['staleOutOfSync'] = P.stale_no_sync_count()
+        except Exception as e:
+            out['previewError'] = f'{type(e).__name__}: {str(e)[:120]}'
+        return out
+
+    scope_res, preview_res = await asyncio.gather(
+        asyncio.to_thread(_scope_summary),
+        asyncio.to_thread(_preview_summary),
+    )
+    summary = dict(scope_res)
+    summary.update(preview_res)
     return {"success": True, "data": {'items': items, 'summary': summary,
                                       'history': A.history(15),
                                       'canWrite': A.can_write(user),

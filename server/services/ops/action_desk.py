@@ -89,7 +89,8 @@ _URGENT_ACTIONS = ('stop_loss', 'reduce', 'take_profit')
 _ACTIONABLE_ACTIONS = _URGENT_ACTIONS + ('giveback',)
 
 _DESK_CACHE: Dict[str, Dict] = {}
-_DESK_CACHE_TTL = 8  # 秒：合并两个账号多标签页的连续请求
+_DESK_CACHE_TTL_LIVE = 8   # 秒：交易时段合并两个账号多标签页的连续请求（轮询同量级）
+_DESK_CACHE_TTL_IDLE = 60  # 秒：休市/盘后/盘前数据不会变，缓存 1 分钟（2026-10-17）
 
 
 def _norm(sym: str) -> str:
@@ -385,8 +386,11 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
 
     cache_key = f'{user_id}:{phase}'
     now_ts = time.time()
+    # 休市/盘后/盘前：推荐/收评/趋势扫描都已定型，8 秒缓存纯属浪费 —— 拉到 60s，
+    # 期间重复打开/多标签页全部命中（2026-10-17，配合情绪非交易时段短路）。
+    ttl = _DESK_CACHE_TTL_LIVE if phase in _LIVE_PHASES else _DESK_CACHE_TTL_IDLE
     hit = _DESK_CACHE.get(cache_key)
-    if hit and (now_ts - hit['ts']) < _DESK_CACHE_TTL:
+    if hit and (now_ts - hit['ts']) < ttl:
         return hit['data']
 
     # 1) 纯本地/文件读取（无网络）

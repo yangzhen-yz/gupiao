@@ -1,5 +1,5 @@
 """scheduler - 定时任务调度"""
-import asyncio, schedule, time
+import asyncio, schedule, time, threading
 from datetime import datetime, timedelta
 
 from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
@@ -150,6 +150,17 @@ async def auto_optimization_task():
 
 
 def run_scheduler():
+    # 2026-10-17 启动预热：universe 选票范围首算要 ~5s（流动性聚合），
+    # 不预热则重启后第一次开配置页白等 5s。放后台线程跑，不阻塞调度器注册。
+    def _prewarm_universe():
+        try:
+            from services.data import universe
+            universe.selectable_count()
+            print(f'[预热 {datetime.now():%H:%M:%S}] universe 选票范围缓存完成')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] universe 预热失败（不致命，首次请求会现算）: {e}')
+    threading.Thread(target=_prewarm_universe, daemon=True, name='prewarm-universe').start()
+
     def job_update_hot_search_ranking():
         asyncio.run(update_hot_search_ranking_task())
 

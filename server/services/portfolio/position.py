@@ -501,15 +501,34 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
 
     symbols = [p['symbol'].lower() for p in positions]
 
-    async def _fetch_quotes():
+    async def _fetch_all():
+        """大盘 + 持仓行情**一次批量拉取**（2026-10-17：原为两次并行 RTT，
+        且 combined 串会进 fetch_with_retry 的 10s 实时缓存，行动台 8s 轮询/
+        持仓页 60s 轮询大部分直接命中）。market 串与持仓串去重后一次请求，
+        再按 symbol 拆回两用；任一失败都不影响另一份（解析不到就退回 0）。"""
+        combined = list(dict.fromkeys(['sh000001'] + symbols))
         try:
-            data = await fetch_with_retry(','.join(symbols))
-            return {p['symbol'].lower(): p for p in parse_tencent_batch_data(data)}
+            data = await fetch_with_retry(','.join(combined))
+            parsed = parse_tencent_batch_data(data)
         except Exception as e:
             print(f'[持仓诊断] 行情拉取失败: {e}')
-            return {}
+            return 0.0, None, {}
+        by_sym = {p['symbol'].lower(): p for p in parsed}
+        market_change, market_open_change = 0.0, None
+        mq = by_sym.get('sh000001')
+        if mq:
+            market_change = float(mq.get('changePercent', 0) or 0)
+            try:
+                open_px = float(mq.get('open') or 0)
+                prev_close = float(mq.get('prevCloseRaw') or 0)
+                if open_px > 0 and prev_close > 0:
+                    market_open_change = (open_px / prev_close - 1) * 100
+            except (TypeError, ValueError):
+                pass
+        quote_map = {s: by_sym[s] for s in symbols if s in by_sym}
+        return market_change, market_open_change, quote_map
 
-    (market_change, market_open_change), quote_map = await asyncio.gather(_fetch_market(), _fetch_quotes())
+    market_change, market_open_change, quote_map = await _fetch_all()
 
     # 黑名单（复用推荐复盘）
     try:

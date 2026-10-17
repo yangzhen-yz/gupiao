@@ -170,13 +170,25 @@ def _calc_support_resistance(kline_data: List[List]) -> Dict:
     return {'support': supports, 'resistance': resistances}
 
 async def _fetch_hot_sectors() -> Dict:
-    """获取当日热点行业板块和概念板块（东方财富API）"""
+    """获取当日热点行业板块和概念板块（东方财富API）
+
+    2026-10-17：接东财共享熔断——冷却期间直接返回空，不再每请求白跑 2 次 10s 超时。
+    """
     import requests
     result = {'industry': [], 'concept': []}
+
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            print('[AI诊断] 东财冷却中，热点板块跳过（prompt 按无板块数据生成）')
+            return result
+    except Exception:
+        pass
 
     def _sync_fetch():
         _h = {**EASTMONEY_HEADERS}
         ind_list, con_list = [], []
+        ind_ok = con_ok = False
         try:
             ind_url = (
                 'https://push2delay.eastmoney.com/api/qt/clist/get'
@@ -188,6 +200,7 @@ async def _fetch_hot_sectors() -> Dict:
             r = requests.get(ind_url, headers=_h, timeout=10)
             data = r.json()
             if data.get('data') and data['data'].get('diff'):
+                ind_ok = True
                 for i, item in enumerate(data['data']['diff']):
                     ind_list.append({
                         'name': item.get('f14', ''),
@@ -200,6 +213,9 @@ async def _fetch_hot_sectors() -> Dict:
                     })
         except Exception as e:
             print(f'[AI诊断] 行业板块请求失败: {e}')
+        # 行业已失败（多为 IP 级封锁）→ 概念同样打不通，跳过省一次 10s 等待
+        if not ind_ok:
+            return ind_list, con_list, ind_ok, con_ok
         try:
             con_url = (
                 'https://push2delay.eastmoney.com/api/qt/clist/get'
@@ -211,6 +227,7 @@ async def _fetch_hot_sectors() -> Dict:
             r = requests.get(con_url, headers=_h, timeout=10)
             data = r.json()
             if data.get('data') and data['data'].get('diff'):
+                con_ok = True
                 _con_rank = 0
                 for i, item in enumerate(data['data']['diff']):
                     _name = item.get('f14', '')
@@ -228,10 +245,20 @@ async def _fetch_hot_sectors() -> Dict:
                     })
         except Exception as e:
             print(f'[AI诊断] 概念板块请求失败: {e}')
-        return ind_list, con_list
+        return ind_list, con_list, ind_ok, con_ok
 
     try:
-        result['industry'], result['concept'] = await asyncio.to_thread(_sync_fetch)
+        ind_list, con_list, ind_ok, con_ok = await asyncio.to_thread(_sync_fetch)
+        result['industry'], result['concept'] = ind_list, con_list
+        # 熔断计数：任一成功即复位，全失败累计（与 fundflow._clist 共用 clist 作用域）
+        try:
+            from services.data import eastmoney_guard
+            if ind_ok and con_ok:
+                eastmoney_guard.ok('clist')
+            else:
+                eastmoney_guard.fail('clist')
+        except Exception:
+            pass
     except Exception as e:
         print(f'[AI诊断] 板块数据获取异常: {e}')
     return result
@@ -480,6 +507,9 @@ async def _call_deepseek_api(prompt: str) -> str:
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
+    # 2026-10-17：推理模型（ark DeepSeek-V4-flash）默认开启思维链，
+    # max_tokens=1500 时思维链吃掉大部分预算，实测生成 >30s 必然超时；
+    # 关闭 thinking + 上限降到 1000 后实测 7-13s 完成（诊断 JSON 实际用量 ~500-730 token）。
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
@@ -487,16 +517,25 @@ async def _call_deepseek_api(prompt: str) -> str:
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3,
-        "max_tokens": 1500,
-        "response_format": {"type": "json_object"}
+        "max_tokens": 1000,
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"}
     }
 
+    # 端点延迟随负载波动大（实测 7-13s），专用 18s 超时（全局 HTTP_TIMEOUT=10s 会间歇性 504）；
+    # 前端该请求已放宽到 20s，两边预留 ~2s 给数据 gather。
+    _AI_TIMEOUT = 18.0
+
     # -fix: 改用 requests 同步 POST + asyncio.to_thread（去 httpx 依赖，规避断连问题）
-    def _do_post():
-        return _sync_post(url, payload, headers=headers, timeout=HTTP_TIMEOUT)
+    def _do_post(body):
+        return _sync_post(url, body, headers=headers, timeout=_AI_TIMEOUT)
 
     try:
-        response = await asyncio.to_thread(_do_post)
+        response = await asyncio.to_thread(_do_post, payload)
+        # 防御：个别模型/端点不认识 thinking 参数会返 400，去掉再试一次
+        if response.status_code == 400 and 'thinking' in payload:
+            fallback = {k: v for k, v in payload.items() if k != 'thinking'}
+            response = await asyncio.to_thread(_do_post, fallback)
         response.raise_for_status()
         result = response.json()
         content = result['choices'][0]['message']['content']

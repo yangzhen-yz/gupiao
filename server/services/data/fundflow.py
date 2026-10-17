@@ -269,30 +269,31 @@ _LAST_GOOD_HIDDEN: Dict[str, List[Dict]] = {}
 # ========== clist 熔断（2026-10-17）：东财对 clist 接口偶发 IP 级限流/封禁，
 # 表现为 403 / 连接被重置(RemoteDisconnected)。前端 30s 轮询若每次都硬重试，
 # 反而会越重试越被封。连续失败达阈值即进入冷却窗口，期间直接走快照兜底、不再打东财，
-# 既降低被封概率，也避免无谓重试拖垮响应。解封后首次成功即复位并落盘快照。 ==========
-_CLIST_FAIL_STREAK = 0
-_CLIST_COOLDOWN_UNTIL = 0.0
-_CLIST_FAIL_THRESHOLD = 3          # 连续失败 3 次（≈3 轮轮询）即熔断
-_CLIST_COOLDOWN_SEC = 300          # 冷却 5 分钟
+# 既降低被封概率，也避免无谓重试拖垮响应。解封后首次成功即复位并落盘快照。
+# 2026-10-17 起熔断状态收敛到 services.data.eastmoney_guard（情绪/AI诊断等热路径共用），
+# 本模块只保留委托，行为与阈值不变。 ==========
+_EASTMONEY_GUARD = None
+
+
+def _guard():
+    """共享熔断器（2026-10-17 起收敛到 services.data.eastmoney_guard，情绪/AI诊断等共用）"""
+    global _EASTMONEY_GUARD
+    if _EASTMONEY_GUARD is None:
+        from services.data import eastmoney_guard
+        _EASTMONEY_GUARD = eastmoney_guard
+    return _EASTMONEY_GUARD
 
 
 def _clist_circuit_open() -> bool:
-    return time.time() < _CLIST_COOLDOWN_UNTIL
+    return _guard().skip('clist')
 
 
 def _clist_on_success() -> None:
-    global _CLIST_FAIL_STREAK, _CLIST_COOLDOWN_UNTIL
-    _CLIST_FAIL_STREAK = 0
-    _CLIST_COOLDOWN_UNTIL = 0.0
+    _guard().ok('clist')
 
 
 def _clist_on_failure() -> None:
-    global _CLIST_FAIL_STREAK, _CLIST_COOLDOWN_UNTIL
-    _CLIST_FAIL_STREAK += 1
-    if _CLIST_FAIL_STREAK >= _CLIST_FAIL_THRESHOLD and time.time() >= _CLIST_COOLDOWN_UNTIL:
-        _CLIST_COOLDOWN_UNTIL = time.time() + _CLIST_COOLDOWN_SEC
-        print(f'[资金流向] clist 连续失败 {_CLIST_FAIL_STREAK} 次，进入冷却 {_CLIST_COOLDOWN_SEC}s'
-              f'（期间使用快照兜底，不再请求东财）')
+    _guard().fail('clist')
 
 
 # ========== 新浪兜底（2026-10-17）：东财 clist 被封锁期间的替代资金流来源 ==========

@@ -212,7 +212,9 @@
     error.value = ''
     diagData.value = null
     try {
-      const result = await apiFetch(`/api/ai-diagnose/${symbol}`)
+      // 2026-10-17：AI 诊断为显式用户动作（弹窗带 loading），后端已关 thinking 提速至 ~8s，
+      // 仍放宽到 20s 兜底（默认 10s 会在模型偶发慢 generation 时误伤）
+      const result = await apiFetch(`/api/ai-diagnose/${symbol}`, { timeout: 20000 })
       if (result.success) {
         diagData.value = result.data
       } else {

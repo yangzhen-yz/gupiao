@@ -42,8 +42,9 @@ _FLAG_TO_CFG = {'universe_main_board_only': 'UNIVERSE_MAIN_BOARD_ONLY',
 
 
 def invalidate_cache() -> None:
-    """配置改动后打掉本进程缓存（范围清单 + ST 名录）。"""
+    """配置改动后打掉本进程缓存（范围清单 + ST 名录 + 选票范围）。"""
     _SCOPE_CACHE['value'] = []
+    _SELECTABLE_CACHE['value'] = []
     try:
         excluded_symbols.cache_clear()
     except Exception:
@@ -123,6 +124,8 @@ def _db_symbols() -> List[str]:
 
 _SCOPE_CACHE = {'ts': 0.0, 'value': []}
 _SCOPE_TTL = 600.0      # 选股范围一天只会因"新股上市/市值刷新"变一次，10 分钟缓存足够新
+_SELECTABLE_CACHE = {'ts': 0.0, 'value': []}
+_SELECTABLE_TTL = 600.0  # 选票范围同节奏（2026-10-17：/api/settings 每次要算 5s，加结果缓存）
 
 
 def eligible_symbols(symbols: Optional[Iterable[str]] = None) -> list:
@@ -172,13 +175,21 @@ def selectable_symbols() -> list:
     MA60 / 60 日高点 / RPS 全被这个洞污染。所以：
       · `eligible_symbols()` = 数据层（同步清单 + 覆盖率分母，稳定）
       · `selectable_symbols()` = 选票层（海选百分位排名、推荐入口、趋势/批量扫描）
+
+    2026-10-17：加 10 分钟结果缓存（流动性聚合一次约 5s，/api/settings 与预告接口
+    每次打开都要问一遍）。配置改动时 `invalidate_cache()` 会一起打掉。
     """
+    import time as _time
+    if _SELECTABLE_CACHE['value'] and _time.time() - _SELECTABLE_CACHE['ts'] < _SELECTABLE_TTL:
+        return list(_SELECTABLE_CACHE['value'])
     try:
         from services.data import liquidity
-        return liquidity.filter_codes(eligible_symbols())
+        result = liquidity.filter_codes(eligible_symbols())
     except Exception as e:
         print(f'[股票范围] 流动性这层没接上(按不含流动性处理): {e}')
-        return eligible_symbols()
+        result = eligible_symbols()
+    _SELECTABLE_CACHE.update(ts=_time.time(), value=list(result))
+    return list(result)
 
 
 def selectable_count() -> int:

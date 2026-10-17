@@ -41,12 +41,24 @@ from db.database import get_db_conn
 from services.ops.review import (_em_zt_pool_get, _em_zb_pool_get, _em_batch_change_percent,
                              _fetch_market_breadth, _calc_lianban_ladder,
                              _calc_sentiment_cycle)
-from services.data.trading_calendar import is_trading_day
+from services.data.trading_calendar import is_trading_day, get_session_phase
 
 # 进程内缓存：情绪是"全市场一个答案"，所有用户/所有 Tab 共用一份即可
 _CACHE: Dict = {'ts': 0.0, 'data': None}
 _REFRESH_FLAG = threading.Lock()      # singleflight：同一时刻只允许一条线程打接口
 _LAST_SAVE_TS = 0.0
+# 只有交易日盘中才值得打接口取情绪（2026-10-17）：与调度器预热窗口一致
+_COLLECT_PHASES = {'auction', 'morning', 'lunch', 'mid', 'tail'}
+_EM_GUARD = None
+
+
+def _em_guard():
+    """东财共享熔断器（懒加载避免循环导入）"""
+    global _EM_GUARD
+    if _EM_GUARD is None:
+        from services.data import eastmoney_guard
+        _EM_GUARD = eastmoney_guard
+    return _EM_GUARD
 # 昨日涨停池按"今天"缓存（昨天的名单收盘后就是定版，不必每次刷新重拉）
 _YEST_MEMO: Dict = {'date': '', 'pool': []}
 # 昨日涨停溢价的批量行情偶尔整批失败（2026-10-14 实测 push2delay 晚间 RemoteDisconnected）。
@@ -197,8 +209,39 @@ def _relay_stats(today_zt_pool: List[Dict], yest_pool: List[Dict],
 
 
 def _sync_collect() -> Dict:
-    """同步取数（调用方用 asyncio.to_thread 包）：4 类东财请求 + 昨日溢价批量行情"""
+    """同步取数（调用方用 asyncio.to_thread 包）：4 类东财请求 + 昨日溢价批量行情
+
+    2026-10-17 两条提速（根因：东财 clist 被 IP 封锁时，6 个请求各带 2 次重试
+    × 6s 超时串行硬打，冷路径实测 ~10s，把默认首页行动台拖到 9.2s）：
+      1. **非交易时段短路**：只在交易日盘中（竞价~尾盘）才打接口。周末/节假日/
+         盘后/盘前打开的页面，看到的情绪本就该是"上一交易日收评定版值"——
+         与持仓页 _load_today_sentiment、行动台 headline 的既有语义一致。
+      2. **共享熔断**：东财连续失败 3 次即冷却 5 分钟（eastmoney_guard），
+         期间直接走收评兜底，不再白等重试。
+    """
     now = datetime.now()
+    # 1) 非交易时段：不碰东财，直接给"上一交易日"口径
+    try:
+        phase = get_session_phase(now).get('phase', '')
+    except Exception:
+        phase = ''
+    if phase not in _COLLECT_PHASES:
+        fb = _fallback_from_review()
+        if fb:
+            fb = dict(fb)
+            fb['source'] = 'review_fallback'
+            return fb
+        return _empty_snapshot(f'非交易时段({phase or "未知"})')
+
+    # 2) 东财熔断中：同样走兜底，不硬打
+    if _em_guard().skip('clist'):
+        fb = _fallback_from_review()
+        if fb:
+            fb = dict(fb)
+            fb['source'] = 'review_fallback'
+            return fb
+        return _empty_snapshot('东财冷却中')
+
     today_str = now.strftime('%Y%m%d')
     yest_pool = _yesterday_zt_pool(now)
 
@@ -210,6 +253,13 @@ def _sync_collect() -> Dict:
                               retries=2, timeout=6.0) or []
     breadth = _fetch_market_breadth()
     ladder = _calc_lianban_ladder(zt_pool)
+
+    # 熔断计数：涨停池空（重试后仍拿不到）记一次失败；正常拿到即复位。
+    # 盘中全市场零涨停基本不存在，误判的代价也只是 5 分钟内走收评兜底，可自愈。
+    if zt_pool:
+        _em_guard().ok('clist')
+    else:
+        _em_guard().fail('clist')
 
     # 昨日涨停股今日表现（赚钱效应）：母数取昨日涨停池，限 200 只控制请求批数
     codes = [str(i.get('c', '')) for i in yest_pool if i.get('c')][:SENTIMENT_PREMIUM_MAX_CODES]
@@ -345,8 +395,9 @@ def peek_cached(max_age_sec: Optional[int] = None) -> Optional[Dict]:
     return out
 
 
-# 20 秒内不重开一轮取数：行动台用 wait_for(2s) 包本函数，超时会立刻释放 singleflight，
-# 没有冷却的话 30 秒轮询 × 多个标签页会排出一串同时打东财的重活 —— 恰是限流最怕的突发。
+# 20 秒内不重开一轮取数：没有冷却的话 30 秒轮询 × 多个标签页会排出一串同时打东财的
+# 重活 —— 恰是限流最怕的突发。（2026-10-17 纠正：wait_for 超时并不会取消 to_thread
+# 里的刷新、也不会释放锁，"超时即释放 singleflight"的旧注释是错的，锁改非阻塞抢。）
 _REFRESH_COOLDOWN_SEC = 20
 _START_TS = 0.0
 
@@ -365,9 +416,11 @@ async def get_sentiment(force: bool = False) -> Dict:
         return cached
 
     # singleflight：已在刷新就返回旧值，不排队打第二拨接口。
-    # 拿锁只等 2 秒——这条路径在请求线程里（asyncio.to_thread），无限等会让一个
-    # 卡住的刷新把同页其他持仓/行动台请求一起拖死。
-    if not _REFRESH_FLAG.acquire(timeout=2):
+    # 非阻塞抢锁（2026-10-17）：本函数在事件循环里被 await，threading.Lock 的
+    # timeout 等待会把**整个事件循环冻住**（行动台冷路径实测白堵 2s，且 wait_for
+    # 的取消对 to_thread 不生效，2s 预算形同虚设）。抢不到就说明有别人正在刷新，
+    # 直接拿旧值/空壳，下轮轮询（30s）自然见到新值。
+    if not _REFRESH_FLAG.acquire(blocking=False):
         return cached or _empty_snapshot('刷新中')
     _START_TS = time.time()
     try:
