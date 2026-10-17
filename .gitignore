@@ -31,3 +31,14 @@ screenshots/
 # 买法矩阵重跑的输出（可复现的分析产物，不是代码；跑一次几分钟，没必要进版本库）
 server/analysis_out/
 
+# ---------- 本地开发辅助与运行时状态（2026-10-17 清理，一律不入库）----------
+# .idea/ 是 IDE 状态；shot_internal.py 里写着公司内网地址；
+# market_alert.json 每 25 分钟被定时任务重写，进版本库只会产生噪声 diff。
+.idea/
+shot_internal.py
+server/market_alert.json
+.playwright-cli/
+# 根目录的临时筛选输出（脚本本身的输出统一去 server/analysis_out/）
+/*.csv
+# 一次性性能探针（含写死的本机绝对路径，不属于代码）
+server/profile_probe*.py

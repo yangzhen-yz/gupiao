@@ -7,7 +7,12 @@ from db.database import (load_hot_search_ranking, load_hot_stock_buttons, load_u
 from services.data.stock import fetch_with_retry, parse_tencent_batch_data
 
 # ========== 大盘预警持久化 ==========
-_ALERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'market_alert.json')
+# 路径要锚在 server/ 根：这个模块 2026-10-16 从 services/ 搬进 services/strategy/ 之后，
+# 旧那句 `dirname(__file__) + '/..'` 变成了指向 services/，预警会写到新位置，
+# 而仓库里那份 server/market_alert.json 从此不再更新 —— 不报错，只是数据悄悄错位。
+_ALERT_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'market_alert.json')
 
 def save_market_alert(alert_data: Dict):
     """保存最新大盘预警到文件（供前端轮询）"""

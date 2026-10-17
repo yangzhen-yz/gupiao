@@ -20,9 +20,11 @@ import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-SERVER = r'D:\Desktop\guizhou\gupiao\server'
+# 不要把本机绝对路径和本机 Python 写死：换机器/换账号就直接跑不起，
+# 还把 Windows 用户名留在仓库里（sys.executable 就是"当前这个解释器"，最准）。
+SERVER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(SERVER, 'data', 'history_kline.db')
-EXE = r'C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe'
+EXE = sys.executable
 
 
 def sync_procs():
