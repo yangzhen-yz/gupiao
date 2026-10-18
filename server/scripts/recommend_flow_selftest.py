@@ -183,6 +183,46 @@ import json as _json
 p = _json.loads(sh[0]['payload'])
 ck('kept' in p, '影子 payload 新增 kept 名单（快照区分"放行/未评估"靠它）')
 
+# P2-2 模式标签：线上主链路要第一次真的算出 verdict 并落库
+print('\n[模式标签]')
+mode_rows = conn.execute(
+    "SELECT rec_date, symbol, name, mode FROM daily_recommendations ORDER BY rec_date DESC LIMIT 6"
+).fetchall()
+ck(len(mode_rows) > 0, f'推荐记录能读到（{len(mode_rows)} 行）')
+ck({r[3] for r in mode_rows} <= {'dixi', 'daban', 'chaodi', 'relay', 'chase', 'ban',
+                                'reduce', 'other', None, ''},
+   f'mode 取值都在枚举内（实得 {[r[3] for r in mode_rows]}）')
+ck(any(r[3] for r in mode_rows), '至少一条推荐带上了模式标签（不是全空 = 没接上）')
+from services.strategy.buy_rules import pick_mode, mode_label
+ck(pick_mode('可低吸') == 'dixi' and pick_mode('可打板') == 'daban'
+   and pick_mode('不接力') == 'relay' and pick_mode(None, {'limitClose': True}) == 'relay'
+   and pick_mode('中性') == 'other',
+   'verdict→mode 映射（含"昨日封板却没判定"要记成接力这条漏口告警）')
+ck(mode_label('daban') == '打板' and mode_label('') == '其他', '模式中文名（老记录无标签归"其他"）')
+from services.pick.recommend_review import get_review_summary
+summ = get_review_summary(120)
+ck('by_mode' in summ, f'复盘汇总透出 by_mode（available={summ.get("available")}）')
+
+# P0-1 执行诚实化：区间与超价必须随 buy_timing JSON 一起落库（刷新后卡片还要能置灰）
+print('\n[执行诚实化]')
+conn9 = sqlite3.connect(_TMP)
+conn9.row_factory = sqlite3.Row
+bt_rows = [dict(r) for r in conn9.execute(
+    "SELECT symbol, name, price, buy_timing FROM daily_recommendations "
+    "WHERE rec_date='2026-10-19'").fetchall()]
+conn9.close()
+ck(len(bt_rows) > 0, f'今日推荐读得到（{len(bt_rows)} 行）')
+import json as _j2
+timings = [(_j2.loads(r['buy_timing'] or '{}'), r) for r in bt_rows]
+ck(all(t.get('buyLow') and t.get('buyHigh') for t, _r in timings),
+   f'每只都带买入区间（实得 {[(t.get("buyLow"), t.get("buyHigh")) for t, _r in timings]}）')
+ck(all(t.get('limitPrice') for t, _r in timings), '每只都带追价上限 limitPrice')
+ck(all(t.get('overPct') is not None for t, _r in timings),
+   f'超价幅度落库（实得 {[t.get("overPct") for t, _r in timings]}%）')
+ck(all(t.get('execHint') for t, _r in timings), '文案不为空（超价警告或实测口径说明）')
+ck(any(t.get('overPct', 0) > 0 for t, _r in timings),
+   '这批测试行情里至少一只是"现价已越过买入上限"——否则置灰逻辑永远没被测到')
+
 # 读端：报告脚本应能吃到这批数据
 conn.close()
 print('\n[读] snapshot_report')
@@ -213,6 +253,35 @@ txt = buf.getvalue()
 ck('已攒快照' in txt, f'report 读到快照\n{txt[:400]}\n[err] {ERR[0]}')
 ck('阶段分布' in txt, 'report 输出阶段分布')
 print(txt[:1500])
+
+# [9] 一只都不推的那一批：空仓分支必须照样落快照
+# （modes 之类的变量如果在 `if not top3` 之后才声明，闭包读到就是 NameError，
+#   而快照自己包了 try/except，会静默不落库 —— 恰恰丢掉最需要的空仓日样本）
+print('\n[空仓分支]')
+RR.get_recent_loser_symbols = lambda: {s for s in [
+    'sh600001', 'sz000002', 'sh600000', 'sh601111', 'sh605555']}
+conn2 = sqlite3.connect(_TMP)
+conn2.execute("DELETE FROM daily_recommendations WHERE rec_date='2026-10-19'")
+conn2.execute("DELETE FROM strategy_snapshot WHERE snap_date='2026-10-19'")
+conn2.execute("DELETE FROM strategy_snapshot_batch WHERE snap_date='2026-10-19'")
+conn2.commit()
+conn2.close()
+import datetime as _dmod
+R.datetime.now = staticmethod(lambda: _dmod.datetime(2026, 10, 19, 13, 30, 5))
+res2 = asyncio.run(R.auto_generate_recommendations_task())
+ck(res2 is None or not (res2 or {}).get('recommendations'),
+   f'全被黑名单挡住时应无推荐（实得 {len((res2 or {}).get("recommendations") or [])} 只）')
+conn3 = sqlite3.connect(_TMP)
+try:
+    b = conn3.execute("SELECT batch, recommended, candidates FROM strategy_snapshot_batch "
+                      "WHERE snap_date='2026-10-19'").fetchall()
+except sqlite3.OperationalError:
+    b = []
+n_row = conn3.execute("SELECT COUNT(1) FROM strategy_snapshot WHERE snap_date='2026-10-19'").fetchone()[0]
+conn3.close()
+ck(len(b) == 1 and b[0][0] == '13:30', f'空仓批次照样落了批次头（实得 {b}）')
+ck(b and b[0][1] == 0 and b[0][2] == 0, '头里 recommended=0、candidates=0（这才是"空仓是正式状态"）')
+ck(n_row > 0, f'扫描过的票仍然有票级快照（{n_row} 行）')
 
 print()
 print('全部通过' if not FAILS else f'失败 {len(FAILS)} 项: {FAILS}')

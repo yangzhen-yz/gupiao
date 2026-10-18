@@ -139,6 +139,15 @@
         >
           <TabSettings />
         </div>
+        <!-- 回测曲线（复盘组第四个子页，2026-10-18）：历史推荐按买卖口径重放的净值曲线
+             与真实胜率走势。曲线口径与命令行 scripts/rec_exit_sim.py 共用一份实现 -->
+        <div
+          :class="['tab-content', { active: activeTab === 'tab-backtest' }]"
+          v-show="activeTab === 'tab-backtest'"
+          v-if="mountedTabs.has('tab-backtest')"
+        >
+          <TabBacktest />
+        </div>
       </div>
     </div>
     <!-- 当前登录账号（固定在左下角浮层，不占用顶部空间）：持仓等私有数据按账号隔离 -->
@@ -208,6 +217,7 @@
   const TabFlow = defineAsyncComponent(() => import('./components/tabs/TabFlow.vue'))
   const TabOptimization = defineAsyncComponent(() => import('./components/tabs/TabOptimization.vue'))
   const TabSettings = defineAsyncComponent(() => import('./components/tabs/TabSettings.vue'))
+  const TabBacktest = defineAsyncComponent(() => import('./components/tabs/TabBacktest.vue'))
   const KlineModal = defineAsyncComponent(() => import('./components/KlineModal.vue'))
   const AiDiagModal = defineAsyncComponent(() => import('./components/AiDiagModal.vue'))
 
@@ -229,6 +239,7 @@
     'tab-sim': '模拟交易',
     'tab-optimization': '自动优化',
     'tab-settings': '口径与开关',
+    'tab-backtest': '回测曲线',
     'tab-desk': '行动台',
   }
   const tabGroups = [
@@ -245,7 +256,7 @@
     {
       key: 'review',
       label: '复盘',
-      tabs: ['tab-review', 'tab-optimization', 'tab-settings'].map(id => ({ id, label: TAB_LABELS[id] })),
+      tabs: ['tab-review', 'tab-optimization', 'tab-settings', 'tab-backtest'].map(id => ({ id, label: TAB_LABELS[id] })),
     },
   ]
   tabGroups.forEach(g => {

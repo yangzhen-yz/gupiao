@@ -183,6 +183,23 @@
             >⚠️ {{ r.buySellPoints.buyTiming.execHint }}</span
           >
         </div>
+        <!-- 执行诚实化（2026-10-18，P0-1）：低吸区间是系统真正的 edge（历史 T+1 胜率 60.4%），
+             所以它做成默认那颗按钮；"按现价买"这颗才是被置灰的对象（43.2% 那个口径）。 -->
+        <div v-if="buyRange(r)" class="recommend-exec">
+          <button class="exec-btn primary" @click="copyPlan(r, 'low')">
+            挂低吸单 {{ buyRange(r) }}
+          </button>
+          <button class="exec-btn chase" :class="{ off: isChase(r) }" :disabled="isChase(r)"
+            @click="copyPlan(r, 'now')">
+            {{ isChase(r) ? '现价追高 · 已置灰' : '按现价 ' + nowPrice(r) }}
+          </button>
+          <span class="exec-meta">
+            现价{{ overTxt(r) }}；今天最多付到 {{ r.buySellPoints.buyTiming.limitPrice }}
+          </span>
+        </div>
+        <div v-if="r.buySellPoints?.buyTiming?.exitNote" class="recommend-exit">
+          {{ r.buySellPoints.buyTiming.exitNote }}
+        </div>
         <div v-if="r.riskControl" class="recommend-risk-box">
           <div class="recommend-risk-title">🛡️ 风控建议</div>
           <div class="recommend-risk-row">
@@ -290,6 +307,54 @@
   function openKlineFor(r, dateStr) {
     if (!r || !r.symbol) return
     emit('open-kline', r.symbol, toISODate(dateStr))
+  }
+
+  /* ---------- 执行诚实化（2026-10-18，P0-1）----------
+     区间与超价幅度都由后端 `services/strategy/buy_range.py` 算好随卡片下发，
+     前端只做"读出来、按不按得下去"这一件事 —— 不在浏览器里再算一遍第二个口径。 */
+  const bt = r => (r && r.buySellPoints && r.buySellPoints.buyTiming) || null
+  function buyRange(r) {
+    const t = bt(r)
+    if (!t || !t.buyLow || !t.buyHigh) return ''
+    return `${t.buyLow}~${t.buyHigh}`
+  }
+  function nowPrice(r) {
+    return (r && r.buySellPoints && r.buySellPoints.current) || (r && r.price) || ''
+  }
+  // 追高判定用后端的 overPct（现价高出买入上限多少），阈值与后端警告文案对齐取 1%：
+  // 低吸参考价按构造就低于现价，0.x% 的差是振幅噪声，不该因此把按钮锁死；
+  // 越过 1% 才是"现价追入"那个 43.2% 的口径，这颗按钮就该按不下去。
+  function isChase(r) {
+    const t = bt(r)
+    return !!(t && t.overPct != null && t.overPct >= 1)
+  }
+  function overTxt(r) {
+    const t = bt(r)
+    if (!t || t.overPct == null) return '与区间关系未知'
+    if (t.overPct >= 1) return `已越过上限 ${t.overPct}%（这就是追高）`
+    if (t.overPct > 0) return `高出 ${t.overPct}%（噪声范围内，可以买）`
+    return `还低 ${Math.abs(t.overPct)}%（在区间内）`
+  }
+  function copyPlan(r, mode) {
+    const t = bt(r)
+    if (mode === 'now' && isChase(r)) {
+      // 这颗按钮在追高时是 disabled 的，点不到；留着这层判断是因为键盘回车能绕过 disabled
+      showNotification('现价已越过买入上限，这个口径历史 T+1 只有 43.2% 胜率——改挂低吸价', 'warning', 3000)
+      return
+    }
+    const txt =
+      mode === 'low'
+        ? `${r.name || ''} ${r.symbol || ''} 挂低吸单 ${buyRange(r)}（追价上限 ${t.limitPrice}）`
+        : `${r.name || ''} ${r.symbol || ''} 现价 ${nowPrice(r)}`
+    const done = () => showNotification(`已复制：${txt}`, 'success', 2500)
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard
+        .writeText(txt)
+        .then(done)
+        .catch(() => showNotification('复制失败，请按卡片上的价手动挂单', 'warning', 3000))
+    } else {
+      showNotification('这台浏览器不给剪贴板权限，请按卡片上的价手动挂单', 'warning', 3000)
+    }
   }
   const todayRecommend = ref([])
   const historyRecommend = ref([])
@@ -460,6 +525,51 @@
     border-radius: 6px;
     padding: 0.25rem 0.5rem;
     line-height: 1.5;
+  }
+  /* 执行按钮（2026-10-18，P0-1）：低吸是默认动作，现价追入才是被置灰的那个。
+     配色不用红绿 —— 这两个颜色在本项目里已经欠给"涨/跌"了，按钮再抢就会读反。 */
+  .recommend-exec {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    flex-wrap: wrap;
+    margin: 0.25rem 0 0;
+  }
+  .exec-btn {
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.25rem 0.625rem;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid var(--accent-primary, #2563eb);
+    background: var(--accent-primary, #2563eb);
+    color: #fff;
+  }
+  .exec-btn.chase {
+    background: transparent;
+    color: #b45309;
+    border-color: #fcd34d;
+  }
+  .exec-btn.chase.off {
+    color: #9ca3af;
+    border-color: #e5e7eb;
+    background: #f3f4f6;
+    cursor: not-allowed;
+    text-decoration: line-through;
+  }
+  .exec-meta {
+    font-size: 0.6875rem;
+    color: #6b7280;
+  }
+  .recommend-exit {
+    margin-top: 0.25rem;
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    color: #6b7280;
+    background: #f8fafc;
+    border-left: 2px solid #cbd5e1;
+    padding: 0.25rem 0.5rem;
   }
   /* 买入时机徽章（2026-10-12） */
   .recommend-timing-row {

@@ -7,6 +7,8 @@ from db.database import (load_daily_recommendations, save_daily_recommendations,
 from services.data.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy.strategy import calc_stock_score_v2, apply_industry_neutralization
 from services.data.utils import to_float as _to_float
+from services.strategy.buy_range import (  # noqa: E402  P0-1 执行诚实化：区间与追高警告的唯一算法
+    buy_range, chase_warning, over_pct)
 from services.data.valuation import get_valuation_batch
 from services.strategy.risk_control import calc_risk_control
 from services.data.placement import fetch_recent_placements
@@ -374,6 +376,89 @@ def calc_buy_timing(stock: Dict, change_pct: float, amplitude: float,
     return {'type': 'intraday', 'label': '盘中灵活', 'note': note}
 
 
+_RATES_CACHE: Dict = {'ts': 0.0, 'rates': {}}
+
+
+def exec_rates(max_age: float = 600.0) -> Dict:
+    """复盘实测的两个胜率（低吸价口径 / 现价追入口径），带 10 分钟缓存。
+
+    为什么要现取：`RECOMMEND_EXEC_HINT` 那句常量写的是"复盘132次：45%/63%"，
+    而复盘样本每天在长（现在 139 条）、口径也在改（1094 选票范围）。
+    警告文案里挂一个会过期的数字，等于让用户信一个没人再核对的结论。
+    单股分析、行动台、命令行都不传 rates，靠这里拿到同一份数。
+    """
+    import time as _t
+    now = _t.time()
+    if now - _RATES_CACHE['ts'] < max_age and _RATES_CACHE['rates']:
+        return _RATES_CACHE['rates']
+    r = {}
+    try:
+        from services.pick.recommend_review import get_review_summary
+        s = get_review_summary(120) or {}
+        r = {'dixiWin': (s.get('t1') or {}).get('win_rate'),
+             'dixiAvg': (s.get('t1') or {}).get('avg'),
+             'dixiN': (s.get('t1') or {}).get('n'),
+             'chaseWin': (s.get('exec_t1') or {}).get('win_rate'),
+             'chaseAvg': (s.get('exec_t1') or {}).get('avg'),
+             'chaseN': (s.get('exec_t1') or {}).get('n')}
+    except Exception as e:
+        print(f'[执行诚实化] 复盘实测数没拿到（文案退回文档口径）: {type(e).__name__}: {e}')
+    _RATES_CACHE.update({'ts': now, 'rates': r})
+    return r
+
+
+def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) -> Dict:
+    """把"低吸区间 / 追价上限 / 现价超了多少"按票算出来，挂进 buyTiming（2026-10-18，P0-1）。
+
+    以前这里是一句全局常量 `RECOMMEND_EXEC_HINT`："建议低吸或尾盘介入，不追盘中高价"。
+    问题是它对所有票都说同一句话，而"现在这只票的现价到底比买入上限高了多少"没人算 ——
+    实测现价追入口径 T+1 胜率 43.2%、挂低吸价成交口径 60.4%，差 17 个百分点，
+    光靠一句劝不住。现在按票给出具体数字，超价 ≥3% 直接写"不建议买入"。
+
+    算不出来（行情缺字段、价格非法）就退回全局常量文案，推荐链路绝不因为文案崩掉。
+    """
+    try:
+        timing = bsp.get('buyTiming')
+        rates = rates or exec_rates()           # 单股分析/命令行调用不传 rates，这里自取一份
+        price = _to_float(stock.get('priceRaw') or stock.get('price'))
+        if not timing or not price or price <= 0:
+            return bsp
+        ref_buy = _to_float(bsp.get('buy'))            # '竞价关注' 这类非数值 → 0
+        lim_up = _to_float(stock.get('changePercent')) >= TREND_LIMIT_UP_THRESHOLD
+        rng = buy_range(price, _to_float(stock.get('amplitude')),
+                        ref_buy=ref_buy or None, timing_type=timing.get('type') or 'intraday',
+                        limit_up=lim_up, code=stock.get('symbol') or '')
+        timing.update({'buyLow': rng['buyLow'], 'buyHigh': rng['buyHigh'],
+                       'limitPrice': rng['limitPrice'], 'chasePct': rng['chasePct'],
+                       'buyNote': rng['buyNote'],
+                       'overPct': over_pct(price, rng['buyHighRaw'])})
+        if RECOMMEND_EXEC_HINT_ENABLED:
+            warn = chase_warning(price, rng['buyHighRaw'], rates)
+            if warn:
+                timing['execHint'] = warn
+            elif rates.get('dixiWin') is not None and rates.get('chaseWin') is not None:
+                # 没超价也要说清"为什么默认挂低吸"：用当天复盘的实测数，不抄旧常量
+                timing['execHint'] = (
+                    f'现价还在买入区间内（超价 {timing.get("overPct")}%），可以按纪律买。'
+                    f'复盘实测：挂低吸价成交 T+1 胜率 {rates["dixiWin"]}%'
+                    f'/均值 {rates.get("dixiAvg")}%（{rates.get("dixiN")}条），'
+                    f'按现价追入 {rates["chaseWin"]}%/均值 {rates.get("chaseAvg")}%'
+                    f'（{rates.get("chaseN")}条）—— 盘中冲高时别改主意')
+            else:
+                timing['execHint'] = RECOMMEND_EXEC_HINT
+        # 打板票的默认出口径（写进卡片，不留给临场决定）：`docs/短线买法-2026-10.md` §2
+        # 用 1094 口径实测过"封板票怎么卖"，次日开盘即走是唯一均值最高、尾部最薄的卖法。
+        if timing.get('type') == 'auction':
+            timing['exitNote'] = (
+                '默认出口径：次日 9:15-9:25 竞价挂卖、开盘即走。'
+                '封板票次日开盘卖 +1.99%/胜率 62.9%、亏超 5% 只有 2.4%；'
+                '持有到次日收盘只 +1.64%/56.2%，亏超 5% 涨到 12.3%。'
+                '竞价高开超过 5% 不追（高开>5% 追板历史 T+1 -1.60%/胜率 30.0%）')
+    except Exception as e:
+        print(f'[执行诚实化] 按票计算失败（回落全局文案）: {type(e).__name__}: {e}')
+    return bsp
+
+
 def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
                          trend_details: Optional[Dict] = None,
                          market_change: float = 0.0) -> Dict:
@@ -462,7 +547,7 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
         sell_pct = min(sell_pct, BUY_SELL_MAX_TARGET_PCT)
 
         stock_type = _build_stock_type(role, position_label)
-        return {
+        return _apply_exec_honesty(stock, {
             'buy': '竞价关注',
             'current': f'{price:.2f}',
             'sell': f'{price * (1 + sell_pct):.2f}',
@@ -471,7 +556,7 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
             'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
             'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
                                          position_label, stock_score, market_change),
-        }
+        })
 
     # ===== 非涨停板：振幅基础 + 三维修正 =====
     if amplitude >= 5:
@@ -500,7 +585,7 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
         buy_pct = base_buy_pct
 
     stock_type = _build_stock_type(role, position_label)
-    return {
+    return _apply_exec_honesty(stock, {
         'buy': f'{price * (1 - buy_pct):.2f}',
         'current': f'{price:.2f}',
         'sell': f'{price * (1 + sell_pct):.2f}',
@@ -510,7 +595,7 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
         'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
         'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
                                      position_label, stock_score, market_change),
-    }
+    })
 
 
 def gen_recommend_reason_server(stock: Dict, score_result: Dict) -> str:
@@ -1038,6 +1123,10 @@ async def auto_generate_recommendations_task():
         # 门槛之下的（score<60）不进这里 —— 快照读的时候按 min_score 一筛就有，
         # 给几百只都写一句"低于门槛"只会把真正有意思的拦截原因淹掉。
         blocked: Dict[str, List[str]] = {}
+        # symbol → 模式代码（P2-2）。声明必须放在这里、早于 _capture_snapshot 与 `if not top3`
+        # 那条提前 return：闭包是在调用时才读这个名字，晚声明会让"一只都不推"的批次
+        # 抛 NameError 被快照自己的 try 吞掉 —— 那时最需要的空仓批次反而没快照。
+        modes: Dict[str, str] = {}
 
         def _blk(sym, why):
             if sym:
@@ -1157,6 +1246,11 @@ async def auto_generate_recommendations_task():
                 _sent = await get_sentiment()
                 _gate = cycle_gate(_sent)
                 _labs: Dict[str, Dict] = {}
+                # 模式标签合并进来：快照每只票一行都要带上它，
+                # 否则"按模式复盘"只能看到最终那 3 只，看不到同一天被挡掉的同模式票。
+                for _sym, _m in (modes or {}).items():
+                    if _sym:
+                        _labs.setdefault(_sym, {})['mode'] = _m
                 if shadow_payload:
                     def _lab(_sym):
                         return _labs.setdefault(_sym, {}) if _sym else {}
@@ -1187,6 +1281,7 @@ async def auto_generate_recommendations_task():
                     'sources': src_map,
                     'pool_info': pool_info,
                     'labels': _labs,
+                    'modes': modes,
                     'market_change': market_change,
                     'sent': _sent,
                     'gate': _gate,
@@ -1210,17 +1305,19 @@ async def auto_generate_recommendations_task():
 
         # ===== 6. 计算买卖点 + 推荐理由 =====
         rec_items = []
+        # 追高警告里的两个胜率用**当天复盘的实测值**（10 分钟缓存），不写死：
+        # 60.4%/43.2% 是 139 条历史推荐算出来的，样本每天在长、口径刚换成 1094，
+        # 写死就等于三个月后还在引用一个没人再核对的数字。
+        _rates = exec_rates()
         for r in top3:
             sym = r.get('symbol', '').lower()
             _trend = trend_map.get(sym)
             bsp = calc_buy_sell_points(r, score_result=r.get('score'),
                                        trend_details=(_trend or {}).get('details'),
                                        market_change=market_change)
-            # 执行诚实化提示（2026-10-12）：复盘证明系统的edge在低吸价口径，
-            # 现价追入会被次日低开吃掉——把真相写在卡片上，管住用户的手。
-            # 放进 buyTiming（已随 buy_timing 列持久化，刷新不丢）。
-            if RECOMMEND_EXEC_HINT_ENABLED and bsp.get('buyTiming'):
-                bsp['buyTiming']['execHint'] = RECOMMEND_EXEC_HINT
+            # 执行诚实化（2026-10-18，P0-1）：买卖点里已经挂过区间，这里再带**当天实测胜率**
+            # 覆写一次文案 —— 同一个函数、同一套数字，只是把默认值换成实测量。
+            _apply_exec_honesty(r, bsp, _rates)
             reason = gen_recommend_reason_server(r, {
                 'total': r['score']['total'],
                 'label': r['score']['label'],
@@ -1240,6 +1337,30 @@ async def auto_generate_recommendations_task():
                 'placement_info': r.get('placement_info'),
                 'reason': reason,
             })
+
+        # 模式标签（2026-10-18，P2-2）：把买法矩阵的 verdict 机械映射成 dixi/daban/chaodi/…，
+        # 复盘第一次有"按模式"这个维度（以前只有"按日期"，回答不了"哪种模式值得加码"）。
+        # 注意这是**线上主链路第一次调用 classify**（此前只有影子与推送算它）：
+        # 每天 ≤3 只、每只一条本地日K查询，不碰网络；失败只少一个标签，不影响推荐。
+        try:
+            from services.strategy.buy_rules import classify as _cls, pick_mode as _pick, mode_label as _ml
+            _pm = _prev_bars([r.get('symbol') for r in top3])
+            for r, item in zip(top3, rec_items):
+                _sym = (r.get('symbol') or '').lower()
+                _prev = _pm.get(_sym[-6:])
+                _v = (_cls({'changePercent': r.get('changePercent'),
+                            'volumeRatio': r.get('volumeRatio'),
+                            'gain20': r.get('gain20')}, _prev, None) or {}).get('verdict')
+                item['mode'] = _pick(_v, _prev)
+                modes[(r.get('symbol') or '').lower()] = item['mode']
+            _relay = [i['name'] for i in rec_items if i.get('mode') == 'relay']
+            if _relay:
+                print(f'[推荐模式] ⚠️ 接力票出现在推荐里（矩阵判"不接力"、实测次日开盘卖六格全负）：'
+                      f'{"、".join(_relay)} —— 这条本该被 4.6/4.7 或门槛挡住，出现即说明有漏口')
+            print('[推荐模式] ' + '、'.join(
+                f"{i['name']}={_ml(i.get('mode', ''))}" for i in rec_items))
+        except Exception as e:
+            print(f'[推荐模式] 标签计算失败（不影响推荐，仅少一个复盘维度）: {type(e).__name__}: {e}')
 
         # ===== 7. 保存到数据库 =====
         date_key = now.date().isoformat()

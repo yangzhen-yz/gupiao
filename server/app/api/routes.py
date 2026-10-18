@@ -475,6 +475,81 @@ async def get_recommend_review_api(days: int = 30):
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
 
+_REC_SIM_CACHE: Dict = {}          # {(months, capital, gap, lots, bench): {ts, data}}
+_REC_SIM_TTL = 1800                # 秒：底层一天才变一次（14:45 推荐 + 16:10 复盘），算一次 0.2s
+
+@router.get("/api/recommend-sim", tags=["推荐记录"])
+async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
+                                gap: float = 5.0, lots: bool = True, bench: bool = False):
+    """历史推荐的钱曲线（2026-10-18，复盘 → 回测曲线子页用）。
+
+    六种口径（三种入口 × 两种卖法）一次算完，实现只在 `services/pick/rec_sim.py` 一份 ——
+    命令行 `scripts/rec_exit_sim.py` 调的是同一个函数，页面与日志不会出现两套数。
+
+    同步的 SQLite 读取全部丢进 `to_thread`：这个接口一次要读 85 只票的完整日K，
+    压在事件循环上就是"一进这页全站卡"（rps/趋势扫描那个教训）。
+
+    缓存的只有"六种口径的模拟结果"（0.17s 一次，底层数据一天才变），
+    `daily`（每日监控点）**每次都重读**：它是 16:20/16:25 定时任务往里追加的时间序列，
+    跟着缓存走就会出"曲线命中缓存 → 监控点停在 30 分钟前"的假象
+    （今天就是这样：点已经落库了，页面还是空的）。
+    """
+    import time as _t
+    key = (months, capital, gap, lots, bench)
+    from services.pick import rec_sim
+    hit = _REC_SIM_CACHE.get(key)
+    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
+        data = dict(hit['data'])          # 浅拷贝：别把 daily 写回缓存里那份
+    else:
+        try:
+            data = await asyncio.to_thread(
+                rec_sim.simulate, months=months, capital=capital,
+                auction_max_gap=gap, whole_lots=lots, with_benchmark=bench)
+            _REC_SIM_CACHE[key] = {'ts': _t.time(), 'data': data}
+            if len(_REC_SIM_CACHE) > 12:
+                _REC_SIM_CACHE.clear()
+            data = dict(data)
+        except Exception as error:
+            raise HTTPException(status_code=500, detail=f"回测曲线计算失败: {str(error)}")
+    try:
+        data['daily'] = await asyncio.to_thread(rec_sim.daily_history, 40)
+    except Exception as e:
+        data['daily'] = []
+        data['dailyError'] = str(e)[:120]
+    return {'success': True, 'data': data, 'cached': bool(hit)}
+
+
+@router.get("/api/shadow-eval", tags=["推荐记录"])
+async def get_shadow_eval_api(limit: int = 30):
+    """影子对照的每日监控点（2026-10-18，实施计划"工具：影子对照脚本"）。
+
+    这里**只读 16:25 落库的那些点**，不现算：现算一次要读整段日K、还会因为窗口随日期
+    漂移而让"今天的数字"和"上周的数字"不可比。计算逻辑只在 `scripts/shadow_eval.py` 一份。
+    没跑过（表还没建）时返回 available=False 并说清第一个点什么时候来，不给空数组让人猜。
+    """
+    def _read():
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            cur = conn.execute("SELECT eval_date, window_days, real_days, events, "
+                               "kept_n, kept_win, kept_avg, excl_n, excl_win, excl_avg, "
+                               "gap_avg, gap_win, verdict FROM recommend_shadow_eval "
+                               "ORDER BY eval_date DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in cur]
+        except Exception:
+            return None                       # 表还没建 = 这个监控今天才上线
+        finally:
+            conn.close()
+    rows = await asyncio.to_thread(_read)
+    from app.config import SHADOW_EVAL_MIN_DAYS
+    if rows is None:
+        return {'success': True,
+                'data': {'available': False, 'rows': [], 'minDays': SHADOW_EVAL_MIN_DAYS,
+                         'note': '影子对照由定时任务在交易日 16:25 写入 recommend_shadow_eval；'
+                                 f'判定要攒满 {SHADOW_EVAL_MIN_DAYS} 个有真放行名单的交易日'}}
+    return {'success': True,
+            'data': {'available': bool(rows), 'rows': rows, 'minDays': SHADOW_EVAL_MIN_DAYS}}
+
 async def _search_stocks_remote(q: str) -> List[Dict]:
     """腾讯 smartbox 远程股票搜索（本地库未命中时的回退，2026-10-12）
 

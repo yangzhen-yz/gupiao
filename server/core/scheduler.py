@@ -2,7 +2,7 @@
 import asyncio, schedule, time, threading
 from datetime import datetime, timedelta
 
-from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
+from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, REC_SIM_DAILY_TIME, SHADOW_EVAL_TIME, SHADOW_EVAL_MIN_DAYS, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
                         KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
 
 from services.data.stock import fetch_eastmoney_hot_list
@@ -240,6 +240,48 @@ def run_scheduler():
             run_recommendation_review()
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 推荐复盘失败: {e}')
+
+    def job_rec_sim_daily():
+        """可成交性日常监控（2026-10-18，实施计划 P0-0）：推荐复盘之后跑，
+        把"同一批推荐在三种入口口径下各值多少钱"存成每天一个点。
+
+        非交易日也跑没意义（推荐记录不会新增、日K也没变），所以只交易日跑；
+        但它**不依赖任何网络**，失败也只是少一个监控点，不影响任何链路。
+        """
+        try:
+            from services.pick import rec_sim
+            from app.config import REC_SIM_DAILY_MONTHS
+            from services.support import app_settings
+            if not app_settings.value('rec_sim_daily_enabled'):
+                print('[可成交性监控] 开关已关闭（复盘·口径与开关），本轮跳过')
+                return
+            rec_sim.record_daily(months=REC_SIM_DAILY_MONTHS)
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 可成交性监控失败: {e}')
+
+    def job_shadow_eval_daily():
+        """影子对照日常监控（2026-10-18，实施计划"工具：影子对照脚本"）：
+        把"影子挡掉的票 T+1 是不是真的更差"每天存一个点，第1批 P0-2 的上线判据。
+
+        实现留在 `scripts/shadow_eval.py` 一份（计划指定的位置）：命令行要用、页面也要读，
+        搬进 services 反而要多一个包外路径依赖，所以这里按文件路径加载，不复制第二份逻辑。
+        样本不足 SHADOW_EVAL_MIN_DAYS 个交易日时脚本自己只报数、不下结论，这里不重复判断。
+        """
+        try:
+            import os as _os
+            import importlib.util as _ilu
+            from services.support import app_settings
+            if not app_settings.value('shadow_eval_daily_enabled'):
+                print('[影子对照] 开关已关闭（复盘·口径与开关），本轮跳过')
+                return
+            _dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            spec = _ilu.spec_from_file_location('shadow_eval',
+                                                _os.path.join(_dir, 'scripts', 'shadow_eval.py'))
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.record_daily()
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 影子对照失败: {e}')
 
     def job_pre_close_snapshot():
         """收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存。
@@ -553,6 +595,14 @@ def run_scheduler():
     # 计算全部历史推荐的 T+1/T+3/T+5 胜率与盈亏并持久化，供 API/前端展示 + 黑名单避让
     schedule.every().day.at(RECOMMEND_REVIEW_TIME).do(job_recommend_review)
 
+    # 可成交性日常监控（2026-10-18，实施计划 P0-0）：推荐复盘之后跑，
+    # 把「同一批推荐在三种入口口径下各值多少钱」存成每天一个点（窗口固定才可比）
+    schedule.every().day.at(REC_SIM_DAILY_TIME).do(_warp_trading_only(job_rec_sim_daily))
+
+    # 影子对照日常监控（2026-10-18，实施计划"工具"）：16:25 日K已同步，
+    # 把「影子挡掉的票 T+1 是不是真的更差」存成每天一个点 —— 第1批 P0-2 的上线判据
+    schedule.every().day.at(SHADOW_EVAL_TIME).do(_warp_trading_only(job_shadow_eval_daily))
+
     # 收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存，
     # 保证"最后一次推荐"落库可复盘（用户明确需求）
     schedule.every().day.at(SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME).do(job_pre_close_snapshot)
@@ -607,6 +657,10 @@ def run_scheduler():
     print(f'[定时任务]   - 15:35: 自动优化（D1-D4权重+角色门槛+网格搜索，仅交易日，周一含全量搜索）')
     print(f'[定时任务]   - {"/".join(SCHEDULE_RECOMMENDATION_TIMES)}: 自动生成智能推荐股票（仅交易日）')
     print(f'[定时任务]   - {RECOMMEND_REVIEW_TIME}: 智能推荐复盘（本地K线库算T+1/T+3/T+5胜率）')
+    print(f'[定时任务]   - {REC_SIM_DAILY_TIME}: 可成交性日常监控（三入口×两卖法落 rec_sim_daily，'
+          f'一切"放宽/多推"提案的验收基线）')
+    print(f'[定时任务]   - {SHADOW_EVAL_TIME}: 影子对照日常监控（放行 vs 被挡 T+1，'
+          f'落 recommend_shadow_eval；满 {SHADOW_EVAL_MIN_DAYS} 个交易日才给上线判据）')
     print(f'[定时任务]   - {SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME}: 收盘前推荐快照（最终生成并自动保存，仅交易日）')
     print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据（月度）')
     print(f'[定时任务]   - {FUNDAMENTAL_UPDATE_TIME}: 更新基本面质量数据（季度）')

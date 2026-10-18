@@ -350,6 +350,13 @@ def init_db():
                 sort_order INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 UNIQUE(rec_date, symbol))''')
+        # mode 列（2026-10-18，P2-2 按模式复盘）：老库建表时没有这一列，得 ALTER 补。
+        # SQLite 的 ADD COLUMN 不幂等，重复执行会报 "duplicate column name"，所以先查 PRAGMA。
+        _rec_cols = {r[1] for r in cursor.execute('PRAGMA table_info(daily_recommendations)')}
+        if 'mode' not in _rec_cols:
+            cursor.execute("ALTER TABLE daily_recommendations ADD COLUMN mode TEXT DEFAULT ''")
+            print('[数据库] daily_recommendations 已补 mode 列（低吸/打板/抄底/接力/其他）')
+
         # 股票映射表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS stock_basic_info (
@@ -789,7 +796,9 @@ def _row_to_recommendation(row) -> Dict:
             'buyTiming': (json.loads(row['buy_timing'])
                           if has_buy_timing_col and row['buy_timing'] else None),
         } if row['buy_price'] else None,
-        'reason': row['reason'] or ''
+        'reason': row['reason'] or '',
+        # 模式标签（低吸/打板/抄底/接力/其他）：老库没这一列时返回空串，前端不显示徽章
+        'mode': (row['mode'] or '') if 'mode' in row.keys() else '',
     }
 
 
@@ -891,8 +900,8 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
                 buy_timing = bsp.get('buyTiming')
                 buy_timing_json = json.dumps(buy_timing, ensure_ascii=False) if buy_timing else ''
                 cursor.execute('''
-                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, buy_timing, sort_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, buy_timing, sort_order, mode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     rec_date,
                     rec.get('symbol', ''),
@@ -906,7 +915,10 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
                     bsp.get('sell', ''),
                     rec.get('reason', ''),
                     buy_timing_json,
-                    sort_order
+                    sort_order,
+                    # 模式标签（2026-10-18）：由 buy_rules.classify 的 verdict 机械映射而来，
+                    # 不人工判断 —— 标签打错，按模式的复盘结论就是歪的。
+                    rec.get('mode', '') or ''
                 ))
         conn.commit()
         conn.close()

@@ -131,3 +131,36 @@ def classify(stock: Dict, prev: Optional[Dict] = None, market: Optional[Dict] = 
     out.update(why='未命中矩阵里的任何一档', risk='按现有评分与仓位纪律执行',
                action='按原计划')
     return out
+
+
+# ---------- 模式标签（2026-10-18，实施计划 P2-2）----------
+# 为什么放在这里而不是 recommend.py：verdict 的语义归本模块管，
+# 映射表写在旁边才不会哪天改了 verdict 名字、标签却还在按旧字符串匹配（静默打错标签）。
+# 「按模式复盘」的全部前提就是这个标签，标签错 → 榜就歪，所以只允许机械映射、不给人工判断。
+MODE_BY_VERDICT = {
+    '可低吸': 'dixi',            # 横盘缩量挂昨收 -2%（实测胜率最高但成交率仅 22%）
+    '可打板': 'daban',            # 当日封板、次日开盘即卖
+    '可竞价低吸': 'chaodi',       # 昨日大面 ≥5%，今天竞价抄回调
+    '不接力': 'relay',            # 昨日封板今天买 —— 正常不该出现在推荐里，出现即告警
+    '当天不追': 'chase',          # 半山腰（4.5~9.8% 没封板）当天还涨着
+    '排除': 'ban',                # 过热/天量/巨量拉升
+    '减仓日': 'reduce',           # 涨停 >120 家的极热日
+    '冻结买入': 'reduce',         # 同上（极热日的另一种表述）
+}
+MODE_LABELS = {
+    'dixi': '低吸', 'daban': '打板', 'chaodi': '抄底', 'relay': '接力',
+    'chase': '半山腰', 'ban': '排除形态', 'reduce': '减仓日', 'other': '其他',
+}
+
+
+def pick_mode(verdict: str, prev: dict = None) -> str:
+    """verdict → 模式代码。没命中任何档但"昨天封过板"的，按接力记账：
+    接力是我们明确不做的动作，它出现在推荐里就是漏口，得被榜照出来。"""
+    code = MODE_BY_VERDICT.get(verdict or '')
+    if code is None:
+        code = 'relay' if (prev and prev.get('limitClose')) else 'other'
+    return code
+
+
+def mode_label(code: str) -> str:
+    return MODE_LABELS.get(code, code or '其他')

@@ -88,7 +88,8 @@ def _load_all_recommendations() -> List[Dict]:
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("""SELECT rec_date, symbol, name, price, change_percent, score, buy_price
+        cur.execute("""SELECT rec_date, symbol, name, price, change_percent, score, buy_price,
+                              COALESCE(mode, '')
                        FROM daily_recommendations ORDER BY rec_date""")
         recs = []
         for row in cur.fetchall():
@@ -104,7 +105,9 @@ def _load_all_recommendations() -> List[Dict]:
                 price = 0
             recs.append({'date': row[0], 'symbol': (row[1] or '').lower(), 'name': row[2],
                          'chg': row[4] or 0, 'score': row[5] or 0,
-                         'buy': buy, 'rec_price': price})
+                         'buy': buy, 'rec_price': price,
+                         # 模式标签（2026-10-18）：老记录是空串，聚合成 '其他' 一档，不影响历史数字
+                         'mode': row[7] or ''})
         conn.close()
         return recs
     except Exception as e:
@@ -284,18 +287,33 @@ def get_review_summary(days: int = 30) -> Dict:
     recs = _load_all_recommendations()
     perf = compute_recommendation_performance(recs)
     if not perf:
-        return {'available': False}
+        # 键全部给齐：前端与调用方可以无脑读 by_mode/by_date，不用到处 .get()。
+        # 临时库/新库跑自测时就会走到这里（假票号没有后续K线）。
+        return {'available': False, 'total': {}, 'recent': {}, 'recent_days': days,
+                'by_date': {}, 'by_mode': {}, 'worst': [], 'best': []}
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
     recent = [r for r in perf if r['date'] >= cutoff]
     by_date: Dict[str, List[Dict]] = {}
     for r in recent:
         by_date.setdefault(r['date'], []).append(r)
+    # 按模式分组（2026-10-18，P2-2）：回答"哪种模式值得加码、哪种该停"。
+    # 标签从 10-19 的批次才开始有内容，之前的老记录全部落 '其他' —— 这是诚实的起点，
+    # 不是漏统计：没有标签的历史不能事后编一个模式出来。
+    by_mode: Dict[str, List[Dict]] = {}
+    try:
+        from services.strategy.buy_rules import mode_label as _ml
+    except Exception:
+        _ml = lambda c: c or '其他'
+    for r in perf:
+        by_mode.setdefault(_ml(r.get('mode') or ''), []).append(r)
     return {
         'available': True,
         'total': _aggregate(perf),
         'recent': _aggregate(recent),
         'recent_days': days,
         'by_date': {d: _aggregate(v) for d, v in sorted(by_date.items(), reverse=True)},
+        'by_mode': {m: _aggregate(v) for m, v in sorted(
+            by_mode.items(), key=lambda kv: -len(kv[1]))},
         'worst': sorted(recent, key=lambda x: x.get('r1') or 0)[:5],
         'best': sorted(recent, key=lambda x: -(x.get('r1') or 0))[:5],
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),

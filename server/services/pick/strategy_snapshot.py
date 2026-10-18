@@ -76,6 +76,7 @@ _DDL_ROWS = '''CREATE TABLE IF NOT EXISTS strategy_snapshot (
     factors        TEXT,
     inputs         TEXT,
     source         TEXT,
+    mode           TEXT,
     role           TEXT,
     timing         TEXT,
     matrix         TEXT,
@@ -119,7 +120,7 @@ def ensure_tables(conn):
     # 补列：早期版本建的表会缺新字段，INSERT 直接报错。
     # 本仓库常有另一路会话同时在改，加列必须自查而不是指望"大家都是从 DDL 建的"。
     have = {r[1] for r in conn.execute('PRAGMA table_info(strategy_snapshot)').fetchall()}
-    for _col, _typ in (('shadow_note', 'TEXT'),):
+    for _col, _typ in (('shadow_note', 'TEXT'), ('mode', 'TEXT')):
         if _col not in have:
             conn.execute(f'ALTER TABLE strategy_snapshot ADD COLUMN {_col} {_typ}')
     # IF NOT EXISTS 覆盖不到"表已存在但要补索引"的情况，这里都得走一遍
@@ -155,7 +156,7 @@ _COLS = ('snap_date', 'batch', 'symbol', 'name', 'rank', 'stage', 'blocked_by',
          'score', 'intraday_score', 'trend_score', 'label',
          'change_percent', 'price', 'volume_ratio', 'turnover_rate',
          'weibi', 'outer_ratio', 'amplitude', 'factors', 'inputs', 'source',
-         'role', 'timing', 'matrix', 'matrix_why', 'shadow_note', 'concept',
+         'mode', 'role', 'timing', 'matrix', 'matrix_why', 'shadow_note', 'concept',
          'r20', 'rank_pct', 'created_at')
 
 _BC = ('snap_date', 'batch', 'generated_at', 'cycle', 'cycle_score',
@@ -179,7 +180,7 @@ def _row(s: Dict, date_key: str, batch: str, rank: int, stage: str,
         _f(s.get('volumeRatio')), _f(s.get('turnoverRate')),
         _f(s.get('weibi')), _f(s.get('outerRatio')), _f(s.get('amplitude')),
         _j(sc.get('base_scores')), _j(sc.get('factor_values')), source,
-        lab.get('role'), lab.get('timing'), lab.get('matrix'), lab.get('matrix_why'),
+        lab.get('mode'), lab.get('role'), lab.get('timing'), lab.get('matrix'), lab.get('matrix_why'),
         lab.get('shadow'),
         s.get('primary_tag'), _f(pool.get('r20')), _f(pool.get('rank_pct')), now_txt,
     )

@@ -28,6 +28,8 @@ const TAB_BY_SEG = {
   // hash 能不能被认出来 —— 漏了它，点「口径与开关」会解析失败并落回 DEFAULT_TAB（行动台），
   // 表现为"点了没反应、跳回首页"。
   settings: 'tab-settings',
+  // 2026-10-18 同理：新子页不登记这里，点「回测曲线」会解析失败并落回行动台
+  backtest: 'tab-backtest',
 }
 const SEG_BY_TAB = Object.fromEntries(Object.entries(TAB_BY_SEG).map(([k, v]) => [v, k]))
 

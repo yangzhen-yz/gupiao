@@ -184,21 +184,19 @@ def _build_tomorrow_plan(q: Dict, timing: Dict, ref: Optional[Dict] = None,
     ref = ref or {}
 
     # ---- 1) 买入价区间（建议挂单范围） ----
-    ref_buy = _price_or_none(ref.get('buy'))
-    if ref_buy:
-        # 智能推荐已按角色/位置算好，直接复用；上限不超过追高线
-        buy_low = ref_buy
-        buy_high = min(ref_buy * 1.01, price * (1 + chase / 100))
+    # 算法收在 `services/strategy/buy_range.py`：智能推荐卡片与这份明日计划必须用同一套
+    # 低吸区间，否则"卡片上的低吸价"和"明日计划里的低吸价"是两个数，用户不知道该挂哪个。
+    # 文案留在这里按分支重写一遍（收评说的是"明天"，措辞与盘中卡片不同），数字不改。
+    from services.strategy.buy_range import buy_range
+    _rng = buy_range(price, amp, ref_buy=_price_or_none(ref.get('buy')),
+                     timing_type=ttype, limit_up=is_limit_up,
+                     code=str(q.get('symbol') or q.get('code') or ''))
+    buy_low, buy_high = _rng['buyLowRaw'], _rng['buyHighRaw']
+    if _rng['branch'] == 'ref':
         buy_note = f'低吸参考 {buy_low:.2f} 附近挂单'
-    elif is_limit_up:
-        # 涨停票次日由竞价定价：平开到小高开可接受
-        buy_low = price
-        buy_high = price * 1.03
+    elif _rng['branch'] == 'limitUp':
         buy_note = '次日竞价挂单（涨停票无法提前定价）'
     else:
-        pct = 0.03 if amp >= 5 else 0.025 if amp >= 3 else 0.02 if amp >= 2 else 0.015
-        buy_low = price * (1 - pct)
-        buy_high = price
         buy_note = f'回踩 {buy_low:.2f} 附近挂单，不追高于今收'
 
     # 买入价中值 = 预期成交价，止盈/止损一律以此为基准，幅度才可比

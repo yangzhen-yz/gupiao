@@ -230,6 +230,22 @@ SPEC: List[Dict[str, Any]] = [
         'note': '0=永久保留。每批 900 只 × 每天 4 批 ≈ 1 万行/天，两年约 500 万行',
         'impact': 'snapshot',
     },
+    {
+        'key': 'rec_sim_daily_enabled', 'cfg': 'REC_SIM_DAILY_ENABLED', 'kind': 'bool',
+        'label': '每日跑可成交性监控（16:20）', 'group': '策略快照', 'live': True,
+        'note': '把"同一批推荐在三种入口口径下各值多少钱"每天存一个点（rec_sim_daily）。'
+                '关掉后回测曲线页仍能现算当天数字，但失去时间序列——'
+                '任何"放宽过滤/多推/改模式"的提案都要靠这条序列证明 auction 口径没恶化',
+        'impact': None,
+    },
+    {
+        'key': 'shadow_eval_daily_enabled', 'cfg': 'SHADOW_EVAL_ENABLED', 'kind': 'bool',
+        'label': '每日跑影子对照（16:25）', 'group': '策略快照', 'live': True,
+        'note': '算"影子规则挡掉的票第二天是不是真的更差"（recommend_shadow_eval）。'
+                '这是第1批把周期门槛搬到线上的判据：关掉只是少一个监控点，'
+                '不影响影子日志本身（它由推荐任务在每个批次写入）',
+        'impact': None,
+    },
 ]
 
 _SPEC_INDEX = {s['key']: s for s in SPEC}
