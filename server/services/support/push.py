@@ -473,6 +473,20 @@ def _pass_filter(stock) -> bool:
     if sym and sym in _loser_blacklist():
         print(f'[推送] 亏损黑名单否决 {stock.get("name") or sym}（近30天推荐后 T+1/T+3 亏超阈值）')
         return False
+    # 涨幅段闸门（2026-10-18）：盘中推送与智能推荐主链同一张表（momentum_zone），
+    # 避免"主链不推、推送推"的漏口。只拦 drop 模式 —— demote 的本意是罚分但可选，
+    # 推送链没有评分可罚，硬拦就跟主链口径不一致了。区间依据见 momentum_zone docstring。
+    try:
+        from services.strategy.momentum_zone import gate_stock as _zone_gate
+        _z = _zone_gate(stock)
+    except Exception as e:
+        # 读不到就不否决：闸门是"少推一只"的保守措施，不该把整条推送链路打断
+        print(f'[推送] 涨幅段闸门读取失败(本轮不否决): {type(e).__name__}: {e}')
+        _z = None
+    if _z:
+        print(f"[推送] 涨幅段闸门否决 {stock.get('name')}: {_z['label']}"
+              f"（当日涨幅 {_z['chg']:+.1f}%）")
+        return False
     return True
 
 

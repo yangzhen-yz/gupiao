@@ -1,18 +1,28 @@
 """recommend_review.py - 智能推荐复盘闭环（2026-10-12 新增）
 
-背景：用户反馈"推荐的股票买入就吃面"。对 2026-05~10 共 132 条历史推荐的复盘
-（本地历史K线库计算）发现：
-  - 从"买入参考价"（低吸价）算 T+1 胜率 62.9%、均值 +1.52%
-  - 从"推荐时现价"算 T+1 胜率仅 45.5%、均值 -1.12%（用户实际体验）
-  - 隔日平均低开 -1.29%，"现价-3%"的低吸单成交率低
-  - 半山腰（推荐时涨幅 4.5%~9.8% 未涨停）T+1 胜率 44%、均值 -2.31%（死亡区）
-  - 三祥新材被连续推荐两次、各亏 26%+（无黑榜机制）
+背景：用户反馈"推荐的股票买入就吃面"。对历史推荐的复盘
+（本地历史K线库计算）发现（2026-10-18 根因下钻，218 条）：
+  - 纸面"低吸参考价"口径 T+1 胜率 60.4%/均值 +1.24%，但其中 44/139 条
+    （31.7%）次日最低价根本没到买入价 = 挂单不会成交，未成交组按构造
+    100% 胜率/+6.21%（最低价都高于买入价，收盘必高于买入价）；
+  - **低吸单真正成交的 95 条：胜率 42.1%/均值 -1.06%**；同样这些日子
+    如果按现价追高只有 25.3%/-3.61% —— 挂低吸的价值是躲诱多，不是保证赚；
+  - 低吸单没成交的日子如果追高：+3.39%/81.8% —— 刚性低吸漏掉强势延续；
+  - 低吸纪律 EV（成交率 68.3%×成交组均值 + 未成交按 0）= -0.72%，
+    同样本无脑追高 EV = -1.39%（`docs/胜率低根因复盘-2026-10-18.md`）；
+  - 现价追高口径 46.8%/-0.55%（全量 218 条；139 子集 43.2%/-1.39%）。
 
 本模块提供：
   1. compute_recommendation_performance()  逐条计算 T+1/T+3/T+5 收益 + 5日最大回撤
+     + filled 标记（低吸价是否真正可成交）
   2. run_recommendation_review()           每日复盘任务：聚合并持久化
   3. get_recent_loser_symbols()            近N天推荐且亏损的黑名单符号（选股避让）
   4. get_review_summary()                  复盘汇总（API/前端展示）
+
+聚合口径（_aggregate）在 t1/exec_t1 之外并列三个"不吹牛"的数字：
+  t1_filled      低吸单真正成交部分的 T+1 统计（条件于成交，有逆向选择偏差）
+  exec_t1_filled 成交部分如果按现价追入的 T+1 统计（低吸纪律的反事实基准）
+  fill_rate      低吸价可成交比例；dixi_ev = 成交率×成交组均值（低吸纪律期望）
 
 数据源：本地历史日K线库（data/history_kline.db，baostock 前复权，无网络依赖），
         T+N 按 rec_date 之后第 N 个交易日收盘价计算。
@@ -37,13 +47,15 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
 
     Args:
         recs: [{'date','symbol','name','price','chg','score','buy'}, ...]
-              buy 为数值买入价（'竞价关注'等非数值记录应提前过滤）
+              buy 为数值买入价；'竞价关注'等非数值记录 buy=None，
+              只算现价口径（exec_r1），低吸口径字段保持 None
 
     Returns:
         与原记录等长的列表（无后续K线的记录被剔除），新增 r1/r3/r5/dd5/exec_r1 字段：
         r1/r3/r5: 从买入参考价的 T+N 收益%
         exec_r1:  从推荐时现价立即买入的 T+1 收益%（用户实际体验口径）
         dd5:      5日内最低价相对买入价的最大回撤%
+        filled:   1=次日最低价触及买入价（低吸单真能成交）；0=没跌到（不会成交）
     """
     if not KLINE_HISTORY_ENABLED:
         return []
@@ -59,7 +71,9 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
             code = sym.replace('sh', '').replace('sz', '').replace('bj', '')
             buy = rec.get('buy')
             rec_price = rec.get('rec_price')
-            if not isinstance(buy, (int, float)) or buy <= 0:
+            has_buy = isinstance(buy, (int, float)) and buy > 0
+            has_price = isinstance(rec_price, (int, float)) and rec_price > 0
+            if not has_buy and not has_price:
                 continue
             try:
                 hcur.execute(
@@ -71,11 +85,16 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
             if not bars:
                 continue
             r = dict(rec)
-            r['r1'] = round((bars[0][2] / buy - 1) * 100, 2)
-            r['r3'] = round((bars[2][2] / buy - 1) * 100, 2) if len(bars) >= 3 else None
-            r['r5'] = round((bars[4][2] / buy - 1) * 100, 2) if len(bars) >= 5 else None
-            r['dd5'] = round((min(x[3] for x in bars) / buy - 1) * 100, 2)
-            if isinstance(rec_price, (int, float)) and rec_price > 0:
+            if has_buy:
+                r['r1'] = round((bars[0][2] / buy - 1) * 100, 2)
+                r['r3'] = round((bars[2][2] / buy - 1) * 100, 2) if len(bars) >= 3 else None
+                r['r5'] = round((bars[4][2] / buy - 1) * 100, 2) if len(bars) >= 5 else None
+                r['dd5'] = round((min(x[3] for x in bars) / buy - 1) * 100, 2)
+                # 2026-10-18 根因下钻：低吸价是否真正可成交。次日最低价都没到买入价，
+                # 这张单不会成交，而旧口径照样按 bars[0].close 记一笔"盈利"——未成交组
+                # 按构造 100% 胜率，把纸面 t1 从 42.1% 抬到 60.4%。
+                r['filled'] = 1 if bars[0][3] <= buy else 0
+            if has_price:
                 r['exec_r1'] = round((bars[0][2] / rec_price - 1) * 100, 2)
             out.append(r)
     finally:
@@ -84,7 +103,12 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
 
 
 def _load_all_recommendations() -> List[Dict]:
-    """从主库加载全部推荐记录（含 price 作为推荐时现价）"""
+    """从主库加载全部推荐记录（含 price 作为推荐时现价）
+
+    2026-10-18：'竞价关注'这类非数值买入价的记录以前被整条丢掉，导致现价追高口径
+    只覆盖 139/218 条（用户实际看到的推荐更多）。现在改为：低吸口径用不了就不算
+    （r1 保持 None），现价口径照算 —— 两个口径各自覆盖能覆盖的样本，不互相连坐。
+    """
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -96,13 +120,15 @@ def _load_all_recommendations() -> List[Dict]:
             try:
                 buy = float(row[6])
             except (TypeError, ValueError):
-                continue  # '竞价关注'等非数值买入价无法计算
-            if buy <= 0:
-                continue
+                buy = None
+            if buy is not None and buy <= 0:
+                buy = None
             try:
                 price = float(row[3])
             except (TypeError, ValueError):
                 price = 0
+            if buy is None and price <= 0:
+                continue  # 两个口径都算不了才丢
             recs.append({'date': row[0], 'symbol': (row[1] or '').lower(), 'name': row[2],
                          'chg': row[4] or 0, 'score': row[5] or 0,
                          'buy': buy, 'rec_price': price,
@@ -116,21 +142,47 @@ def _load_all_recommendations() -> List[Dict]:
 
 
 def _aggregate(perf: List[Dict]) -> Dict:
-    """聚合一组复盘结果为汇总指标"""
-    def _stats(key):
-        vals = [r[key] for r in perf if r.get(key) is not None]
+    """聚合一组复盘结果为汇总指标
+
+    2026-10-18 起在 t1/exec_t1 之外并列三个"不吹牛"的数字（根因下钻见模块 docstring）：
+      t1_filled      低吸单真正成交部分（filled=1）的 T+1 统计。
+                     注意它条件于"跌到了挂单价"，有逆向选择偏差——但它是用户
+                     真正拿到的交易，比纸面 t1（含未成交幻觉胜利）诚实；
+      exec_t1_filled 同一批成交记录如果按推荐现价追入的 T+1 统计。
+                     低吸纪律的反事实基准：两个数字的差就是"挂低吸"躲掉的诱多；
+      fill_rate      低吸价可成交比例；dixi_ev=成交率×成交组均值，
+                     即"挂低吸单"这条纪律的期望收益（未成交按 0，不幻想）。
+    """
+    def _stats_vals(vals):
         if not vals:
             return None
         return {'n': len(vals),
                 'win_rate': round(sum(1 for v in vals if v > 0) / len(vals) * 100, 1),
                 'avg': round(sum(vals) / len(vals), 2),
                 'median': round(sorted(vals)[len(vals) // 2], 2)}
+
+    def _stats(key):
+        return _stats_vals([r[key] for r in perf if r.get(key) is not None])
+
+    filled = [r for r in perf if r.get('filled') == 1 and r.get('r1') is not None]
+    n_buy = sum(1 for r in perf if r.get('r1') is not None)
+    fill_rate = round(len(filled) / n_buy * 100, 1) if n_buy else None
+    t1_filled = _stats_vals([r['r1'] for r in filled])
+    dixi_ev = None
+    if t1_filled and fill_rate:
+        dixi_ev = round(fill_rate / 100 * t1_filled['avg'], 2)
     dds = [r['dd5'] for r in perf if r.get('dd5') is not None]
     return {
         't1': _stats('r1'), 't3': _stats('r3'), 't5': _stats('r5'),
         'exec_t1': _stats('exec_r1'),
+        't1_filled': t1_filled,
+        'exec_t1_filled': _stats_vals([r['exec_r1'] for r in filled
+                                       if r.get('exec_r1') is not None]),
+        'fill_rate': fill_rate,
+        'dixi_ev': dixi_ev,
         'dd5_avg': round(sum(dds) / len(dds), 2) if dds else None,
         'noodle_count': sum(1 for r in perf if (r.get('r1') or 0) < -5),
+        'noodle_count_exec': sum(1 for r in perf if (r.get('exec_r1') or 0) < -5),
     }
 
 
@@ -181,10 +233,13 @@ def run_recommendation_review() -> Dict:
         return summary
 
     t1 = summary.get('t1') or {}
+    tf = summary.get('t1_filled') or {}
     ex = summary.get('exec_t1') or {}
-    print(f"[推荐复盘] 全量{len(perf)}条: T+1胜率{t1.get('win_rate')}% 均值{t1.get('avg')}%"
-          f" | 现价追入T+1胜率{ex.get('win_rate')}% 均值{ex.get('avg')}%"
-          f" | 吃面(>5%){summary.get('noodle_count')}只")
+    print(f"[推荐复盘] 全量{len(perf)}条: 纸面T+1 {t1.get('win_rate')}%/{t1.get('avg')}%"
+          f" | 低吸单成交 {tf.get('win_rate')}%/{tf.get('avg')}%"
+          f"(n={tf.get('n')}, 成交率{summary.get('fill_rate')}%, 纪律EV {summary.get('dixi_ev')}%)"
+          f" | 现价追入 {ex.get('win_rate')}%/{ex.get('avg')}%"
+          f" | 吃面(>5%) 纸面{summary.get('noodle_count')}只/现价{summary.get('noodle_count_exec')}只")
     return summary
 
 

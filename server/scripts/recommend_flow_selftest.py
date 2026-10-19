@@ -146,7 +146,9 @@ import asyncio
 res = asyncio.run(R.auto_generate_recommendations_task())
 ck(res is not None, f'任务应正常返回（实得 {type(res).__name__}）')
 recs = (res or {}).get('recommendations') or []
-ck(len(recs) == 2, f'应推荐 2 只（5 只里 2 只炸板、1 只黑名单；实得 {len(recs)}）')
+# 2026-10-18 B 涨幅段闸门上线后期望从 2 变 1：sh605555 当日 +4.5% 正落在死亡区
+# 下界 [4.5, 9.8)，被 4.8 节整只拦掉（它的 blocked/影子留痕在下面断言）。
+ck(len(recs) == 1, f'应推荐 1 只（5 只里 2 只炸板、1 只黑名单、1 只涨幅段闸门；实得 {len(recs)}）')
 
 conn = sqlite3.connect(_TMP)
 conn.row_factory = sqlite3.Row
@@ -160,6 +162,13 @@ ck(bysym['sh601111']['blocked_by'] == '亏损黑名单(近30天)',
    f'黑名单原因写进快照（实得 {bysym["sh601111"]["blocked_by"]}）')
 ck(bysym['sh600001']['stage'] == 'scored' and bysym['sh600001']['blocked_by'] == '炸板',
    f'炸板那只停在 scored 且原因落库（{bysym["sh600001"]["stage"]}/{bysym["sh600001"]["blocked_by"]}）')
+# B 涨幅段闸门（2026-10-18）：+4.5% 落在死亡区下界 → 整只拦下、原因落库、且进影子 excluded
+ck(bysym['sh605555']['blocked_by'] == '涨幅段闸门·半山腰死亡区',
+   f'死亡区票被涨幅段闸门拦下且原因落库（实得 {bysym["sh605555"]["blocked_by"]}）')
+ck((bysym['sh605555']['shadow_note'] or '').startswith('影子挡:涨幅段闸门'),
+   f'被闸票有影子挡留痕（反事实的入口，实得 {bysym["sh605555"]["shadow_note"]}）')
+ck(bysym['sh600000']['blocked_by'] in (None, '', '未进精选(概念分散/名额3只)'),
+   f'甜点区 +2.0% 不被误伤（实得 {bysym["sh600000"]["blocked_by"]}）')
 ck(bysym['sh600001']['shadow_note'] is None,
    '影子只评估过门槛的 candidates，被炸板挡掉的没有影子判定（NULL=未评估）')
 ck((bysym['sh600000']['shadow_note'] or '').startswith(('影子放行', '影子挡')),
@@ -182,6 +191,10 @@ ck(len(sh) == 1, '影子日志照旧落库')
 import json as _json
 p = _json.loads(sh[0]['payload'])
 ck('kept' in p, '影子 payload 新增 kept 名单（快照区分"放行/未评估"靠它）')
+_zone_ex = [it for it in (p.get('excluded') or [])
+            if '涨幅段闸门' in '；'.join(it.get('reasons') or [])]
+ck(len(_zone_ex) == 1 and _zone_ex[0]['symbol'].endswith('605555'),
+   f'影子 excluded 带涨幅段闸门挡掉的票（shadow_eval 的反事实测量对象，实得 {len(_zone_ex)} 只）')
 
 # P2-2 模式标签：线上主链路要第一次真的算出 verdict 并落库
 print('\n[模式标签]')

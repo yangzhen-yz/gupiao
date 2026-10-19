@@ -2,7 +2,8 @@
 import json, re, asyncio, requests, time
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date, timedelta
-from app.config import (TENCENT_QUOTE_API, TENCENT_KLINE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, KLINE_START_DATE, KLINE_DATA_LIMIT, CHANGE_RANK_TOP_N, TURNOVER_RANK_TOP_N, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS)
+from app.config import (TENCENT_QUOTE_API, TENCENT_KLINE_API, SINA_QUOTE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, KLINE_START_DATE, KLINE_DATA_LIMIT, CHANGE_RANK_TOP_N, TURNOVER_RANK_TOP_N, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS)
+from services.data import source_health
 from db.database import load_stock_basic_info, save_stock_basic_info, load_hot_search_ranking, load_stock_concept_tags
 
 _stock_basic_info_cache = None
@@ -43,6 +44,23 @@ _DEFAULT_HEADERS = {
 # 注意：必须在 _DEFAULT_HEADERS 定义之后初始化
 _REALTIME_SESSION = requests.Session()
 _REALTIME_SESSION.headers.update(_DEFAULT_HEADERS)
+
+# ========== 行情备源：腾讯 → 新浪（2026-10-19）==========
+# 腾讯是主源；连续失败 3 次后 60 秒内直接走新浪，避免每次请求都先白等两轮腾讯超时。
+# 新浪要求 Referer，否则 403；返回 GBK，字段格式与腾讯不同，需转换成腾讯 50 字段格式，
+# 这样所有现有调用方（parse_tencent_batch_data / 前端 parseTencentData）零改动。
+_SINA_HEADERS = {
+    'User-Agent': _DEFAULT_HEADERS['User-Agent'],
+    'Referer': 'https://finance.sina.com.cn/',
+    'Accept': '*/*',
+}
+_SINA_SESSION = requests.Session()
+_SINA_SESSION.headers.update(_SINA_HEADERS)
+
+_TENCENT_DOWN_STREAK = 3        # 连续失败 3 次视为腾讯短期不可用
+_TENCENT_COOLDOWN_SEC = 60.0    # 冷却期内优先新浪；到期后重试腾讯，避免永久旁路
+_tencent_down_until = 0.0
+_last_fallback_log = 0.0
 
 
 # ========== 同步 HTTP 调用辅助（替代原 httpx.AsyncClient）==========
@@ -116,24 +134,181 @@ def is_main_board(symbol: str) -> bool:
         return True
     # 其他（创业板、科创板、北交所等）→ 不是主板
     return False
-async def fetch_with_retry(symbols: str) -> str:
-    """-fix: httpx.AsyncClient 在生产环境会触发 "Server disconnected without sending a response"
-    错误（参考 project_memory.md 硬约束），改用 requests 同步客户端 + asyncio.to_thread 包装。
+def _valid_symbols(symbols: str) -> List[str]:
+    """过滤出合法的 sh/sz 六位代码，避免把参数原样拼进备源 URL。"""
+    out = []
+    for s in (symbols or '').split(','):
+        s = s.strip().lower()
+        if re.match(r'^(sh|sz)\d{6}$', s):
+            out.append(s)
+    return out
 
-    2026-07-08 优化：
-    1. 全局 _REALTIME_SESSION 复用 keep-alive TCP 连接
-    2. MAX_RETRIES 3→2 + 退避 0.5→0.1
-    3. 新增 _realtime_cache（10 秒 TTL），同 symbol 重复请求 < 5ms
+
+def _sina_num(fields: List[str], idx: int, default: float = 0.0) -> float:
+    try:
+        return float(fields[idx])
+    except (IndexError, TypeError, ValueError):
+        return default
+
+
+def _sina_volume_lots(symbol: str, shares: float) -> float:
+    """新浪成交量换算成腾讯的「手」。
+
+    实测（2026-10-19）：上证指数 sh000* 的成交量已经是手；个股和深证指数 sz399*
+    是股，需要 /100。弄反会让成交量放大/缩小 100 倍，均价和量比跟着全错。
     """
-    symbols_lower = symbols.lower()
+    return shares if symbol.startswith('sh000') else shares / 100.0
+
+
+def _sina_quote_to_tencent(symbol: str, fields: List[str]) -> Optional[str]:
+    """把新浪单行行情转换成腾讯 50 字段格式（双方字段位置不同，只填现有解析器用到的）。"""
+    if len(fields) < 32:
+        return None
+    name = (fields[0] or '').strip()
+    if not name:
+        return None
+
+    price = _sina_num(fields, 3)
+    prev_close = _sina_num(fields, 2)
+    open_price = _sina_num(fields, 1)
+    high = _sina_num(fields, 4)
+    low = _sina_num(fields, 5)
+    if price <= 0 and prev_close > 0:
+        # 停牌票新浪会给 price=0：直接算会变成 -100%，按平盘处理
+        price = prev_close
+        open_price = prev_close if open_price <= 0 else open_price
+        high = prev_close if high <= 0 else high
+        low = prev_close if low <= 0 else low
+    volume_lots = _sina_volume_lots(symbol, _sina_num(fields, 8))
+    amount = _sina_num(fields, 9)
+    change = price - prev_close
+    change_pct = (change / prev_close * 100.0) if prev_close else 0.0
+    amplitude = ((high - low) / prev_close * 100.0) if prev_close else 0.0
+
+    def _lots(idx: int) -> float:
+        return _sina_volume_lots(symbol, _sina_num(fields, idx))
+
+    out = [''] * 50
+    # 第 0 位：腾讯原始是 "1"，这里写 "2" 作为「新浪兜底」标记，解析器会带出 quoteSource
+    out[0] = '2'
+    out[1] = name
+    out[2] = symbol[2:]
+    out[3] = f'{price:.2f}'
+    out[4] = f'{prev_close:.2f}'
+    out[5] = f'{open_price:.2f}'
+    out[6] = f'{volume_lots:.0f}'
+    out[7] = '0'          # 外盘：新浪不提供
+    out[8] = '0'          # 内盘：新浪不提供
+    # 五档买卖（新浪 10~29 = 买一量/价…卖五量/价；腾讯 9~28）
+    pairs = [(9, 11, 10), (11, 13, 12), (13, 15, 14), (15, 17, 16), (17, 19, 18),
+             (19, 21, 20), (21, 23, 22), (23, 25, 24), (25, 27, 26), (27, 29, 28)]
+    for t_price, s_price, t_vol in pairs:
+        out[t_price] = fields[s_price] if s_price < len(fields) else ''
+        out[t_vol] = f'{_lots(s_price - 1):.0f}'
+    out[31] = f'{change:.2f}'
+    out[32] = f'{change_pct:.2f}'
+    out[33] = f'{high:.2f}'
+    out[34] = f'{low:.2f}'
+    out[35] = f'{price:.2f}/{volume_lots:.0f}/{amount:.0f}'
+    out[36] = f'{volume_lots:.0f}'
+    out[37] = f'{amount / 10000.0:.0f}'   # 腾讯成交额单位：万元
+    out[38] = '0'          # 换手率：新浪单行行情里没有
+    out[39] = '0'          # PE：同上
+    out[43] = f'{amplitude:.2f}'
+    out[49] = '0'          # 量比：同上
+    return f'v_{symbol}="{"~".join(out)}";'
+
+
+def _sina_raw_to_tencent(raw: str) -> str:
+    """新浪批量返回 → 腾讯格式多行字符串；空行/无效代码直接跳过。"""
+    lines = []
+    for line in (raw or '').splitlines():
+        m = re.match(r'\s*var hq_str_([a-z]{2}\d{6})="(.*)";?\s*$', line)
+        if not m:
+            continue
+        symbol, content = m.group(1), m.group(2)
+        if not content.strip():
+            continue
+        converted = _sina_quote_to_tencent(symbol, content.split(','))
+        if converted:
+            lines.append(converted)
+    return '\n'.join(lines)
+
+
+def _fetch_sina_quotes(symbols: str) -> str:
+    """新浪行情备源（同步，调用方用 asyncio.to_thread 包）。"""
+    syms = _valid_symbols(symbols)
+    if not syms:
+        raise ValueError('无有效股票代码')
+    out = []
+    for i in range(0, len(syms), 120):
+        chunk = syms[i:i + 120]
+        url = SINA_QUOTE_API + ','.join(chunk)
+        resp = _SINA_SESSION.get(url, timeout=(2, 3))
+        resp.raise_for_status()
+        raw = resp.content.decode('gbk', errors='ignore')
+        converted = _sina_raw_to_tencent(raw)
+        if converted:
+            out.append(converted)
+    if not out:
+        raise ValueError('新浪行情返回为空/无法解析')
+    return '\n'.join(out)
+
+
+def detect_quote_source(raw: str) -> str:
+    """从原始行情串判断来源：'2~' 开头是新浪兜底，其余按腾讯主源。"""
+    m = re.search(r'v_[a-z]{2}\d{6}="(\d)~', raw or '')
+    return 'sina' if (m and m.group(1) == '2') else 'tencent'
+
+
+def quote_route_status() -> Dict:
+    """当前行情路由策略（供诊断接口展示，不做网络请求）。"""
+    remain = max(0.0, _tencent_down_until - time.time())
+    return {
+        'preferred': 'sina' if remain > 0 else 'tencent',
+        'tencentDownStreak': source_health.status('quote_tencent')['streak'],
+        'tencentCooldownRemainSec': int(remain),
+        'cooldownAfterFailures': _TENCENT_DOWN_STREAK,
+        'cooldownSec': int(_TENCENT_COOLDOWN_SEC),
+    }
+
+
+async def fetch_with_retry(symbols: str) -> str:
+    """腾讯主源 + 新浪备源的行情入口（2026-10-19）。
+
+    主路不变：腾讯 2 次重试（keep-alive + 5 秒缓存）。
+    新增降级：腾讯连续失败 3 次后 60 秒内优先走新浪；否则腾讯最终失败时再走新浪。
+    新浪返回会转换成腾讯 50 字段格式，所以所有现有解析器/前端都不用改；
+    第 0 位写 "2"，解析结果里会带 quoteSource='sina'，方便页面标"新浪兜底"。
+    """
+    global _tencent_down_until, _last_fallback_log
+
+    symbols_lower = (symbols or '').lower()
     # 2026-07-08 优化：5 秒内同 symbol 直接返回缓存
     now = time.time()
     cached = _realtime_cache.get(symbols_lower)
     if cached and (now - cached[0]) < REALTIME_CACHE_TTL:
         return cached[1]
 
-    url = TENCENT_API + symbols
     last_err: Optional[Exception] = None
+    sina_err: Optional[Exception] = None
+    syms = _valid_symbols(symbols)
+    use_sina_first = bool(syms) and time.time() < _tencent_down_until
+
+    # 腾讯刚被判为不可用：先试新浪，避免每轮都白等两轮腾讯超时
+    if use_sina_first:
+        t0 = time.time()
+        try:
+            data = await asyncio.to_thread(_fetch_sina_quotes, symbols)
+            source_health.ok('quote_sina', (time.time() - t0) * 1000)
+            _realtime_cache[symbols_lower] = (time.time(), data)
+            return data
+        except Exception as err:
+            source_health.fail('quote_sina', err)
+            sina_err = err
+            # 新浪也不可用 → 继续试腾讯，不直接放弃
+
+    url = TENCENT_API + symbols
 
     def _sync_fetch() -> str:
         # 2026-07-08 优化：用 _REALTIME_SESSION 复用 keep-alive（无 keep-alive 时自动新建，不影响正确性）
@@ -150,20 +325,47 @@ async def fetch_with_retry(symbols: str) -> str:
             raise Exception('API返回数据为空')
         return data
 
+    t0 = time.time()
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             data = await asyncio.to_thread(_sync_fetch)
-            # 2026-07-08 优化：写入缓存（10 秒 TTL）
+            # 2026-07-08 优化：写入缓存（5 秒 TTL）
             _realtime_cache[symbols_lower] = (time.time(), data)
+            source_health.ok('quote_tencent', (time.time() - t0) * 1000)
+            _tencent_down_until = 0.0
             return data
         except Exception as err:
             last_err = err
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_BACKOFF_BASE * attempt)
 
+    source_health.fail('quote_tencent', last_err)
+    if source_health.status('quote_tencent')['streak'] >= _TENCENT_DOWN_STREAK:
+        _tencent_down_until = time.time() + _TENCENT_COOLDOWN_SEC
+
+    # 腾讯最终失败 → 新浪兜底（本轮还没试过新浪才试）
+    if syms and not use_sina_first:
+        t0 = time.time()
+        try:
+            data = await asyncio.to_thread(_fetch_sina_quotes, symbols)
+            source_health.ok('quote_sina', (time.time() - t0) * 1000)
+            _realtime_cache[symbols_lower] = (time.time(), data)
+            # 兜底日志限流：最多 60 秒一条，避免 5 秒轮询刷屏
+            if time.time() - _last_fallback_log > 60:
+                _last_fallback_log = time.time()
+                print(f'[行情] 腾讯不可用，已切新浪兜底（{len(syms)} 只，'
+                      f'{(time.time() - t0) * 1000:.0f}ms）')
+            return data
+        except Exception as err:
+            source_health.fail('quote_sina', err)
+            last_err = Exception(f'腾讯: {last_err}; 新浪: {err}')
+    elif sina_err is not None:
+        # 冷却期内先试新浪也失败：报错要把两边的错一起带上，别只留腾讯的
+        last_err = Exception(f'新浪: {sina_err}; 腾讯: {last_err}')
+
     # 兜底：str(err) 为空时用 repr，否则 detail 看不到错误
     err_msg = str(last_err) or (repr(last_err) if last_err else '未知错误')
-    raise Exception(f'fetch_with_retry 失败（已重试{MAX_RETRIES}次）: {err_msg}')
+    raise Exception(f'fetch_with_retry 失败（腾讯/新浪均不可用）: {err_msg}')
 
 async def fetch_stock_data(symbol: str) -> Optional[Dict]:
     try:
@@ -192,7 +394,17 @@ async def fetch_eastmoney_hot_list():
     _POPULARITY_API = 'https://emappdata.eastmoney.com/stockrank/getAllCurrentList'
 
     def _fetch_clist(fid: str, fetch_count: int) -> list:
-        """从东方财富 clist 接口拉取全 A 股（按 fid 排序），返回原始 diff 列表。"""
+        """从东方财富 clist 接口拉取全 A 股（按 fid 排序），返回原始 diff 列表。
+
+        2026-10-19：接入共享熔断 eastmoney_guard（东财 clist IP 级风控根治）——
+        冷却中直接返回 []，热搜榜走降级路径，不再翻页重试硬打。
+        """
+        try:
+            from services.data import eastmoney_guard
+            if eastmoney_guard.skip('clist'):
+                return []
+        except Exception:
+            pass
         url = EASTMONEY_HOT_LIST_API
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -203,6 +415,7 @@ async def fetch_eastmoney_hot_list():
             'Origin': 'https://quote.eastmoney.com',
         }
         all_stocks = []
+        last_err = None          # 交给熔断器分级：连接被重置=被封，空数据=抖动，两者处置不同
         total_pages = (fetch_count + 99) // 100
         for pn in range(1, total_pages + 1):
             params = {
@@ -210,15 +423,32 @@ async def fetch_eastmoney_hot_list():
                 'fs': 'm:0+t:2,m:1+t:2',
                 'fields': 'f2,f3,f4,f6,f12,f13,f14'
             }
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            if not data or not data.get('data') or not data['data'].get('diff'):
+            try:
+                r = requests.get(url, params=params, headers=headers, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                if not data or not data.get('data') or not data['data'].get('diff'):
+                    break
+                page_stocks = data['data']['diff']
+                all_stocks.extend(page_stocks)
+                if len(page_stocks) < 100:
+                    break
+            except Exception as e:
+                print(f'[热搜榜] clist 第{pn}页失败: {e}')
+                last_err = e
                 break
-            page_stocks = data['data']['diff']
-            all_stocks.extend(page_stocks)
-            if len(page_stocks) < 100:
-                break
+        if all_stocks:
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.ok('clist')
+            except Exception:
+                pass
+        else:
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.fail('clist', last_err)
+            except Exception:
+                pass
         return all_stocks
 
     def _fetch_popularity_rank() -> list:
@@ -264,9 +494,18 @@ async def fetch_eastmoney_hot_list():
         """用 push2 ulist.np 批量获取股票行情（名称/价格/涨跌幅）。
         symbols: ['sh600248', 'sz000001', ...]
         返回: {'sh600248': {'name': '陕建股份', 'price': 3.01, 'changePercent': 2.38, 'change': 0.07}, ...}
+
+        2026-10-19：接入共享熔断（独立 scope 'ulist'，与 clist 分开计数——
+        push2delay 同域，clist 被封时 ulist 大概率同样命运，但分开计数避免误挡）。
         """
         if not symbols:
             return {}
+        try:
+            from services.data import eastmoney_guard
+            if eastmoney_guard.skip('ulist'):
+                return {}
+        except Exception:
+            pass
         # push2 secids 格式: "1.600248,0.000001" (1=沪市, 0=深市)
         secid_map = {'sh': '1', 'sz': '0'}
         secids = ','.join(f"{secid_map.get(s[:2], '1')}.{s[2:]}" for s in symbols)
@@ -302,6 +541,17 @@ async def fetch_eastmoney_hot_list():
                     }
         except Exception as e:
             print(f'[热搜榜] 批量行情获取失败: {e}')
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.fail('ulist')
+            except Exception:
+                pass
+        if result:
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.ok('ulist')
+            except Exception:
+                pass
         return result
 
     def _filter_mainboard(stocks: list, limit: int) -> list:
@@ -478,7 +728,8 @@ def parse_realtime_fields(data: str) -> Optional[Dict]:
                         'open': float(fields[5]) if fields[5] else 0,
                         'high': float(fields[33]) if fields[33] else 0,
                         'low': float(fields[34]) if fields[34] else 0,
-                        'volume': float(fields[36]) if fields[36] else 0
+                        'volume': float(fields[36]) if fields[36] else 0,
+                        'quoteSource': 'sina' if fields[0] == '2' else 'tencent',
                     }
     except Exception as e:
         print(f'[解析实时数据] 失败: {str(e)}')
@@ -658,6 +909,7 @@ def parse_tencent_batch_data(data: str) -> List[Dict]:
             'name': fields[1],
             'symbol': symbol,
             'code': fields[2],
+            'quoteSource': 'sina' if fields[0] == '2' else 'tencent',
             'price': fields[3],
             'priceRaw': price,
             'prevClose': fields[4],

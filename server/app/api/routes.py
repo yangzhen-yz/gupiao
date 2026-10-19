@@ -6,7 +6,7 @@ import json, asyncio, time, re, inspect
 from datetime import date, datetime
 from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
-from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk)
+from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk, detect_quote_source, quote_route_status)
 from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
 from services.strategy.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
 from services.strategy.trend_backtest import backtest_trend_predictions
@@ -91,6 +91,31 @@ def _build_scan_universe(codes_list: List[str], pool_only: bool = False) -> List
 async def health_check():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
+
+@router.get("/api/data-sources/health", tags=["健康检查"])
+async def data_sources_health():
+    """数据源健康台账（2026-10-19，只读，不发网络请求）。
+
+    行情：腾讯主源 / 新浪备源的连续失败计数与当前路由（是否处于腾讯冷却期）。
+    东财：clist / ulist / datacenter 三个 scope 的熔断与全域闸门状态。
+    页面“数据为什么旧/为什么标了新浪兜底”可以直接在这里找到答案。
+    """
+    from services.data import source_health, eastmoney_guard
+    return {
+        "success": True,
+        "data": {
+            "quotes": {
+                "tencent": source_health.status('quote_tencent'),
+                "sina": source_health.status('quote_sina'),
+                "route": quote_route_status(),
+            },
+            "eastmoney": {
+                scope: eastmoney_guard.status(scope)
+                for scope in ('clist', 'ulist', 'datacenter')
+            },
+        },
+    }
+
 @router.get("/api/hot_search_ranking", tags=["热搜榜数据"])
 async def get_hot_search_ranking_api():
     try:
@@ -153,7 +178,8 @@ async def get_stock(symbol: str):
         print(f'[单只查询] {symbol}')
         data = await fetch_with_retry(symbol.lower())
         from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(content=data, media_type="text/plain")
+        return PlainTextResponse(content=data, media_type="text/plain",
+                                 headers={'X-Quote-Source': detect_quote_source(data)})
     except Exception as error:
         err_msg = str(error) or repr(error) or '未知错误'
         raise HTTPException(status_code=502, detail=f"获取股票数据失败: {err_msg}")
@@ -220,6 +246,7 @@ async def get_stock_analysis(symbol: str):
             "success": True,
             "data": {
                 "symbol": stock_data.get('symbol'),
+                "quoteSource": stock_data.get('quoteSource', 'tencent'),
                 "score": result.get('total', 0),
                 "label": result.get('label', '无评分'),
                 "predictDirection": result.get('predict_direction', 'neutral'),
@@ -317,6 +344,7 @@ async def get_stock_full(symbol: str):
             "data": {
                 "symbol": sym,
                 "raw": raw,  # 腾讯原始行情字符串，前端 parseTencentData 解析
+                "quoteSource": detect_quote_source(raw),  # 腾讯主源 / 新浪兜底（缓存命中也能判）
                 "score": result.get('total', 0),
                 "label": result.get('label', '无评分'),
                 "predictDirection": result.get('predict_direction', 'neutral'),
@@ -347,7 +375,8 @@ async def get_stocks(symbols: str):
     try:
         data = await fetch_with_retry(symbols)
         from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(content=data, media_type="text/plain")
+        return PlainTextResponse(content=data, media_type="text/plain",
+                                 headers={'X-Quote-Source': detect_quote_source(data)})
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"批量获取失败: {str(error)}")
 
@@ -2755,8 +2784,20 @@ def _get_eastmoney_session() -> _req.Session:
 
 @router.api_route("/eastmoney/{path:path}", methods=["GET", "POST"])
 async def proxy_eastmoney(request: Request, path: str):
-    """将 /eastmoney/* 请求转发到东方财富 API（requests Session + 重试，解决 RemoteDisconnected）"""
+    """将 /eastmoney/* 请求转发到东方财富 API（requests Session + 重试，解决 RemoteDisconnected）
+
+    2026-10-19：接入共享熔断 eastmoney_guard——前端唯一能任意路径直连东财的通道，
+    冷却中直接 503，不再 3 次重试硬打（东财 clist IP 级风控实锤，频率是主因）。
+    前端对非 2xx 均 catch(()=>null) 静默降级，行为兼容。
+    """
     import asyncio, time as _time
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            return Response(content=b'{"error":"eastmoney clist cooling"}',
+                            status_code=503, media_type="application/json")
+    except Exception:
+        pass
     target_url = f"https://push2delay.eastmoney.com/{path}"
     query_params = dict(request.query_params)
     session = _get_eastmoney_session()
@@ -2778,6 +2819,11 @@ async def proxy_eastmoney(request: Request, path: str):
 
     try:
         resp = await asyncio.to_thread(_do_request)
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.ok('clist')
+        except Exception:
+            pass
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -2785,6 +2831,11 @@ async def proxy_eastmoney(request: Request, path: str):
         )
     except Exception as e:
         print(f'[东方财富代理] 请求失败: {e}')
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.fail('clist')
+        except Exception:
+            pass
         return Response(content=b"{}", status_code=502, media_type="application/json")
 
 

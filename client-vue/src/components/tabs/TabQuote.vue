@@ -62,7 +62,14 @@
           <div class="stock-header">
             <div class="stock-name-code">
               <div class="stock-name">{{ quoteData.name }}</div>
-              <div class="stock-code">{{ quoteData.symbol.toUpperCase() }}</div>
+              <div class="stock-code">
+                {{ quoteData.symbol.toUpperCase() }}
+                <span
+                  v-if="quoteData.quoteSource === 'sina'"
+                  class="quote-source-badge"
+                  title="腾讯行情接口连续失败，当前价格由新浪行情兜底；换手率/量比/PE/内外盘新浪不提供，显示为 0"
+                >新浪兜底</span>
+              </div>
             </div>
             <div class="stock-price-section">
               <div class="stock-price" :class="quoteData.isUp ? 'up' : 'down'">{{ quoteData.price }}</div>
@@ -553,6 +560,7 @@
               avgPrice: parseFloat(avgPrice.toFixed(2)),
               avgPriceDeviation: parseFloat(avgPriceDeviation.toFixed(2)),
               outerRatio: parseFloat(outerRatio.toFixed(1)),
+              quoteSource: fields[0] === '2' ? 'sina' : 'tencent',
             }
           }
         }
@@ -581,13 +589,15 @@
       if (!resp || !resp.success) {
         throw new Error(resp?.detail || '数据获取失败')
       }
-      const { raw, score, label, predictDirection, details, riskControl, buySellPoints } = resp.data
+      const { raw, score, label, predictDirection, details, riskControl, buySellPoints, quoteSource } = resp.data
       const parsed = parseTencentData(raw)
       // 注入后端 score（后端 calc_stock_score_v2 是权威评分源）
       if (parsed) {
         parsed.score = score
         parsed.scoreDetails = details || []
         parsed.label = label
+        // 行情来源（腾讯主源 / 新浪兜底）：后端判定优先，缺省时保留原始串推断
+        parsed.quoteSource = quoteSource || parsed.quoteSource || 'tencent'
         // 风控止损 + 买卖点（散户最关心的止损位 / 预期涨幅 / 买入参考价）
         parsed.riskControl = riskControl || null
         parsed.buySellPoints = buySellPoints || null
@@ -766,6 +776,21 @@
 </script>
 
 <style scoped>
+  /* 行情来源标记：腾讯挂掉走新浪兜底时，避免用户把"缺字段的 0"当成真实值 */
+  .quote-source-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: var(--radius-pill);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    vertical-align: middle;
+    white-space: nowrap;
+    color: var(--accent-warning);
+    background: var(--accent-warning-bg);
+    border: 1px solid var(--accent-warning-border);
+  }
+
   /* ===== 交易决策卡 ===== */
   .decision-card {
     background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);

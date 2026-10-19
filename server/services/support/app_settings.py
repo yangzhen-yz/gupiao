@@ -188,6 +188,55 @@ SPEC: List[Dict[str, Any]] = [
         'note': '不分级时这一项就是关禁天数', 'impact': None,
     },
     {
+        'key': 'zone_gate_enabled', 'cfg': 'RECOMMEND_ZONE_GATE_ENABLED', 'kind': 'bool',
+        'label': '启用涨幅段闸门', 'group': '推荐涨幅段闸门', 'live': True,
+        'note': '复盘实测两个当日涨幅段是负期望：弱势区 0~2%（36.4%/−2.59%）与'
+                '半山腰死亡区 4.5~9.8%（40.0%/−2.27%），两段共 91 条；砍掉后剩 52.8%/+0.82%。'
+                '关掉=回到不拦的老行为',
+        'impact': None,
+    },
+    {
+        'key': 'zone_gate_mode', 'cfg': 'RECOMMEND_ZONE_GATE_MODE', 'kind': 'enum',
+        'label': '闸门模式', 'group': '推荐涨幅段闸门', 'live': True,
+        'options': [{'value': 'drop', 'label': '过滤（死亡区票不进候选）'},
+                    {'value': 'demote', 'label': '罚分（压低分数但仍可选）'},
+                    {'value': 'off', 'label': '关闭（不拦）'}],
+        'note': '过滤模式下被挡的票会进影子记录，系统自动跟踪它们此后的表现来验证闸门是否有效；'
+                '罚分模式更温和，但排名靠前的高分死亡区票仍可能入选',
+        'impact': None,
+    },
+    {
+        'key': 'zone_weak_max', 'cfg': 'RECOMMEND_ZONE_WEAK_MAX', 'kind': 'float',
+        'label': '弱势区上限（%）', 'group': '推荐涨幅段闸门', 'live': True,
+        'min': 0, 'max': 6, 'step': 0.5, 'unit': '%',
+        'note': '当日涨幅在 [0, 此值) 算"没涨起来"：不是安全，是没人要（36.4% 胜率）',
+        'impact': None,
+    },
+    {
+        'key': 'zone_weak_penalty', 'cfg': 'RECOMMEND_ZONE_WEAK_PENALTY', 'kind': 'int',
+        'label': '弱势区罚分', 'group': '推荐涨幅段闸门', 'live': True,
+        'min': 0, 'max': 20, 'step': 1, 'unit': '分',
+        'note': '仅罚分模式生效；过滤模式下整只拦掉，不需要罚分', 'impact': None,
+    },
+    {
+        'key': 'zone_chase_min', 'cfg': 'RECOMMEND_ZONE_CHASE_MIN', 'kind': 'float',
+        'label': '死亡区下限（%）', 'group': '推荐涨幅段闸门', 'live': True,
+        'min': 2, 'max': 8, 'step': 0.5, 'unit': '%',
+        'note': '甜点区上界：低于此值不拦', 'impact': None,
+    },
+    {
+        'key': 'zone_chase_max', 'cfg': 'RECOMMEND_ZONE_CHASE_MAX', 'kind': 'float',
+        'label': '死亡区上限（%）', 'group': '推荐涨幅段闸门', 'live': True,
+        'min': 6, 'max': 15, 'step': 0.5, 'unit': '%',
+        'note': '达到此值按涨停区对待（历史最强的一段，不拦）', 'impact': None,
+    },
+    {
+        'key': 'zone_chase_penalty', 'cfg': 'RECOMMEND_ZONE_CHASE_PENALTY', 'kind': 'int',
+        'label': '死亡区罚分', 'group': '推荐涨幅段闸门', 'live': True,
+        'min': 0, 'max': 20, 'step': 1, 'unit': '分',
+        'note': '仅罚分模式生效；过滤模式下整只拦掉，不需要罚分', 'impact': None,
+    },
+    {
         'key': 'push_daily_limit', 'cfg': 'WECOM_PUSH_DAILY_LIMIT', 'kind': 'int',
         'label': '每天最多推送条数', 'group': '推送', 'live': True,
         'min': 1, 'max': 30, 'step': 1, 'unit': '条',
@@ -244,6 +293,15 @@ SPEC: List[Dict[str, Any]] = [
         'note': '算"影子规则挡掉的票第二天是不是真的更差"（recommend_shadow_eval）。'
                 '这是第1批把周期门槛搬到线上的判据：关掉只是少一个监控点，'
                 '不影响影子日志本身（它由推荐任务在每个批次写入）',
+        'impact': None,
+    },
+    {
+        'key': 'westock_crosscheck_enabled', 'cfg': 'WESTOCK_CROSSCHECK_ENABLED', 'kind': 'bool',
+        'label': '每日双源数据校验（16:30，westock 权威）', 'group': '策略快照', 'live': True,
+        'note': '把本地资金流/行情与 westock（腾讯自选股）比对，落 westock_snapshot 与 '
+                'data_cross_check（authoritative=westock）。行情层不一致=某一侧接口异常需告警；'
+                '资金流层只记录偏差与符号冲突（三口径定义不同，不当场校正展示）。'
+                '关掉只是少一个监控点，不影响任何选股/推送链路',
         'impact': None,
     },
 ]

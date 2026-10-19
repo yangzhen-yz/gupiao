@@ -191,7 +191,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票行情、K线图、趋势发现", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source"])
 
 # 注册路由
 from app.api.routes import router
@@ -199,9 +199,23 @@ app.include_router(router)
 
 @app.get("/eastmoney/{path:path}", tags=["东方财富代理"])
 async def eastmoney_proxy(path: str, request: Request):
-    """将 /eastmoney/* 请求代理到 https://push2delay.eastmoney.com/*（使用 requests 同步库，避免 httpx 断连）"""
+    """将 /eastmoney/* 请求代理到 https://push2delay.eastmoney.com/*（使用 requests 同步库，避免 httpx 断连）
+
+    2026-10-19：接入共享熔断 eastmoney_guard——这是前端唯一能任意路径直连东财的通道
+    （复盘页 4 路并发 clist 等），冷却中直接 503，不再代理 3 次重试硬打
+    （东财 clist IP 级风控实锤：10-17/10-19 两次封禁均封数小时，频率是主因）。
+    前端对非 2xx 均为 catch(()=>null) 静默降级，行为兼容。
+    """
     import requests as _req
     import asyncio, time as _time
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            raise HTTPException(status_code=503, detail='eastmoney clist cooling')
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     query_string = str(request.url.query)
     target_url = f"https://push2delay.eastmoney.com/{path}"
     if query_string:
@@ -214,7 +228,7 @@ async def eastmoney_proxy(path: str, request: Request):
         'Referer': 'https://quote.eastmoney.com/',
         'Origin': 'https://quote.eastmoney.com',
     }
-    
+
     def _do_req():
         last_err = None
         for attempt in range(3):
@@ -228,12 +242,22 @@ async def eastmoney_proxy(path: str, request: Request):
 
     try:
         resp = await asyncio.to_thread(_do_req)
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.ok('clist')
+        except Exception:
+            pass
         return Response(
             content=resp.content,
             status_code=resp.status_code,
             headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
         )
     except Exception as e:
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.fail('clist')
+        except Exception:
+            pass
         raise HTTPException(status_code=502, detail=f"代理请求失败: {str(e)}")
 
 

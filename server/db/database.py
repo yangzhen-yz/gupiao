@@ -513,6 +513,42 @@ def init_db():
                 snap_key TEXT PRIMARY KEY,       -- 'stocks:<n>' / 'sectors:<n>' / 'hidden:<key>'
                 snap_json TEXT NOT NULL,         -- 该区块最后成功数据的整包 JSON
                 updated_at TEXT)''')
+        # 双源交叉校验（2026-10-19）：westock（腾讯自选股）每日快照 + 与本地口径比对，
+        # 权威源=westock（用户决策"不一致的以 westock 为准"）。
+        # 宇宙=当日资金流 top + 热搜 top + 当日推荐（约 150-200 只），非全市场。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS westock_snapshot (
+                date TEXT NOT NULL,
+                symbol TEXT NOT NULL,            -- 小写带前缀 sh600519
+                name TEXT,
+                close_price REAL,
+                change_pct REAL,
+                main_net_inflow REAL,            -- 腾讯口径主力净流入（元，权威值）
+                jumbo_net_flow REAL,             -- 超大单净流
+                mid_net_flow REAL,
+                retail_net_flow REAL,
+                main_net_5d REAL,
+                main_net_10d REAL,
+                main_net_20d REAL,
+                industry_rank INTEGER,
+                fetched_at TEXT,
+                PRIMARY KEY (date, symbol))''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS data_cross_check (
+                date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                our_change_pct REAL,              -- 本地口径涨跌幅（%）
+                westock_change_pct REAL,          -- westock 涨跌幅（%）
+                quote_agreed INTEGER,             -- 行情层是否一致（0/1）
+                our_main_inflow REAL,             -- 本地口径主力净流入（元）
+                westock_main_inflow REAL,         -- westock 主力净流入（元，权威值）
+                inflow_diff REAL,                 -- westock - our（元）
+                inflow_diff_pct REAL,             -- 偏差百分比（相对 our）
+                direction_conflict INTEGER,       -- 符号相反（0/1）
+                authoritative TEXT DEFAULT 'westock',
+                checked_at TEXT,
+                PRIMARY KEY (date, symbol))''')
         # 索引（2026-07-20 性能优化 A4）：基本面/估值按 symbol 高频点查
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_symbol ON stock_fundamental(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
@@ -2267,6 +2303,148 @@ def load_fund_flow_snapshot(snap_key: str):
     except Exception as _e:
         print(f'[数据库] 读取资金流向快照失败({snap_key}): {_e}')
         return None
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def save_westock_snapshot(date_key: str, rows: List[Dict]) -> int:
+    """保存某交易日 westock 快照（逐只 UPSERT，按 date+symbol 幂等）。
+
+    rows: [{'symbol','name','close_price','change_pct','main_net_inflow',...}]
+    返回写入条数。
+    """
+    from datetime import datetime
+    if not rows:
+        return 0
+    conn = None
+    try:
+        conn = get_db_conn()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        n = 0
+        for r in rows:
+            sym = (r.get('symbol') or '').lower()
+            if not sym:
+                continue
+            conn.execute('''
+                INSERT INTO westock_snapshot
+                    (date, symbol, name, close_price, change_pct, main_net_inflow,
+                     jumbo_net_flow, mid_net_flow, retail_net_flow,
+                     main_net_5d, main_net_10d, main_net_20d, industry_rank, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date, symbol) DO UPDATE SET
+                    name=excluded.name, close_price=excluded.close_price,
+                    change_pct=excluded.change_pct, main_net_inflow=excluded.main_net_inflow,
+                    jumbo_net_flow=excluded.jumbo_net_flow, mid_net_flow=excluded.mid_net_flow,
+                    retail_net_flow=excluded.retail_net_flow,
+                    main_net_5d=excluded.main_net_5d, main_net_10d=excluded.main_net_10d,
+                    main_net_20d=excluded.main_net_20d, industry_rank=excluded.industry_rank,
+                    fetched_at=excluded.fetched_at''',
+                         (date_key, sym, r.get('name'), r.get('close_price'),
+                          r.get('change_pct'), r.get('main_net_inflow'),
+                          r.get('jumbo_net_flow'), r.get('mid_net_flow'),
+                          r.get('retail_net_flow'), r.get('main_net_5d'),
+                          r.get('main_net_10d'), r.get('main_net_20d'),
+                          r.get('industry_rank'), now))
+            n += 1
+        conn.commit()
+        return n
+    except Exception as e:
+        print(f'[数据库] 保存 westock 快照失败: {e}')
+        return 0
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def save_cross_check(date_key: str, rows: List[Dict]) -> int:
+    """保存某交易日双源比对结果（UPSERT，authoritative=westock）。"""
+    from datetime import datetime
+    if not rows:
+        return 0
+    conn = None
+    try:
+        conn = get_db_conn()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        n = 0
+        for r in rows:
+            sym = (r.get('symbol') or '').lower()
+            if not sym:
+                continue
+            # 三态：True→1 / False→0 / None（未比对）→ NULL（不与"不一致"混淆）
+            qg = r.get('quote_agreed')
+            qg_val = None if qg is None else (1 if qg else 0)
+            dc = r.get('direction_conflict')
+            dc_val = None if dc is None else (1 if dc else 0)
+            conn.execute('''
+                INSERT INTO data_cross_check
+                    (date, symbol, name, our_change_pct, westock_change_pct, quote_agreed,
+                     our_main_inflow, westock_main_inflow, inflow_diff, inflow_diff_pct,
+                     direction_conflict, authoritative, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'westock', ?)
+                ON CONFLICT(date, symbol) DO UPDATE SET
+                    name=excluded.name, our_change_pct=excluded.our_change_pct,
+                    westock_change_pct=excluded.westock_change_pct, quote_agreed=excluded.quote_agreed,
+                    our_main_inflow=excluded.our_main_inflow,
+                    westock_main_inflow=excluded.westock_main_inflow,
+                    inflow_diff=excluded.inflow_diff, inflow_diff_pct=excluded.inflow_diff_pct,
+                    direction_conflict=excluded.direction_conflict,
+                    authoritative='westock', checked_at=excluded.checked_at''',
+                         (date_key, sym, r.get('name'), r.get('our_change_pct'),
+                          r.get('westock_change_pct'), qg_val,
+                          r.get('our_main_inflow'), r.get('westock_main_inflow'),
+                          r.get('inflow_diff'), r.get('inflow_diff_pct'),
+                          dc_val, now))
+            n += 1
+        conn.commit()
+        return n
+    except Exception as e:
+        print(f'[数据库] 保存双源比对失败: {e}')
+        return 0
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def load_westock_snapshot(date_key: str) -> List[Dict]:
+    """读取某交易日 westock 快照（无记录返回 []）。"""
+    conn = None
+    try:
+        conn = get_db_conn()
+        rows = conn.execute(
+            'SELECT * FROM westock_snapshot WHERE date = ?', (date_key,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f'[数据库] 读取 westock 快照失败: {e}')
+        return []
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def load_cross_check(date_key: str) -> List[Dict]:
+    """读取某交易日双源比对结果（无记录返回 []）。"""
+    conn = None
+    try:
+        conn = get_db_conn()
+        rows = conn.execute(
+            'SELECT * FROM data_cross_check WHERE date = ?', (date_key,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f'[数据库] 读取双源比对失败: {e}')
+        return []
     finally:
         if conn:
             try:

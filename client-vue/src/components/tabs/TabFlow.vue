@@ -4,12 +4,13 @@
     <div class="refresh-controls">
       <div class="toggle-section">
         <span class="toggle-label"
-          >📊 资金流向 · {{ statusText }}<span v-if="sourceLabel" class="cooling-badge">{{ sourceLabel }}</span></span
+          >📊 资金流向 · {{ statusText }}<span v-if="sourceLabel" class="cooling-badge">{{ sourceLabel }}</span
+          ><span v-if="stale" class="cooling-badge stale-badge">⚠ 数据截至 {{ lastUpdateTime }}（离线快照，今日未刷新）</span></span
         >
       </div>
       <div style="display: flex; gap: 0.5rem; align-items: center">
         <button class="btn-secondary" @click="refresh" :disabled="loading">手动刷新</button>
-        <div class="last-update">{{ lastUpdateTime }}</div>
+        <div class="last-update">数据时间 {{ lastUpdateTime }}</div>
       </div>
     </div>
 
@@ -90,7 +91,10 @@
 
       <!-- 区块2：行业板块资金流（净流入左 / 净流出右，同一行） -->
       <h3 class="section-title">行业板块净流入 / 净流出排名</h3>
-      <p class="section-subtitle">行业板块，按主力净流入（元）排序 · 红=流入 / 绿=流出 · 每页 {{ PAGE_SIZE }} 条</p>
+      <p class="section-subtitle">
+        行业板块，按主力净流入（元）排序 · 红=流入 / 绿=流出 · 每页 {{ PAGE_SIZE }} 条
+        <span v-if="sectorNote" class="cooling-badge">{{ sectorNote }}</span>
+      </p>
       <div class="flow-grid">
         <div class="flow-col">
           <div class="flow-col-title inflow">🔴 行业板块净流入排名</div>
@@ -268,7 +272,9 @@
   const lastUpdateTime = ref('--:--:--')
   const statusText = ref(getTradingStatusText())
   const cooling = ref(false) // 2026-10-17：东财 clist 熔断冷却中，显示的是历史缓存
+  const stale = ref(false) // 2026-10-19：数据龄期超阈值（今天从未成功刷新，页面显示的是旧快照）
   const sourceLabel = ref('') // 2026-10-17：数据来源提示（新浪兜底 / 冷却缓存）
+  const sectorNote = ref('') // 2026-10-19：板块数据来源提示（兜底/快照/概念暂缺）
 
   const hiddenChangeThreshold = ref(3.0)
   const hiddenHotTopN = ref(30)
@@ -332,15 +338,26 @@
       if (r && r.success && r.data) {
         const d = r.data
         cooling.value = !!d.cooling
+        stale.value = !!d.stale
         const ds = d.dataSource || {}
+        // 只说"冷却中"没用，得说还剩多久；说"来自新浪"也必须带上口径差
+        // （新浪排行只到超大单 r0，东财 f62 是超大单+大单，同一只票数值会不一样）
+        const coolMin = Math.ceil((d.coolingRemainSec || 0) / 60)
         sourceLabel.value =
           ds.stocks === 'sina'
-            ? '主力资金来自新浪(东财受限)'
+            ? '主力资金来自新浪·超大单口径（东财 clist 被封）'
             : ds.stocks === 'snapshot'
               ? '显示上次缓存数据'
               : d.cooling
-                ? '东财冷却中·显示缓存'
+                ? `东财冷却中·约 ${coolMin} 分钟后才再试`
                 : ''
+        sectorNote.value =
+          ds.sectors === 'sina'
+            ? '板块为「新浪个股资金流 × 本地行业分类」聚合（行业来自 baostock 周更表，' +
+              '与东财板块名不是同一套分类；概念板块无本地分类，暂缺）'
+            : ds.sectors === 'snapshot'
+              ? '板块为历史快照'
+              : ''
         // 容错：任一部分失败返回空对象时补默认值，避免模板报错
         d.stocks = d.stocks || { inflow: [], outflow: [] }
         d.stocks.inflow = d.stocks.inflow || []
@@ -365,7 +382,9 @@
           return
         }
         data.value = d
-        lastUpdateTime.value = formatNowTime()
+        // 2026-10-19 诚实化：显示数据真实时间（后端 updateTime），而非本次调用时间——
+        // 封禁日静默返回旧快照时，旧时间戳是用户唯一能看出数据过期的线索。
+        lastUpdateTime.value = (d.updateTime && d.updateTime !== '--') ? d.updateTime.slice(11) : formatNowTime()
         // 数据更新后重置所有分页到第 1 页
         Object.keys(pageState).forEach(k => {
           pageState[k] = 1
@@ -380,15 +399,17 @@
     }
   }
 
-  // 轮询治理（2026-10-13）：资金流向 30s 轮询只在 Tab 可见时跑；
-  // 休市时段仍会自查一次并长睡到下一个开盘点（保持原有"收盘后看缓存"的行为）。
+  // 轮询治理（2026-10-19）：盘中 30s→120s。东财 clist IP 级风控实锤两次
+  // （10-17/10-19 封禁均封数小时），根因是请求频率：原 30s×7次clist/轮=840次/小时，
+  // 远超正常浏览器页面量级。治理后 fundflow 每轮 4 次 × 120s = 120次/小时（降 7 倍），
+  // 资金流 2 分钟粒度对盘中决策无影响；休市仍自查一次长睡到下一个开盘点。
   const { start: startFlowPolling } = usePolling(
     async () => {
       statusText.value = getTradingStatusText()
       if (isTradingTime() || !data.value) await refresh()
     },
     {
-      interval: () => (isTradingTime() ? 30000 : getNextRefreshDelay()),
+      interval: () => (isTradingTime() ? 120000 : getNextRefreshDelay()),
       active: () => props.active,
       immediate: false,
     }
@@ -412,6 +433,12 @@
     border-radius: 999px;
     vertical-align: middle;
     white-space: nowrap;
+  }
+  /* 2026-10-19：数据龄期超阈值（离线快照）——比冷却更醒目的警示色 */
+  .stale-badge {
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+    border-color: rgba(220, 38, 38, 0.4);
   }
   .flow-grid {
     display: grid;

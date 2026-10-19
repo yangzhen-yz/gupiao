@@ -7,9 +7,10 @@
 用户就再也不知道该挂哪个数。这里收在一处，两边都调它。
 
 口径来源（不是拍脑袋）：`docs/短线买法-2026-10.md` §5 与推荐复盘的实测——
-从**低吸参考价**成交的历史 T+1 胜率 60.4%，从**推荐时现价追入**只有 43.2%。
-所以"现价高于买入上限"不是措辞问题，是一个有 17 个百分点差距的执行动作，
-必须按票算出来、摆在按钮上，而不是全局贴一句"建议低吸"了事。
+现价追入的 T+1 胜率 46.8%（218 条），低吸单**真正成交**的口径 42.1%（95 条成交，
+纸面 60.4% 里三成是"没跌到买入价"的幻觉胜利）；且成交日如果追高只有 25.3% ——
+"现价高于买入上限"不是措辞问题，是同一个日子里两种执行动作差 17 个百分点以上的
+事实，必须按票算出来、摆在按钮上，而不是全局贴一句"建议低吸"了事。
 """
 from typing import Dict, Optional
 
@@ -96,23 +97,30 @@ def chase_warning(price: float, buy_high: Optional[float], rates: Optional[Dict]
                   warn_at: float = 1.0, stop_at: float = 3.0) -> str:
     """按票算出来的追高警告；没超阈值返回空串（不硬凑一句废话）。
 
-    rates 传推荐复盘的实测数 `{'dixiWin':…, 'chaseWin':…, 'dixiN':…, 'chaseN':…}`，
-    拿不到就退回文档口径（60.4% / 43.2%，`docs/短线买法-2026-10.md`）——
+    rates 传推荐复盘的实测数 `{'dixiWin':…, 'chaseWin':…, 'dixiN':…, 'chaseN':…,
+    'filledChaseWin':…}`（`recommend.exec_rates()` 的返回值），拿不到就退回文档口径
+    （42.1% / 46.8%，`docs/胜率低根因复盘-2026-10-18.md`）——
     数字必须带出处，但出处可以是文档；有实测量时把样本条数一起写出来，
-    几十笔的胜率本来就飘，让用户看得见"这只是 139 条给出的 60.4%"。
+    几十笔的胜率本来就飘，让用户看得见"这只是 95 条成交给出的 42.1%"。
+
+    2026-10-18 口径纠偏：`dixiWin` 现在是**低吸单真正成交**口径（纸面 60.4% 里
+    31.7% 是未成交的幻觉胜利，不能往警告文案里放）。`filledChaseWin`（成交日追高
+    胜率）是这句话的重点：挂低吸的意义是躲诱多，不是保证赚。
     """
     op = over_pct(price, buy_high)
     if op is None or op < warn_at:
         return ''
     r = rates or {}
-    dw = r.get('dixiWin') if r.get('dixiWin') is not None else 60.4
-    cw = r.get('chaseWin') if r.get('chaseWin') is not None else 43.2
+    dw = r.get('dixiWin') if r.get('dixiWin') is not None else 42.1
+    cw = r.get('chaseWin') if r.get('chaseWin') is not None else 46.8
     n_txt = ''
     if r.get('dixiN') and r.get('chaseN'):
         n_txt = f'（样本 {r["dixiN"]}/{r["chaseN"]} 条）'
+    fcw = r.get('filledChaseWin')
+    fcw_txt = f'，而这些成交日如果追高只有 {fcw}%' if fcw is not None else ''
     txt = (f'现价已高于买入参考价上限 {op:.1f}%（上限 {buy_high:.2f}）。'
-           f'这个追入口径历史 T+1 胜率 {cw}%，挂到低吸价成交的口径是 {dw}%{n_txt} —— '
-           f'建议挂单等回踩，不追盘中高价')
+           f'现价追入口径历史 T+1 胜率 {cw}%，低吸单真正成交的口径是 {dw}%'
+           f'{fcw_txt}{n_txt} —— 建议挂单等回踩，不追盘中高价')
     if op >= stop_at:
         txt += f'；超出 {stop_at:g}% 以上不建议买入'
     return txt

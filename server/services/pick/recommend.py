@@ -2,13 +2,16 @@
 import asyncio, json, re, requests, time
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_CHASE_MIN_CHANGE, RECOMMEND_CHASE_MAX_CHANGE, RECOMMEND_CHASE_PENALTY, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE)
+from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE)
 from db.database import (load_daily_recommendations, save_daily_recommendations, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry)
 from services.data.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy.strategy import calc_stock_score_v2, apply_industry_neutralization
 from services.data.utils import to_float as _to_float
 from services.strategy.buy_range import (  # noqa: E402  P0-1 执行诚实化：区间与追高警告的唯一算法
     buy_range, chase_warning, over_pct)
+from services.strategy.momentum_zone import (  # noqa: E402  B 涨幅段闸门：分区唯一实现
+    cfg as zone_cfg, evaluate as zone_evaluate, gate_stock as zone_gate,
+    penalty_stock as zone_penalty)
 from services.data.valuation import get_valuation_batch
 from services.strategy.risk_control import calc_risk_control
 from services.data.placement import fetch_recent_placements
@@ -36,6 +39,15 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
     """
     if not codes:
         return {}
+
+    # 2026-10-19：接入共享熔断（scope 'ulist'，东财 IP 级风控根治）——
+    # 冷却中返回 {}，推荐链路走本地K线库降级，不再并发批量硬打。
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('ulist'):
+            return {}
+    except Exception:
+        pass
 
     # 2026-08-31 性能优化：按排序后的代码集合做 20s 内存缓存
     _ck = ','.join(sorted(set(c.lower() for c in codes)))
@@ -111,9 +123,20 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
         print(f'[资金流向] 靶向获取 {len(found)}/{len(codes)} 只股票数据 (分 {len(batches)} 批)')
         # 2026-08-31 性能优化：写入内存缓存（TTL 20s）
         _FUND_FLOW_BATCH_CACHE[_ck] = {'ts': time.time(), 'data': found}
+        if found:
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.ok('ulist')
+            except Exception:
+                pass
         return found
     except Exception as e:
         print(f'[资金流向] 靶向获取失败: {e}')
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.fail('ulist', e)
+        except Exception:
+            pass
         return {}
 
 
@@ -380,12 +403,21 @@ _RATES_CACHE: Dict = {'ts': 0.0, 'rates': {}}
 
 
 def exec_rates(max_age: float = 600.0) -> Dict:
-    """复盘实测的两个胜率（低吸价口径 / 现价追入口径），带 10 分钟缓存。
+    """复盘实测的胜率（低吸单真实成交口径 / 现价追入口径），带 10 分钟缓存。
 
     为什么要现取：`RECOMMEND_EXEC_HINT` 那句常量写的是"复盘132次：45%/63%"，
-    而复盘样本每天在长（现在 139 条）、口径也在改（1094 选票范围）。
+    而复盘样本每天在长（现在 218 条）、口径也在改（1094 选票范围）。
     警告文案里挂一个会过期的数字，等于让用户信一个没人再核对的结论。
     单股分析、行动台、命令行都不传 rates，靠这里拿到同一份数。
+
+    2026-10-18 口径纠偏（根因下钻 `docs/胜率低根因复盘-2026-10-18.md`）：
+    纸面"低吸参考价 60.4%"里 44/139 条次日没跌到买入价（挂单不会成交，
+    未成交组按构造 100% 胜率）——那个数字不能往卡片上放。现在给三组：
+      filledWin/filledAvg/filledN   低吸单真正成交部分的 T+1（42.1%/-1.06%，n=95）
+      filledChaseWin                同样这些成交日如果按现价追高的 T+1（25.3%）
+                                    —— 两个数的差就是"挂低吸"躲掉的诱多；
+      fillRate/dixiEv               低吸价可成交比例与纪律期望（未成交按 0，不幻想）
+      chaseWin/chaseAvg/chaseN      现价追入口径（覆盖全部推荐，不只数值买入价那些）
     """
     import time as _t
     now = _t.time()
@@ -395,12 +427,18 @@ def exec_rates(max_age: float = 600.0) -> Dict:
     try:
         from services.pick.recommend_review import get_review_summary
         s = get_review_summary(120) or {}
-        r = {'dixiWin': (s.get('t1') or {}).get('win_rate'),
-             'dixiAvg': (s.get('t1') or {}).get('avg'),
-             'dixiN': (s.get('t1') or {}).get('n'),
-             'chaseWin': (s.get('exec_t1') or {}).get('win_rate'),
-             'chaseAvg': (s.get('exec_t1') or {}).get('avg'),
-             'chaseN': (s.get('exec_t1') or {}).get('n')}
+        tf = s.get('t1_filled') or {}
+        ef = s.get('exec_t1_filled') or {}
+        ex = s.get('exec_t1') or {}
+        r = {'dixiWin': tf.get('win_rate'),
+             'dixiAvg': tf.get('avg'),
+             'dixiN': tf.get('n'),
+             'filledChaseWin': ef.get('win_rate'),
+             'fillRate': s.get('fill_rate'),
+             'dixiEv': s.get('dixi_ev'),
+             'chaseWin': ex.get('win_rate'),
+             'chaseAvg': ex.get('avg'),
+             'chaseN': ex.get('n')}
     except Exception as e:
         print(f'[执行诚实化] 复盘实测数没拿到（文案退回文档口径）: {type(e).__name__}: {e}')
     _RATES_CACHE.update({'ts': now, 'rates': r})
@@ -412,7 +450,8 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) ->
 
     以前这里是一句全局常量 `RECOMMEND_EXEC_HINT`："建议低吸或尾盘介入，不追盘中高价"。
     问题是它对所有票都说同一句话，而"现在这只票的现价到底比买入上限高了多少"没人算 ——
-    实测现价追入口径 T+1 胜率 43.2%、挂低吸价成交口径 60.4%，差 17 个百分点，
+    实测现价追入口径 T+1 胜率 46.8%，低吸单真正成交的口径 42.1%（纸面 60.4% 里
+    三成是未成交的幻觉胜利，见 `docs/胜率低根因复盘-2026-10-18.md`），
     光靠一句劝不住。现在按票给出具体数字，超价 ≥3% 直接写"不建议买入"。
 
     算不出来（行情缺字段、价格非法）就退回全局常量文案，推荐链路绝不因为文案崩掉。
@@ -437,13 +476,23 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) ->
             if warn:
                 timing['execHint'] = warn
             elif rates.get('dixiWin') is not None and rates.get('chaseWin') is not None:
-                # 没超价也要说清"为什么默认挂低吸"：用当天复盘的实测数，不抄旧常量
+                # 没超价也要说清"为什么默认挂低吸"：用当天复盘的实测数，不抄旧常量。
+                # 2026-10-18 口径纠偏：纸面"低吸 60.4%"里三成是未成交的幻觉胜利，
+                # 卡片只放真正成交口径，并列"成交日追高只有 filledChaseWin%"——
+                # 挂低吸的意义是躲诱多，不是保证赚（`docs/胜率低根因复盘-2026-10-18.md`）。
+                # 两个附属数字可能缺（复盘表没算出来），缺就不写，不许出现"None%"。
+                _fill = rates.get('fillRate')
+                _fill_txt = f'，成交率 {_fill}%' if _fill is not None else ''
+                _fcw = rates.get('filledChaseWin')
+                _fcw_txt = (f'；同样这些日子按现价追高只有 {_fcw}%——挂低吸是躲诱多，'
+                            f'不是保证赚' if _fcw is not None else '')
                 timing['execHint'] = (
                     f'现价还在买入区间内（超价 {timing.get("overPct")}%），可以按纪律买。'
-                    f'复盘实测：挂低吸价成交 T+1 胜率 {rates["dixiWin"]}%'
-                    f'/均值 {rates.get("dixiAvg")}%（{rates.get("dixiN")}条），'
-                    f'按现价追入 {rates["chaseWin"]}%/均值 {rates.get("chaseAvg")}%'
-                    f'（{rates.get("chaseN")}条）—— 盘中冲高时别改主意')
+                    f'复盘实测：低吸单真正成交 T+1 胜率 {rates["dixiWin"]}%'
+                    f'/均值 {rates.get("dixiAvg")}%（{rates.get("dixiN")}条成交{_fill_txt}）'
+                    f'{_fcw_txt}。现价追入全样本 {rates["chaseWin"]}%'
+                    f'/均值 {rates.get("chaseAvg")}%（{rates.get("chaseN")}条），'
+                    f'盘中冲高时别改主意')
             else:
                 timing['execHint'] = RECOMMEND_EXEC_HINT
         # 打板票的默认出口径（写进卡片，不留给临场决定）：`docs/短线买法-2026-10.md` §2
@@ -451,9 +500,9 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) ->
         if timing.get('type') == 'auction':
             timing['exitNote'] = (
                 '默认出口径：次日 9:15-9:25 竞价挂卖、开盘即走。'
-                '封板票次日开盘卖 +1.99%/胜率 62.9%、亏超 5% 只有 2.4%；'
-                '持有到次日收盘只 +1.64%/56.2%，亏超 5% 涨到 12.3%。'
-                '竞价高开超过 5% 不追（高开>5% 追板历史 T+1 -1.60%/胜率 30.0%）')
+                '封板票次日开盘卖 +2.05%/胜率 64.6%、亏超 5% 只有 2.4%；'
+                '持有到次日收盘只 +1.97%/59.3%，亏超 5% 涨到 11.4%。'
+                '竞价高开超过 5% 不追（高开 +5~8% 追板持有到次日收盘 -0.11%/46.5%、亏超 5% 30.7%）')
     except Exception as e:
         print(f'[执行诚实化] 按票计算失败（回落全局文案）: {type(e).__name__}: {e}')
     return bsp
@@ -785,12 +834,15 @@ def _attach_matrix(items, sent):
 
 
 async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
-                               market_change, live_min_score):
+                               market_change, live_min_score, zone_dropped=None):
     """影子精选：同一份候选池，按"情绪周期门槛 + 角色否决 + 不追高"再选一遍，只落库不替换线上。
 
     口径与线上唯一的不同就是这三条市场级规则，因此两天结果的差集可以直接回答：
       · 被挡掉的票 T+1 是不是真的更差（证明否决有效）；
       · 影子多推的票 T+1 是不是真的更好（证明门槛有效）。
+
+    zone_dropped：涨幅段闸门（drop 模式）从候选里整只拦掉的票。并进 excluded 组，
+    让 shadow_eval 给它们算 T+1 —— 被闸的票不是消失，是换个组别继续接受检验。
     """
     from db.database import get_db_conn
     from services.strategy.sentiment import get_sentiment, cycle_gate
@@ -846,6 +898,24 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
             break
     if len(shadow_top) < 3:
         shadow_top.extend([s for s in kept if s not in shadow_top][:3 - len(shadow_top)])
+
+    # 涨幅段闸门挡掉的票并入 excluded：reasons 写清落在哪一段、当日涨幅多少，
+    # 之后 shadow_eval 对这组算 T+1，就是"闸门该不该留"的反事实证据。
+    for s in (zone_dropped or []):
+        _z = s.get('zone') or {}
+        try:
+            _bsp = calc_buy_sell_points(s, score_result=s.get('score'),
+                                        trend_details=((trend_map.get((s.get('symbol') or '').lower())) or {}).get('details'),
+                                        market_change=market_change)
+        except Exception:
+            _bsp = {}
+        _item = _shadow_item(s, _bsp)
+        _item['reasons'] = [f'涨幅段闸门·{_z.get("label") or "死亡区"}'
+                            f'（当日涨幅 {float(s.get("changePercent") or 0):+.1f}%）']
+        excluded.append(_item)
+    if zone_dropped:
+        print(f'[影子精选] 涨幅段闸门挡掉 {len(zone_dropped)} 只并入 excluded，'
+              f'shadow_eval 将自动跟踪其 T+1 表现')
 
     payload = {
         'generatedAt': now.isoformat(timespec='seconds'),
@@ -1091,20 +1161,32 @@ async def auto_generate_recommendations_task():
             tags = concept_tags.get(sym)
             stock['primary_tag'] = tags[0] if tags else '其他'
 
-        # ===== 3.5 半山腰追高惩罚（2026-10-12，基于132条历史推荐复盘） =====
-        # 复盘：推荐时涨幅 4.5%~9.8%（未涨停）T+1胜率仅44%、均值-2.31%（死亡区），
-        # 而 2~4.5% 为 72%/+3.80%、涨停为 73%/+3.81%。
-        # 半山腰=已涨一段但未涨停=接力资金最犹豫的位置，罚分压低其入选概率。
-        chase_penalized = 0
+        # ===== 3.5 涨幅段闸门·罚分与分区标签（2026-10-18，根因复盘 §3；原"半山腰追高惩罚"重写） =====
+        # 老规则三个毛病：只罚 4.5~9.8% 一段（漏了更差的 0~2% 弱势区）、
+        # abs() 把下跌股算进死亡区、没有开关想关只能改代码。
+        # 复盘补全后：弱势区 0~2% 36.4%/-2.59% 与死亡区 4.5~9.8% 40.0%/-2.27%
+        # 都是负期望（砍掉后剩 52.8%/+0.82%），负涨幅样本不足不闸。
+        # 分区实现与三处调用点（主链/影子/推送）统一收在 momentum_zone。
+        _zone_c = zone_cfg()
+        _zone_drop = _zone_c['enabled'] and _zone_c['mode'] == 'drop'
         for s in all_results:
-            chg = abs(float(s.get('changePercent', 0) or 0))
-            if RECOMMEND_CHASE_MIN_CHANGE <= chg < RECOMMEND_CHASE_MAX_CHANGE:
-                s['score']['total'] = max(0, s['score']['total'] - RECOMMEND_CHASE_PENALTY)
-                s['score']['chase_penalty'] = RECOMMEND_CHASE_PENALTY
-                chase_penalized += 1
-        if chase_penalized:
-            print(f'[智能推荐] 半山腰追高惩罚：{chase_penalized} 只涨幅'
-                  f'{RECOMMEND_CHASE_MIN_CHANGE}~{RECOMMEND_CHASE_MAX_CHANGE}%未涨停股票 -{RECOMMEND_CHASE_PENALTY}分')
+            # 每只票都挂分区标签：快照复盘时能按段统计，不依赖事后重算
+            _z = zone_evaluate(s.get('changePercent'), _zone_c)
+            s['zone'] = {'key': _z['key'], 'label': _z['label'], 'chg': _z['chg']}
+        if _zone_c['enabled'] and _zone_c['mode'] == 'demote':
+            zone_penalized = 0
+            for s in all_results:
+                _z = zone_penalty(s, _zone_c)
+                if _z:
+                    s['score']['total'] = max(0, s['score']['total'] - _z['penalty'])
+                    s['score']['zone_penalty'] = _z['penalty']
+                    zone_penalized += 1
+            if zone_penalized:
+                print(f'[智能推荐] 涨幅段闸门·罚分：{zone_penalized} 只落在负期望涨幅段'
+                      f'（弱势区 0~{_zone_c["weak_max"]:g}% / 死亡区 '
+                      f'{_zone_c["chase_min"]:g}~{_zone_c["chase_max"]:g}%）各罚 '
+                      f'{_zone_c["weak_penalty"]}~{_zone_c["chase_penalty"]}分')
+        # drop 模式不在这里罚分 —— 票在 4.8 整只拦掉，罚分没有意义。
 
         # 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total（与 routes 路径对齐）
         if STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED:
@@ -1204,6 +1286,31 @@ async def auto_generate_recommendations_task():
             if skipped:
                 print(f'[智能推荐] 亏损黑名单过滤：跳过 {skipped} 只近{RECOMMEND_LOSER_LOOKBACK_DAYS}天'
                       f'推荐亏损>{RECOMMEND_LOSER_LOSS_THRESHOLD}%的股票')
+
+        # ===== 4.8 涨幅段闸门·过滤模式（2026-10-18，B） =====
+        # drop 模式：弱势区 0~2% 与死亡区 4.5~9.8% 的票不进候选。
+        # 它们不是被静默吞掉 —— 全部进影子 excluded（见 7.5 传参），
+        # shadow_eval 照样给这组算 T+1：闸门拦得对不对，两周后拿实测说，
+        # 不信这个结论就直接把模式改回 demote/off，代码不用动。
+        zone_dropped = []
+        if _zone_drop:
+            _safe3 = []
+            for s in candidates:
+                _z = zone_gate(s, _zone_c)
+                if _z:
+                    _sym = (s.get('symbol') or '').lower()
+                    _blk(_sym, f'涨幅段闸门·{_z["label"]}')
+                    zone_dropped.append(s)
+                    print(f'[智能推荐] 涨幅段闸门: {s["name"]}({s["symbol"]}) '
+                          f'当日涨幅{_z["chg"]:+.1f}% 落在{_z["label"]}，'
+                          f'评分{s["score"]["total"]}跳过')
+                else:
+                    _safe3.append(s)
+            candidates = _safe3
+            if zone_dropped:
+                print(f'[智能推荐] 涨幅段闸门：跳过 {len(zone_dropped)} 只负期望涨幅段股票'
+                      f'（弱势区 0~{_zone_c["weak_max"]:g}%、死亡区 '
+                      f'{_zone_c["chase_min"]:g}~{_zone_c["chase_max"]:g}%）')
 
         # 概念分散：每种「有标签的」概念取最高分的一只，最多 3 只。
         # 2026-10-15 修正：'其他' 不再参与去重。stock_concept_tags 只覆盖 55 只票，
@@ -1305,9 +1412,9 @@ async def auto_generate_recommendations_task():
 
         # ===== 6. 计算买卖点 + 推荐理由 =====
         rec_items = []
-        # 追高警告里的两个胜率用**当天复盘的实测值**（10 分钟缓存），不写死：
-        # 60.4%/43.2% 是 139 条历史推荐算出来的，样本每天在长、口径刚换成 1094，
-        # 写死就等于三个月后还在引用一个没人再核对的数字。
+        # 追高警告里的胜率用**当天复盘的实测值**（10 分钟缓存），不写死：
+        # 低吸单真正成交 42.1%（n=95）/ 现价追入 46.8%（n=218）是历史推荐算出来的，
+        # 样本每天在长、口径刚换成 1094，写死就等于三个月后还在引用没人核对的数字。
         _rates = exec_rates()
         for r in top3:
             sym = r.get('symbol', '').lower()
@@ -1383,7 +1490,7 @@ async def auto_generate_recommendations_task():
         try:
             _shadow_payload = await _log_shadow_selection(now, date_key, candidates, top3,
                                                           trend_map, market_change,
-                                                          MIN_RECOMMEND_SCORE)
+                                                          MIN_RECOMMEND_SCORE, zone_dropped)
         except Exception as e:
             print(f'[智能推荐] 影子精选落库失败（不影响线上推荐）: {e}')
             _shadow_payload = None

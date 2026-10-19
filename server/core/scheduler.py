@@ -30,13 +30,44 @@ from services.pick.candidate_pool import build_pool as build_candidate_pool
 from app.config import CANDIDATE_POOL_TIME
 from app.config import MATRIX_RERUN_ENABLED, MATRIX_RERUN_TIME
 from app.config import (MARKET_CAP_REFRESH_TIME, MARKET_CAP_REFRESH_WEEKDAY,
+                        INDUSTRY_SYNC_TIME, INDUSTRY_SYNC_WEEKDAY,
                         CANDIDATE_POOL_MAX, KLINE_POOL_MIN_COVERAGE)
 from app.config import (POSITION_WATCH_ENABLED, POSITION_WATCH_INTERVAL_SEC,
                         POSITION_WATCH_START, POSITION_WATCH_END, PUSH_T1_PLAN_TIME)
+# 盘后慢变数据刷新节奏（2026-10-19 降频专项，见 config.py 同名片段）
+from app.config import (SLOW_DATA_HOLDER_NUM_WEEKDAYS, SLOW_DATA_FUNDAMENTAL_WEEKDAYS,
+                        SLOW_DATA_DAILY_MONTHS, SLOW_DATA_VALUATION_TRADING_ONLY)
+# 双源数据交叉校验（2026-10-19，westock 权威源）
+from app.config import WESTOCK_CROSSCHECK_TIME
 
 
 # 盘后数据自检的告警去重：同一天+同一"库内最新日期"只轰一次，否则每轮重跑都发一条
 _KLINE_ALERTED = set()
+
+
+_WEEKDAY_CN = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+
+
+def _weekday_names(weekdays) -> str:
+    """把 [0, 3] 这种人能读的形式写成 '周一/周四'；空列表 = 每日（=改造前）。"""
+    if not weekdays:
+        return '每日'
+    return '/'.join(_WEEKDAY_CN[w] for w in sorted(weekdays) if 0 <= w <= 6)
+
+
+def _slow_data_due(weekdays) -> bool:
+    """盘后慢变数据（股东人数/基本面）今天该不该刷。
+
+    判据只看日历，不发任何网络请求；返回 False 时任务打一行日志就退出。
+    财报季（SLOW_DATA_DAILY_MONTHS）恢复每日——那几个月周末公告密集，新披露不能等一周。
+    weekdays 传空列表 = 每个自然日都刷，行为与改造前完全一致（关掉开关就是老样子）。
+    """
+    if not weekdays:
+        return True
+    now = datetime.now()
+    if now.month in SLOW_DATA_DAILY_MONTHS:
+        return True
+    return now.weekday() in weekdays
 
 
 def _today_is_trading() -> bool:
@@ -283,6 +314,59 @@ def run_scheduler():
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 影子对照失败: {e}')
 
+    def job_westock_crosscheck_daily():
+        """双源数据交叉校验（2026-10-19，westock 权威源）：每日收盘后跑。
+
+        本地资金流/行情 vs westock（腾讯自选股），权威值=westock
+        （用户决策"不一致的以 westock 为准"）。行情层不一致=接口异常告警；
+        资金流层只记录偏差与符号冲突（三口径定义不同）。全流程 1-2 分钟
+        （97 只宇宙实测），串行+限频退避，不阻塞调度循环（脚本内同步跑完即返回，
+        单轮 2 分钟内，晚于它的任务只有 18:15 日K同步，无冲突）。
+        """
+        try:
+            import os as _os
+            import importlib.util as _ilu
+            from services.support import app_settings
+            if not app_settings.value('westock_crosscheck_enabled'):
+                print('[双源校验] 开关已关闭（复盘·口径与开关），本轮跳过')
+                return
+            _dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            spec = _ilu.spec_from_file_location('westock_crosscheck',
+                                                _os.path.join(_dir, 'scripts', 'westock_crosscheck.py'))
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.run()
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 双源校验失败: {e}')
+
+    def job_sync_industry_map():
+        """行业分类周更（2026-10-19）：baostock 一次登录把全市场行业落到 stock_industry_map。
+
+        为什么以**子进程**跑：脚本要 bs.login()/logout() 并等一次全量查询，
+        而调度循环是单线程的 asyncio —— 在里面同步等会把 09:00 海选/09:45 推荐一起拖住。
+        为什么要这张表：10-19 东财 clist 被封一整天，资金流向页「行业」列全空、
+        板块资金流聚合也没了分母。行业分类几个月才动一次，不该依赖一条会被封的行情接口。
+        """
+        try:
+            import os as _os
+            import subprocess
+            import sys as _sys
+            server_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            script = _os.path.join(server_dir, 'scripts', 'sync_stock_industry.py')
+            log = _os.path.join(server_dir, 'analysis_out', 'industry_sync.log')
+            _os.makedirs(_os.path.dirname(log), exist_ok=True)
+            with open(log, 'a', encoding='utf-8') as fh:
+                flags = 0
+                if _os.name == 'nt':
+                    flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+                p = subprocess.Popen([_sys.executable, '-u', script], cwd=server_dir,
+                                     stdout=fh, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, creationflags=flags)
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 行业分类周更已拉起（pid {p.pid}，'
+                  f'日志 server/analysis_out/industry_sync.log）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 行业分类周更拉起失败: {e}')
+
     def job_pre_close_snapshot():
         """收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存。
 
@@ -317,7 +401,15 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照校验失败: {e}')
 
     def job_update_holder_num():
-        # 股东人数是月度数据，每日更新即可；非交易日也可拉取（上一交易日收盘后发布也有）
+        # 股东人数是月度数据；2026-10-19 降频：接口取的是"最新一期"，一期披露后内容不再变，
+        # 每天重拉全市场 ~50 页只是把同样的行搬一遍，而东财 datacenter 正是 IP 风控的来源。
+        # 非刷新日直接退出（一行日志，零请求）；财报季自动恢复每日。原注释"非交易日也可拉取"
+        # 的意图保留：刷新日不看是否交易日，周末披露的公告照样能在下一个刷新日入库。
+        if not _slow_data_due(SLOW_DATA_HOLDER_NUM_WEEKDAYS):
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 股东人数：今天不是刷新日'
+                  f'（节奏 {_weekday_names(SLOW_DATA_HOLDER_NUM_WEEKDAYS)}，'
+                  f'财报季 {"、".join(str(m) for m in SLOW_DATA_DAILY_MONTHS)} 月每日），跳过')
+            return
         asyncio.run(update_holder_num_task())
 
     def job_refresh_market_cap():
@@ -333,11 +425,23 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 市值刷新异常: {e}')
 
     def job_update_fundamental():
-        # 基本面季度披露，非交易日可拉取
+        # 基本面季度披露（ROE/净利同比/EPS），2026-10-19 降频：非财报季每周一拉一次即可，
+        # 新披露的财报最多晚 6 天入库；财报季（1/3/4/7/8/10 月）自动恢复每日。
+        if not _slow_data_due(SLOW_DATA_FUNDAMENTAL_WEEKDAYS):
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 基本面：今天不是刷新日'
+                  f'（节奏 {_weekday_names(SLOW_DATA_FUNDAMENTAL_WEEKDAYS)}，'
+                  f'财报季 {"、".join(str(m) for m in SLOW_DATA_DAILY_MONTHS)} 月每日），跳过')
+            return
         asyncio.run(update_fundamental_task())
 
     def job_update_valuation():
-        # 估值百分位（PE/PB），非交易日可拉取上一交易日数据
+        # 估值百分位（PE/PB）——PE/PB = 收盘价 × 报表数，只在有收盘价变化的日子才变，
+        # 所以保持每日，只去掉周末/节假日的空跑（那两天拉回来的是同一份数据）。
+        # 开关 SLOW_DATA_VALUATION_TRADING_ONLY=False 即退回 7 天无休（改造前行为）。
+        if SLOW_DATA_VALUATION_TRADING_ONLY and not _today_is_trading():
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 估值分位：非交易日（没有新收盘价，'
+                  f'拉回来还是同一份），跳过')
+            return
         # 2026-09-02 修复：update_valuation_task 是同步普通函数，不能用 asyncio.run 包裹（会抛 a coroutine was expected）
         update_valuation_task()
 
@@ -603,6 +707,10 @@ def run_scheduler():
     # 把「影子挡掉的票 T+1 是不是真的更差」存成每天一个点 —— 第1批 P0-2 的上线判据
     schedule.every().day.at(SHADOW_EVAL_TIME).do(_warp_trading_only(job_shadow_eval_daily))
 
+    # 双源数据交叉校验（2026-10-19）：16:30 本地 vs westock（权威源），
+    # 落 westock_snapshot + data_cross_check，行情不一致告警、资金流记录符号冲突
+    schedule.every().day.at(WESTOCK_CROSSCHECK_TIME).do(_warp_trading_only(job_westock_crosscheck_daily))
+
     # 收盘前推荐快照（2026-10-12）：14:45 用最新数据最终生成一次并自动保存，
     # 保证"最后一次推荐"落库可复盘（用户明确需求）
     schedule.every().day.at(SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME).do(job_pre_close_snapshot)
@@ -634,6 +742,9 @@ def run_scheduler():
     # 总市值表每周刷新（2026-10-16）：选票/K线/分时线据此剔除 <35亿 小微盘，防量化操控；非交易日也跑
     getattr(schedule.every(), MARKET_CAP_REFRESH_WEEKDAY).at(MARKET_CAP_REFRESH_TIME).do(job_refresh_market_cap)
 
+    # 行业分类周更（2026-10-19）：东财被封时，资金流向的行业列与板块聚合都靠这张本地表
+    getattr(schedule.every(), INDUSTRY_SYNC_WEEKDAY).at(INDUSTRY_SYNC_TIME).do(job_sync_industry_map)
+
     # 买法矩阵按"选股范围 2462"重跑（一次性，跑成功写标记后自动不再触发）；非交易日也要跑
     schedule.every().day.at(MATRIX_RERUN_TIME).do(job_matrix_rerun)
 
@@ -659,12 +770,21 @@ def run_scheduler():
     print(f'[定时任务]   - {RECOMMEND_REVIEW_TIME}: 智能推荐复盘（本地K线库算T+1/T+3/T+5胜率）')
     print(f'[定时任务]   - {REC_SIM_DAILY_TIME}: 可成交性日常监控（三入口×两卖法落 rec_sim_daily，'
           f'一切"放宽/多推"提案的验收基线）')
+    print(f'[定时任务]   - {INDUSTRY_SYNC_WEEKDAY} {INDUSTRY_SYNC_TIME}: 行业分类周更'
+          f'（baostock 全量落 stock_industry_map；东财被封时资金流向的行业列/板块聚合靠它）')
     print(f'[定时任务]   - {SHADOW_EVAL_TIME}: 影子对照日常监控（放行 vs 被挡 T+1，'
           f'落 recommend_shadow_eval；满 {SHADOW_EVAL_MIN_DAYS} 个交易日才给上线判据）')
+    print(f'[定时任务]   - {WESTOCK_CROSSCHECK_TIME}: 双源数据校验（本地 vs westock 权威源，'
+          f'落 westock_snapshot + data_cross_check；行情不一致告警、资金流记符号冲突）')
     print(f'[定时任务]   - {SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME}: 收盘前推荐快照（最终生成并自动保存，仅交易日）')
-    print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据（月度）')
-    print(f'[定时任务]   - {FUNDAMENTAL_UPDATE_TIME}: 更新基本面质量数据（季度）')
-    print(f'[定时任务]   - {VALUATION_UPDATE_TIME}: 更新估值分位数据（PE/PB 百分位）')
+    print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据'
+          f'（月度披露；刷新节奏 {_weekday_names(SLOW_DATA_HOLDER_NUM_WEEKDAYS)}，'
+          f'财报季 {"、".join(str(m) for m in SLOW_DATA_DAILY_MONTHS)} 月恢复每日）')
+    print(f'[定时任务]   - {FUNDAMENTAL_UPDATE_TIME}: 更新基本面质量数据'
+          f'（季度披露；刷新节奏 {_weekday_names(SLOW_DATA_FUNDAMENTAL_WEEKDAYS)}，'
+          f'财报季恢复每日）')
+    print(f'[定时任务]   - {VALUATION_UPDATE_TIME}: 更新估值分位数据（PE/PB 百分位，'
+          f'{"仅交易日——周末没有新收盘价" if SLOW_DATA_VALUATION_TRADING_ONLY else "每日（含周末，改造前行为）"}）')
     print(f'[定时任务]   - {",".join(SCHEDULE_MARKET_ALERT_TIMES)}: 大盘风险预警自动扫描（仅交易日）')
     print(f'[定时任务]   - {SMART_MONEY_UPDATE_TIME}: 刷新龙虎榜+北向资金数据（刷新至最近已收盘交易日）')
     if KLINE_HISTORY_ENABLED:

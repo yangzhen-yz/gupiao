@@ -77,12 +77,17 @@ ck(over_pct(10.0, 10.0) == 0.0 and over_pct(10.3, 10.0) == 3.0, '超价按 (现�
 ck(over_pct(10.0, None) is None and over_pct(0, 10.0) is None, '缺价时返回 None 而不是炸')
 ck(chase_warning(10.05, 10.0) == '', '超价 0.5% 不说话（阈值 1%）')
 w = chase_warning(10.15, 10.0)
-ck('上限 10.00' in w and '43.2%' in w and '不建议买入' not in w,
-   f'超价 1.5% → 警告带上限价与两个胜率，但不到"不建议"：{w[:70]}…')
+ck('上限 10.00' in w and '46.8%' in w and '42.1%' in w and '不建议买入' not in w,
+   f'超价 1.5% → 警告带上限价与两个胜率（兜底值=真实成交口径 42.1/追高 46.8），'
+   f'但不到"不建议"：{w[:70]}…')
 w3 = chase_warning(10.40, 10.0)
 ck('超出 3% 以上不建议买入' in w3, f'超价 4% → 追加不建议买入：…{w3[-24:]}')
-r = chase_warning(10.15, 10.0, {'dixiWin': 66.2, 'chaseWin': 45.5})
-ck('66.2%' in r and '45.5%' in r, '传了当天复盘实测数就用实测数，不写死 60.4/43.2')
+r = chase_warning(10.15, 10.0, {'dixiWin': 66.2, 'chaseWin': 45.5, 'filledChaseWin': 20.0})
+ck('66.2%' in r and '45.5%' in r and '20.0%' in r,
+   '传了当天复盘实测数就用实测数（含成交日追高反事实），不写死 42.1/46.8')
+r_nofcw = chase_warning(10.15, 10.0, {'dixiWin': 66.2, 'chaseWin': 45.5})
+ck('None' not in r_nofcw and '追高只有' not in r_nofcw,
+   '缺 filledChaseWin 时不出现 None，也不硬凑反事实句')
 
 print('\n[4] 推荐卡片：三种形态各挂一遍（涨停/半山腰/横盘）')
 import app.config as cfg                                    # noqa: E402
@@ -145,19 +150,27 @@ R.RECOMMEND_EXEC_HINT_ENABLED = True
 
 print('\n[7] 胜率数字取当天复盘实测，不写死在常量里')
 import time as _t
-R._RATES_CACHE.update({'ts': _t.time() + 9999,
-                       'rates': {'dixiWin': 66.2, 'dixiAvg': 1.5, 'dixiN': 139,
-                                 'chaseWin': 45.5, 'chaseAvg': -1.1, 'chaseN': 139}})
-ck(R.exec_rates() == {'dixiWin': 66.2, 'dixiAvg': 1.5, 'dixiN': 139,
-                      'chaseWin': 45.5, 'chaseAvg': -1.1, 'chaseN': 139},
+_NEW_RATES = {'dixiWin': 66.2, 'dixiAvg': 1.5, 'dixiN': 139,
+              'filledChaseWin': 20.0, 'fillRate': 68.3, 'dixiEv': -0.72,
+              'chaseWin': 45.5, 'chaseAvg': -1.1, 'chaseN': 218}
+R._RATES_CACHE.update({'ts': _t.time() + 9999, 'rates': dict(_NEW_RATES)})
+ck(R.exec_rates() == _NEW_RATES,
    '缓存新鲜时不重算（这函数每次推荐都要调，复盘表算全量 T+1/3/5）')
 bsp3 = R.calc_buy_sell_points(cases[1][1], score_result={'total': 72, 'label': 'B',
-                                                         'base_scores': {'position': 50}},
+                                                        'base_scores': {'position': 50}},
                               trend_details={'positionPct': 50})
 h3 = bsp3['buyTiming']['execHint']
-ck('66.2%' in h3 and '45.5%' in h3 and '139' in h3,
-   f'卡片带的是实测数与样本条数（{h3[:96]}…）')
-ck('132次' not in h3 and '132' not in cfg.RECOMMEND_EXEC_HINT,
+ck('66.2%' in h3 and '45.5%' in h3 and '20.0%' in h3 and '139' in h3
+   and '真正成交' in h3,
+   f'超价票：警告带实测数+样本条数+成交日反事实（{h3[:96]}…）')
+bsp4 = R.calc_buy_sell_points(cases[2][1], score_result={'total': 72, 'label': 'B',
+                                                        'base_scores': {'position': 50}},
+                              trend_details={'positionPct': 50})
+h4 = bsp4['buyTiming']['execHint']
+ck('68.3%' in h4 and '躲诱多' in h4 and '66.2%' in h4 and '45.5%' in h4,
+   f'未超价票：文案带成交率+"挂低吸是躲诱多不是保证赚"（{h4[:96]}…）')
+ck('None' not in h3 and 'None' not in h4, '缺键不许渲染成 None')
+ck('132次' not in h3 and '132次' not in h4 and '132' not in cfg.RECOMMEND_EXEC_HINT,
    '老常量里那句"复盘132次"已经不再出现在任何文案里')
 R._RATES_CACHE.update({'ts': 0.0, 'rates': {}})
 

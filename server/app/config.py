@@ -8,6 +8,7 @@ SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 
 # ========== API 地址配置 ==========
 TENCENT_QUOTE_API = 'https://qt.gtimg.cn/q='
 TENCENT_KLINE_API = 'https://ifzq.gtimg.cn/appstock/app/fqkline/get'
+SINA_QUOTE_API = 'https://hq.sinajs.cn/list='
 EASTMONEY_HOT_LIST_API = 'https://push2delay.eastmoney.com/api/qt/clist/get'
 
 # ========== AI 诊断配置 ==========
@@ -319,6 +320,19 @@ VALUATION_ENABLED = True
 VALUATION_OVERVALUED_PE_PCT = 90   # PE 百分位 ≥ 此值视为偏高
 VALUATION_OVERVALUED_PB_PCT = 90   # PB 百分位 ≥ 此值视为偏高
 VALUATION_UPDATE_TIME = '18:10'    # 与基本面(18:05)错开，避免并发拉取
+
+# ========== 盘后慢变数据刷新节奏（2026-10-19 降频专项）==========
+# 背景：股东人数（月/季披露）和基本面（季度披露）此前每天 18:00/18:05 各拉一次全市场分页
+# （约 50 页/次、7 天无休），但接口用 ISNEW=1 取的是"最新一期"，一期数据披露之后内容就不再变
+# —— 绝大多数请求只是把同样的行重复拉回来，而东财 datacenter 恰恰是 IP 风控的来源。
+# 这里只改"什么时候去拉"，不改任何评分口径、不碰盘中链路（行情/资金流/情绪照旧）。
+# 时效代价：非财报季时，新披露最多晚 3 天（股东）/ 6 天（基本面）入库；
+# 财报季（周末公告尤其密集）自动恢复每日，最多晚 1 天。
+# 口径：weekdays 用 datetime.weekday()（0=周一 … 6=周日）；**置空 = 每个自然日都刷 = 完全等于改造前**。
+SLOW_DATA_HOLDER_NUM_WEEKDAYS = [0, 3]        # 股东人数：周一、周四
+SLOW_DATA_FUNDAMENTAL_WEEKDAYS = [0]          # 基本面：周一
+SLOW_DATA_DAILY_MONTHS = [1, 3, 4, 7, 8, 10]  # 这些月份（年报/一季报/半年报/三季报窗口）恢复每日
+SLOW_DATA_VALUATION_TRADING_ONLY = True       # 估值只在交易日跑：周末没有新收盘价，拉回来是同一份
 
 # ========== 风控止损（P2a，2026-07-16 新增）==========
 # 止损幅度基于当日振幅(波动率代理)动态缩放，clamp 在 [STOP_LOSS_MIN, STOP_LOSS_MAX] 之间。
@@ -680,12 +694,20 @@ TREND_GATE_LOW_SCORE = 45        # 趋势分低于此值视为下行/弱势区�
 TREND_GATE_MIN_CHANGE = 3.0      # 当日涨幅≥此值(%)才可能是"反弹"；未大涨不触发，避免误伤横盘弱势股
 DEAD_CAT_BOUNCE_PENALTY = 0.30   # 日内分打折比例：×0.70（反弹股日内分80→56，再融合低趋势分后总分显著下移）
 
-# ========== 智能推荐：半山腰追高惩罚 + 亏损黑名单（2026-10-12，基于132条历史推荐复盘） ==========
-# 复盘数据：推荐时涨幅 4.5%~9.8%（未涨停）T+1胜率仅44%、均值-2.31%（死亡区），
-# 而 2~4.5% 为 72%/+3.80%、涨停为 73%/+3.81%——半山腰追高是"吃面"主因之一。
-RECOMMEND_CHASE_MIN_CHANGE = 4.5      # 死亡区下限（%）
-RECOMMEND_CHASE_MAX_CHANGE = 9.8      # 死亡区上限（%），≥9.8 算涨停不罚
-RECOMMEND_CHASE_PENALTY = 4           # 死亡区罚分
+# ========== 智能推荐：涨幅段闸门（2026-10-18，根因复盘 §3；替换原"半山腰追高惩罚"） ==========
+# 复盘数据（218 条，`docs/胜率低根因复盘-2026-10-18.md`）：推荐时当日涨幅
+# 0~2%（弱势区）T+1 36.4%/-2.59%、4.5~9.8%（半山腰死亡区）40.0%/-2.27%，
+# 两段共 91 条、均值与超额双负；砍掉后剩 52.8%/+0.82%。甜点区 2~4.5%
+# 与涨停区 ≥9.8% 历史最强，不拦；负涨幅样本不足（n=2）同样不拦。
+# 原 RECOMMEND_CHASE_*（只罚 4.5~9.8% 一段、abs() 误伤下跌股、无开关）已删除，
+# 由 services/strategy/momentum_zone.py 统一实现，app_settings 可热改。
+RECOMMEND_ZONE_GATE_ENABLED = True       # 总闸：False=完全关（等价 off）
+RECOMMEND_ZONE_GATE_MODE = 'drop'        # off=不拦 / demote=罚分 / drop=不进候选
+RECOMMEND_ZONE_WEAK_MAX = 2.0            # 弱势区上限（%）：[0, 此值) 算"没涨起来"
+RECOMMEND_ZONE_WEAK_PENALTY = 4          # demote 模式弱势区罚分
+RECOMMEND_ZONE_CHASE_MIN = 4.5           # 死亡区下限（%）
+RECOMMEND_ZONE_CHASE_MAX = 9.8           # 死亡区上限（%），≥此值按涨停区对待不拦
+RECOMMEND_ZONE_CHASE_PENALTY = 4         # demote 模式死亡区罚分
 # 亏损黑名单：近N天被推荐且T+1亏损超过阈值的股票不再推荐（三祥新材连续两亏26%+案例）
 RECOMMEND_LOSER_LOOKBACK_DAYS = 30
 RECOMMEND_LOSER_LOSS_THRESHOLD = 3.0  # T+1亏损超过此值(%)进黑名单
@@ -703,6 +725,9 @@ RECOMMEND_LOSER_CACHE_SEC = 600       # 这张表要算全量推荐的 T+1/3/5�
 # 2026-10-18 起这条常量退居"兜底文案"：卡片上的警告改成按票算的（现价比买入上限高多少），
 # 胜率数字也换成当天复盘的实测值（`recommend.exec_rates`）。原来那句写着"复盘132次…45%/63%"，
 # 样本每天在长、口径刚换成 1094 选票范围，写死的数字迟早变成没人核对的旧结论。
+# 同日口径再纠偏（`docs/胜率低根因复盘-2026-10-18.md`）：纸面"低吸参考价 60.4%"里
+# 31.7% 是次日没跌到买入价的幻觉胜利（未成交组按构造 100% 胜率），卡片只放
+# "低吸单真正成交 42.1%（n=95）+ 成交日追高 25.3% + 现价追入 46.8%（n=218）"。
 RECOMMEND_EXEC_HINT_ENABLED = True
 RECOMMEND_EXEC_HINT = ('建议挂低吸单或尾盘介入，不追盘中高价：'
                        '按买入参考价成交与按现价追入这两个口径的历史 T+1 胜率差距很大'
@@ -814,6 +839,13 @@ REC_SIM_DAILY_MONTHS = 3            # 每天固定回看 3 个月（与用户最
 SHADOW_EVAL_ENABLED = True
 SHADOW_EVAL_TIME = '16:25'
 SHADOW_EVAL_MIN_DAYS = 10            # 少于 10 个交易日不下结论（10-14 上线，10-30 窗口闭合）
+
+# 双源数据交叉校验（2026-10-19，westock 权威源）：每日收盘后把本地资金流/行情与
+# westock（腾讯自选股）比对，权威值=westock（用户决策"不一致的以 westock 为准"）。
+# 挂在 16:30：收评(15:10)/rec_sim(16:20)/shadow_eval(16:25) 之后，日K同步(18:15) 之前。
+WESTOCK_CROSSCHECK_ENABLED = True
+WESTOCK_CROSSCHECK_TIME = '16:30'
+WESTOCK_UNIVERSE_CAP = 200           # 宇宙封顶（fund flow 单批 10 只，全市场不现实）
 
 
 # ========== 企业微信「自建应用」单聊通道（2026-10-14，待凭据启用） ==========
@@ -929,6 +961,14 @@ LIQ_MIN_PRICE = 3.0                # 最新收盘价下限（元）；前复权�
 SETTINGS_WRITE_USER_IDS = ()
 MARKET_CAP_WORKERS = 4             # 刷新线程数：实测 12 线程猛拉约 1100 次后被东财限流，降到 4 线程才稳
 MARKET_CAP_REQUEST_DELAY = 0.5     # 每个请求前小睡（秒），配合低并发避开限流；周刷新慢几分钟无所谓
+# 行业分类周更（2026-10-19）：`stock_industry_map` 由 baostock 一次登录全量刷新。
+# 为什么单独一张表、还周更：资金流向页的「行业」列原来只有东财 clist f100 一个来源，
+# 10-19 clist 被封一整天 → 整列变"—"、板块聚合也没了分母。行业几个月才动一次，
+# 不该跟着行情接口一起失效。放在周二凌晨：离 18:15~20:15 日K同步和 09:00 海选都远，
+# 且只在 baostock 冷却期外才登录（脚本里读同一份冷却文件）。
+INDUSTRY_SYNC_WEEKDAY = 'tuesday'
+INDUSTRY_SYNC_TIME = '03:30'
+
 MARKET_CAP_REFRESH_WEEKDAY = 'sunday'  # 每周刷新星期（schedule 库：monday..sunday）
 MARKET_CAP_REFRESH_TIME = '18:30'  # 刷新时刻（盘后，错开 16:00 K线同步 / 18:05 基本面）
 

@@ -52,9 +52,23 @@ def _ensure_schema(conn) -> None:
 
 
 def _clist_codes() -> List[str]:
-    """分页拉全市场 A 股代码列表（接口单页有上限，需翻页合并；多 fs 候选合并去重）。"""
+    """分页拉全市场 A 股代码列表（接口单页有上限，需翻页合并；多 fs 候选合并去重）。
+
+    2026-10-19：接入共享熔断 eastmoney_guard——冷却中直接返回 []，
+    RPS 用本地库降级，不再翻页 ×3 重试硬打（东财 clist IP 级风控根治）。
+    """
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            return []
+    except Exception:
+        pass
     codes: List[str] = []
     seen = set()
+    # 熔断分级要用它：Python 3 在 except 块结束时会把 `e` 删掉，所以自己留一份。
+    # 不初始化会在"一次异常都没发生但结果为空"时抛 NameError —— 而那个 except 是
+    # `except Exception: pass`，熔断计数就这么被静默吞掉了。
+    last_err = None
     pz = 100
     for fs in _FS_CANDIDATES:
         pn = 1
@@ -72,6 +86,13 @@ def _clist_codes() -> List[str]:
                     batch = (r.json().get('data') or {}).get('diff') or []
                     break
                 except Exception as e:
+                    last_err = e
+                    try:
+                        from services.data import eastmoney_guard
+                        if not eastmoney_guard.should_retry(e):
+                            break        # 被封就别再戳，第三次只是续封
+                    except Exception:
+                        pass
                     if attempt < 2:
                         time.sleep(0.5 * (attempt + 1))
             if not batch:
@@ -88,6 +109,18 @@ def _clist_codes() -> List[str]:
                 break
             pn += 1
             time.sleep(0.2)
+    if codes:
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.ok('clist')
+        except Exception:
+            pass
+    else:
+        try:
+            from services.data import eastmoney_guard
+            eastmoney_guard.fail('clist', last_err)
+        except Exception:
+            pass
     return codes
 
 

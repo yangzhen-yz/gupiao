@@ -326,9 +326,16 @@ def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, r
             return pool
         except Exception as e:
             last_err = e
+            try:
+                from services.data import eastmoney_guard
+                if not eastmoney_guard.should_retry(e):
+                    break
+            except Exception:
+                pass
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
-    print(f'[收评] {pool_type}pool 全部{retries}次重试失败 date={date_str} err={last_err}')
+    print(f'[收评] {pool_type}pool 重试后仍失败（{attempt + 1}/{retries} 次）'
+          f' date={date_str} err={last_err}')
     return []
 
 
@@ -354,7 +361,17 @@ def _em_clist_get(fid: str, fs: str, fields: str, pz: int, po: int = 1, pn: int 
     - raise_for_status（503/429 走重试）；
     - 空 body / rc!=0 / JSONDecodeError 统一走重试；
     - 所有重试失败：返回 []（绝不抛异常，上层业务 100% 降级）。
+
+    2026-10-19：接入共享熔断 eastmoney_guard（东财 clist IP 级风控根治）——
+    冷却中直接返回 []，不再每请求白跑 3 次重试（越重试越延长封禁）；
+    成功/失败计入熔断状态，解封后首次成功即全局复位。
     """
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            return []
+    except Exception:
+        pass
     params = {
         'pn': pn, 'pz': pz, 'po': po, 'np': 1, 'fltt': 2, 'invt': 2,
         'fid': fid, 'fs': fs, 'fields': fields, 'ut': _EM_UT,
@@ -374,12 +391,30 @@ def _em_clist_get(fid: str, fs: str, fields: str, pz: int, po: int = 1, pn: int 
                 last_err = ValueError(f"rc={data.get('rc')}")
                 time.sleep(0.5 * (attempt + 1))
                 continue
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.ok('clist')
+            except Exception:
+                pass
             return (data.get('data') or {}).get('diff') or []
         except Exception as e:
             last_err = e
+            # 连接被重置 = 这个 IP 正在被封，再睡再试只是给它续封，直接停手
+            try:
+                from services.data import eastmoney_guard
+                if not eastmoney_guard.should_retry(e):
+                    break
+            except Exception:
+                pass
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
-    print(f'[收评] clist 全部{retries}次重试失败 fid={fid!r} fs={fs!r} err={last_err}')
+    print(f'[收评] clist 重试后仍失败（{attempt + 1}/{retries} 次）'
+          f' fid={fid!r} fs={fs!r} err={last_err}')
+    try:
+        from services.data import eastmoney_guard
+        eastmoney_guard.fail('clist', last_err)
+    except Exception:
+        pass
     return []
 
 
