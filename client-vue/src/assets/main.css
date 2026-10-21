@@ -3248,6 +3248,16 @@ body {
     display: none;
   }
 
+  /* 资金流向页例外（2026-10-21）：上面的 nth-child 藏列是给趋势卡 7 列写的，
+     顺带把 TabFlow 的「涨跌幅/主力净流入/行业」也藏了——用户手机实拍"看不到资金"。
+     .flow-col 里的表恢复第4(净流入)/5(行业)列；趋势卡等其余复用者不受影响。 */
+  .flow-col .stock-table-header span:nth-child(4),
+  .flow-col .stock-table-header span:nth-child(5),
+  .flow-col .stock-table-row span:nth-child(4),
+  .flow-col .stock-table-row span:nth-child(5) {
+    display: block;
+  }
+
   .score-details {
     grid-template-columns: 1fr;
   }
@@ -3299,6 +3309,15 @@ body {
   .stock-table-row span:nth-child(5),
   .stock-table-row span:nth-child(6) {
     display: none;
+  }
+
+  /* 资金流向页例外（同上，≤480px）：恢复第3(涨跌幅)/4(主力净流入)列——资金页的主角；
+     第5列行业在手机上仍隐藏（列名长、400px 放不下）。板块表4列（板块/涨跌幅/净流入/涨跌家数）全部恢复。 */
+  .flow-col .stock-table-header span:nth-child(3),
+  .flow-col .stock-table-header span:nth-child(4),
+  .flow-col .stock-table-row span:nth-child(3),
+  .flow-col .stock-table-row span:nth-child(4) {
+    display: block;
   }
 
   .price-points {

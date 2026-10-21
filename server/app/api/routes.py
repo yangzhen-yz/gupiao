@@ -593,6 +593,41 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
     return {'success': True, 'data': data, 'cached': bool(hit)}
 
 
+@router.get("/api/recommend-batches", tags=["推荐记录"])
+async def recommend_batches_api(date: str = ''):
+    """当日各批次推荐回看（2026-10-21）：daily_recommendations 先删后插只留末批，
+    上午推过什么（如 10-21 的 10:26 上工申贝）只有 strategy_snapshot 记得。
+    按批次返回推荐档名单＋批次现场（周期/情绪分），供智能推荐页折叠区展示。"""
+    from datetime import datetime as _dt
+    d = date or _dt.now().strftime('%Y-%m-%d')
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+        raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD")
+
+    def _read():
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        rows = conn.execute(
+            "SELECT batch, symbol, name, rank, score, timing, mode, price, change_percent "
+            "FROM strategy_snapshot WHERE snap_date=? AND stage='recommended' ORDER BY batch, rank",
+            (d,)).fetchall()
+        meta = conn.execute(
+            "SELECT batch, cycle, cycle_score, recommended, market_change "
+            "FROM strategy_snapshot_batch WHERE snap_date=? ORDER BY batch", (d,)).fetchall()
+        m = {x['batch']: dict(x) for x in meta}
+        groups = {}
+        for r in rows:
+            g = groups.setdefault(r['batch'], [])
+            g.append({k: r[k] for k in ('symbol', 'name', 'rank', 'score',
+                                        'timing', 'mode', 'price', 'change_percent')})
+        return [{'batch': b, 'meta': m.get(b) or {}, 'stocks': groups.get(b, [])}
+                for b in sorted(set(groups) | set(m))]
+    try:
+        batches = await asyncio.to_thread(_read)
+        return {'success': True, 'data': {'date': d, 'batches': batches}}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"读取当日批次失败: {str(error)}")
+
+
 @router.get("/api/recommend-sim-batch", tags=["推荐记录"])
 async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, gap: float = 5.0):
     """上午档 vs 下午档拆批次回测（2026-10-21）：名单从 strategy_snapshot 还原

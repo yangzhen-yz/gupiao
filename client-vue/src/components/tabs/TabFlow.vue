@@ -219,7 +219,7 @@
         <button class="btn-secondary" @click="refresh">应用并刷新</button>
         <span class="filter-info">共 {{ data.hiddenGems.length }} 只</span>
       </div>
-      <div class="stock-table">
+      <div class="flow-col stock-table">
         <div class="stock-table-header" :style="gridStock">
           <span>名称</span><span>现价</span><span>涨跌幅</span><span>主力净流入</span><span>行业</span>
         </div>

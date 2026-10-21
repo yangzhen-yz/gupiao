@@ -645,14 +645,18 @@ async def _sina_sector_rankings(top_n: int) -> Optional[Dict]:
     if not ind_map:
         print('[资金流向] 板块兜底：本地行业分类为空，无法聚合（先跑 scripts/sync_stock_industry.py）')
         return None
-    # 聚合：行业 -> 净流入合计 / 上涨家数 / 下跌家数
+    # 聚合：行业 -> 净流入合计 / 上涨家数 / 下跌家数 / 成员股涨幅累计
+    # （chgSum/chgN 用于等权平均涨跌幅——旧实现把板块 changePercent 写死 0.0，
+    #   2026-10-21 用户手机实拍"行业板块涨跌幅全 +0.00%"；成员股涨幅现成就有，没理由不算）
     agg: Dict[str, Dict] = {}
     for r in rows:
         ind = ind_map.get(r['symbol'])
         if not ind:
             continue
-        a = agg.setdefault(ind, {'net': 0.0, 'rise': 0, 'fall': 0})
+        a = agg.setdefault(ind, {'net': 0.0, 'rise': 0, 'fall': 0, 'chgSum': 0.0, 'chgN': 0})
         a['net'] += r['mainNetInflow']
+        a['chgSum'] += r['changePercent']
+        a['chgN'] += 1
         if r['changePercent'] > 0:
             a['rise'] += 1
         elif r['changePercent'] < 0:
@@ -660,11 +664,17 @@ async def _sina_sector_rankings(top_n: int) -> Optional[Dict]:
     if not agg:
         return None
     ordered = sorted(agg.items(), key=lambda kv: kv[1]['net'], reverse=True)
-    inflow = [{'name': name, 'changePercent': 0.0, 'mainNetInflow': round(a['net'], 2),
-               'riseCount': a['rise'], 'fallCount': a['fall'], 'rank': i + 1}
+
+    def _avg_chg(a):
+        return round(a['chgSum'] / a['chgN'], 2) if a['chgN'] else 0.0
+
+    inflow = [{'name': name, 'changePercent': _avg_chg(a), 'mainNetInflow': round(a['net'], 2),
+               'riseCount': a['rise'], 'fallCount': a['fall'], 'rank': i + 1,
+               'chgCaliber': '成员股等权平均'}
               for i, (name, a) in enumerate(ordered) if a['net'] > 0][:top_n]
-    outflow = [{'name': name, 'changePercent': 0.0, 'mainNetInflow': round(a['net'], 2),
-                'riseCount': a['rise'], 'fallCount': a['fall'], 'rank': i + 1}
+    outflow = [{'name': name, 'changePercent': _avg_chg(a), 'mainNetInflow': round(a['net'], 2),
+                'riseCount': a['rise'], 'fallCount': a['fall'], 'rank': i + 1,
+                'chgCaliber': '成员股等权平均'}
                for i, (name, a) in enumerate(reversed(ordered)) if a['net'] < 0][:top_n]
     return {'industry': {'inflow': inflow, 'outflow': outflow}, 'concept': {'inflow': [], 'outflow': []}}
 

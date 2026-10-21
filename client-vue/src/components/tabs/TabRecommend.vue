@@ -2,8 +2,8 @@
   <div>
     <div class="section-title">AI智能选股推荐</div>
     <div class="section-subtitle">
-      基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示 · 每日 09:45 / 13:30 / 14:45
-      自动生成并保存，收盘前快照确保"最后一次推荐"落库可复盘
+      基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示 · 每日 09:45 / 10:00 / 13:30 /
+      14:05 自动生成，14:45 收盘前快照；页面名单每次生成会覆盖当天旧批次，上午推过什么看下方「当日批次」
     </div>
     <div
       class="scan-controls"
@@ -82,6 +82,31 @@
       <div class="section-header">
         <div class="section-subtitle-small">今日推荐股票</div>
         <span class="section-stats">{{ todayDate }}</span>
+      </div>
+      <!-- 当日批次折叠区（2026-10-21）：推荐表先删后插只留末批，各批次名单从 strategy_snapshot 回看 -->
+      <div v-if="dayBatches.length" class="batch-fold">
+        <div class="batch-fold-h" @click="batchOpen = !batchOpen">
+          <span class="batch-fold-t">当日批次（快照回看）</span>
+          <span class="batch-sum">{{ batchSummary }}</span>
+          <span class="batch-arrow">{{ batchOpen ? '▾' : '▸' }}</span>
+        </div>
+        <div v-if="batchOpen" class="batch-body">
+          <div v-for="g in dayBatches" :key="g.batch" class="batch-group">
+            <div class="batch-g-h">
+              <b>{{ g.batch }}</b>
+              <span v-if="g.meta.cycle" class="batch-cycle">{{ g.meta.cycle }} {{ g.meta.cycle_score || '' }}分</span>
+              <span v-if="!g.stocks.length" class="batch-none">本批无推荐档</span>
+            </div>
+            <div v-for="s in g.stocks" :key="s.symbol" class="batch-row">
+              <b>{{ s.name }}</b>
+              <span class="batch-timing">{{ s.timing }}</span>
+              <span class="batch-score">{{ s.score != null ? s.score + '分' : '' }}</span>
+              <span :style="{ color: (s.change_percent ?? 0) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">
+                {{ (s.change_percent ?? 0) >= 0 ? '+' : '' }}{{ s.change_percent }}%
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
       <div
         v-if="todayRecommend.length === 0"
@@ -376,6 +401,23 @@
   const todayRecommend = ref([])
   const historyRecommend = ref([])
   const todayDate = ref('--')
+
+  // 当日批次折叠区（2026-10-21）：数据来自 /api/recommend-batches（strategy_snapshot 按批次）
+  const dayBatches = ref([])
+  const batchOpen = ref(false)
+  const batchSummary = computed(() => {
+    const withStocks = dayBatches.value.filter(g => g.stocks.length)
+    if (!withStocks.length) return '今日暂无推荐档批次'
+    return withStocks.map(g => `${g.batch}·${g.stocks.length}只`).join(' / ')
+  })
+  async function loadBatches() {
+    try {
+      const r = await apiFetch('/api/recommend-batches')
+      dayBatches.value = (r.data && r.data.batches) || []
+    } catch (e) {
+      /* 回看区加载失败不影响主列表，静默 */
+    }
+  }
   const recommendStats = ref('--')
   const generating = ref(false)
   const reviewData = ref({})
@@ -491,10 +533,83 @@
   onMounted(() => {
     loadRecommendations()
     loadReview()
+    loadBatches()
   })
 </script>
 
 <style scoped>
+  /* 当日批次折叠区（默认收起一行，点开看各批次名单；A股红涨绿跌） */
+  .batch-fold {
+    margin: 0 0 0.75rem;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: #f8fafc;
+    overflow: hidden;
+  }
+  .batch-fold-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .batch-fold-t {
+    font-weight: 600;
+    color: #334155;
+    white-space: nowrap;
+  }
+  .batch-sum {
+    flex: 1;
+    color: #64748b;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .batch-arrow {
+    color: #94a3b8;
+  }
+  .batch-body {
+    border-top: 1px dashed #e2e8f0;
+    padding: 6px 12px 8px;
+  }
+  .batch-group {
+    margin-bottom: 6px;
+  }
+  .batch-g-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #334155;
+  }
+  .batch-cycle {
+    font-size: 11px;
+    color: #64748b;
+  }
+  .batch-none {
+    font-size: 11px;
+    color: #94a3b8;
+  }
+  .batch-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #475569;
+    padding: 2px 0 2px 1.2rem;
+  }
+  .batch-timing {
+    font-size: 10px;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .batch-score {
+    color: #64748b;
+  }
+
   /* 推荐复盘摘要（2026-10-12） */
   .review-summary-box {
     margin: 0 0 1rem;
