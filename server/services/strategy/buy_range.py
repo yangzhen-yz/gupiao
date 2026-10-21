@@ -12,7 +12,10 @@
 "现价高于买入上限"不是措辞问题，是同一个日子里两种执行动作差 17 个百分点以上的
 事实，必须按票算出来、摆在按钮上，而不是全局贴一句"建议低吸"了事。
 """
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+from app.config import (BUY_RANGE_DYNAMIC_ENABLED, BUY_RANGE_BAND_BASE_PCT,
+                        BUY_RANGE_BAND_MAX_PCT, BUY_RANGE_VOL_BARS, BUY_RANGE_VOL_K)
 
 # 各买入时机允许的最高涨幅%（超过即视为追高，进否决清单）。
 # 数值沿用 `_build_tomorrow_plan` 一直在用的那张表，本次只是搬过来，没有改。
@@ -24,6 +27,63 @@ OPEN_FLOOR: Dict[str, float] = {'auction': 0.0, 'early': -2.0, 'tail': -3.0,
 # 振幅→低吸回撤（波动大的票值得多等一点；与 calc_buy_sell_points 的 base_buy_pct 同源）
 AMPLITUDE_BUY_PCT = ((5.0, 0.03), (3.0, 0.025), (2.0, 0.02))
 DEFAULT_BUY_PCT = 0.015
+
+
+def _setting(key: str, default):
+    """覆盖表里有的键现读（复盘子页「口径与开关」），读不到退回 config 默认值。
+
+    与 momentum_zone 同一个套路：能被热改的键不该要求重启。
+    """
+    try:
+        from services.support import app_settings
+        if key in [s['key'] for s in app_settings.SPEC]:
+            return app_settings.value(key)
+    except Exception:
+        pass
+    return default
+
+
+def recent_volatility(closes: List[float], bars: Optional[int] = None) -> Optional[float]:
+    """近 N 个已收盘交易日的日收益标准差（%），closes 必须按时间**升序**。
+
+    这是"区间宽度该给多宽"的唯一输入：一只 5 日波动 3% 的票，挂价比低吸价高 1% 也可能
+    一整天都碰不到；而一只 0.8% 的票，高 1% 早就买到了。用一个与波动无关的常数带宽，
+    就等于假装所有票的可达价格范围一样宽。
+
+    返回 None 的情形（**不做判决，带宽退回核心值 = 改造前**）：
+      · 收盘序列缺失/太短（不足 3 个收益样本）；
+      · 出现非正值或 NaN（停牌、数据缺口）——这种票宁可用核心口径，不硬造波动率。
+    """
+    n = int(bars or _setting('band_vol_bars', BUY_RANGE_VOL_BARS))
+    try:
+        seq = [float(x) for x in (closes or []) if x is not None]
+    except (TypeError, ValueError):
+        return None
+    seq = [x for x in seq if x > 0]
+    if len(seq) < n + 1:
+        return None
+    seq = seq[-(n + 1):]
+    rets = [(seq[i] / seq[i - 1] - 1.0) * 100 for i in range(1, len(seq))]
+    if len(rets) < 3:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)   # 样本标准差(ddof=1)
+    return round(var ** 0.5, 3)
+
+
+def dynamic_band_pct(vol5: Optional[float]) -> float:
+    """扩展带宽% = 核心带宽 + K×5日波动率，钳制在 [BASE, MAX]。
+
+    钳制是刻意的：下限=核心带宽（扩展区间永远不比核心区间的 1% 更窄，否则统计上会出现
+    "扩展口径反而更难成交"的荒谬包含关系）；上限=BUY_RANGE_BAND_MAX_PCT（再疯的票也不给
+    到 +4% 的空间，那已经是替别人抬轿的范畴，不是"稍微贵一点"）。
+    """
+    base = float(_setting('band_base_pct', BUY_RANGE_BAND_BASE_PCT))
+    cap = float(_setting('band_max_pct', BUY_RANGE_BAND_MAX_PCT))
+    k = float(_setting('band_vol_k', BUY_RANGE_VOL_K))
+    if vol5 is None:
+        return base
+    return min(max(base, base + k * float(vol5)), cap)
 
 
 def base_buy_pct(amplitude: float) -> float:
@@ -44,8 +104,10 @@ def limit_pct_of(code: str) -> float:
 
 def buy_range(price: float, amplitude: float = 0.0, ref_buy: Optional[float] = None,
               timing_type: str = 'intraday', limit_up: bool = False,
-              code: str = '') -> Dict:
-    """给出这只票的挂单区间。返回 {'buyLow','buyHigh','chasePct','buyNote','limitPrice'}。
+              code: str = '', vol5: Optional[float] = None,
+              dynamic: Optional[bool] = None) -> Dict:
+    """给出这只票的挂单区间。返回 {'buyLow','buyHigh','chasePct','buyNote','limitPrice'}，
+    开动态带宽时另加 {'buyHighDyn','buyHighDynRaw','bandPct','vol5','dynNote','dynEnabled'}。
 
     三个分支的优先级不能换：
       1. 有买入参考价（智能推荐按角色/位置算好的）→ 以它为准，上限不越过追高线；
@@ -54,6 +116,10 @@ def buy_range(price: float, amplitude: float = 0.0, ref_buy: Optional[float] = N
 
     `limitPrice` = 今天真想买最多付到这个价（再高就是替别人抬轿）：
     封板票给次日涨停价（打板唯一可能的成交价），其余给"现价 × 该时机的追高上限"。
+
+    `vol5`/`dynamic`（2026-10-19 加）是**并列的影子口径**：既有键 buyLow/buyHigh/buyHighRaw
+    一个字都不改（下游 over_pct、chase_warning、止盈止损、历史对照全靠它们），动态上沿
+    只写进 buyHighDyn。开关关着或 vol5 拿不到时 buyHighDyn == buyHigh，即完全等于改造前。
     """
     chase = CHASE_MAX.get(timing_type, 3.0)
     if ref_buy and ref_buy > 0:
@@ -76,12 +142,31 @@ def buy_range(price: float, amplitude: float = 0.0, ref_buy: Optional[float] = N
         limit_price = price * (1 + limit_pct_of(code) / 100)
     else:
         limit_price = min(price * (1 + chase / 100), price * (1 + limit_pct_of(code) / 100))
+    # ===== 扩展上沿（默认关；关掉时 buyHighDyn 与 buyHigh 完全相等）=====
+    # 三层封顶：① 不越过该时机的追高线，② 不越过涨停价，③ 不得低于核心上沿——
+    # 第三条保证统计上"扩展可成交 ⊇ 核心可成交"这个包含关系永远成立，否则会出现
+    # 区间更宽反而更难成交的荒谬结果，两套口径就没法对比了。
+    if dynamic is None:
+        dynamic = bool(_setting('buy_band_dynamic_enabled', BUY_RANGE_DYNAMIC_ENABLED))
+    band_pct = 0.0
+    buy_high_dyn = buy_high
+    if dynamic and buy_low > 0:
+        band_pct = dynamic_band_pct(vol5)
+        cap = min(price * (1 + chase / 100), price * (1 + limit_pct_of(code) / 100))
+        buy_high_dyn = max(buy_high, min(buy_low * (1 + band_pct / 100), cap))
+    dyn_note = ''
+    if dynamic and vol5 is not None and buy_high_dyn > buy_high * 1.0001:
+        dyn_note = (f'按 {BUY_RANGE_VOL_BARS} 日波动 {vol5:.1f}% 可放到 '
+                    f'{buy_high_dyn:.2f}（带宽 +{band_pct:.1f}%，影子口径不改挂单价）')
     # branch 一起返回：调用方各自的文案不同（收评说明天，说的是"不追高于今收"；
     # 推荐卡片说的是当下，得写"不追高于现价"），数字则只有一份算法。
     # Raw 两个键是给下游算止盈止损用的：那边一直用未取整的价格，这里提前 round 到分
     # 就会让 buy_mid/stop/takeProfit 与改造前差 0.01 ——"重构不改行为"那条断言当场过不了。
     return {'buyLow': round(buy_low, 2), 'buyHigh': round(buy_high, 2),
             'buyLowRaw': buy_low, 'buyHighRaw': buy_high,
+            'buyHighDyn': round(buy_high_dyn, 2), 'buyHighDynRaw': buy_high_dyn,
+            'bandPct': round(band_pct, 2), 'vol5': vol5,
+            'dynNote': dyn_note, 'dynEnabled': bool(dynamic),
             'chasePct': chase, 'buyNote': note, 'limitPrice': round(limit_price, 2),
             'branch': branch}
 

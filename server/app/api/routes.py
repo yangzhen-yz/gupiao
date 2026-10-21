@@ -11,7 +11,6 @@ from services.strategy.strategy import backtest_yesterday_predictions, save_pred
 from services.strategy.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
 from services.strategy.trend_backtest import backtest_trend_predictions
 from services.data.trading_calendar import is_trading_day
-from services.support.ai import _build_diagnosis_prompt, _call_deepseek_api, _fetch_hot_sectors, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, load_ai_config
 from services.pick.recommend import auto_generate_recommendations_task, calc_buy_sell_points
 from services.ops.review import generate_daily_review
 from services.strategy.market import predict_market_risk, check_market_crash, load_market_alert
@@ -110,8 +109,9 @@ async def data_sources_health():
                 "route": quote_route_status(),
             },
             "eastmoney": {
+                # 2026-10-20：加 'ann'——公告接口当天也接入了共享熔断（此前是闸门覆盖缺口）
                 scope: eastmoney_guard.status(scope)
-                for scope in ('clist', 'ulist', 'datacenter')
+                for scope in ('clist', 'ulist', 'datacenter', 'ann')
             },
         },
     }
@@ -153,6 +153,51 @@ async def get_tab_scan_config():
             },
         }
     }
+
+# ========== 第三方接口调用用量统计（2026-10-19） ==========
+@router.get("/api/api-usage", tags=["运维"])
+async def api_usage_api(user: Dict = Depends(current_user)):
+    """第三方接口每日调用计数与上限预警（只读）。管理员可改上限。
+
+    用途：改代码前先看"哪个接口快撞上限"，避免把东财/腾讯/新浪等平台的日调用量推过封禁阈值。
+    """
+    from services.data import api_usage
+    from services.support import app_settings as A
+    items = api_usage.get_stats()
+    history = api_usage.get_history(14)
+    return {
+        "success": True,
+        "data": {
+            "items": items,
+            "history": history,
+            "canWrite": A.can_write(user),
+            "writeIds": list(A.write_ids()),
+            "alertThreshold": api_usage.ALERT_THRESHOLD * 100,
+        },
+    }
+
+
+@router.post("/api/api-usage/limits", tags=["运维"])
+async def api_usage_set_limit_api(body: Dict, user: Dict = Depends(current_user)):
+    """修改某接口的每日上限（管理员）。key 形如 'eastmoney:clist'。"""
+    from services.data import api_usage
+    from services.support import app_settings as A
+    if not A.can_write(user):
+        raise HTTPException(status_code=403, detail='当前账号无权修改接口调用上限（默认仅最早注册的账号可改）')
+    key = (body or {}).get('key')
+    limit = (body or {}).get('limit')
+    if not key or ':' not in key:
+        raise HTTPException(status_code=400, detail='key 格式应为 provider:interface，例如 eastmoney:clist')
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='limit 必须是正整数')
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail='limit 必须是正整数')
+    api_usage.set_limit(key, limit, updated_by=str(user.get('username') or user.get('id')))
+    print(f"[接口用量] {user.get('username') or user.get('id')} 改了 {key} 上限 = {limit}")
+    return {"success": True, "data": {"key": key, "limit": limit}}
+
 
 @router.get("/api/update-hot_search_ranking", tags=["热搜榜数据"])
 async def update_hot_search_ranking_api():
@@ -546,6 +591,28 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
         data['daily'] = []
         data['dailyError'] = str(e)[:120]
     return {'success': True, 'data': data, 'cached': bool(hit)}
+
+
+@router.get("/api/recommend-sim-batch", tags=["推荐记录"])
+async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, gap: float = 5.0):
+    """上午档 vs 下午档拆批次回测（2026-10-21）：名单从 strategy_snapshot 还原
+    （10-19 起才有），撮合/费用/封板判据与末批曲线同一引擎（rec_sim._curve_stats）。
+    只读本地两个 SQLite、一次约 0.1s，丢线程池 + 30 分钟缓存，同 recommend-sim 的规矩。"""
+    import time as _t
+    key = ('batch', months, capital, gap)
+    hit = _REC_SIM_CACHE.get(key)
+    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
+        return {'success': True, 'data': hit['data'], 'cached': True}
+    from services.pick import rec_sim_batch
+    try:
+        data = await asyncio.to_thread(
+            rec_sim_batch.simulate_batch, months=months, capital=capital, auction_max_gap=gap)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"拆档回测计算失败: {str(error)}")
+    if len(_REC_SIM_CACHE) > 12:
+        _REC_SIM_CACHE.clear()
+    _REC_SIM_CACHE[key] = {'ts': _t.time(), 'data': data}
+    return {'success': True, 'data': data, 'cached': False}
 
 
 @router.get("/api/shadow-eval", tags=["推荐记录"])
@@ -1361,153 +1428,18 @@ async def get_trend_backtest_records(predict_date: str = None, symbol: str = Non
         raise HTTPException(status_code=500, detail=f"获取回测明细失败: {str(error)}")
 
 
-@router.get("/api/ai-diagnose/{symbol}", tags=["AI诊断"])
-async def ai_diagnose(symbol: str):
-    load_ai_config()
-    if not re.match(r'^(sh|sz)\d{6}$', symbol.lower()):
+@router.get("/api/stock-diagnose/{symbol}", tags=["五层诊断"])
+async def stock_diagnose_api(symbol: str):
+    """五层本地诊断书（2026-10-20，替代已删除的 AI 诊断）：位置/资金/环境/系统历史/纪律价，
+    纯本地库聚合＋规则判据，不接任何大模型；DB 密集读取放线程池，不压事件循环。"""
+    if not re.match(r'^(sh|sz)?\d{6}$', symbol.lower()):
         raise HTTPException(status_code=400, detail="无效的股票代码格式")
-
-    symbol = symbol.lower()
-
+    from services.support.diagnose import diagnose_stock
     try:
-        # 2026-10-17：三路数据 gather 并行（个股行情/K线/三大指数互不依赖），
-        # 省掉原来 ~1-1.5s 的串行 RTT 叠加，给 20s 前端预算留头。
-        _idx_syms = ','.join(info['symbol'] for info in INDEX_SYMBOLS.values())
-        _quote_task = asyncio.create_task(fetch_with_retry(symbol))
-        _kline_task = asyncio.create_task(asyncio.wait_for(get_kline_data(symbol), timeout=6.0))
-        _idx_task = asyncio.create_task(fetch_with_retry(_idx_syms))
-        raw_data, kline_data, idx_raw = await asyncio.gather(
-            _quote_task, _kline_task, _idx_task, return_exceptions=True
-        )
-        if isinstance(raw_data, BaseException) or not raw_data:
-            raise HTTPException(status_code=404, detail="获取股票数据失败")
-        if isinstance(kline_data, BaseException):
-            print(f'[AI诊断] K线获取失败: {kline_data}')
-            kline_data = []
-        if isinstance(idx_raw, BaseException):
-            print(f'[AI诊断] 大盘指数获取失败: {idx_raw}')
-            idx_raw = ''
-        parsed_list = parse_tencent_batch_data(raw_data)
-        if not parsed_list or len(parsed_list) == 0:
-            raise HTTPException(status_code=404, detail="获取股票数据失败")
-
-        raw_fields = raw_data
-        stock_parsed = parsed_list[0]
-
-        content = ""
-        lines = raw_fields.split(';')
-        for line in lines:
-            if line.startswith('v_') and '=' in line:
-                content = line[line.index('"') + 1 : line.rfind('"')]
-                break
-        fields = content.split('~')
-
-        if len(fields) <= 49:
-            raise HTTPException(status_code=404, detail="股票数据不完整")
-
-        price = float(fields[3]) if fields[3] else 0
-        yesterday_close = float(fields[4]) if fields[4] else 0
-        change_val = price - yesterday_close
-        change_pct = (change_val / yesterday_close * 100) if yesterday_close > 0 else 0
-        volume_raw = float(fields[36]) if fields[36] else 0
-        turnover_raw = float(fields[37]) if fields[37] else 0
-        bid1_vol = float(fields[12]) if fields[12] else 0
-        ask1_vol = float(fields[22]) if fields[22] else 0
-        weibi_val = ((bid1_vol - ask1_vol) / (bid1_vol + ask1_vol) * 100) if (bid1_vol + ask1_vol) > 0 else 0
-        avg_price_val = (turnover_raw * 10000) / (volume_raw * 100) if volume_raw > 0 else price
-        avg_dev = ((price - avg_price_val) / avg_price_val * 100) if avg_price_val > 0 else 0
-
-        stock_info = {
-            'name': fields[1],
-            'symbol': symbol,
-            'price': price,
-            'yesterdayClose': yesterday_close,
-            'open': float(fields[5]) if fields[5] else 0,
-            'high': float(fields[33]) if fields[33] else 0,
-            'low': float(fields[34]) if fields[34] else 0,
-            'changePercent': round(change_pct, 2),
-            'volume': volume_raw,
-            'turnover': turnover_raw,
-            'turnoverRate': float(fields[38]) if fields[38] else 0,
-            'volumeRatio': float(fields[49]) if fields[49] else 0,
-            'pe': float(fields[39]) if fields[39] else 0,
-            'outerPlate': float(fields[7]) if fields[7] else 0,
-            'innerPlate': float(fields[8]) if fields[8] else 0,
-            'weibi': round(weibi_val, 2),
-            'amplitude': float(fields[43]) if fields[43] else 0,
-            'avgPrice': round(avg_price_val, 2),
-            'avgPriceDeviation': round(avg_dev, 2),
-            'circulateMarketCap': float(fields[44]) if fields[44] else 0,
-            'bid1': float(fields[11]) if fields[11] else 0,
-            'bid1Vol': bid1_vol,
-            'ask1': float(fields[21]) if fields[21] else 0,
-            'ask1Vol': ask1_vol,
-        }
-
-        # 指数数据已在上面与行情/K线并行拉取（idx_raw），此处只做解析拆分
-        market_data = {}
-        try:
-            _by_sym = {p['symbol'].lower(): p for p in parse_tencent_batch_data(idx_raw)} if idx_raw else {}
-            for key, info in INDEX_SYMBOLS.items():
-                p = _by_sym.get(info['symbol'].lower())
-                market_data[key] = ({'name': info['name'],
-                                     'price': p.get('priceRaw', 0),
-                                     'changePercent': p.get('changePercent', 0)}
-                                    if p else {'name': info['name'], 'price': 0, 'changePercent': 0})
-        except Exception as _e:
-            print(f'[AI诊断] 大盘指数解析失败: {_e}')
-            for key, info in INDEX_SYMBOLS.items():
-                market_data[key] = {'name': info['name'], 'price': 0, 'changePercent': 0}
-
-        # 获取个股概念标签
-        try:
-            all_tags = load_stock_concept_tags()
-            stock_concepts = all_tags.get(symbol, [])
-        except Exception as _e:
-            print(f'[AI诊断] 概念标签加载失败: {_e}')
-            stock_concepts = []
-
-        # 获取热点板块和概念数据
-        try:
-            hot_sectors = await _fetch_hot_sectors()
-        except Exception as e:
-            print(f'[AI诊断] 热点板块获取失败: {e}')
-            hot_sectors = {'industry': [], 'concept': []}
-
-        prompt = _build_diagnosis_prompt(stock_info, kline_data, market_data, stock_concepts, hot_sectors)
-        ai_result = await _call_deepseek_api(prompt)
-
-        try:
-            diagnosis = json.loads(ai_result)
-        except Exception as _e:
-            print(f'[AI诊断] AI 返回非 JSON: {_e}')
-            diagnosis = {"raw": ai_result}
-
-        return {
-            "success": True,
-            "data": {
-                "stock": stock_info,
-                "diagnosis": diagnosis
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f'AI诊断失败: {str(e)}')
-        raise HTTPException(status_code=500, detail=f"AI诊断失败: {str(e)}")
-
-@router.get("/api/ai-config", tags=["AI诊断"])
-async def get_ai_config():
-    load_ai_config()
-    return {
-        "success": True,
-        "data": {
-            "configured": bool(DEEPSEEK_API_KEY) and not DEEPSEEK_API_KEY.startswith("在"),
-            "baseUrl": DEEPSEEK_BASE_URL,
-            "model": DEEPSEEK_MODEL,
-            "apiKeyHint": f"****{DEEPSEEK_API_KEY[-4:]}" if len(DEEPSEEK_API_KEY) > 4 else ""
-        }
-    }
+        return await asyncio.to_thread(diagnose_stock, symbol)
+    except Exception as error:
+        print(f'[五层诊断] 失败 {symbol}: {error}')
+        raise HTTPException(status_code=500, detail=f"诊断失败: {str(error)}")
 
 @router.get("/api/stock-map", tags=["股票映射"])
 async def get_stock_basic_info_api():

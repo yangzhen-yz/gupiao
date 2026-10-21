@@ -12,13 +12,17 @@
 
 三条最容易骗人的口径，这里都按"现实里做不到就不算"处理
 ------------------------------------------------------
-  1. **尾盘已封死涨停 = 买不到**：默认直接剔除并计数（`entry='tailclose'`）。
+  1. **封死涨停 = 买不到**：默认直接剔除并计数（`entry='tailclose'`）。
      系统偏爱强势票，126 条里有 64 条当天封死——把这些当成"我买到了"，
      三个月能从 -25% 变成 +25%，这种"改进"是假的。
      但完全不处理也不对：卡片对这些票的本意是**次日竞价买**，所以另有
      `entry='auction'` 按推荐顺延一根（并执行卡片写的"高开 5% 以上不追"纪律）。
      `entry='filled'` 是排板 100% 成交的上界，只在比较"错过多少"时用。
-  2. **卖不掉就顺延**：次日一字跌停开盘卖不出去 → 顺延到下一根K线。
+     2026-10-20 把"封死"的判据换成**价位**：只要当日最低价低于涨停价，就说明存在过
+     可成交的价格（炸过板），不再一律剔除；一字/T 字全天没低下去过才算买不到。
+  2. **卖不掉就顺延**：跌停那天如果全天最高价都没高过跌停价（真一字跌停），挂着也出不去，
+     顺延到下一根K线。2026-10-20 之前这条**只对开盘卖生效**，尾盘卖（`mode='close'`）连检查都没有,
+     等于假设一字跌停也能按收盘价卖掉——回撤因此被系统性低估。现在两种卖法都判。
   3. **前复权 vs 当时实盘价不是一个尺度**：记录价落在当日 [最低, 最高] 之外
      说明期间除过权，这时买入价退回当日复权收盘并计数（比"与收盘差多少"可靠，
      差 1% 以内也可能已经越界）。
@@ -30,6 +34,10 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+from app.config import (REC_SIM_BOARD_PRICE_V2, REC_SIM_DEFER_LIMIT_DOWN, REC_SIM_BOARD_EPS,
+                        REC_SIM_SIZING_V2, REC_SIM_RISK_PER_TRADE, REC_SIM_STOP_PCT,
+                        REC_SIM_MAX_POSITION_PCT, REC_SIM_MAX_EXPOSURE_PCT)
 
 FEE_RATE = 0.00025      # 佣金（单边）
 FEE_MIN = 5.0           # 单笔最低佣金
@@ -55,6 +63,29 @@ def _fee_sell(amount: float) -> float:
 
 def _limit_pct(code: str) -> float:
     return 20.0 if code.startswith(('30', '68')) else 10.0
+
+
+def _setting(key: str, default):
+    """覆盖表里有这个键就现读（复盘子页可热改），读不到退回 config 默认值。"""
+    try:
+        from services.support import app_settings
+        if key in [s['key'] for s in app_settings.SPEC]:
+            return app_settings.value(key)
+    except Exception:
+        pass
+    return default
+
+
+def _limit_prices(prev_close: float, lim_pct: float) -> Tuple[float, float]:
+    """按前收盘算出当日涨停价/跌停价（交易所口径：四舍五入到 0.01）。
+
+    不直接用"涨幅≥9.7%"这种百分比近似：4 元以下的票四舍五入后涨停幅度会明显偏离 10%，
+    而"封没封死"恰恰要拿**具体价位**比，差一分就判错。
+    """
+    if not prev_close or prev_close <= 0:
+        return 0.0, 0.0
+    return (round(prev_close * (1 + lim_pct / 100.0), 2),
+            round(prev_close * (1 - lim_pct / 100.0), 2))
 
 
 def load(since: str) -> Tuple[List[Dict], Dict[str, List[tuple]]]:
@@ -96,7 +127,17 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
 
     mode: 'open' 次日开盘卖 / 'close' 次日尾盘（收盘）卖
     entry: 见 ENTRIES；auction_max_gap 是"高开多少就不追"的纪律阈值（999=不限制）
+
+    封板判定（2026-10-20 改，两个独立开关、都关掉即回到旧行为）：
+      · `rec_sim_board_price_v2` 开：封不封死看**当日是否存在突破价成交**——
+        买入侧「最低价 < 涨停价」即炸过板、存在过可买价（炸板回封算可买，但按收盘价买
+        仍需排队，note 里标出来）；卖出侧「最高价 > 跌停价」即存在过可卖价。
+        关：用旧口径（收盘==当日最高价 且 涨幅≥97%限额 视为封死）。
+      · `rec_sim_defer_limit_down` 开：真一字跌停卖不掉就顺延到下一根K线，
+        **open 和 close 两种卖法都判**（旧口径只判 open）。
     """
+    v2 = bool(_setting('rec_sim_board_price_v2', REC_SIM_BOARD_PRICE_V2))
+    defer = bool(_setting('rec_sim_defer_limit_down', REC_SIM_DEFER_LIMIT_DOWN))
     by_date = defaultdict(list)
     for r in recs:
         by_date[r['rec_date']].append(r)
@@ -121,7 +162,23 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
                 price = c
                 entry_note = ('记录价越出当日高低区间(期间除权)→买入价改用当日复权收盘'
                               if rp else '记录价缺失→买入价用复权收盘')
-            sealed = (abs(h - c) < 1e-6 and chg >= lim * 0.97)
+            # 两档判据不能合成一个：
+            #   sealed_at_close＝收盘仍钉在涨停价（卡片的本意是"次日竞价关注"，auction 入口该走那条）；
+            #   sealed_hard＝全天一分都没低于涨停价（真一字/T字，谁都买不到，只有它才该被剔除）。
+            # 旧实现用同一个 sealed 表达这两件事；v2 只放宽"能不能买"，如果继续共用一个变量，
+            # 就会把 auction 的分支一起带偏（实测：剔除从 23 掉到 6，那不是更真实，
+            # 而是涨停票不再走次日竞价、改成按当天涨停价买——反而更乐观）。
+            lu_buy, ld_buy = _limit_prices(prev_c or 0, lim)
+            if lu_buy > 0:
+                sealed_at_close = (abs(h - c) < 1e-6 and c >= lu_buy - REC_SIM_BOARD_EPS)
+            else:                                   # 没有前收（首日/缺数据）退回旧的百分比近似
+                sealed_at_close = (abs(h - c) < 1e-6 and chg >= lim * 0.97)
+            sealed_hard = ((l >= lu_buy - REC_SIM_BOARD_EPS) if (v2 and lu_buy > 0)
+                           else sealed_at_close)
+            sealed_note = ''
+            if v2 and lu_buy > 0 and sealed_at_close and not sealed_hard:
+                sealed_note = '盘中炸过板·收盘回封涨停（按收盘价买仍要排队）'
+            sealed = sealed_at_close
             if sealed and entry == 'auction':
                 if idx + 2 >= len(series):
                     skipped.append((r, '次日竞价买入但次次日无K线'))
@@ -139,9 +196,14 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
                 price, entry_note = o1, '封板票按推荐次日竞价买入'
                 buy_date = series[idx + 1][0]
                 idx += 1                      # 买卖基准整体后移一根
+                # 已经按次日竞价买入了，两档"封死"判定都要清空——
+                # 只清 sealed 不清 sealed_hard 的话，下面那道剔除会把这条分支买进来的票再剔一遍
+                # （自测就是这么抓出来的：auction 的笔数从 101 掉到 60，跟 tailclose 一模一样）。
                 sealed = False
-            if sealed and entry != 'filled':
-                skipped.append((r, '尾盘已封死涨停，排板未必成交'))
+                sealed_hard = False
+            if sealed_hard and entry != 'filled':
+                skipped.append((r, '一字涨停（全天无低于涨停价的成交）→买不到' if v2
+                                else '尾盘已封死涨停，排板未必成交'))
                 continue
             if idx + 1 >= len(series):
                 skipped.append((r, '次日无K线(未成交/停牌)'))
@@ -149,14 +211,30 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
             sell_i = idx + 1
             shifted = ''
             while sell_i < len(series):
-                so, sl, sc = series[sell_i][1], series[sell_i][3], series[sell_i][4]
+                so, sh, sl, sc = (series[sell_i][1], series[sell_i][2],
+                                  series[sell_i][3], series[sell_i][4])
                 spc = series[sell_i - 1][4]
                 schg = (sc / spc - 1) * 100 if spc else 0.0
-                stuck = (mode == 'open' and abs(so - sl) < 1e-6 and abs(so - sc) < 1e-6
-                         and schg <= -lim * 0.97)
+                _, ld = _limit_prices(spc, lim)
+                # 卖不卖得掉：v2 看"当天有没有过高于跌停价的成交"（最高价 > 跌停价 就能卖），
+                # 最高价一分都没高出去 = 真一字跌停，挂着也出不去 → 顺延到下一根。
+                # 旧口径只认"open==low==close 且跌≥97%限额"的那种一字，而且**只对开盘卖判**，
+                # 尾盘卖（mode='close'）连这条都没有 —— 于是一字跌停照样按收盘价结算，回撤被低估。
+                # defer 开关控制"这条是否也管尾盘卖"；v2+defer 都关掉 = 逐字节回到旧行为。
+                apply_stuck = (mode == 'open') or defer
+                stuck = False
+                if apply_stuck:
+                    if v2 and ld > 0:
+                        stuck = (sh <= ld + REC_SIM_BOARD_EPS)
+                        if stuck:
+                            shifted = '一字跌停（全天无高于跌停价的成交）→顺延到下一根'
+                    else:
+                        stuck = (abs(so - sl) < 1e-6 and abs(so - sc) < 1e-6
+                                 and schg <= -lim * 0.97)
+                        if stuck:
+                            shifted = '次日一字跌停→顺延到下一根'
                 if not stuck:
                     break
-                shifted = '次日一字跌停→顺延到下一根'
                 sell_i += 1
             if sell_i >= len(series):
                 skipped.append((r, '顺延到最后一根仍卖不掉'))
@@ -168,16 +246,41 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
             orders.append({'rec_date': d, 'buy_date': buy_date, 'sell_date': series[sell_i][0],
                            'entry_price': price, 'exit_price': exit_price, 'r': r,
                            'symbol': r['symbol'], 'name': r['name'], 'score': r['score'],
-                           'note': entry_note or shifted})
+                           # note 只做展示与复盘说明，不参与任何成交/收益计算；
+                           # 这里把"越界改价""炸板回封""跌停顺延"三段都留下来（旧实现只留第一段），
+                           # 是因为 v2 之后同一笔可能既改了买入价又被顺延，只留一个会误导弹道。
+                           'note': '；'.join([x for x in ((entry_note or sealed_note), shifted) if x])})
     return orders, skipped
 
 
-def run(orders: List[Dict], capital: float, whole_lots: bool = True) -> Dict:
+def run(orders: List[Dict], capital: float, whole_lots: bool = True,
+        sizing: Optional[bool] = None, sizing_opts: Optional[Dict] = None) -> Dict:
     """按交易日推进：先结算当天到期的卖出，再用**当时可用**的现金买当天的单。
 
     这一步不能省：竞价口径一笔占两天，若把每笔当成"当天买当天回款"来复利，
     资金周转过快、期末会明显偏高。返回里带逐日净值序列（页面画曲线用的就是它）。
+
+    仓位规则（2026-10-20 加，默认关）：`sizing=None` 时读覆盖表/config；关掉就是老规则
+    ——`budget = cash / 当天要买的只数`，满仓等分、不留缓冲。打开后每笔仓位取
+    「风险预算÷止损幅度」与「单票上限」的较小值，再被「当天剩余总敞口」和现金夹住。
+    对照脚本可以直接传 sizing=True/False 与 sizing_opts 覆盖参数，不必改配置。
     """
+    opts = dict(sizing_opts or {})
+    if sizing is None:
+        sizing = bool(_setting('rec_sim_sizing_v2', REC_SIM_SIZING_V2))
+    # ⚠️ 单位：覆盖表 `value()` 返回的是**界面单位（百分数）**——SPEC 里 scale=100 会把
+    # config 的 0.015 换算成 1.5。所以这里四个值一律按百分数对待：risk÷stop 无量纲，正好就是
+    # 仓位比例；cap 与 exposure_cap 要除以 100 才回到比例。`sizing_opts` 传参也用同一单位
+    # （risk=1.5、stop=8、cap=25、exposure=60），别混着传 0.015 进去。
+    risk = float(opts.get('risk', _setting('rec_sim_risk_per_trade', REC_SIM_RISK_PER_TRADE * 100)))
+    stop = float(opts.get('stop', _setting('rec_sim_stop_pct', REC_SIM_STOP_PCT * 100)))
+    cap = float(opts.get('cap', _setting('rec_sim_max_position_pct',
+                                         REC_SIM_MAX_POSITION_PCT * 100))) / 100.0
+    exposure_cap = float(opts.get('exposure', _setting('rec_sim_max_exposure_pct',
+                                                        REC_SIM_MAX_EXPOSURE_PCT * 100))) / 100.0
+    stats = {'sizing': sizing, 'risk': risk, 'stop': stop, 'cap': cap, 'exposure': exposure_cap,
+             'per_trade_pct': round(min(risk / stop, cap) * 100, 2) if stop > 0 else None,
+             'cap_hits': 0, 'no_room': 0, 'max_ratio': 0.0, 'one_stock_days': 0}
     buy_days = defaultdict(list)
     for o in orders:
         buy_days[o['buy_date']].append(o)
@@ -195,12 +298,38 @@ def run(orders: List[Dict], capital: float, whole_lots: bool = True) -> Dict:
             trades.append(p)
         todays = buy_days.get(day) or []
         if todays and cash > 0:
-            budget = cash / len(todays)
+            equity = cash + sum(p['cost'] for p in open_pos)      # 买之前当天的净值（成本法）
+            held = equity - cash                                   # 已被持仓占用的敞口
+            if len(todays) == 1:
+                stats['one_stock_days'] += 1                        # "当天只 1 只→一笔押满"那种日子
+            if sizing:
+                # 每笔目标仓位 = min(风险预算÷止损幅度, 单票上限)，
+                # 再被"当天剩余总敞口"和可用现金夹住；关掉 sizing 就一个字都不受影响
+                per = equity * min(risk / stop if stop > 0 else 1.0, cap)
+                room = max(0.0, equity * exposure_cap - held)
+                budget = min(per, room / len(todays), cash / len(todays))
+                if budget <= 0:
+                    stats['no_room'] += len(todays)
+                    for o in todays:
+                        unsold.append((o['r'], '总敞口已满（风险预算口径），今天不加仓'))
+                    continue
+            else:
+                budget = cash / len(todays)
+            committed = 0.0
             for o in todays:
+                budget_i = budget
+                if sizing:
+                    # 逐笔扣减：除了单票上限，还要保证"当天累计敞口"不越 exposure_cap 那条线
+                    left = max(0.0, equity * exposure_cap - held - committed)
+                    budget_i = min(budget, left, cash)
+                    if budget_i <= 0:
+                        stats['cap_hits'] += 1
+                        unsold.append((o['r'], '单票/总敞口上限已满'))
+                        continue
                 # whole_lots=False 是敏感性检验：100 股一手会让高价票自动少买、低价票多买，
                 # 等于给权重掺了取整噪声。要看"等权满仓"的真实结果就得放开整股。
-                shares = (int(budget / o['entry_price'] / 100) * 100 if whole_lots
-                          else budget / o['entry_price'])
+                shares = (int(budget_i / o['entry_price'] / 100) * 100 if whole_lots
+                          else budget_i / o['entry_price'])
                 if shares <= 0:
                     unsold.append((o['r'], f"一手要 {o['entry_price'] * 100:,.0f} 元，份额不够"))
                     continue
@@ -214,11 +343,17 @@ def run(orders: List[Dict], capital: float, whole_lots: bool = True) -> Dict:
                     continue
                 proceeds = shares * o['exit_price'] - _fee_sell(shares * o['exit_price'])
                 cash -= cost
+                committed += cost
+                if equity > 0:
+                    # 两种模式都统计：关掉 sizing 时这就是"现状单笔最大占净值比"的实测证据
+                    stats['max_ratio'] = max(stats['max_ratio'], cost / equity)
                 open_pos.append({**o, 'shares': shares, 'cost': cost, 'proceeds': proceeds,
                                  'ret': (proceeds / cost - 1) * 100})
         invested = sum(p['cost'] for p in open_pos)
-        nav.append({'date': day, 'nav': round(cash + invested, 2),
-                    'positions': len(open_pos), 'cash': round(cash, 2)})
+        _eq = cash + invested
+        nav.append({'date': day, 'nav': round(_eq, 2),
+                    'positions': len(open_pos), 'cash': round(cash, 2),
+                    'exposurePct': round(invested / _eq * 100, 1) if _eq > 0 else 0.0})
         peak = max(peak, cash + invested)
         mdd = max(mdd, (peak - (cash + invested)) / peak * 100)
     for p in open_pos:                       # 日历尽头还没卖出的（最后一天之后无K线），按口径价收尾
@@ -229,13 +364,14 @@ def run(orders: List[Dict], capital: float, whole_lots: bool = True) -> Dict:
     for p in trades:
         p.pop('r', None)
     return {'end': round(cash, 2), 'trades': trades, 'unsold': unsold,
-            'mdd': round(mdd, 2), 'nav': nav}
+            'mdd': round(mdd, 2), 'nav': nav, 'sizing': stats}
 
 
 def _curve_stats(entry: str, mode: str, recs, bars, capital: float,
-                 auction_max_gap: float, whole_lots: bool) -> Dict:
+                 auction_max_gap: float, whole_lots: bool,
+                 sizing: Optional[bool] = None, sizing_opts: Optional[Dict] = None) -> Dict:
     orders, skipped = plan(recs, bars, mode, entry=entry, auction_max_gap=auction_max_gap)
-    res = run(orders, capital, whole_lots=whole_lots)
+    res = run(orders, capital, whole_lots=whole_lots, sizing=sizing, sizing_opts=sizing_opts)
     trades, unsold = res['trades'], skipped + [(o, w) for o, w in res['unsold']]
     rets = [t['ret'] for t in trades]
     cost_sum = sum(t['cost'] for t in trades)
@@ -265,12 +401,15 @@ def _curve_stats(entry: str, mode: str, recs, bars, capital: float,
         'worst': {k: worst[k] for k in ('name', 'rec_date', 'ret')} if worst else None,
         'skipReasons': dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         'notes': {t['name']: t['note'] for t in trades if t['note']},
+        # 仓位规则的实际参数与触发次数（关掉 sizing 时也要回传，页面才能显示"现在是老规则"）
+        'sizing': res.get('sizing'),
     }
 
 
 def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = None,
              auction_max_gap: float = 5.0, whole_lots: bool = True,
-             with_benchmark: bool = False) -> Dict:
+             with_benchmark: bool = False, sizing: Optional[bool] = None,
+             sizing_opts: Optional[Dict] = None) -> Dict:
     """一次算完六种口径（三种入口 × 两种卖法），给页面用。
 
     默认窗口=近 3 个月（与用户提的问题一致）；`since` 可以指定起始日。
@@ -296,7 +435,8 @@ def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = 
     for entry in ('tailclose', 'auction', 'filled'):
         for mode in ('open', 'close'):
             out['curves'].append(_curve_stats(entry, mode, recs, bars, capital,
-                                              auction_max_gap, whole_lots))
+                                              auction_max_gap, whole_lots,
+                                              sizing=sizing, sizing_opts=sizing_opts))
     if with_benchmark:
         out['benchmark'] = benchmark(since)
     return out

@@ -196,6 +196,10 @@
           <span class="exec-meta">
             现价{{ overTxt(r) }}；今天最多付到 {{ r.buySellPoints.buyTiming.limitPrice }}
           </span>
+          <!-- 区间类型（2026-10-19 影子口径）：上面那颗「挂低吸单」用的核心区间一个字没改，
+               这一行只补一句"愿意多付一点的话可达范围到哪"。成交判定、统计口径、
+               按钮的置灰逻辑全都还看核心区间——它是对照，不是新默认。 -->
+          <div v-if="bandNote(r)" class="exec-band">{{ bandNote(r) }}</div>
         </div>
         <div v-if="r.buySellPoints?.buyTiming?.exitNote" class="recommend-exit">
           {{ r.buySellPoints.buyTiming.exitNote }}
@@ -334,6 +338,19 @@
     if (t.overPct >= 1) return `已越过上限 ${t.overPct}%（这就是追高）`
     if (t.overPct > 0) return `高出 ${t.overPct}%（噪声范围内，可以买）`
     return `还低 ${Math.abs(t.overPct)}%（在区间内）`
+  }
+  // 区间类型标注（2026-10-19）：核心区间=挂单价与严格统计口径（不变），
+  // 可达范围=按近 5 日波动放宽后的扩展上沿（影子）。数字全部后端 buy_range 算好下发，
+  // 前端不再算第二套口径；开关关掉时后端 dynEnabled=false，这行直接不渲染。
+  function bandNote(r) {
+    const t = bt(r)
+    if (!t || !t.dynEnabled || !t.buyHighDyn) return ''
+    if (!(Number(t.buyHighDyn) > Number(t.buyHigh))) return ''
+    let v = ''
+    if (t.vol5 !== null && t.vol5 !== undefined) {
+      v = `｜5日波动 ${Number(t.vol5).toFixed(2)}%，带宽 +${Number(t.bandPct).toFixed(1)}%`
+    }
+    return `核心 ${t.buyLow}~${t.buyHigh}（挂这个）· 可达 ${t.buyHighDyn}${v} · 影子对照，不改挂单价`
   }
   function copyPlan(r, mode) {
     const t = bt(r)
@@ -561,6 +578,18 @@
   .exec-meta {
     font-size: 0.6875rem;
     color: #6b7280;
+  }
+  /* 区间类型（2026-10-19 影子口径）单独占一行，用灰底虚线框明确它是"对照说明"，
+     不是新的操作指令——操作还是看上面那颗「挂低吸单」。 */
+  .exec-band {
+    flex-basis: 100%;
+    font-size: 0.6875rem;
+    color: #475569;
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    border-radius: 6px;
+    padding: 0.125rem 0.375rem;
+    line-height: 1.5;
   }
   .recommend-exit {
     margin-top: 0.25rem;

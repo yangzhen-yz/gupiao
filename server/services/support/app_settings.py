@@ -237,6 +237,103 @@ SPEC: List[Dict[str, Any]] = [
         'note': '仅罚分模式生效；过滤模式下整只拦掉，不需要罚分', 'impact': None,
     },
     {
+        'key': 'buy_band_dynamic_enabled', 'cfg': 'BUY_RANGE_DYNAMIC_ENABLED', 'kind': 'bool',
+        'label': '启用动态区间宽度（影子）', 'group': '买入区间带宽', 'live': True,
+        'note': '现行上沿恒为「低吸价×1.01」，与个股波动无关；打开后按近 5 日已实现波动率'
+                '放宽到 +band%，但**只写进新键 buyHighDyn**：线上挂单价、成交判定、主统计'
+                '一律还是核心区间。关掉=逐字节等于改造前',
+        'impact': None,
+    },
+    {
+        'key': 'band_base_pct', 'cfg': 'BUY_RANGE_BAND_BASE_PCT', 'kind': 'float',
+        'label': '核心带宽（%）', 'group': '买入区间带宽', 'live': True,
+        'min': 0.5, 'max': 3, 'step': 0.1, 'unit': '%',
+        'note': '就是现行那个 1%；它同时是扩展带宽的**下限**（扩展不会比核心更窄）',
+        'impact': None,
+    },
+    {
+        'key': 'band_max_pct', 'cfg': 'BUY_RANGE_BAND_MAX_PCT', 'kind': 'float',
+        'label': '扩展带宽封顶（%）', 'group': '买入区间带宽', 'live': True,
+        'min': 1, 'max': 6, 'step': 0.5, 'unit': '%',
+        'note': '再怎么波动也不给超过低吸价 +3%：再往上就是替别人抬轿，不是"稍微贵一点"。'
+                '扩展上沿另外还被追高线与涨停价双重封顶',
+        'impact': None,
+    },
+    {
+        'key': 'band_vol_k', 'cfg': 'BUY_RANGE_VOL_K', 'kind': 'float',
+        'label': '带宽对波动的系数 K', 'group': '买入区间带宽', 'live': True,
+        'min': 0, 'max': 3, 'step': 0.25, 'unit': '倍',
+        'note': '扩展带宽 = 核心带宽 + K×5日波动率。K=0 等于不用动态，K 越大越宽',
+        'impact': None,
+    },
+    {
+        'key': 'band_vol_bars', 'cfg': 'BUY_RANGE_VOL_BARS', 'kind': 'int',
+        'label': '波动率窗口（个交易日）', 'group': '买入区间带宽', 'live': True,
+        'min': 3, 'max': 20, 'step': 1, 'unit': '天',
+        'note': '只取**已收盘**交易日，数据来自本地日K库（零网络请求）；样本不足 3 个收益时'
+                'vol5=None，带宽退回核心值——没有数据不做判决',
+        'impact': None,
+    },
+    {
+        'key': 'rec_sim_board_price_v2', 'cfg': 'REC_SIM_BOARD_PRICE_V2', 'kind': 'bool',
+        'label': '回测封板改判"有无突破价成交"', 'group': '回测成交口径', 'live': True,
+        'note': '买入：当日最低价低于涨停价就算存在过可成交价（炸板回封也可买），一字/T字全天'
+                '没低下去过才剔；卖出：当日最高价高于跌停价就能卖，一字跌停卖不掉则顺延。'
+                '关掉=用旧判据（收盘==当日最高价且涨幅≥97%限额视为封死）',
+        'impact': 'backtest',
+    },
+    {
+        'key': 'rec_sim_defer_limit_down', 'cfg': 'REC_SIM_DEFER_LIMIT_DOWN', 'kind': 'bool',
+        'label': '一字跌停顺延也管尾盘卖', 'group': '回测成交口径', 'live': True,
+        'note': '旧实现只对"开盘卖"判一字跌停顺延，尾盘卖连检查都没有——等于假设跌停也能按'
+                '收盘价卖掉，回撤被低估。关掉=恢复只对开盘卖生效的老行为',
+        'impact': 'backtest',
+    },
+    {
+        'key': 'rec_sim_board_eps', 'cfg': 'REC_SIM_BOARD_EPS', 'kind': 'float',
+        'label': '涨跌停价比较容差（元）', 'group': '回测成交口径', 'live': True,
+        'min': 0.0, 'max': 0.05, 'step': 0.005, 'unit': '元',
+        'note': '价格按四舍五入到分算，比较时留半分容差；调大只会让更多票被判成"能成交"',
+        'impact': 'backtest',
+    },
+    {
+        'key': 'rec_sim_sizing_v2', 'cfg': 'REC_SIM_SIZING_V2', 'kind': 'bool',
+        'label': '启用仓位约束（风险预算＋上限）', 'group': '回测仓位规则', 'live': True,
+        'note': '关掉就是现行规则「当天可用现金 ÷ 当天要买的只数」——满仓等分、不留缓冲；'
+                '实测单笔占净值中位 32%、最大 99.5%（当天只推 1 只时一笔押满）。'
+                '打开后每笔＝min(风险预算÷止损幅度, 单票上限)，再被当天剩余总敞口和现金夹住',
+        'impact': None,
+    },
+    {
+        'key': 'rec_sim_risk_per_trade', 'cfg': 'REC_SIM_RISK_PER_TRADE', 'kind': 'float',
+        'label': '每笔账户风险预算（%）', 'group': '回测仓位规则', 'live': True,
+        'min': 0.25, 'max': 3, 'step': 0.25, 'unit': '%', 'scale': 100,
+        'note': '仓位＝这个值 ÷ 止损幅度。1.5%÷8% ≈ 19% 仓；它的前提是止损真会执行',
+        'impact': None,
+    },
+    {
+        'key': 'rec_sim_stop_pct', 'cfg': 'REC_SIM_STOP_PCT', 'kind': 'float',
+        'label': '折算用止损幅度（%）', 'group': '回测仓位规则', 'live': True,
+        'min': 4, 'max': 12, 'step': 0.5, 'unit': '%', 'scale': 100,
+        'note': '线上三套止损口径还没统一（risk_control 振幅×1.5 钳[4,12]、position ×0.8 钳[4,8]），'
+                '所以这里先当参数用，别当成"系统真会在这个价止损"',
+        'impact': None,
+    },
+    {
+        'key': 'rec_sim_max_position_pct', 'cfg': 'REC_SIM_MAX_POSITION_PCT', 'kind': 'float',
+        'label': '单票占净值上限（%）', 'group': '回测仓位规则', 'live': True,
+        'min': 5, 'max': 100, 'step': 5, 'unit': '%', 'scale': 100,
+        'note': '专治"当天只推 1 只就 100% 押一只"；设成 100 等于不加这条约束',
+        'impact': None,
+    },
+    {
+        'key': 'rec_sim_max_exposure_pct', 'cfg': 'REC_SIM_MAX_EXPOSURE_PCT', 'kind': 'float',
+        'label': '同日总敞口上限（%）', 'group': '回测仓位规则', 'live': True,
+        'min': 20, 'max': 100, 'step': 5, 'unit': '%', 'scale': 100,
+        'note': '持仓＋当天新买单占净值上限，剩下是现金缓冲；设成 100 等于不留缓冲（老行为）',
+        'impact': None,
+    },
+    {
         'key': 'push_daily_limit', 'cfg': 'WECOM_PUSH_DAILY_LIMIT', 'kind': 'int',
         'label': '每天最多推送条数', 'group': '推送', 'live': True,
         'min': 1, 'max': 30, 'step': 1, 'unit': '条',

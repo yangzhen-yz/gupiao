@@ -549,6 +549,24 @@ def init_db():
                 authoritative TEXT DEFAULT 'westock',
                 checked_at TEXT,
                 PRIMARY KEY (date, symbol))''')
+        # 接口用量统计（2026-10-19）：第三方 API 每日调用计数与上限预警
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_usage_daily (
+                date TEXT NOT NULL,
+                provider TEXT NOT NULL,          -- tencent / eastmoney / sina / westock / wecom ...
+                interface TEXT NOT NULL,          -- quote / kline / clist / ulist / push / chat ...
+                count INTEGER DEFAULT 0,          -- 当日累计调用次数
+                ok INTEGER DEFAULT 0,             -- 成功（HTTP<400）次数
+                fail INTEGER DEFAULT 0,           -- 失败（HTTP>=400 或异常）次数
+                PRIMARY KEY (date, provider, interface))''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_usage_limits (
+                provider TEXT NOT NULL,
+                interface TEXT NOT NULL,
+                daily_limit INTEGER NOT NULL,     -- 每日上限（防封禁阈值）
+                updated_by TEXT DEFAULT '',
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')),
+                PRIMARY KEY (provider, interface))''')
         # 索引（2026-07-20 性能优化 A4）：基本面/估值按 symbol 高频点查
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_fundamental_symbol ON stock_fundamental(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_symbol ON stock_valuation(symbol)')
@@ -2797,4 +2815,94 @@ def load_optimization_history(module: str = None, limit: int = 50) -> List[Dict]
         return [dict(r) for r in rows]
     except Exception as error:
         print(f'加载优化历史失败: {str(error)}')
+        return []
+
+
+# ========== 接口用量统计（2026-10-19） ==========
+def save_api_usage_daily(rows) -> int:
+    """批量 upsert 当日接口调用计数。rows = [(date, provider, interface, count, ok, fail), ...]"""
+    if not rows:
+        return 0
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.executemany(
+            '''INSERT INTO api_usage_daily(date, provider, interface, count, ok, fail)
+               VALUES(?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date, provider, interface) DO UPDATE SET
+                 count=excluded.count, ok=excluded.ok, fail=excluded.fail''',
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return len(rows)
+    except Exception as error:
+        print(f'保存接口用量失败: {str(error)}')
+        return 0
+
+
+def load_api_usage_today(date_str: str) -> List[Dict]:
+    """读取某一天的接口用量计数（install 时回填内存，避免重启丢当天累计）。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            'SELECT * FROM api_usage_daily WHERE date = ?', (date_str,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'读取当日接口用量失败: {str(error)}')
+        return []
+
+
+def load_api_usage_history(days: int = 14) -> List[Dict]:
+    """读取近 N 天接口用量（按 date 升序），供趋势图。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            '''SELECT * FROM api_usage_daily
+               WHERE date >= date('now', ?)
+               ORDER BY date ASC''',
+            (f'-{days - 1} days',),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'读取接口用量历史失败: {str(error)}')
+        return []
+
+
+def save_api_usage_limit(provider: str, interface: str, limit: int, updated_by: str = '') -> bool:
+    """保存（upsert）某接口的每日上限。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO api_usage_limits(provider, interface, daily_limit, updated_by, updated_at)
+               VALUES(?, ?, ?, ?, datetime('now', '+8 hours'))
+               ON CONFLICT(provider, interface) DO UPDATE SET
+                 daily_limit=excluded.daily_limit, updated_by=excluded.updated_by,
+                 updated_at=datetime('now', '+8 hours')''',
+            (provider, interface, int(limit), updated_by),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'保存接口上限失败: {str(error)}')
+        return False
+
+
+def load_api_usage_limits() -> List[Dict]:
+    """读取所有已持久化的接口上限。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        rows = cursor.execute('SELECT * FROM api_usage_limits').fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'读取接口上限失败: {str(error)}')
         return []

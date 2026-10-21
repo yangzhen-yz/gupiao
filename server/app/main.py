@@ -91,7 +91,6 @@ def _reload_config():
 from db.database import init_db, save_hot_search_ranking, load_trend_scan_results, load_daily_market_reviews
 from services.data.stock import fetch_eastmoney_hot_list
 from services.strategy.trend import scan_trend_task
-from services.support.ai import load_ai_config
 from services.data.trading_calendar import is_trading_day
 
 _last_scan_result = None
@@ -107,7 +106,13 @@ def _lazy_start_scheduler():
 async def lifespan(app: FastAPI):
     global _last_scan_result, _last_scan_date, _last_scan_ts
     init_db()
-    load_ai_config()
+    # 接口用量统计：在 scheduler 启动前接管所有出站 HTTP（requests/httpx/urllib），
+    # 这样首屏热搜榜拉取、盘后同步等全部被计入，避免遗漏。失败不影响主流程。
+    try:
+        from services.data import api_usage
+        api_usage.install()
+    except Exception as _e:
+        print(f'[初始化] 接口用量统计安装失败（不影响其他功能）: {_e}')
     print('[初始化] 正在获取热搜榜数据...')
     try:
         data = await fetch_eastmoney_hot_list()

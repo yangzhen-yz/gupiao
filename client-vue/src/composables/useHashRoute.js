@@ -30,6 +30,8 @@ const TAB_BY_SEG = {
   settings: 'tab-settings',
   // 2026-10-18 同理：新子页不登记这里，点「回测曲线」会解析失败并落回行动台
   backtest: 'tab-backtest',
+  // 2026-10-19 同理：漏登记「接口用量」会解析失败落回行动台，表现为"点了没反应"（已实锤）
+  'api-usage': 'tab-api-usage',
 }
 const SEG_BY_TAB = Object.fromEntries(Object.entries(TAB_BY_SEG).map(([k, v]) => [v, k]))
 

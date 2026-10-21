@@ -447,14 +447,28 @@ def _em_zb_pool_get(date_str: str, pagesize: int = 500, retries: int = 3, timeou
 
 def _em_batch_change_percent(codes: List[str], batch_size: int = 40,
                              retries: int = 2, timeout: float = 10.0) -> Dict[str, float]:
-    """按代码批量查询最新涨跌幅（东财 ulist 接口）。返回 {code: changePercent}。"""
+    """按代码批量查询最新涨跌幅（东财 ulist 接口）。返回 {code: changePercent}。
+
+    2026-10-20：接入共享熔断 eastmoney_guard（scope 'ulist'）。此前这里是闸门覆盖
+    缺口——情绪温度计盘中每 ≥180s 调一次本函数，东财 IP 被封当天仍真实发出 612 次
+    请求、失败 487 次，等于持续给封禁续命。现在冷却期内直接返回空 dict，两个调用方
+    （sentiment 沿用今日早前值 / 收评跳过该维）本来就按"拿不到"设计了兜底，行为不变。
+    连接级失败（classify=blocked）不再重试：东财要么一次就通，要么在封这个 IP。
+    """
     result: Dict[str, float] = {}
+    from services.data import eastmoney_guard
+    if eastmoney_guard.skip('ulist'):
+        print('[批量行情] ulist 冷却中，本轮跳过东财（调用方走兜底）')
+        return {}
 
     def _to_secid(code: str) -> str:
         # 东财 secid 前缀：沪市 1.，深市/北交所 0.
         return ('1.' if code.startswith('6') else '0.') + code
 
     for i in range(0, len(codes), batch_size):
+        # 熔断可能在批次中途因连续失败跳闸：后面的批次就别再打了
+        if i and eastmoney_guard.skip('ulist'):
+            break
         batch = codes[i:i + batch_size]
         secids = ','.join(_to_secid(c) for c in batch if c)
         if not secids:
@@ -473,12 +487,14 @@ def _em_batch_change_percent(codes: List[str], batch_size: int = 40,
                     pct = item.get('f3')
                     if code and pct is not None:
                         result[code] = float(pct)
+                eastmoney_guard.ok('ulist')
                 break
             except Exception as e:
-                if attempt == retries - 1:
+                eastmoney_guard.fail('ulist', e)
+                if attempt == retries - 1 or not eastmoney_guard.should_retry(e):
                     print(f'[收评] 批量行情查询失败({len(batch)}只): {e}')
-                else:
-                    time.sleep(0.4)
+                    break
+                time.sleep(0.4)
     return result
 
 

@@ -34,12 +34,28 @@ from typing import Dict, List, Optional, Set
 
 from app.config import KLINE_HISTORY_ENABLED, KLINE_HISTORY_DB_PATH
 from db.database import get_db_conn
+# 区间口径必须与卡片同源：复盘算的"扩展上沿"就是 buy_range 那一份算法，不能在这儿重写一遍
+from services.strategy.buy_range import buy_range, recent_volatility
 
 
 def _local_history_conn():
     """本地历史K线库只读连接（独立库，避免与主库事务互相影响）"""
     conn = sqlite3.connect(f'file:{KLINE_HISTORY_DB_PATH}?mode=ro', uri=True)
     return conn
+
+
+def _fill_price(limit_price: float, next_open: Optional[float]) -> float:
+    """挂 limit_price 的买单，次日实际的撮合成交价近似。
+
+    开盘价 ≤ 挂单价 → 集合竞价按**开盘价**成交（成交价不会高于挂单）；
+    开盘高于挂单、盘中回落到挂单价 → 按挂单价成交。
+
+    核心口径与扩展口径共用这一个函数，两套的唯一差别才只剩"挂在哪里"，
+    不会把"带宽的代价"和"成交价的定义差"算成同一件事。
+    """
+    if next_open and next_open > 0 and next_open <= limit_price:
+        return float(next_open)
+    return float(limit_price)
 
 
 def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
@@ -66,6 +82,18 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
         return []
     try:
         hcur = hconn.cursor()
+        # 波动率序列：动态带宽要的是「推荐那一天**之前** 5 个交易日的波动率」，
+        # 拿今天的值回填历史等于偷看未来（前视偏差），算出来的对照直接不作数。
+        # 一次 SQL 把涉及票的收盘序列全捞进内存，不逐票查——同一个坑 10-17 踩过。
+        codes = sorted({(r.get('symbol') or '')[-6:] for r in recs if r.get('symbol')})
+        series = {}
+        if codes:
+            _ph = ','.join('?' * len(codes))
+            for _code, _d, _close in hcur.execute(
+                    f"SELECT symbol, date, close FROM stock_daily "
+                    f"WHERE symbol IN ({_ph}) ORDER BY symbol, date", tuple(codes)).fetchall():
+                if _close is not None:
+                    series.setdefault(_code, []).append((_d, float(_close)))
         for rec in recs:
             sym = (rec.get('symbol') or '').lower()
             code = sym.replace('sh', '').replace('sz', '').replace('bj', '')
@@ -94,6 +122,41 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
                 # 这张单不会成交，而旧口径照样按 bars[0].close 记一笔"盈利"——未成交组
                 # 按构造 100% 胜率，把纸面 t1 从 42.1% 抬到 60.4%。
                 r['filled'] = 1 if bars[0][3] <= buy else 0
+                # ===== 扩展区间（2026-10-19 影子口径，与核心**同分母**）=====
+                # 只做旁路对照，不动 filled/r1：主统计与历史数字的口径一个字都没改，
+                # 所以两边的成交率、胜率可以直接对着看。分母必须一致（都是"有数值买入价"
+                # 这一批），否则两个百分比是两套人日，看着像提升了其实是换了分母。
+                # 复盘这里显式 dynamic=True，不受线上卡片开关控制——影子要攒数据就得一直算。
+                if rec_price and rec_price > 0:
+                    prior = [c for _d, c in (series.get(code) or []) if _d <= rec['date']]
+                    vol5 = recent_volatility(prior)
+                    # timing_type 没落库，统一按 'intraday'（追高线 3%）算：若那只票当天其实是
+                    # "次日竞价"（追高线 5%），这里的扩展上沿会被**压得更低**——
+                    # 也就是扩展口径的成交率被低估、结论偏保守，不会反过来美化它。
+                    rng = buy_range(rec_price, 0.0, ref_buy=buy, timing_type='intraday',
+                                    limit_up=False, code=code, vol5=vol5, dynamic=True)
+                    r['vol5'] = vol5
+                    r['buyHighCore'] = rng['buyHigh']
+                    r['buyHighDyn'] = rng['buyHighDyn']
+                    r['bandPct'] = rng['bandPct']
+                    # 次日最低价触及扩展上沿 = "愿意多付 band% 的话，这张单能成交"
+                    r['filled_dyn'] = 1 if bars[0][3] <= rng['buyHighDynRaw'] else 0
+                    # 收益按**扩展上沿**（更贵的成交价）算，不是把买入价往好处挪。
+                    # 所以这组数大概率比核心口径差——差的那部分就是"真买得到"的代价，
+                    # 那才是这轮对照要回答的问题。
+                    r['r1_dyn'] = round((bars[0][2] / rng['buyHighDynRaw'] - 1) * 100, 2)
+                    # —— 但上面那种算法两套口径承担的成本假设**不对称**：核心按挂单价 buy 算，
+                    # 扩展按挂单价 hi 算，而现实中挂 24.60 若次日 24.10 就开盘，成交在 24.10、
+                    # 不是 24.60（集合竞价撮合不高于挂单）。不修正的话"带宽的代价"里混着
+                    # "成交定义差"，两个百分比就不是同一件事。所以再并列一组撮合价口径：
+                    # 核心与扩展都按"min(挂单价, 次日开盘价)"成交，唯一差别只剩挂单价本身。
+                    _nx_open = bars[0][1]
+                    fc = _fill_price(buy, _nx_open)
+                    fd = _fill_price(rng['buyHighDynRaw'], _nx_open)
+                    r['fillCorePrice'] = round(fc, 2)
+                    r['fillDynPrice'] = round(fd, 2)
+                    r['r1_fill'] = round((bars[0][2] / fc - 1) * 100, 2)
+                    r['r1_dyn_fill'] = round((bars[0][2] / fd - 1) * 100, 2)
             if has_price:
                 r['exec_r1'] = round((bars[0][2] / rec_price - 1) * 100, 2)
             out.append(r)
@@ -171,6 +234,27 @@ def _aggregate(perf: List[Dict]) -> Dict:
     dixi_ev = None
     if t1_filled and fill_rate:
         dixi_ev = round(fill_rate / 100 * t1_filled['avg'], 2)
+    # ===== 扩展口径（影子）：与核心口径并列输出，不做替换 =====
+    # n_dyn 与 n_buy 的差别只可能来自"有买入价但推荐时现价为 0"的老记录；
+    # 两个 n 都单独返回，分母不一样时百分比就不许直接比（这是 10-16 那次分母教训）。
+    filled_dyn = [r for r in perf if r.get('filled_dyn') == 1 and r.get('r1_dyn') is not None]
+    n_dyn = sum(1 for r in perf if r.get('r1_dyn') is not None)
+    fill_rate_dyn = round(len(filled_dyn) / n_dyn * 100, 1) if n_dyn else None
+    t1_filled_dyn = _stats_vals([r['r1_dyn'] for r in filled_dyn])
+    dixi_ev_dyn = None
+    if t1_filled_dyn and fill_rate_dyn:
+        dixi_ev_dyn = round(fill_rate_dyn / 100 * t1_filled_dyn['avg'], 2)
+    # 撮合价口径：核心与扩展用**同一条**成交规则（min(挂单价, 次日开盘价)），
+    # 两边只差"挂在哪里"。回答"放宽带宽值不值"要看这一组，不是上面那组
+    # ——上面 r1 vs r1_dyn 的差里混着"按上沿成交"这个额外成本假设。
+    _fill_core = [r['r1_fill'] for r in perf
+                  if r.get('filled') == 1 and r.get('r1_fill') is not None]
+    _fill_dyn = [r['r1_dyn_fill'] for r in perf
+                 if r.get('filled_dyn') == 1 and r.get('r1_dyn_fill') is not None]
+    # 增量组：核心口径下没成交、只有放宽才成交的那些票——"多付一点"换来的到底是什么
+    _inc = [r['r1_dyn_fill'] for r in perf
+            if r.get('filled_dyn') == 1 and r.get('filled') == 0
+            and r.get('r1_dyn_fill') is not None]
     dds = [r['dd5'] for r in perf if r.get('dd5') is not None]
     return {
         't1': _stats('r1'), 't3': _stats('r3'), 't5': _stats('r5'),
@@ -180,6 +264,15 @@ def _aggregate(perf: List[Dict]) -> Dict:
                                        if r.get('exec_r1') is not None]),
         'fill_rate': fill_rate,
         'dixi_ev': dixi_ev,
+        't1_filled_dyn': t1_filled_dyn,
+        'exec_t1_filled_dyn': _stats_vals([r['exec_r1'] for r in filled_dyn
+                                          if r.get('exec_r1') is not None]),
+        'fill_rate_dyn': fill_rate_dyn,
+        'dixi_ev_dyn': dixi_ev_dyn,
+        't1_fill': _stats_vals(_fill_core),
+        't1_dyn_fill': _stats_vals(_fill_dyn),
+        't1_dyn_increment': _stats_vals(_inc),
+        'n_buy': n_buy, 'n_dyn': n_dyn,
         'dd5_avg': round(sum(dds) / len(dds), 2) if dds else None,
         'noodle_count': sum(1 for r in perf if (r.get('r1') or 0) < -5),
         'noodle_count_exec': sum(1 for r in perf if (r.get('exec_r1') or 0) < -5),

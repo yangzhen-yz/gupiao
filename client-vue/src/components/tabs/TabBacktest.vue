@@ -53,6 +53,7 @@
             </button>
           </div>
         </header>
+        <div v-if="batchNote" class="bt-note">{{ batchNote }}</div>
 
         <svg
           class="bt-chart"
@@ -360,10 +361,17 @@
   // 颜色只表达"卖法"，线型表达"入口"。A股是红涨绿跌，所以红/绿这两个语义色
   // 一律留给数字本身（赚了红、亏了绿），曲线不碰它们，免得看图的人在颜色上读反。
   const HUE = { open: 'var(--accent-info)', close: 'var(--accent-warning)' }
-  const DASH = { auction: null, tailclose: '6 3', filled: '2 3' }
-  const linestyleOf = c => (c.entry === 'tailclose' ? 'dashed' : c.entry === 'filled' ? 'dotted' : 'solid')
+  // am/pm＝上午档/下午档拆批次线（2026-10-21）：虚线区分末批实线，颜色仍按卖法
+  const DASH = { auction: null, tailclose: '6 3', filled: '2 3', am: '9 3', pm: '2 3' }
+  const linestyleOf = c =>
+    c.entry === 'tailclose' || c.entry === 'am'
+      ? 'dashed'
+      : c.entry === 'filled' || c.entry === 'pm'
+        ? 'dotted'
+        : 'solid'
 
   const curves = computed(() => (data.value && data.value.curves) || [])
+  const batchNote = ref('')
   const shown = ref(new Set())
   const visible = computed(() => curves.value.filter(c => shown.value.has(c.key)))
   const byKey = k => curves.value.find(c => c.key === k) || { retPct: 0, end: capital, nav: [] }
@@ -419,7 +427,8 @@
   const hueOf = c => HUE[c.mode] || 'var(--text-tertiary)'
   const dashOf = c => DASH[c.entry]
   const lineStyle = linestyleOf
-  const short = c => `${c.entryLabel.split('（')[0]}·${c.modeLabel}`
+  const short = c =>
+    (c.sideLabel ? `${c.sideLabel}·${c.modeLabel}` : `${c.entryLabel.split('（')[0]}·${c.modeLabel}`)
 
   /* ---------- 资金曲线（坐标换算全在 utils/chart.js，那边有 Node 断言） ---------- */
   const BOX = { w: W, h: H, pl: PAD_L, pr: PAD_R, pt: PAD_T, pb: PAD_B }
@@ -533,7 +542,19 @@
     try {
       const d = await apiFetch(`/api/recommend-sim?months=${months.value}&bench=${withBench ? 1 : 0}`)
       data.value = d.data
-      shown.value = new Set((d.data.curves || []).filter(c => c.default).map(c => c.key))
+      // 拆批次曲线（上午档/下午档，快照 10-19 起）并进同一组图例；失败不影响主曲线
+      try {
+        const bd = await apiFetch(`/api/recommend-sim-batch?months=${months.value}`)
+        const bc = (bd.data && bd.data.curves) || []
+        bc.forEach(c => {
+          c.entry = c.side
+        })
+        data.value.curves = (data.value.curves || []).concat(bc)
+        batchNote.value = (bd.data && bd.data.note) || ''
+      } catch (e) {
+        batchNote.value = ''
+      }
+      shown.value = new Set((data.value.curves || []).filter(c => c.default).map(c => c.key))
       readIdx.value = null
     } catch (e) {
       error.value = '回测曲线加载失败：' + (e.message || e)
@@ -700,6 +721,15 @@
   }
   .bt-legend-2 {
     margin-top: 4px;
+  }
+  .bt-note {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    background: var(--bg-tertiary);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-sm);
+    padding: 5px 8px;
+    margin-bottom: 6px;
   }
   .bt-leg {
     display: inline-flex;

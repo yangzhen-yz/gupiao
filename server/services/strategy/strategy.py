@@ -7,7 +7,6 @@ from db.database import (get_db_conn, load_strategy_factor_weights, save_strateg
 # 2026-10-14：IC 权重学习开关（bug 修复后默认先影子，见 config 注释）
 from app.config import FACTOR_WEIGHT_LEARNING_ENABLED
 from services.data.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data, get_kline_data
-from services.support.ai import load_ai_config, DEEPSEEK_API_KEY, _call_deepseek_api
 
 
 def _score_main_inflow(main_inflow_ratio: Optional[float]) -> float:
@@ -1200,62 +1199,27 @@ async def _analyze_misjudgments(bull_misjudge: List[Dict], bear_misjudge: List[D
         avg_weibi = sum(s.get('weibi', 0) for s in bull_misjudge) / len(bull_misjudge)
         avg_vol = sum(s.get('volume_ratio', 1) for s in bull_misjudge) / len(bull_misjudge)
         
-        # 尝试使用AI进行深度诊断
-        try:
-            load_ai_config()
-            if DEEPSEEK_API_KEY:
-                import json
-                prompt = f"""
-作为专业的A股量化分析师，请对昨日选股策略的"看涨误判"进行深度分析。
-【大盘环境】
-{analysis['market_context']}
+        # 规则分析（2026-10-20：原"先试 AI 再回退规则"的 AI 分支随豆包/ARK 一起下线，
+        # 规则路径原样保留——顺带修掉旧结构里"没配 key 时 try 正常走完、except 不触发、
+        # 误判分析整段为空"的隐性 bug：现在规则分析无条件执行）
+        patterns = []
+        if market_change > 0 and bull_misjudge:
+            patterns.append('大盘上涨但个股下跌，可能是个股基本面问题或行业轮动')
+        if avg_outer > STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high']:
+            patterns.append('外盘占比偏高但下跌，可能存在主力对倒出货')
+        if avg_weibi > 20:
+            patterns.append('委比偏高但下跌，可能是虚假委托（挂大买单不成交）')
 
-【误判数据统计】
-- 误判数量: {len(bull_misjudge)}只 (策略预测看涨，但实际下跌)
-- 预测时平均涨幅: {avg_predict_change:.2f}%
-- 实际平均跌幅: {avg_actual_change:.2f}%
-- 误判样本平均特征:
-  * 外盘占比: {avg_outer:.1f}%
-  * 委比: {avg_weibi:.1f}%
-  * 量比: {avg_vol:.2f}
+        analysis['bull_misjudge_analysis'] = (
+            f'共{len(bull_misjudge)}只看涨误判，'
+            f'预测时平均涨幅{avg_predict_change:.2f}%，实际平均跌幅{avg_actual_change:.2f}%。'
+            + '；'.join(patterns) if patterns else ''
+        )
 
-【部分误判样本详情】
-{json.dumps(bull_misjudge[:5], ensure_ascii=False)}
-
-请分析误判的核心原因，并给出下一步优化选股策略的建议。
-返回格式必须是JSON:
-{{
-  "bull_misjudge_analysis": "总结误判的核心原因，例如指出哪些技术指标存在失效或被主力骗线的可能（约100字）",
-  "suggestions": ["优化建议1", "优化建议2"]
-}}
-"""
-                ai_response = await _call_deepseek_api(prompt)
-                ai_result = json.loads(ai_response)
-                
-                analysis['bull_misjudge_analysis'] = f"共{len(bull_misjudge)}只看涨误判，预测时平均涨幅{avg_predict_change:.2f}%，实际平均跌幅{avg_actual_change:.2f}%。" + ai_result.get('bull_misjudge_analysis', '')
-                analysis['suggestions'] = ai_result.get('suggestions', [])
-                
-        except Exception as e:
-            print(f"AI误判分析失败，回退到规则分析: {str(e)}")
-            # 回退到基于规则的分析
-            patterns = []
-            if market_change > 0 and bull_misjudge:
-                patterns.append('大盘上涨但个股下跌，可能是个股基本面问题或行业轮动')
-            if avg_outer > STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high']:
-                patterns.append('外盘占比偏高但下跌，可能存在主力对倒出货')
-            if avg_weibi > 20:
-                patterns.append('委比偏高但下跌，可能是虚假委托（挂大买单不成交）')
-
-            analysis['bull_misjudge_analysis'] = (
-                f'共{len(bull_misjudge)}只看涨误判，'
-                f'预测时平均涨幅{avg_predict_change:.2f}%，实际平均跌幅{avg_actual_change:.2f}%。'
-                + '；'.join(patterns) if patterns else ''
-            )
-
-            if avg_outer > STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high']:
-                analysis['suggestions'].append('外盘占比指标的可靠性下降，建议降低该因子权重')
-            if avg_weibi > 20:
-                analysis['suggestions'].append(f'委比指标可能存在虚假信号，已增加交叉验证：委比>{STRATEGY_WEBI_VERIFY["weibi_high"]}但股价下跌时降分，委比高但外盘占比<{STRATEGY_WEBI_VERIFY["outer_ratio_low"]}%或量比<{STRATEGY_WEBI_VERIFY["volume_ratio_low"]}时降分')
+        if avg_outer > STRATEGY_SCORE_THRESHOLDS['outer_ratio']['high']:
+            analysis['suggestions'].append('外盘占比指标的可靠性下降，建议降低该因子权重')
+        if avg_weibi > 20:
+            analysis['suggestions'].append(f'委比指标可能存在虚假信号，已增加交叉验证：委比>{STRATEGY_WEBI_VERIFY["weibi_high"]}但股价下跌时降分，委比高但外盘占比<{STRATEGY_WEBI_VERIFY["outer_ratio_low"]}%或量比<{STRATEGY_WEBI_VERIFY["volume_ratio_low"]}时降分')
 
     # 看跌误判分析（预测跌但实际涨）
     if bear_misjudge:

@@ -71,7 +71,7 @@
             ref="tabQuoteRef"
             :active="activeTab === 'tab-quote'"
             @open-kline="openKline"
-            @open-ai-diag="openAiDiag"
+            @open-diag="openDiag"
           />
         </div>
         <div
@@ -148,6 +148,14 @@
         >
           <TabBacktest />
         </div>
+        <!-- 接口用量（运维组，2026-10-19）：第三方 API 每日调用计数 + 上限预警，防平台封禁 -->
+        <div
+          :class="['tab-content', { active: activeTab === 'tab-api-usage' }]"
+          v-show="activeTab === 'tab-api-usage'"
+          v-if="mountedTabs.has('tab-api-usage')"
+        >
+          <TabApiUsage />
+        </div>
       </div>
     </div>
     <!-- 当前登录账号（固定在左下角浮层，不占用顶部空间）：持仓等私有数据按账号隔离 -->
@@ -173,8 +181,8 @@
       :before-date="klineBeforeDate"
       @close="onKlineClose"
     />
-    <!-- AI诊断弹窗 -->
-    <AiDiagModal v-if="aiDiagVisible" :visible="aiDiagVisible" :symbol="aiDiagSymbol" @close="aiDiagVisible = false" />
+    <!-- 五层诊断弹窗（纯本地数据聚合，无 AI 源） -->
+    <StockDiagModal v-if="diagVisible" :visible="diagVisible" :symbol="diagSymbol" @close="diagVisible = false" />
     <!-- 全局通知 -->
     <TransitionGroup name="toast" tag="div" class="notification-container">
       <div v-for="n in notifications" :key="n.id" :class="['notification', `toast-${n.type}`]">
@@ -218,8 +226,9 @@
   const TabOptimization = defineAsyncComponent(() => import('./components/tabs/TabOptimization.vue'))
   const TabSettings = defineAsyncComponent(() => import('./components/tabs/TabSettings.vue'))
   const TabBacktest = defineAsyncComponent(() => import('./components/tabs/TabBacktest.vue'))
+  const TabApiUsage = defineAsyncComponent(() => import('./components/tabs/TabApiUsage.vue'))
   const KlineModal = defineAsyncComponent(() => import('./components/KlineModal.vue'))
-  const AiDiagModal = defineAsyncComponent(() => import('./components/AiDiagModal.vue'))
+  const StockDiagModal = defineAsyncComponent(() => import('./components/StockDiagModal.vue'))
 
   // ========== hash 路由（2026-10-13）：刷新停在本页、链接可分享 ==========
   const { activeTab, route } = useHashRoute()
@@ -241,6 +250,7 @@
     'tab-settings': '口径与开关',
     'tab-backtest': '回测曲线',
     'tab-desk': '行动台',
+    'tab-api-usage': '接口用量',
   }
   const tabGroups = [
     {
@@ -257,6 +267,11 @@
       key: 'review',
       label: '复盘',
       tabs: ['tab-review', 'tab-optimization', 'tab-settings', 'tab-backtest'].map(id => ({ id, label: TAB_LABELS[id] })),
+    },
+    {
+      key: 'ops',
+      label: '运维',
+      tabs: ['tab-api-usage'].map(id => ({ id, label: TAB_LABELS[id] })),
     },
   ]
   tabGroups.forEach(g => {
@@ -499,12 +514,12 @@
     klineBeforeDate.value = ''
   }
 
-  // AI诊断弹窗
-  const aiDiagVisible = ref(false)
-  const aiDiagSymbol = ref('')
-  function openAiDiag(symbol) {
-    aiDiagSymbol.value = symbol
-    aiDiagVisible.value = true
+  // 五层诊断弹窗
+  const diagVisible = ref(false)
+  const diagSymbol = ref('')
+  function openDiag(symbol) {
+    diagSymbol.value = symbol
+    diagVisible.value = true
   }
 </script>
 

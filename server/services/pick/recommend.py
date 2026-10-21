@@ -445,7 +445,33 @@ def exec_rates(max_age: float = 600.0) -> Dict:
     return r
 
 
-def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) -> Dict:
+def _vol5_for_stock(stock: Dict) -> Optional[float]:
+    """单票近 5 日已实现波动率（%），供 buy_range 算动态带宽。
+
+    三条纪律：
+      · 开关没开就直接返回 None，连本地库都不查——关掉的代价必须等于改造前，一行多余查询也不该有；
+      · 数据只来自本地日K库那份带 TTL 的全市场缓存，**零外部请求**（10-19 刚做完降频专项，
+        不能为了算波动率再开一条每轮打接口的路）；
+      · 取不到（库未回填、新上市/停牌样本不足）返回 None，buy_range 会退回核心带宽。
+        这里故意不打日志：它在批量链路里逐票调用，一次盘后同步晚到就能刷几百行。
+    """
+    try:
+        from app.config import BUY_RANGE_DYNAMIC_ENABLED
+        from services.support import app_settings
+        enabled = app_settings.value('buy_band_dynamic_enabled') \
+            if 'buy_band_dynamic_enabled' in [s['key'] for s in app_settings.SPEC] \
+            else BUY_RANGE_DYNAMIC_ENABLED
+        if not enabled:
+            return None
+        from services.data.kline_history import get_vol_closes_for
+        from services.strategy.buy_range import recent_volatility
+        return recent_volatility(get_vol_closes_for(stock.get('symbol') or ''))
+    except Exception:
+        return None
+
+
+def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
+                        vol5: Optional[float] = None) -> Dict:
     """把"低吸区间 / 追价上限 / 现价超了多少"按票算出来，挂进 buyTiming（2026-10-18，P0-1）。
 
     以前这里是一句全局常量 `RECOMMEND_EXEC_HINT`："建议低吸或尾盘介入，不追盘中高价"。
@@ -464,13 +490,22 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None) ->
             return bsp
         ref_buy = _to_float(bsp.get('buy'))            # '竞价关注' 这类非数值 → 0
         lim_up = _to_float(stock.get('changePercent')) >= TREND_LIMIT_UP_THRESHOLD
+        # 近 5 日波动率：批量调用方（智能推荐/盘中推送）会传进来，单股分析与命令行调用
+        # 没传时自取一次——取的是本地日K库那份带 TTL 的全市场缓存，不产生任何外部请求。
+        if vol5 is None:
+            vol5 = _vol5_for_stock(stock)
         rng = buy_range(price, _to_float(stock.get('amplitude')),
                         ref_buy=ref_buy or None, timing_type=timing.get('type') or 'intraday',
-                        limit_up=lim_up, code=stock.get('symbol') or '')
+                        limit_up=lim_up, code=stock.get('symbol') or '', vol5=vol5)
         timing.update({'buyLow': rng['buyLow'], 'buyHigh': rng['buyHigh'],
                        'limitPrice': rng['limitPrice'], 'chasePct': rng['chasePct'],
                        'buyNote': rng['buyNote'],
                        'overPct': over_pct(price, rng['buyHighRaw'])})
+        # 动态带宽是**并列的影子口径**：核心那套键一个字不改，扩展信息只进新键。
+        # dynEnabled=False（开关关着或波动率取不到）时这些键等于核心值，行为与改造前一致。
+        timing.update({'buyHighDyn': rng['buyHighDyn'], 'bandPct': rng['bandPct'],
+                       'vol5': rng['vol5'], 'overPctDyn': over_pct(price, rng['buyHighDynRaw']),
+                       'dynEnabled': rng['dynEnabled'], 'dynNote': rng['dynNote']})
         if RECOMMEND_EXEC_HINT_ENABLED:
             warn = chase_warning(price, rng['buyHighRaw'], rates)
             if warn:

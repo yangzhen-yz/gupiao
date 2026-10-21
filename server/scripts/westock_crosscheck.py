@@ -102,12 +102,21 @@ def _num(v) -> Optional[float]:
 
 
 def _fetch_batched(symbols: List[str], batch_size: int, cmd: List[str],
-                   batch_sleep: float) -> Dict[str, Dict]:
+                   batch_sleep: float, api_name: Optional[str] = None) -> Dict[str, Dict]:
     """串行分批拉取 + 空返回退避重试（2026-10-19：并发/密集触发服务端限频，
-    空返回即退避重试，不限于限频标记——超时/空响应同样走重试）。"""
+    空返回即退避重试，不限于限频标记——超时/空响应同样走重试）。
+
+    api_name 非空时，每批记 1 次到接口用量统计（westock 走子进程，不走 HTTP，需显式计数）。
+    """
     out: Dict[str, Dict] = {}
     batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
     for idx, batch in enumerate(batches):
+        if api_name:
+            try:
+                from services.data import api_usage
+                api_usage.record(api_name, 1)
+            except Exception:
+                pass
         args = cmd + [','.join(batch)]
         rows: List[Dict] = []
         for attempt in range(_RATE_LIMIT_RETRY + 1):
@@ -139,7 +148,7 @@ def fetch_fund_flow(symbols: List[str], date: Optional[str] = None) -> Dict[str,
     cmd = ['fund', 'flow']
     if date:
         cmd += ['--date', date]
-    return _fetch_batched(symbols, _FF_BATCH, cmd, _FF_BATCH_SLEEP)
+    return _fetch_batched(symbols, _FF_BATCH, cmd, _FF_BATCH_SLEEP, api_name='westock:fundflow')
 
 
 def fetch_quotes(symbols: List[str], date: Optional[str] = None) -> Dict[str, Dict]:
@@ -147,7 +156,7 @@ def fetch_quotes(symbols: List[str], date: Optional[str] = None) -> Dict[str, Di
     cmd = ['quote']
     if date:
         cmd += ['--date', date]
-    return _fetch_batched(symbols, _QT_BATCH, cmd, _QT_BATCH_SLEEP)
+    return _fetch_batched(symbols, _QT_BATCH, cmd, _QT_BATCH_SLEEP, api_name='westock:quote')
 
 
 # ========== 校验宇宙 ==========

@@ -1024,6 +1024,12 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
         return cached[1].get('announcements', [])
 
     def _sync_fetch() -> List[Dict]:
+        # 2026-10-20：接入共享熔断 eastmoney_guard（scope 'ann'）。趋势扫描逐票调这里，
+        # 东财被封当天曾白打几百次（今日 ann 378 次/115 失败的来源之一）。冷却期内
+        # 静默返回空列表——本函数契约本来就是"失败返回空、不抛异常"，调用方无感。
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('ann'):
+            return []
         try:
             cutoff = date.today() - timedelta(days=lookback_days)
             # 东方财富公告 API：ann_type=A 全部公告，page_size=50
@@ -1051,6 +1057,7 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
             except Exception:
                 data = json.loads(_strip_eastmoney_jsonp(r.text))
             # 接口返回结构：data.list = [{ art_code, title, notice_date, columns_name, ... }]
+            eastmoney_guard.ok('ann')
             items = []
             for grp in (data.get('data') or {}).get('list', []) or []:
                 # list 可能是嵌套的二级 list
@@ -1078,6 +1085,7 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
                 })
             return out
         except Exception as e:
+            eastmoney_guard.fail('ann', e)
             print(f'[公告] 拉取 {symbol} 公告失败: {e}')
             return []
 

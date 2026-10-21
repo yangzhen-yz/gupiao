@@ -53,10 +53,19 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
     """批量拉取指定股票在窗口内的公告（自动翻页直到覆盖窗口边界）。
 
     返回 [{stock_code, title, notice_date}]，仅含窗口内的记录。
+
+    2026-10-20：接入共享熔断 eastmoney_guard（scope 'ann'）。此前这里是闸门覆盖
+    缺口——东财 IP 被封当天公告接口仍真实发出 378 次请求、失败 115 次。冷却期内
+    直接返回空列表（调用方本来就按"接口异常返回空 dict 优雅降级"设计，行为一致）。
     """
     stock_list = ','.join(codes)
     results: List[Dict] = []
+    from services.data import eastmoney_guard
+    if eastmoney_guard.skip('ann'):
+        return results
     for page in range(1, _MAX_PAGES + 1):
+        if eastmoney_guard.skip('ann'):
+            break   # 熔断可能在本批翻页途中跳闸，后面的页别再打
         params = {
             'sr': '-1', 'page_size': str(_PAGE_SIZE), 'page_index': str(page),
             'ann_type': 'A', 'client_source': 'web', 'stock_list': stock_list,
@@ -66,7 +75,9 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
             resp = requests.get(_ANNOUNCE_API, params=params, headers=_HEADERS, timeout=_TIMEOUT)
             resp.raise_for_status()
             lst = (resp.json().get('data') or {}).get('list') or []
-        except Exception:
+            eastmoney_guard.ok('ann')
+        except Exception as e:
+            eastmoney_guard.fail('ann', e)
             # 单页失败即放弃本批（降级为空），不影响推荐主流程
             break
         if not lst:

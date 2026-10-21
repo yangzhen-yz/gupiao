@@ -192,6 +192,24 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] universe 预热失败（不致命，首次请求会现算）: {e}')
     threading.Thread(target=_prewarm_universe, daemon=True, name='prewarm-universe').start()
 
+    # 区间带宽波动率预热（2026-10-19 动态区间宽度）：这份缓存是一次"全市场近 6 个已收盘
+    # 交易日收盘序列"的**同步** SQLite 查询。不预热的话，09:45 批次里第一只票会在 asyncio
+    # 事件循环上等它几百毫秒——偏偏那一刻正是"开盘后第一时间出推荐"的关键路径（同一个坑
+    # 在 2026-10-17 的 history_available 上踩过一次）。开关关着就一行都不查：
+    # 关掉的代价必须严格等于改造前，一次多余的库访问也不给留。
+    def _prewarm_vol():
+        try:
+            from services.support import app_settings
+            if not app_settings.value('buy_band_dynamic_enabled'):
+                return
+            from services.data.kline_history import get_vol_close_map
+            m = get_vol_close_map()
+            print(f'[预热 {datetime.now():%H:%M:%S}] 区间带宽波动率缓存完成：'
+                  f'{len(m)} 只票有收盘序列')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 波动率预热失败（不致命，带宽退回核心值）: {e}')
+    threading.Thread(target=_prewarm_vol, daemon=True, name='prewarm-vol').start()
+
     def job_update_hot_search_ranking():
         asyncio.run(update_hot_search_ranking_task())
 
@@ -204,7 +222,7 @@ def run_scheduler():
         """盘前 9:00 全市场海选候选池（2026-10-15）。
 
         为什么排在 9:00：本地日K由 18:15 同步维护，9:00 已含昨收；而 9:45 是第一次
-        生成推荐，海选必须在那之前落库，让 9:45 / 13:30 / 14:05 三次共用同一份名单。
+        生成推荐，海选必须在那之前落库，让 9:45 / 10:00 / 13:30 / 14:05 四次共用同一份名单。
         失败不静默：池子为空时打警告，因为"入口静默退化回热搜池"和当年因子权重
         学习崩 40 天是同一类事故 —— 看起来一切正常，其实是能力悄悄少了大半。
         """
@@ -289,6 +307,23 @@ def run_scheduler():
             rec_sim.record_daily(months=REC_SIM_DAILY_MONTHS)
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 可成交性监控失败: {e}')
+
+    def job_rec_sim_batch_daily():
+        """上午档/下午档拆批次监控（2026-10-21）：现有末批曲线只反映 14:45 名单，
+        上午档（盘中灵活低吸）与下午档（涨停票次日竞价）是两种策略，混在一条曲线上
+        互相污染。这里把两档四口径的当日摘要落 rec_sim_batch_daily，攒对照数据。
+        只读本地库不依赖网络；当天日K 18:15~20:15 分五批同步，所以排 20:30 跑——
+        排 16:26 会把当天名单整批判成"无当日K线"白白跳过（16:20 末批监控就有这个滞后，
+        靠次日重算追平，拆档没必要重蹈）。"""
+        try:
+            from services.pick import rec_sim_batch
+            r = rec_sim_batch.record_batch_daily()
+            if r:
+                w = r['window']
+                print(f"[拆档回测] 落库 {r['rows']} 行（窗口 {w.get('since')}→{w.get('until')}，"
+                      f"上午 {w.get('recCountAm')} 条 / 下午 {w.get('recCountPm')} 条）")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 拆档回测落库失败: {e}')
 
     def job_shadow_eval_daily():
         """影子对照日常监控（2026-10-18，实施计划"工具：影子对照脚本"）：
@@ -467,6 +502,16 @@ def run_scheduler():
             cleanup_old_cache()
         except Exception as e:
             print(f'[DB维护] 异常: {e}')
+
+    def job_api_usage_flush():
+        """每 60s 把内存计数器落库（api_usage_daily），跨天自动归档，防丢当日计数。"""
+        try:
+            from services.data import api_usage
+            n = api_usage.flush()
+            if n:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 接口用量落库 {n} 个接口')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 接口用量落库失败: {e}')
 
     def _alert_kline_stale(sync_err=None, final=True):
         """盘后自检：今天该有 K 线，库里却没有 —— 就别让它悄悄过去。
@@ -665,7 +710,7 @@ def run_scheduler():
 
     schedule.every().day.at(SCHEDULE_MA10_CHECK_TIME).do(job_scan_ma10)
 
-    # 盘前全市场海选候选池（2026-10-15）：9:00 出池，供 9:45/13:30/14:05 三次生成共用
+    # 盘前全市场海选候选池（2026-10-15）：9:00 出池，供 9:45/10:00/13:30/14:05 四次生成共用
     schedule.every().day.at(CANDIDATE_POOL_TIME).do(job_build_candidate_pool)
 
     # T+1 预案（2026-10-15）：昨天买的今天才能卖，提醒时点放在 9:15 竞价
@@ -702,6 +747,10 @@ def run_scheduler():
     # 可成交性日常监控（2026-10-18，实施计划 P0-0）：推荐复盘之后跑，
     # 把「同一批推荐在三种入口口径下各值多少钱」存成每天一个点（窗口固定才可比）
     schedule.every().day.at(REC_SIM_DAILY_TIME).do(_warp_trading_only(job_rec_sim_daily))
+
+    # 上午档/下午档拆批次监控（2026-10-21）：排在日K同步批次（18:15~20:15）之后，
+    # 当天名单才不会被判"无当日K线"；落 rec_sim_batch_daily
+    schedule.every().day.at('20:30').do(_warp_trading_only(job_rec_sim_batch_daily))
 
     # 影子对照日常监控（2026-10-18，实施计划"工具"）：16:25 日K已同步，
     # 把「影子挡掉的票 T+1 是不是真的更差」存成每天一个点 —— 第1批 P0-2 的上线判据
@@ -754,13 +803,17 @@ def run_scheduler():
     # 数据库维护：每周六凌晨3点清理过期缓存+VACUUM（防 SQLite 膨胀）
     schedule.every().saturday.at("03:00").do(job_db_maintenance)
 
+    # 接口用量：每 60s 把内存计数器落库（2026-10-19，防第三方平台封禁的观测手段）
+    schedule.every(60).seconds.do(job_api_usage_flush)
+    print(f'[定时任务]   - 每 60s: 接口用量计数落库（第三方 API 调用观测，防封禁）')
+
     _now = datetime.now()
     print(f'\n[定时任务 {_now:%Y-%m-%d %H:%M:%S}] 已注册以下定时任务（今日交易日={_today_is_trading()}）：')
     print(f'[定时任务]   - {"/".join(SCHEDULE_UPDATE_HOT_SEARCH_TIMES)}: 更新热搜榜（仅交易日）')
     print(f'[定时任务]   - {",".join(trend_scan_times)} (每{SCHEDULE_TREND_SCAN_INTERVAL_MIN}分钟): 自动扫描趋势股（仅交易日）')
     print(f'[定时任务]   - {SCHEDULE_MA10_CHECK_TIME}: 检查10日线+连跌天数并清理股票池（仅交易日）')
     print(f'[定时任务]   - {CANDIDATE_POOL_TIME}: 盘前海选候选池（范围：沪深主板、剔除ST，'
-          f'上限 {CANDIDATE_POOL_MAX} 只，喂给 9:45/13:30/14:05 的推荐）')
+          f'上限 {CANDIDATE_POOL_MAX} 只，喂给 {"/".join(SCHEDULE_RECOMMENDATION_TIMES)} 的推荐）')
     print(f'[定时任务]   - {PUSH_T1_PLAN_TIME}: T+1 可卖预案推送（昨日买入当天卖不掉的票，今天竞价提醒）')
     print(f'[定时任务]   - {SCHEDULE_DAILY_REVIEW_TIME}: 自动生成每日收评（仅交易日，含 AI 情绪评分/操作建议）')
     print(f'[定时任务]   - {SCHEDULE_BACKTEST_TIME}: 回测验证昨日预测并调整策略权重（仅交易日）')
@@ -770,6 +823,8 @@ def run_scheduler():
     print(f'[定时任务]   - {RECOMMEND_REVIEW_TIME}: 智能推荐复盘（本地K线库算T+1/T+3/T+5胜率）')
     print(f'[定时任务]   - {REC_SIM_DAILY_TIME}: 可成交性日常监控（三入口×两卖法落 rec_sim_daily，'
           f'一切"放宽/多推"提案的验收基线）')
+    print(f'[定时任务]   - 20:30: 上午档/下午档拆批次回测（名单从 strategy_snapshot 还原，'
+          f'落 rec_sim_batch_daily；10-19 起才有快照）')
     print(f'[定时任务]   - {INDUSTRY_SYNC_WEEKDAY} {INDUSTRY_SYNC_TIME}: 行业分类周更'
           f'（baostock 全量落 stock_industry_map；东财被封时资金流向的行业列/板块聚合靠它）')
     print(f'[定时任务]   - {SHADOW_EVAL_TIME}: 影子对照日常监控（放行 vs 被挡 T+1，'

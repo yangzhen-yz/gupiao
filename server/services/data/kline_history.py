@@ -601,6 +601,30 @@ class HistoryKlineEngine:
             data.setdefault(sym, []).append((d, close))
         return latest, data
 
+    def load_close_map(self, bars: int = 6) -> Dict[str, List[Tuple[str, float]]]:
+        """取最近 bars 个**已收盘**交易日的收盘价：{symbol: [(date, close), ...] 升序}。
+
+        给"买入区间动态带宽"用的近 5 日波动率取数。两条硬性要求：
+          · 零网络——只读本地 stock_daily，绝不打行情接口（10-19 刚做完第三方调用降频，
+            不能为了算波动率反而多打一轮）；
+          · 一次 SQL 捞全市场，不按票循环（几百只票逐票查会把推荐批次拖慢一个量级）。
+        """
+        dates = [r[0] for r in self._get_conn().execute(
+            "SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT ?",
+            (max(int(bars), 2),)).fetchall()]
+        if not dates:
+            return {}
+        cutoff = dates[-1]
+        rows = self._get_conn().execute(
+            "SELECT symbol, date, close FROM stock_daily WHERE date >= ? ORDER BY symbol, date",
+            (cutoff,)).fetchall()
+        out: Dict[str, List[Tuple[str, float]]] = {}
+        for sym, d, close in rows:
+            if close is None:
+                continue
+            out.setdefault(sym, []).append((d, float(close)))
+        return out
+
     def get_kline_tencent_format(self, symbol: str, limit: int = 320) -> List[List]:
         """返回与腾讯K线同构的列表：[[date, open, close, high, low, volume], ...]（升序）。
 
@@ -631,6 +655,49 @@ class HistoryKlineEngine:
         return self._get_conn().execute(
             "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
         ).fetchall()
+
+
+_VOL_MAP_CACHE: Dict[str, object] = {'ts': 0.0, 'bars': 0, 'map': {}}
+
+
+def get_vol_close_map(bars: Optional[int] = None) -> Dict[str, List[float]]:
+    """全市场「近 bars 个已收盘交易日收盘价序列」：{6位代码: [close 升序]}，进程内 TTL 缓存。
+
+    给买入区间的动态带宽（`buy_range.recent_volatility`）喂数。三条纪律写在这里：
+      · **零网络**：只读本地 stock_daily；10-19 刚把东财/新浪的请求量砍下来，
+        不能为了算波动率再开一条每轮全量外部请求；
+      · **一次查询捞全市场**，绝不逐票查（几百只票逐票查 = 把推荐批次拖慢一个量级，
+        这正是 history_available 那次踩过的坑）；
+      · 波动率是日级慢变量，一天只变一次 → 缓存 BUY_RANGE_VOL_CACHE_SEC，盘中各批共用。
+    库不存在/没回填时返回 {}，调用方据此退回核心带宽（不硬造波动率）。
+    """
+    from app.config import BUY_RANGE_VOL_BARS, BUY_RANGE_VOL_CACHE_SEC
+    n = int(bars or BUY_RANGE_VOL_BARS) + 1          # N 个收益要 N+1 个收盘
+    now = time.time()
+    # 命中条件只看"上次尝试过 + 窗口相同 + 未过期"，**不要求非空**：
+    # 库里没回填时若按空值反复重建，批量链路逐票调用会把一次全表查询放大成几百次
+    # （这正是 2026-10-17 history_available 那个坑的翻版——同步查询压在事件循环上）。
+    if (_VOL_MAP_CACHE['bars'] == n
+            and now - float(_VOL_MAP_CACHE['ts']) < BUY_RANGE_VOL_CACHE_SEC):
+        return _VOL_MAP_CACHE['map']       # type: ignore[return-value]
+    _VOL_MAP_CACHE['ts'] = now             # 先记时刻：失败也不允许下一只票再来一次
+    try:
+        raw = get_engine().load_close_map(bars=n)
+    except Exception as e:
+        print(f'[波动率] 本地日K读取失败（带宽退回核心值，10 分钟内不再重试）: {e}')
+        return _VOL_MAP_CACHE['map'] or {}       # type: ignore[return-value]
+    m = {sym: [c for _, c in seq] for sym, seq in raw.items()}
+    _VOL_MAP_CACHE.update({'bars': n, 'map': m})
+    return m
+
+
+def get_vol_closes_for(symbol: str, bars: Optional[int] = None) -> List[float]:
+    """单票收盘序列（升序）。传 sh600519/600519 都行；库里没有该票时返回空列表。
+
+    走的是那份全市场缓存，所以单股分析页调用它同样不产生额外查询。
+    """
+    code = _normalize_local_symbol(symbol)      # sh600519/600519 都能命中（库里以纯代码存）
+    return get_vol_close_map(bars).get(code) or []
 
 
 # ───────────────────────── 模块级便捷函数（供 RPS / 调度器调用） ─────────────────────────

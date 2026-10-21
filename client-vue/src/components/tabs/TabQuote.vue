@@ -107,9 +107,9 @@
                 color: var(--accent-warning);
                 border-color: var(--accent-warning-border);
               "
-              @click="startAiDiagnose(quoteData.symbol)"
+              @click="$emit('open-diag', quoteData.symbol)"
             >
-              AI诊断
+              五层诊断
             </button>
           </div>
           <div class="stock-card-actions" style="padding: 0 0.25rem">
@@ -411,7 +411,7 @@
 
   // 轮询治理（2026-10-13）：Tab 隐藏时不再每 2s 打行情，只 gate 定时器，组件永不销毁
   const props = defineProps({ active: { type: Boolean, default: true } })
-  const emit = defineEmits(['open-kline', 'open-ai-diag'])
+  defineEmits(['open-kline', 'open-diag'])
 
   // 自重排的行情轮询：交易时段 2s，休市时按下一个开盘点长睡；隐藏即停
   const { start: startQuotePolling } = usePolling(
@@ -683,10 +683,6 @@
 
   function scheduleRefresh() {
     startQuotePolling()
-  }
-
-  async function startAiDiagnose(symbol) {
-    emit('open-ai-diag', symbol)
   }
 
   async function handleAddToHot(code, name) {
