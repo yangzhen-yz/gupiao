@@ -442,6 +442,190 @@ def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = 
     return out
 
 
+def open_hold_excess(months: int = 6, since: Optional[str] = None,
+                     hold_days: Tuple[int, ...] = (1, 3, 5, 10)) -> Dict:
+    """次日开盘买入、持有 N 个交易日卖出的**可执行超额**（2026-10-22，P0 评估基座）。
+
+    为什么单独算这一条：现有六条曲线是"次日就卖"的短线口径，回答不了
+    "这些票拿 5 天到底行不行"。而 `daily_recommendations.price` 是推荐时点的参考价，
+    用它当买入价会混入"当天已经涨了多少"的日内收益；这里统一改用**次日开盘价**，
+    与实盘最容易执行的动作一致，再和同期范围内的等权基准（同样次日开盘买、持 N 日）
+    逐日对齐，超额才不是 beta 冒充 alpha。
+
+    口径：
+      · 买入：推荐日下一交易日开盘；次日一字涨停买不到 → 跳过；
+      · 卖出：买入后第 N 个交易日开盘；
+      · 费用：买卖双边按 10 万名义本金计，和 rec_sim 主引擎同一套费率；
+      · 基准：选股范围内所有票，同一买入日开盘买、同一持有期开盘卖，等权平均；
+      · 超额 = 推荐均值 - 当日基准均值，先逐条配对再平均（不是两个总数相减）。
+    """
+    if not since:
+        since = (datetime.now() - timedelta(days=months * 31)).strftime('%Y-%m-%d')
+    import sqlite3
+    from app.config import KLINE_HISTORY_DB_PATH
+
+    recs, bars = load(since)
+    days = sorted({r['rec_date'] for r in recs})
+    target_dates = set()
+    per_day: Dict[int, List[Dict]] = {n: [] for n in hold_days}
+    skipped: Dict[str, int] = {}
+
+    def _skip(reason: str):
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for r in recs:
+        code = (r['symbol'] or '')[2:]
+        series = bars.get(code) or []
+        idx = next((i for i, b in enumerate(series) if b[0] == r['rec_date']), None)
+        if idx is None:
+            _skip('推荐日无K线')
+            continue
+        j = idx + 1
+        if j >= len(series):
+            _skip('次日无K线')
+            continue
+        b0, b1 = series[idx], series[j]
+        o1, h1, l1, c1 = b1[1], b1[2], b1[3], b1[4]
+        lim = _limit_pct(code)
+        _, lu = _limit_prices(b0[4], lim)
+        if (lu > 0 and abs(o1 - h1) < 1e-6 and abs(o1 - l1) < 1e-6
+                and c1 >= lu - REC_SIM_BOARD_EPS):
+            _skip('次日一字涨停买不到')
+            continue
+        if not o1 or o1 <= 0:
+            _skip('次日开盘价无效')
+            continue
+        target_dates.add(b1[0])
+        for n in hold_days:
+            k = j + n
+            if k >= len(series):
+                _skip(f'持有{n}日K线不足')
+                continue
+            exit_px = series[k][1]
+            if not exit_px or exit_px <= 0:
+                _skip(f'持有{n}日开盘价无效')
+                continue
+            gross = (exit_px / o1 - 1) * 100
+            cost = _rt_cost_pct(o1, exit_px)
+            per_day[n].append({'date': b1[0], 'ret': gross - cost, 'month': b1[0][:7],
+                               'code': code, 'entry': o1, 'exit': exit_px})
+
+    # 基准：仍用选股范围内全部票、同一买入日、同一持有期，但改成"票 × 交易日"矩阵一次算完。
+    # 旧版逐票两两配对 + 逐票算费，6 个月 30 万行来回搬实测 8 秒；矩阵法只搬一次数据、
+    # 每只票顺着时间轴累加，实测约 2.5 秒。不引 numpy：venv 里没有，核心服务不为一个
+    # 基准函数新增第三方依赖（2026-10-23 踩过：系统 Python 有 numpy、服务跑在 venv 里就 500）。
+    bench: Dict[int, Dict[str, float]] = {n: {} for n in hold_days}
+    scope_desc = ''
+    if target_dates:
+        conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=60)
+        try:
+            try:
+                from services.data import universe
+                scope = {s[-6:] for s in universe.eligible_symbols()}
+                scope_desc = universe.describe_selectable()
+            except Exception:
+                scope, scope_desc = None, '（范围读取失败，按全库算）'
+            kdays = [r[0] for r in conn.execute(
+                'SELECT DISTINCT date FROM stock_daily WHERE date>=? ORDER BY date',
+                (since,)).fetchall()]
+            if scope:
+                # 2462 只票塞不进 IN (...) 的参数上限，用临时表让 SQLite 自己 join。
+                conn.execute('CREATE TEMP TABLE sc(symbol TEXT PRIMARY KEY)')
+                conn.executemany('INSERT INTO sc VALUES (?)', [(s,) for s in scope])
+                rows = conn.execute(
+                    'SELECT d.symbol,d.date,d.open FROM stock_daily d '
+                    'JOIN sc ON sc.symbol=d.symbol WHERE d.date>=? AND d.open>0',
+                    (since,)).fetchall()
+            else:
+                rows = conn.execute(
+                    'SELECT symbol,date,open FROM stock_daily '
+                    'WHERE date>=? AND open>0', (since,)).fetchall()
+        finally:
+            conn.close()
+        didx = {d: i for i, d in enumerate(kdays)}
+        code_at: Dict[str, int] = {}
+        mat: List[List[Optional[float]]] = []
+        for sym, d, o in rows:
+            j = didx.get(d)
+            if j is None:
+                continue
+            ci = code_at.get(sym)
+            if ci is None:
+                ci = code_at[sym] = len(mat)
+                mat.append([None] * len(kdays))
+            mat[ci][j] = o
+        sums = {n: [0.0] * len(kdays) for n in hold_days}
+        counts = {n: [0] * len(kdays) for n in hold_days}
+        for row in mat:
+            for n in hold_days:
+                if n >= len(kdays):
+                    continue
+                s, c = sums[n], counts[n]
+                for i in range(len(kdays) - n):
+                    a, b = row[i], row[i + n]
+                    if a and b:
+                        s[i] += (b / a - 1.0) * 100.0
+                        c[i] += 1
+        for n in hold_days:
+            if n >= len(kdays):
+                continue
+            for i in range(len(kdays) - n):
+                if not counts[n][i]:
+                    continue
+                mg = sums[n][i] / counts[n][i]
+                # 费用按"买入额 10 万"线性：买 0.026%、卖 0.126%×卖出额/买入额。
+                # 逐票费用求平均 = 用均值算一次（佣金远高于 5 元最低线，不会触底）。
+                cost = ((FEE_RATE + TRANSFER) * 100.0
+                        + (FEE_RATE + STAMP + TRANSFER) * 100.0 * (1.0 + mg / 100.0))
+                bench[n][kdays[i]] = mg - cost
+
+    by_day = {}
+    by_month: Dict[str, Dict[str, Dict]] = {}
+    for n in hold_days:
+        rows = per_day[n]
+        if not rows:
+            by_day[str(n)] = {'n': 0}
+            continue
+        ex_list = [x['ret'] - bench[n][x['date']] for x in rows if x['date'] in bench[n]]
+        bench_vals = [bench[n][x['date']] for x in rows if x['date'] in bench[n]]
+        by_day[str(n)] = {
+            'n': len(rows), 'pairedN': len(ex_list),
+            'winRate': round(sum(1 for x in rows if x['ret'] > 0) / len(rows) * 100, 1),
+            'avg': round(sum(x['ret'] for x in rows) / len(rows), 2),
+            'benchAvg': round(sum(bench_vals) / len(bench_vals), 2) if bench_vals else None,
+            'excess': round(sum(ex_list) / len(ex_list), 2) if ex_list else None,
+        }
+        for x in rows:
+            m = by_month.setdefault(x['month'], {}).setdefault(
+                str(n), {'n': 0, 'sum': 0.0, 'win': 0, 'exc': [], 'bench': []})
+            m['n'] += 1
+            m['sum'] += x['ret']
+            m['win'] += 1 if x['ret'] > 0 else 0
+            if x['date'] in bench[n]:
+                m['exc'].append(x['ret'] - bench[n][x['date']])
+                m['bench'].append(bench[n][x['date']])
+    for mon, d in by_month.items():
+        for n, m in d.items():
+            m['avg'] = round(m['sum'] / m['n'], 2) if m['n'] else None
+            m['winRate'] = round(m['win'] / m['n'] * 100, 1) if m['n'] else None
+            m['excess'] = round(sum(m['exc']) / len(m['exc']), 2) if m['exc'] else None
+            del m['sum'], m['win'], m['exc'], m['bench']
+    return {
+        'available': bool(recs), 'since': since,
+        'until': days[-1] if days else '', 'recCount': len(recs), 'days': list(hold_days),
+        'byDay': by_day, 'byMonth': by_month, 'skipped': skipped,
+        'scopeText': scope_desc,
+        'generatedAt': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def _rt_cost_pct(entry: float, exit_px: float) -> float:
+    """双边费用占名义本金的比例（%）。按 10 万本金算，避免最低 5 元佣金扭曲小单。"""
+    amt = 100000.0
+    qty = amt / entry
+    return (_fee_buy(amt) + _fee_sell(qty * exit_px)) / amt * 100.0
+
+
 def benchmark(since: str) -> Dict:
     """同期背景：数据范围内等权买入持有。
 

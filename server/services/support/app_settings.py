@@ -393,6 +393,41 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'eval_lab_enabled', 'cfg': 'EVAL_LAB_ENABLED', 'kind': 'bool',
+        'label': '每周六跑因子体检（08:30）', 'group': '策略快照', 'live': True,
+        'note': '本地日K上算 20 日反转/低波/缩量/60日动量/涨停拥挤度的 IC 与分组超额，'
+                '落 eval_lab_runs。只读、不联网、不改推荐；关掉只是停止更新体检结果',
+        'impact': None,
+    },
+    {
+        'key': 'auction_snapshot_enabled', 'cfg': 'AUCTION_SNAPSHOT_ENABLED', 'kind': 'bool',
+        'label': '09:25 采集集合竞价快照', 'group': '数据与门槛', 'live': True,
+        'note': '腾讯批量行情，采选票范围的竞价匹配价/量/额，落 auction_daily。'
+                '这是以后验证"弱转强"的前提数据；失败不阻塞 09:45 推荐',
+        'impact': None,
+    },
+    {
+        'key': 'minute5_forward_enabled', 'cfg': 'MINUTE5_FORWARD_ENABLED', 'kind': 'bool',
+        'label': '收盘后采集活跃票 5 分钟线', 'group': '数据与门槛', 'live': True,
+        'note': '只采当日推荐/持仓/候选，走腾讯 5 分钟接口（避开 baostock 登录封禁）。'
+                '默认关：先确认字段与落库口径再加量',
+        'impact': None,
+    },
+    {
+        'key': 'exit_rules_shadow_enabled', 'cfg': 'EXIT_RULES_SHADOW_ENABLED', 'kind': 'bool',
+        'label': '持仓页展示统一卖出建议（影子）', 'group': '卖出规则', 'live': True,
+        'note': '在每只持仓上并列显示"固定止损/逻辑止损/时间止损"的统一结论，'
+                '不改变现有动作、不影响推送。用来攒 20 日以上对照',
+        'impact': None,
+    },
+    {
+        'key': 'exit_rules_live_enabled', 'cfg': 'EXIT_RULES_LIVE_ENABLED', 'kind': 'bool',
+        'label': '卖出规则接管页面动作与推送（实盘）', 'group': '卖出规则', 'live': True,
+        'note': '⚠️ 打开后 exit_rules 的建议会覆盖现有 action/推送，属于实盘行为变更。'
+                '默认关；需影子期 ≥20 个交易日、回撤不恶化才打开',
+        'impact': None,
+    },
+    {
         'key': 'westock_crosscheck_enabled', 'cfg': 'WESTOCK_CROSSCHECK_ENABLED', 'kind': 'bool',
         'label': '每日双源数据校验（16:30，westock 权威）', 'group': '策略快照', 'live': True,
         'note': '把本地资金流/行情与 westock（腾讯自选股）比对，落 westock_snapshot 与 '
@@ -400,6 +435,44 @@ SPEC: List[Dict[str, Any]] = [
                 '资金流层只记录偏差与符号冲突（三口径定义不同，不当场校正展示）。'
                 '关掉只是少一个监控点，不影响任何选股/推送链路',
         'impact': None,
+    },
+    {
+        'key': 'mainline_enabled', 'cfg': 'MAINLINE_ENABLED', 'kind': 'bool',
+        'label': '市场主线/支线判定（行动台 sectors 卡）', 'group': '市场主线', 'live': True,
+        'note': '五维评分（涨停梯队/主力资金/涨幅持续性/量能，源内分位归一）判主线≤2、支线≤5、'
+                '退潮板块，300 秒一档并落 market_mainline_snapshots 攒影子数据。'
+                '关掉=行动台不出这张卡、零执行，返回体与改造前逐字节相同；'
+                '权重不在这里改（防止随手调参污染校准），在 config.MAINLINE_WEIGHTS',
+        'impact': 'desk',
+    },
+    {
+        'key': 'mainline_min_score', 'cfg': 'MAINLINE_MIN_SCORE', 'kind': 'int',
+        'label': '主线最低分', 'group': '市场主线', 'live': True,
+        'min': 40, 'max': 90, 'step': 2, 'unit': '分',
+        'note': '冰点/退潮档自动 +8；与第二名分差≥断层值时只认一条主线',
+        'impact': 'desk',
+    },
+    {
+        'key': 'mainline_sub_min_score', 'cfg': 'MAINLINE_SUB_MIN_SCORE', 'kind': 'int',
+        'label': '支线地板分（低于它=无主线）', 'group': '市场主线', 'live': True,
+        'min': 20, 'max': 60, 'step': 2, 'unit': '分',
+        'note': '全场最高分都够不着它 → 输出"无主线"+原因，对应游资心法的空仓哨兵',
+        'impact': 'desk',
+    },
+    {
+        'key': 'sector_min_members', 'cfg': 'SECTOR_MIN_MEMBERS', 'kind': 'int',
+        'label': '板块持续性最少成员数', 'group': '市场主线', 'live': True,
+        'min': 3, 'max': 30, 'step': 1, 'unit': '只',
+        'note': '近10日窗口内每天都有 bar 的成员才计入交集（10-16 选股范围收窄的混合日靠它保口径），'
+                '不足则该板块持续性=None、权重重归一并在 dataGaps 点名',
+        'impact': 'desk',
+    },
+    {
+        'key': 'desk_sector_chips', 'cfg': 'DESK_SECTOR_CHIPS_IN_SENTIMENT', 'kind': 'bool',
+        'label': '情绪条保留涨停板块 chip', 'group': '市场主线', 'live': True,
+        'note': '默认关：板块名单归一到 sectors 卡，避免同页两份"板块名单"打架；'
+                '新卡出问题时打开可立刻回到旧观感',
+        'impact': 'desk',
     },
 ]
 

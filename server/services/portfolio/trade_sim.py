@@ -325,13 +325,66 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
             'created_count': len(created), 'rejected_count': len(rejected)}
 
 
+# ---------- 手动卖出 ----------
+async def manual_sell(user_id: int, symbol: str, qty: Optional[int] = None) -> Dict:
+    """模拟盘手动卖出：按实时价立即成交（不产生真实委托）。
+
+    与建议卖单的区别：不校验“建议价偏离”（用户就是主动按现价卖），
+    但仍受 T+1 与持仓数量约束；qty 不传 = 卖出全部。
+    落一条 source='manual' 的已成交订单，审计日志可追溯。
+    """
+    _ensure_sim_account(user_id)
+    sym = (symbol or '').lower()
+    positions = _load_positions(user_id)
+    pos = next((p for p in positions if p['symbol'].lower() == sym), None)
+    if not pos:
+        return {'success': False, 'message': '无对应模拟持仓'}
+    q = (await _quotes([pos['symbol']])).get(sym)
+    price = float(q.get('priceRaw') or q.get('price') or 0) if q else 0
+    if price <= 0:
+        return {'success': False, 'message': '行情缺失，无法按现价卖出'}
+    if qty is None:
+        qty = int(pos['shares'])
+    try:
+        qty = int(qty)
+    except (TypeError, ValueError):
+        return {'success': False, 'message': '卖出数量非法'}
+    if qty <= 0:
+        return {'success': False, 'message': '卖出数量非法'}
+    err = _check_sell(user_id, pos['symbol'], qty, price, positions, _today())
+    if err:
+        return {'success': False, 'message': err}
+    conn = get_db_conn()
+    cur = conn.execute('''INSERT INTO sim_orders
+        (user_id, symbol, name, side, proposed_price, proposed_qty, source, status, reason)
+        VALUES (?,?,?,?,?,?,?,?,?)''',
+        (user_id, pos['symbol'], pos['name'], 'sell', round(price, 2), qty,
+         'manual', 'pending', '手动卖出（按现价）'))
+    order_id = cur.lastrowid
+    conn.commit(); conn.close()
+    try:
+        _fill_sell(user_id, {'id': order_id, 'symbol': pos['symbol'],
+                             'name': pos['name'], 'proposed_qty': qty}, price)
+    except Exception:
+        # 成交写入失败：删掉刚落的 pending 单，避免审计里留下一条"虚假待执行"
+        conn = get_db_conn()
+        conn.execute('DELETE FROM sim_orders WHERE id=? AND user_id=?', (order_id, user_id))
+        conn.commit(); conn.close()
+        raise
+    return {'success': True, 'symbol': pos['symbol'], 'name': pos['name'],
+            'price': round(price, 2), 'qty': qty, 'amount': round(price * qty, 2)}
+
+
 # ---------- 执行模拟成交 ----------
 async def execute_sim(user_id: int) -> Dict:
     """把 pending 建议订单按实时价撮合成交（仅在模拟账户记账，绝不连券商）"""
     _ensure_sim_account(user_id)
     pending = _load_orders(user_id, status='pending')
     if not pending:
-        return {'success': True, 'filled': [], 'rejected': [], 'message': '无待执行建议'}
+        # 早退分支也必须带 count 字段：否则前端"成交 undefined 条，拦截 undefined 条"
+        # （2026-10-22 实锤：没待执行建议时点「执行模拟成交」就是这个文案）
+        return {'success': True, 'filled': [], 'rejected': [],
+                'filled_count': 0, 'rejected_count': 0, 'message': '无待执行建议'}
     positions = _load_positions(user_id)
     cash_v, mv, total, day_start, day_pnl = await _portfolio(user_id, positions)
     qmap = await _quotes([o['symbol'] for o in pending])
@@ -425,14 +478,61 @@ def _fill_sell(user_id: int, o: Dict, price: float):
 
 
 # ---------- 查询 ----------
+def _position_advice(pos: Dict, quote: Optional[Dict], market_change: float,
+                     losers: set) -> Dict:
+    """单只模拟持仓的诊断结论（同步函数，由 get_sim_state 放进线程跑）。
+
+    diagnose_position 会读本地日K算趋势，冷缓存时单只 ~1.8s；直接在事件循环里跑
+    会把整个服务的请求一起卡住，所以必须 to_thread。
+    """
+    try:
+        d = diagnose_position(pos, quote, market_change, losers)
+    except Exception as error:
+        d = {'action': 'watch', 'action_label': '持有观察',
+             'detail': f'诊断失败：{type(error).__name__}: {error}',
+             'sellable': True, 'locked_reason': ''}
+    return {
+        'action': d.get('action'),
+        'label': d.get('action_label'),
+        'detail': d.get('detail') or '',
+        'locked': not d.get('sellable', True),
+        'lockedReason': d.get('locked_reason') or '',
+    }
+
+
 async def get_sim_state(user_id: int) -> Dict:
     _ensure_sim_account(user_id)
     positions = _load_positions(user_id)
     cash_v, mv, total, day_start, day_pnl = await _portfolio(user_id, positions)
     qmap = await _quotes([p['symbol'] for p in positions])
+    # 持仓建议（2026-10-23）：把 diagnose_position 的结论直接挂到持仓行，
+    # 不点「从信号生成建议」也能看到“继续持有 / 减仓 / 止损 / 止盈”。
+    # 卖单仍只在 generate_proposals 看到诊断动作触发时生成，避免每天刷一堆无用卖单。
+    # 空仓不取指数/黑名单：否则每打开一次页面都白打一次行情、还刷一条黑名单日志。
+    market_change = 0.0
+    losers = set()
+    if positions:
+        try:
+            m = (await _quotes(['sh000001'])).get('sh000001')
+            if m:
+                market_change = float(m.get('changePercent') or 0)
+        except Exception:
+            pass
+        try:
+            from services.pick.recommend_review import get_recent_loser_symbols
+            losers = get_recent_loser_symbols()
+        except Exception:
+            pass
+    # 诊断放线程：冷缓存单只 ~1.8s，不能卡住事件循环
+    if positions:
+        advice_list = await asyncio.to_thread(
+            lambda: [_position_advice(p, qmap.get(p['symbol'].lower()), market_change, losers)
+                     for p in positions])
+    else:
+        advice_list = []
     pos_view = []
     cost_total = 0.0
-    for p in positions:
+    for idx, p in enumerate(positions):
         q = qmap.get(p['symbol'].lower())
         price = float(q.get('priceRaw') or q.get('price') or p['cost_price']) if q else p['cost_price']
         mv_p = price * p['shares']
@@ -444,6 +544,7 @@ async def get_sim_state(user_id: int) -> Dict:
             'marketValue': round(mv_p, 2), 'pnl': round(mv_p - cost_p, 2),
             'pnlPct': round((mv_p - cost_p) / cost_p * 100, 2) if cost_p else 0,
             'weight': round(mv_p / total * 100, 1) if total else 0,
+            'advice': advice_list[idx] if idx < len(advice_list) else None,
         })
     return {
         'success': True,

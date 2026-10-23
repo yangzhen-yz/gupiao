@@ -2,7 +2,7 @@
 from fastapi import HTTPException, APIRouter, Request, Depends
 from fastapi.responses import Response
 from typing import List, Dict, Optional
-import json, asyncio, time, re, inspect
+import json, asyncio, time, re, inspect, threading
 from datetime import date, datetime
 from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
@@ -197,6 +197,68 @@ async def api_usage_set_limit_api(body: Dict, user: Dict = Depends(current_user)
     api_usage.set_limit(key, limit, updated_by=str(user.get('username') or user.get('id')))
     print(f"[接口用量] {user.get('username') or user.get('id')} 改了 {key} 上限 = {limit}")
     return {"success": True, "data": {"key": key, "limit": limit}}
+
+
+# ========== 因子体检（2026-10-22，P0 评估基座） ==========
+# 结果每周六 08:30 由调度任务落 eval_lab_runs；这里只读，不重算。
+# 手动重算给管理员一个按钮，但必须防重复点击：一次要读 140 万行日K、约 1 分钟。
+_EVAL_LAB_STATE: Dict = {'running': False, 'startedAt': ''}
+
+
+def _eval_lab_module():
+    """轻量读写层（只读 sqlite + 子进程跑体检；不把 numpy/pandas 拉进 web 进程）。"""
+    from services.support import eval_lab
+    return eval_lab
+
+
+@router.get("/api/eval-lab/latest", tags=["复盘"])
+async def eval_lab_latest_api(user: Dict = Depends(current_user)):
+    try:
+        mod = _eval_lab_module()
+        data = await asyncio.to_thread(mod.latest_run)
+        data['running'] = _EVAL_LAB_STATE['running']
+        data['startedAt'] = _EVAL_LAB_STATE['startedAt']
+        return {"success": True, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'因子体检结果读取失败: {type(e).__name__}: {e}')
+
+
+@router.post("/api/eval-lab/run", tags=["复盘"])
+async def eval_lab_run_api(user: Dict = Depends(current_user)):
+    from services.support import app_settings as A
+    if not A.can_write(user):
+        raise HTTPException(status_code=403, detail='当前账号无权触发全量因子体检')
+    if _EVAL_LAB_STATE['running']:
+        return {"success": True, "data": {'started': False, 'why': '上一轮还在跑',
+                                         'startedAt': _EVAL_LAB_STATE['startedAt']}}
+    import threading
+
+    def _work():
+        try:
+            mod = _eval_lab_module()
+            r = mod.run_analysis()
+            print(f"[因子体检] 手动触发完成: {r.get('runDate')} / {r.get('interpreter')} / "
+                  f"{r.get('universe')} 只 / 5日超额 {((r.get('recommendations') or {}).get('ret5') or {}).get('excessMean')}%")
+        except Exception as e:
+            print(f'[因子体检] 手动触发失败: {type(e).__name__}: {e}')
+        finally:
+            _EVAL_LAB_STATE['running'] = False
+
+    _EVAL_LAB_STATE.update(running=True, startedAt=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    threading.Thread(target=_work, daemon=True, name='eval-lab-run').start()
+    return {"success": True, "data": {'started': True, 'startedAt': _EVAL_LAB_STATE['startedAt']}}
+
+
+@router.get("/api/auction/latest", tags=["复盘"])
+async def auction_latest_api(date_str: str = ''):
+    """09:25 竞价快照（只读）。date_str 为空取今天；用于核对定时任务是否真的采到。"""
+    from services.data.auction import load_day
+    day = date_str or datetime.now().strftime('%Y-%m-%d')
+    try:
+        rows = await asyncio.to_thread(load_day, day)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'竞价快照读取失败: {type(e).__name__}: {e}')
+    return {"success": True, "data": {'date': day, 'n': len(rows), 'items': rows[:300]}}
 
 
 @router.get("/api/update-hot_search_ranking", tags=["热搜榜数据"])
@@ -425,120 +487,185 @@ async def get_stocks(symbols: str):
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"批量获取失败: {str(error)}")
 
+async def _build_daily_recs_payload() -> Dict:
+    """实际构建"历史推荐记录 + 实时盈亏"响应体（原 get_daily_recommendations 函数体抽出）
+
+    抽出原因：SWR 模式下首次 miss 要同步算、过期后要在线程里 asyncio.run() 重算，
+    两处必须复用同一份构建逻辑，否则必然漂移。
+    """
+    daily_recommendations = load_daily_recommendations()
+    # 实时计算历史推荐盈利
+    today_str = date.today().isoformat()
+
+    # 性能优化（2026-07-02）：原实现每条历史记录串行 await client.get（最多29次，4-9s）
+    # 改为：先收集所有历史 symbols，一次性批量拉取，再回填
+    # Step 1: 标记 isToday + 收集所有历史 symbols
+    all_history_symbols = []
+    for record in daily_recommendations:
+        rec_date = record.get('date', '')
+        if rec_date >= today_str:
+            record['isToday'] = True
+            continue
+        record['isToday'] = False
+        stocks = record.get('daily_recommendations') or record.get('stocks') or []
+        for s in stocks:
+            sym = s.get('symbol', '')
+            if sym:
+                all_history_symbols.append(sym)
+
+    # Step 2: 一次性批量拉取所有历史 symbols 的实时行情
+    price_map = {}
+    if all_history_symbols:
+        try:
+            # 去重
+            unique_symbols = list(set(all_history_symbols))
+            # 分批拉取（每批最多100只，避免URL过长）
+            batch_size = 100
+            async def _fetch_quote_batch(syms):
+                try:
+                    codes_str = ','.join(syms)
+                    url = f"{TENCENT_QUOTE_API}{codes_str}"
+                    # -fix: 改用 requests + asyncio.to_thread（去 httpx）
+                    resp = await asyncio.to_thread(_sync_get, url)
+                    return resp.text.strip()
+                except Exception as _e:
+                    print(f'[历史推荐] 行情批量拉取失败: {_e}')
+                    return ''
+
+            batch_tasks = [
+                _fetch_quote_batch(unique_symbols[i:i + batch_size])
+                for i in range(0, len(unique_symbols), batch_size)
+            ]
+            batch_texts = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+            for text in batch_texts:
+                if isinstance(text, Exception) or not text:
+                    continue
+                for line in text.split(';'):
+                    line = line.strip()
+                    if not line or '=' not in line:
+                        continue
+                    parts = line.split('~')
+                    if len(parts) > 3:
+                        raw_code = parts[2].lower().strip()
+                        try:
+                            cur_price = float(parts[3])
+                        except (ValueError, IndexError):
+                            cur_price = 0
+                        if cur_price > 0:
+                            prefix = 'sz' if raw_code.startswith(('0', '3')) else 'sh'
+                            full_sym = prefix + raw_code
+                            price_map[full_sym] = cur_price
+                            price_map[raw_code] = cur_price
+        except Exception as _e:
+            print(f'[历史推荐] 行情解析失败: {_e}')
+
+    # Step 3: 回填每条记录的 currentPrice + profitRatio
+    for record in daily_recommendations:
+        if record.get('isToday'):
+            continue
+        stocks = record.get('daily_recommendations') or record.get('stocks') or []
+        for s in stocks:
+            sym = s.get('symbol', '').lower()
+            cur = price_map.get(sym, 0)
+            if cur > 0:
+                s['currentPrice'] = cur
+                buy_price = 0
+                bsp = s.get('buySellPoints')
+                if bsp and bsp.get('buy'):
+                    try:
+                        buy_price = float(bsp['buy'])
+                    except (ValueError, TypeError):
+                        pass
+                if buy_price <= 0:
+                    try:
+                        buy_price = float(s.get('price', 0))
+                    except (ValueError, TypeError):
+                        pass
+                if buy_price > 0:
+                    s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
+
+    return {"success": True, "data": daily_recommendations}
+
+
+# ========== daily_recommendations 缓存（SWR 模式，2026-10-23） ==========
+# 沿革：2026-10-17 加 30s TTL 同步缓存，解决了"每次打开都重拉行情"（0.9~1.3s），
+# 但 miss 时用户仍要白等 500ms+（实测 14.6/183.8/518.2ms 三次采样）。
+# "历史推荐现在赚多少"是分钟级信息量，没有理由让请求方等一次全量行情重算。
+# 现改为 stale-while-revalidate：
+#   · fresh 期内（300s）直接返缓存
+#   · 过期但有旧档：立即返旧数据（<20ms），同时后台线程重算，下一个请求就是新档
+#   · 无旧档（冷启动/被写接口清掉）：同步算，这一次不可避免
+# generation：写接口清缓存时 +1，后台刷新完成时若 generation 已变（说明期间有新写入）
+# 则丢弃刷新结果，避免把用户刚保存/删除的档又被后台旧数据覆盖回去。
+_DAILY_RECS_CACHE: Dict = {'ts': 0.0, 'payload': None, 'generation': 0}
+_DAILY_RECS_FRESH_TTL = 300.0          # 新鲜期秒数：历史推荐盈亏是分钟级信息量
+_DAILY_RECS_REFRESH_LOCK = threading.Lock()
+_DAILY_RECS_REFRESHING = False         # 防并发重复刷新（锁保护）
+
+
+def _invalidate_daily_recs_cache():
+    """写接口调用：清档 + 重置时间 + bump generation（作废进行中的后台刷新）"""
+    with _DAILY_RECS_REFRESH_LOCK:
+        _DAILY_RECS_CACHE['payload'] = None
+        _DAILY_RECS_CACHE['ts'] = 0.0
+        _DAILY_RECS_CACHE['generation'] += 1
+
+
+def _kick_daily_recs_refresh():
+    """后台线程重算 daily_recommendations（节流：已有刷新在跑就直接返回）"""
+    global _DAILY_RECS_REFRESHING
+    with _DAILY_RECS_REFRESH_LOCK:
+        if _DAILY_RECS_REFRESHING:
+            return
+        _DAILY_RECS_REFRESHING = True
+        gen = _DAILY_RECS_CACHE['generation']
+
+    def _run():
+        global _DAILY_RECS_REFRESHING
+        try:
+            payload = asyncio.run(_build_daily_recs_payload())
+            with _DAILY_RECS_REFRESH_LOCK:
+                if gen == _DAILY_RECS_CACHE['generation']:
+                    _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload)
+                else:
+                    # 刷新期间发生了写入：丢弃本次结果，让下一个请求同步重建
+                    pass
+        except Exception as _e:
+            # 刷新失败不静默：旧档会继续服役（SWR 的容错面），但要有日志可查
+            print(f'[历史推荐] 后台刷新失败（旧档继续服役）: {_e}')
+        finally:
+            with _DAILY_RECS_REFRESH_LOCK:
+                _DAILY_RECS_REFRESHING = False
+
+    threading.Thread(target=_run, daemon=True, name='daily-recs-refresh').start()
+
+
 @router.get("/api/daily_recommendations", tags=["推荐记录"])
 async def get_daily_recommendations():
-    """历史推荐记录 + 实时盈亏
+    """历史推荐记录 + 实时盈亏（SWR：过期返旧档+后台刷新，2026-10-23）
 
-    2026-10-17：整档响应加 30s 缓存。原实现每次请求都对全部历史推荐票批量拉腾讯行情
-    （实测 0.9~1.3s），而"历史推荐现在赚多少"是分钟级信息量，TabRecommend 又无轮询
-    （只 onMounted 一次），30 秒缓存对可见性无感、对重复打开/切 Tab 是数量级提升。
-    保存/删除推荐后由写接口负责清缓存。
+    实测背景（本机直连）：30s 同步缓存时三次采样 14.6/183.8/518.2ms——
+    命中 15ms，miss 要同步等全量历史票行情重算 500ms+。本接口无轮询
+    （TabRecommend 只 onMounted 一次），用户体感 = 每次打开都可能转圈半秒。
+    保存/删除推荐后由写接口调 _invalidate_daily_recs_cache 清档。
     """
-    global _DAILY_RECS_CACHE
-    import time as _t
-    now = _t.time()
-    if _DAILY_RECS_CACHE.get('payload') and now - _DAILY_RECS_CACHE['ts'] < 30:
-        return _DAILY_RECS_CACHE['payload']
+    now = time.time()
+    cached = _DAILY_RECS_CACHE.get('payload')
+    if cached is not None:
+        age = now - _DAILY_RECS_CACHE['ts']
+        if age < _DAILY_RECS_FRESH_TTL:
+            return cached                      # 新鲜期：直接返
+        _kick_daily_recs_refresh()             # 过期：返旧档 + 后台刷新
+        return cached
+    # 冷启动或被写接口清档：同步算（唯一不可避免的等待路径）
     try:
-        daily_recommendations = load_daily_recommendations()
-        # 实时计算历史推荐盈利
-        today_str = date.today().isoformat()
-
-        # 性能优化（2026-07-02）：原实现每条历史记录串行 await client.get（最多29次，4-9s）
-        # 改为：先收集所有历史 symbols，一次性批量拉取，再回填
-        # Step 1: 标记 isToday + 收集所有历史 symbols
-        all_history_symbols = []
-        for record in daily_recommendations:
-            rec_date = record.get('date', '')
-            if rec_date >= today_str:
-                record['isToday'] = True
-                continue
-            record['isToday'] = False
-            stocks = record.get('daily_recommendations') or record.get('stocks') or []
-            for s in stocks:
-                sym = s.get('symbol', '')
-                if sym:
-                    all_history_symbols.append(sym)
-
-        # Step 2: 一次性批量拉取所有历史 symbols 的实时行情
-        price_map = {}
-        if all_history_symbols:
-            try:
-                # 去重
-                unique_symbols = list(set(all_history_symbols))
-                # 分批拉取（每批最多100只，避免URL过长）
-                batch_size = 100
-                async def _fetch_quote_batch(syms):
-                    try:
-                        codes_str = ','.join(syms)
-                        url = f"{TENCENT_QUOTE_API}{codes_str}"
-                        # -fix: 改用 requests + asyncio.to_thread（去 httpx）
-                        resp = await asyncio.to_thread(_sync_get, url)
-                        return resp.text.strip()
-                    except Exception as _e:
-                        print(f'[历史推荐] 行情批量拉取失败: {_e}')
-                        return ''
-
-                batch_tasks = [
-                    _fetch_quote_batch(unique_symbols[i:i + batch_size])
-                    for i in range(0, len(unique_symbols), batch_size)
-                ]
-                batch_texts = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-                for text in batch_texts:
-                    if isinstance(text, Exception) or not text:
-                        continue
-                    for line in text.split(';'):
-                        line = line.strip()
-                        if not line or '=' not in line:
-                            continue
-                        parts = line.split('~')
-                        if len(parts) > 3:
-                            raw_code = parts[2].lower().strip()
-                            try:
-                                cur_price = float(parts[3])
-                            except (ValueError, IndexError):
-                                cur_price = 0
-                            if cur_price > 0:
-                                prefix = 'sz' if raw_code.startswith(('0', '3')) else 'sh'
-                                full_sym = prefix + raw_code
-                                price_map[full_sym] = cur_price
-                                price_map[raw_code] = cur_price
-            except Exception as _e:
-                print(f'[历史推荐] 行情解析失败: {_e}')
-
-        # Step 3: 回填每条记录的 currentPrice + profitRatio
-        for record in daily_recommendations:
-            if record.get('isToday'):
-                continue
-            stocks = record.get('daily_recommendations') or record.get('stocks') or []
-            for s in stocks:
-                sym = s.get('symbol', '').lower()
-                cur = price_map.get(sym, 0)
-                if cur > 0:
-                    s['currentPrice'] = cur
-                    buy_price = 0
-                    bsp = s.get('buySellPoints')
-                    if bsp and bsp.get('buy'):
-                        try:
-                            buy_price = float(bsp['buy'])
-                        except (ValueError, TypeError):
-                            pass
-                    if buy_price <= 0:
-                        try:
-                            buy_price = float(s.get('price', 0))
-                        except (ValueError, TypeError):
-                            pass
-                    if buy_price > 0:
-                        s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
-
-        _payload = {"success": True, "data": daily_recommendations}
-        _DAILY_RECS_CACHE.update(ts=now, payload=_payload)
-        return _payload
+        payload = await _build_daily_recs_payload()
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐记录失败: {str(error)}")
-
-_DAILY_RECS_CACHE: Dict = {'ts': 0.0, 'payload': None}   # 30s TTL，写接口负责清
+    with _DAILY_RECS_REFRESH_LOCK:
+        _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload)
+    return payload
 
 @router.get("/api/recommend-review", tags=["推荐记录"])
 async def get_recommend_review_api(days: int = 30):
@@ -550,6 +677,7 @@ async def get_recommend_review_api(days: int = 30):
         raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
 
 _REC_SIM_CACHE: Dict = {}          # {(months, capital, gap, lots, bench): {ts, data}}
+_EXCESS_CACHE: Dict = {}           # 可执行超额单独一份：它要 4 秒，别把 0.2 秒的曲线缓存挤掉
 _REC_SIM_TTL = 1800                # 秒：底层一天才变一次（14:45 推荐 + 16:10 复盘），算一次 0.2s
 
 @router.get("/api/recommend-sim", tags=["推荐记录"])
@@ -647,6 +775,34 @@ async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, 
     if len(_REC_SIM_CACHE) > 12:
         _REC_SIM_CACHE.clear()
     _REC_SIM_CACHE[key] = {'ts': _t.time(), 'data': data}
+    return {'success': True, 'data': data, 'cached': False}
+
+
+@router.get("/api/recommend-excess", tags=["推荐记录"])
+async def get_recommend_excess_api(months: int = 6):
+    """次日开盘买入、持有 1/3/5/10 日的**可执行超额**（2026-10-22，P0 评估基座）。
+
+    为什么不塞进 /api/recommend-sim：主曲线 0.2 秒，这里要多算一遍选股范围等权基准
+    （6 个月矩阵法约 3.8 秒），同一个响应会让曲线白屏等它。页面并行请求，
+    曲线先出来、这张表后补；30 分钟缓存，底层一天才变一次。
+
+    口径固定为"推荐日下一交易日开盘买、持 N 个交易日开盘卖"，次日一字涨停买不到就跳过；
+    基准是范围内**全部票**同一买入日、同一持有期等权，逐条配对后再平均。
+    默认 6 个月而不是 3 个月：3 个月里 10 日样本不足 60 条，月度切片全是噪声。
+    """
+    import time as _t
+    key = (months,)
+    hit = _EXCESS_CACHE.get(key)
+    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
+        return {'success': True, 'data': hit['data'], 'cached': True}
+    from services.pick import rec_sim
+    try:
+        data = await asyncio.to_thread(rec_sim.open_hold_excess, months=months)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"可执行超额计算失败: {str(error)}")
+    if len(_EXCESS_CACHE) > 6:
+        _EXCESS_CACHE.clear()
+    _EXCESS_CACHE[key] = {'ts': _t.time(), 'data': data}
     return {'success': True, 'data': data, 'cached': False}
 
 
@@ -1101,7 +1257,11 @@ async def discover_push_sessions_api(user: Dict = Depends(current_user)):
 
     不需要公网域名、不需要管理员建应用 —— 智能机器人的授权走腾讯托管页面，
     本地 CLI 轮询取结果，所以回调和域名都没关系。
+    2026-10-22：列表含全部会话（姓名+chat_id），只有管理员（yz）可刷新，
+    普通账号认领走"手填 chat_id"或让管理员代认领。
     """
+    if not user.get('isAdmin'):
+        raise HTTPException(status_code=403, detail='机器人会话列表仅管理员可查看/刷新')
     from services.support.push_channel import discover_sessions
     ok, err, items = discover_sessions()
     return {"success": ok, "data": {"sessions": items},
@@ -1110,7 +1270,10 @@ async def discover_push_sessions_api(user: Dict = Depends(current_user)):
 
 @router.post("/api/push-channels/search-user", tags=["推送设置"])
 async def search_push_user_api(body: Dict, user: Dict = Depends(current_user)):
-    """按姓名查企微成员 userid（需机器人「通讯录」权限；没授权时返回带授权链接的错误）"""
+    """按姓名查企微成员 userid（需机器人「通讯录」权限；没授权时返回带授权链接的错误）
+    与 discover 同理：查的是企业通讯录，仅管理员可用。"""
+    if not user.get('isAdmin'):
+        raise HTTPException(status_code=403, detail='通讯录查询仅管理员可用')
     from services.support.push_channel import search_users
     ok, err, items = search_users(str(body.get('keyword') or ''))
     return {"success": ok, "data": {"users": items},
@@ -1204,11 +1367,19 @@ async def adjust_position_api(body: Dict, user: Dict = Depends(current_user)):
         if not save_user_position(pos, user_id=user['id']):
             raise HTTPException(status_code=500, detail="保存失败")
 
+    # 已实现盈亏落账（2026-10-23）：减仓/清仓赚的 money 不能只活在 note 文本里——
+    # 清仓会整行删除持仓，不落数的话「当前资金/总盈亏」永远停在初始本金。
+    realized_total = None
+    if res['realized_pnl'] is not None:
+        from db.database import add_user_realized_pnl
+        realized_total = add_user_realized_pnl(res['realized_pnl'], user_id=user['id'])
+
     msg = describe(res, cur.get('name') or symbol)
     return {"success": True, "message": msg,
             "data": {"symbol": symbol, 'cleared': res['cleared'],
                      'cost_price': res['cost_price'], 'shares': res['shares'],
-                     'realized_pnl': res['realized_pnl']}}
+                     'realized_pnl': res['realized_pnl'],
+                     'realized_total': realized_total}}
 
 
 @router.delete("/api/positions/{symbol}", tags=["持仓管理"])
@@ -1254,6 +1425,20 @@ async def sim_execute_api(user: Dict = Depends(current_user)):
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"模拟成交失败: {str(error)}")
 
+@router.post("/api/sim/sell", tags=["模拟交易"])
+async def sim_sell_api(payload: Dict, user: Dict = Depends(current_user)):
+    """模拟盘手动卖出（按实时价立即成交）。body: {symbol, qty?}；不传 qty = 全部"""
+    try:
+        from services.portfolio.trade_sim import manual_sell
+        r = await manual_sell(user['id'], payload.get('symbol') or '', payload.get('qty'))
+        if not r.get('success'):
+            raise HTTPException(status_code=400, detail=r.get('message') or '卖出失败')
+        return r
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"卖出失败: {str(error)}")
+
 @router.post("/api/sim/reset", tags=["模拟交易"])
 async def sim_reset_api(user: Dict = Depends(current_user)):
     """重置模拟账户（清空持仓/订单/现金回到初始）"""
@@ -1287,7 +1472,7 @@ async def post_daily_recommendations(record: Dict):
         saved = save_daily_recommendations(daily_recommendations)
         
         if saved:
-            _DAILY_RECS_CACHE['payload'] = None      # 写后清 30s 缓存，避免旧档多显示一轮
+            _invalidate_daily_recs_cache()      # 写后清档，避免旧档多显示一轮
             return {"success": True, "message": "推荐记录保存成功"}
         else:
             raise HTTPException(status_code=500, detail="保存推荐记录失败: save_daily_recommendations 返回 False（详见服务端日志）")
@@ -1310,7 +1495,7 @@ async def delete_recommendation(date: str):
         # 被过滤掉的日期必须显式 DELETE，否则旧行残留（端点曾返回"删除成功"但记录仍在）。
         save_daily_recommendations(daily_recommendations)
         delete_daily_recommendations_by_date(date)
-        _DAILY_RECS_CACHE['payload'] = None          # 写后清 30s 缓存
+        _invalidate_daily_recs_cache()          # 写后清档
         
         return {"success": True, "message": "推荐记录删除成功"}
     except HTTPException:
@@ -1359,6 +1544,23 @@ async def get_trend_scan_results():
         # V4.2: 为每只趋势股票注入买卖点（位置+龙头感知，trend_details 精确度最高）
         stocks = trend_data.get('stocks', [])
         for s in stocks:
+            # 涨跌幅（2026-10-23）：新快照写在 details.changePercent；
+            # 旧快照没有该字段时用 recent5Days[-2]（昨收）与 latestPrice 回退，
+            # 二者同属一次扫描快照，保证价格与涨跌幅口径一致。
+            change_pct = (s.get('details') or {}).get('changePercent')
+            if change_pct is None:
+                recent = s.get('recent5Days') or []
+                price = s.get('latestPrice')
+                try:
+                    prev_close = float(recent[-2]) if len(recent) >= 2 else 0
+                    if prev_close > 0 and price:
+                        change_pct = (float(price) - prev_close) / prev_close * 100
+                except (TypeError, ValueError):
+                    change_pct = None
+            try:
+                s['changePercent'] = round(float(change_pct), 2) if change_pct is not None else None
+            except (TypeError, ValueError):
+                s['changePercent'] = None
             try:
                 details = s.get('details', {}) or {}
                 score_result = {'total': s.get('score', 0), 'base_scores': {}, 'factor_values': {}}

@@ -27,6 +27,9 @@ from services.portfolio.position import get_portfolio_diagnosis
 from services.data.stock import fetch_with_retry, parse_tencent_batch_data
 from services.strategy.risk_control import calc_risk_control
 from services.strategy.sentiment import get_sentiment, cycle_gate, _empty_snapshot, peek_cached
+from services.strategy.mainline import (
+    get_mainline, peek_mainline_cached, _setting as _ml_setting, DISCLAIMER as _ML_DISCLAIMER)
+from app.config import MAINLINE_ENABLED, DESK_SECTOR_CHIPS_IN_SENTIMENT
 
 # 需要实时行情的时段（休市/盘后不取指数，省 RTT）
 _LIVE_PHASES = {'auction', 'morning', 'lunch', 'mid', 'tail'}
@@ -63,7 +66,10 @@ def _allowed_timings(phase: str, now: Optional[datetime] = None) -> tuple:
 # 前端轮询间隔建议（毫秒）：越靠近决策窗口越密
 _PHASE_POLL_MS = {
     'pre': 120000, 'auction': 20000, 'morning': 60000, 'lunch': 300000,
-    'mid': 60000, 'tail': 30000, 'post': 600000, 'closed': 1800000,
+    'mid': 60000, 'tail': 30000,
+    # 盘后 15:00-18:00：收评 15:10 才生成，原来 10 分钟一刷会让定版最晚 15:20 才出现。
+    # 定版读取只查本地收评表（零外部请求），缩到 2 分钟没有接口成本。
+    'post': 120000, 'closed': 1800000,
     'unknown': 600000,
 }
 
@@ -71,15 +77,20 @@ _PHASE_POLL_MS = {
 # 2026-10-14：盘中各时段把 sentiment 排在最前 —— 短线决策的顺序本来就是
 # "先定情绪周期 → 再看主线板块 → 最后选个股"，页面顺序就是这个秩序的体现，
 # 反过来先看见个股卡片，人就会先买票再找理由。
+# 2026-10-22：'sectors'（主线/支线卡）紧跟 sentiment——它就是"再看主线板块"那一步，
+# 之前用注释里这句话的语义补上了实现。MAINLINE_ENABLED=False 时 build 阶段整个剔除
+# （见 data['sections'] 的过滤），返回体逐字节回到改造前。
 _PHASE_SECTIONS = {
-    'pre':     ['tradeWindow', 'tomorrowPlan', 'positionActions', 'watchlist'],
-    'auction': ['sentiment', 'tomorrowPlan', 'tradeWindow', 'buyNow', 'watchlist'],
-    'morning': ['sentiment', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'lunch':   ['sentiment', 'positionActions', 'reviewDigest', 'buyNow', 'watchlist'],
-    'mid':     ['sentiment', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'tail':    ['sentiment', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'post':    ['sentiment', 'reviewDigest', 'tomorrowPlan', 'positionActions', 'watchlist'],
-    'closed':  ['tomorrowPlan', 'reviewDigest', 'watchlist'],
+    'pre':     ['tradeWindow', 'sectors', 'tomorrowPlan', 'positionActions', 'watchlist'],
+    'auction': ['sentiment', 'sectors', 'tomorrowPlan', 'tradeWindow', 'buyNow', 'watchlist'],
+    'morning': ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'lunch':   ['sentiment', 'sectors', 'positionActions', 'reviewDigest', 'buyNow', 'watchlist'],
+    'mid':     ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'tail':    ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'post':    ['sentiment', 'sectors', 'reviewDigest', 'tomorrowPlan', 'positionActions', 'watchlist'],
+    # 2026-10-23：休市不等于"没有情绪"。收盘后此处给的是**今天/最近交易日的收盘定版**，
+    # 之前把它藏起来，用户只看到"市场主线"（且被 stale 闸门拦成候选），才以为页面停在昨天。
+    'closed':  ['tomorrowPlan', 'sentiment', 'sectors', 'reviewDigest', 'watchlist'],
     'unknown': ['reviewDigest', 'sentiment', 'watchlist'],
 }
 
@@ -99,6 +110,28 @@ def _norm(sym: str) -> str:
 
 def _today_str() -> str:
     return datetime.now().strftime('%Y-%m-%d')
+
+
+def _sentiment_final_label(s: Dict, today: str, is_trading_day: bool) -> str:
+    """收盘定版标签：只说"这份数字是哪天/哪个时点的"，不替数据质量下结论。
+
+    2026-10-23：用户看到"数据降级 · 沿用 10-22 收评"以为页面坏了，实际是收盘后
+    用收评定版的口径。把"定版"和"降级"分开写，且日期必须显式。
+    """
+    if not s.get('final'):
+        return ''
+    as_of = str(s.get('asOf') or '')
+    day, hm = as_of[:10], (as_of[11:16] if len(as_of) >= 16 else '')
+    short = day[5:] if len(day) >= 10 else ''
+    if s.get('source') == 'snapshot_final':
+        when = f'{hm} ' if hm else ''
+        return f'收评未生成 · 沿用 {when}快照'
+    if day == today:
+        return f'{short} 收评'
+    if is_trading_day:
+        return (f'今日收评未生成 · 参考 {short} 收盘' if short
+                else '今日收评未生成')
+    return f'休市 · 参考 {short} 收盘' if short else '休市 · 参考最近收盘'
 
 
 def _quote_map_to_dict(quotes: List[Dict]) -> Dict[str, Dict]:
@@ -429,6 +462,10 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
     quotes_task = asyncio.ensure_future(_batch_quotes(symbols_needed) if live else _immediate({}))
     crash_task = asyncio.ensure_future(check_market_crash() if live else _immediate(None))
     sentiment_task = asyncio.ensure_future(get_sentiment())
+    # 第五路（2026-10-22）：主线/支线判定。scheduler 每 180s 预热，常态命中缓存 0ms；
+    # 预算 1.5s < sentiment 的 2s，超时先拿 peek 兜底——它挂了只降级这一张卡。
+    mainline_on = bool(_ml_setting('mainline_enabled', MAINLINE_ENABLED))
+    mainline_task = asyncio.ensure_future(get_mainline()) if mainline_on else None
 
     diag = await _guarded(diag_task, 3.0, 'positions',
                           {'positions': [], 'envAdvice': None, 'has_positions': False})
@@ -438,6 +475,15 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
                                # 超时不写"情绪不可用"：先拿最近一次的真实值兜底（15 分钟内），
                                # 拿"5 分钟前的退潮"总比拿"未知"更接近此刻的盘面
                                peek_cached(max_age_sec=900) or _empty_snapshot('超时'))
+    sectors = None
+    if mainline_on:
+        sectors = await _guarded(mainline_task, 1.5, 'sectors',
+                                 peek_mainline_cached(900) or {
+                                     'main': [], 'sub': [], 'fading': [],
+                                     'none': {'reason': '主线判定超时，稍后刷新'}, 'meta': {}})
+        if not isinstance(sectors, dict):
+            sectors = {'main': [], 'sub': [], 'fading': [],
+                       'none': {'reason': '主线判定异常'}, 'meta': {}}
     if not isinstance(quote_map, dict):
         quote_map = {}
     if not isinstance(sentiment, dict):
@@ -470,7 +516,9 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         'nextPhaseAt': info['nextPhaseAt'],
         'minutesToNext': info['minutesToNext'],
         'nextPollMs': poll_ms,
-        'sections': _PHASE_SECTIONS.get(phase, ['watchlist']),
+        # 主线开关关 → 从 sections 里剔除 'sectors'（前端 v-for 见不到这张卡），返回体回到改造前
+        'sections': ([s for s in _PHASE_SECTIONS.get(phase, ['watchlist']) if s != 'sectors']
+                     if not mainline_on else _PHASE_SECTIONS.get(phase, ['watchlist'])),
         'degraded': degraded,
         'headline': headline,
         # 盘中情绪（2026-10-14）：周期 + 五维数字 + 当日主线板块 + 由此推出的纪律。
@@ -483,9 +531,18 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'asOf': sentiment.get('asOf'),
             'stale': bool(sentiment.get('stale')),
             'source': sentiment.get('source'),
+            # 收盘定版（2026-10-23）：非交易时段给的是今天的收评定版，不是"接口降级"。
+            # final 与 stale 分开：stale 仍让纪律侧不给否决权，final 只决定页面措辞。
+            'final': bool(sentiment.get('final')),
+            'finalLabel': _sentiment_final_label(
+                sentiment, _today_str(), bool(info.get('isTradingDay'))),
+            'finalToday': bool(sentiment.get('final')
+                               and str(sentiment.get('asOf') or '')[:10] == _today_str()),
             'dataGaps': sentiment.get('dataGaps') or [],
             'indicators': sentiment.get('indicators') or {},
-            'leadSectors': (sentiment.get('leadSectors') or [])[:3],
+            'leadSectors': ((sentiment.get('leadSectors') or [])[:3]
+                            if _ml_setting('desk_sector_chips', DESK_SECTOR_CHIPS_IN_SENTIMENT)
+                            else []),   # 名单归一到 sectors 卡（2026-10-22），开关可回退
             'failedLeaders': (sentiment.get('failedLeaders') or [])[:3],
             'weakSignals': (sentiment.get('weakSignals') or [])[:4],
             'rule': gate.get('reason') or '',
@@ -501,6 +558,19 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'advisoryMinScore': gate.get('advisoryMinScore'),
             'cacheAgeSec': gate.get('cacheAgeSec'),
         },
+        # 主线/支线板块卡（2026-10-22，影子期：只展示与落库，不进选股/门槛/推送）。
+        # 全量在 market_mainline_snapshots，这里只下发截断视图。开关关时不下发此键。
+        **({'sectors': {
+            'main': (sectors or {}).get('main') or [],
+            'sub': (sectors or {}).get('sub') or [],
+            'fading': (sectors or {}).get('fading') or [],
+            'candidates': (sectors or {}).get('candidates') or [],
+            'none': (sectors or {}).get('none'),
+            'asOf': (sectors or {}).get('asOf'),
+            'stale': bool((sectors or {}).get('stale')),
+            'meta': (sectors or {}).get('meta') or {},
+            'disclaimer': _ML_DISCLAIMER,
+        }} if mainline_on else {}),
         'market': {
             'riskScore': _to_float((alert or {}).get('riskScore')),
             'savedAt': (alert or {}).get('savedAt') or '',
@@ -533,6 +603,9 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         'tomorrowPlan': [{'symbol': _norm(f.get('code') or f.get('symbol')),
                           'name': f.get('name'),
                           'score': f.get('score'),
+                          # 当日涨跌幅%（2026-10-23 用户要求：明日计划也要能看到当天涨跌了多少）。
+                          # 收评落库时随行情写入；历史收评无此字段，前端批量拉实时行情兜底。
+                          'pctChg': f.get('pctChg'),
                           # 入选依据（同来源同分数段的历史 T+1 胜率）——名单就是按它排的
                           'winRate': f.get('expectedWinRate'),
                           'avgRet': f.get('expectedAvgRet'),

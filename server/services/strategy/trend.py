@@ -1924,11 +1924,21 @@ async def scan_trend_scan_results(force: bool = False):
                                                              fundamental_data=fd,
                                                              smart_money_data=sm_data)
 
+                    # 当日涨跌幅（2026-10-23）：与 latestPrice 取自同一次实时快照，
+                    # 随 details_json 一起落库，供趋势页在两次扫描之间稳定展示。
+                    _change_pct = None
+                    if realtime_data:
+                        try:
+                            _change_pct = round(float(realtime_data.get('changePercent')), 2)
+                        except (TypeError, ValueError):
+                            _change_pct = None
+
                     return {
                         'symbol': symbol,
                         'name': name,
                         'score': trend_result['score'],
                         'details': trend_result['details'],
+                        'changePercent': _change_pct,
                         'latestPrice': trend_result['latestPrice'],
                         'ma5': trend_result.get('ma5'),
                         'ma10': trend_result.get('ma10'),
@@ -2014,11 +2024,17 @@ async def scan_trend_scan_results(force: bool = False):
                             'market_change': market_change,
                         })
                 # 清理不需要返回给前端的字段
+                # 涨跌幅并进 details：save_trend_scan_results 只持久化 details_json，
+                # 这样不新增表字段也能让后续 /api/trend-stocks 读到当日涨幅。
+                _clean_details = dict(r.get('details') or {})
+                if r.get('changePercent') is not None:
+                    _clean_details['changePercent'] = r['changePercent']
                 cleaned_r = {
                     'symbol': r['symbol'],
                     'name': r['name'],
                     'score': r['score'],
-                    'details': r['details'],
+                    'details': _clean_details,
+                    'changePercent': r.get('changePercent'),
                     'latestPrice': r['latestPrice'],
                     'ma5': r['ma5'],
                     'ma10': r['ma10'],
