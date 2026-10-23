@@ -1,0 +1,46 @@
+#!/bin/sh
+# pre-push —— 本地拦强推（2026-10-23 上线）
+#
+# 这台机器没装 gh CLI，GitHub 的分支保护（禁 force push / 禁删分支）要你在网页开，
+# 命令行证实不了。所以本地这一层是"唯一能当场拦住误操作"的地方：
+# 非快进推送 = 会把远程已有提交丢掉 = 今晚那种"我的改动被覆盖"的远程版本。
+#
+# 开关：git config --local hooks.pushforce.enabled false
+# 整体停用：git config --local --unset core.hooksPath
+#
+# 输入协议（每行）：<local_ref> <local_sha> <remote_ref> <remote_sha>
+
+set -u
+
+z40=0000000000000000000000000000000000000000
+blocked=0
+
+if [ "$(git config --bool hooks.pushforce.enabled 2>/dev/null)" = "false" ]; then
+    exit 0
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+
+    if [ "$local_sha" = "$z40" ]; then
+        # 删除远程分支：本地只提醒，真正禁掉靠 GitHub 分支保护（网页设置）
+        echo "⚠ 正在删除远程分支 ${remote_ref#refs/heads/}（分支保护开启后会被 GitHub 拒绝）"
+        continue
+    fi
+    if [ "$remote_sha" = "$z40" ]; then
+        # 新建分支：没有可丢的历史，放行
+        continue
+    fi
+
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        echo "⛔ 非快进推送（= force push）已禁止：${remote_ref#refs/heads/} 上 $(printf '%.7s' "$remote_sha") 不在你本地历史里。"
+        echo "   强推会把远程已有的提交丢掉——那正是今晚'整节被覆盖'的远程版本。"
+        echo "   正确做法：git fetch origin && git rebase origin/${remote_ref#refs/heads/} 之后正常 push。"
+        echo "   个人 feat/fix 分支确需重写历史时，只允许 git push --force-with-lease"
+        echo "   （它在远程有别人新提交时会自己拒绝，不会盖掉未知改动；但 main/dev 上任何强推都不该发生）。"
+        echo "   （确要临时停用本项：git config --local hooks.pushforce.enabled false）"
+        blocked=1
+    fi
+done
+
+exit $blocked

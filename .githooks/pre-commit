@@ -1,0 +1,127 @@
+#!/bin/sh
+# pre-commit —— 本仓的提交前硬拦截（2026-10-23 上线）
+#
+# 为什么不用文档拦：AGENTS.md/CONTRIBUTING.md 只是"给人和 Agent 看的指令"，
+# 写"禁止 git add ."拦不住一次真实的 `git add .` —— 2026-10-23 实测工作区有
+# 101 条未提交改动（37 M / 28 D 构建产物 / 36 未跟踪），一次 `git add .` 就会把
+# 36 个不确定的文件全带进提交。只有 hook 是"不依赖自觉"的那一层。
+#
+# 零第三方依赖：Git 自带的 sh，不需要 pre-commit 框架、不需要 pip 装任何东西。
+#
+# 每一项都有独立开关，关掉后行为必须逐字节等于改造前：
+#   git config --local hooks.behind.enabled   false   # B1 本地落后于远程
+#   git config --local hooks.bulkadd.enabled  false   # B2 疑似 git add . 批量混提
+#   git config --local hooks.artifacts.enabled false  # B3 前端产物删增不成对
+#   git config --local hooks.secret.enabled   false   # B4 凭据/本机绝对路径写进代码
+#   git config --local hooks.docsync.enabled  false   # B5 文档未同步（只提醒，本来就不拦）
+# 整体停用：git config --local --unset core.hooksPath
+#
+# 失败信息一律给出"怎么改对"，不给出"怎么绕过"（不提供 --no-verify 建议）。
+
+set -u
+
+enabled() {
+    [ "$(git config --bool "hooks.$1.enabled" 2>/dev/null)" != "false" ]
+}
+
+count_lines() {
+    if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | grep -c . ; fi
+}
+
+# ---------------------------------------------------------------- B1 落后拦截
+branch=$(git symbolic-ref --short -q HEAD || echo '')
+if enabled behind && [ -n "$branch" ] && git remote get-url origin >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+        fetch_cmd="timeout 25 git fetch -q origin $branch"
+    else
+        fetch_cmd="git fetch -q origin $branch"
+    fi
+    if eval "$fetch_cmd" >/dev/null 2>&1; then
+        # 用 ancestry 判断而不是比 hash：本地领先远程是正常状态，只有"落后"才要拦
+        if ! git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+            echo "⛔ 本地落后于 origin/$branch —— 现在提交会把别人的改动当基线吃掉。"
+            echo "   正确做法：git pull --rebase origin $branch（有冲突自己解，不许整块丢弃他人改动）"
+            echo "   为什么拦：本仓多路会话共用同一工作树，'落后的提交'正是今晚整节被覆盖的成因之一。"
+            echo "   （确要临时停用本项：git config --local hooks.behind.enabled false）"
+            exit 1
+        fi
+    else
+        # fail-open：这台机器常处于离线/代理异常状态，网络不通不该让人没法提交
+        echo "⚠ 读不到 origin/$branch（离线或代理异常），落后检查已跳过（本次放行）"
+    fi
+fi
+
+# ------------------------------------------------------ B2 疑似 git add . 混提
+if enabled bulkadd; then
+    new_non_artifact=$(git diff --cached --name-only --diff-filter=A -- . ':(exclude)server/static' ':(exclude)client-vue/dist' 2>/dev/null)
+    n_new=$(count_lines "$new_non_artifact")
+    # 总数阈值只统计**非产物**文件：一次正常构建会换 28 个 hash 文件名 + index.html，
+    # 把产物算进"批量暂存"会让合法的前端提交永远被拦（2026-10-23 走分支流程时实测到）
+    n_all=$(count_lines "$(git diff --cached --name-only -- . ':(exclude)server/static' ':(exclude)client-vue/dist' 2>/dev/null)")
+    if [ "$n_new" -gt 8 ]; then
+        echo "⛔ 本次暂存里有 $n_new 个**新增（未跟踪→A）非产物文件**，疑似 'git add .' 一把梭。"
+        printf '%s\n' "$new_non_artifact" | head -10 | sed 's/^/      新增: /'
+        echo "   正确做法：git reset 之后逐路径 git add <这次真的改过的文件>。"
+        echo "   （确要临时停用本项：git config --local hooks.bulkadd.enabled false）"
+        exit 1
+    fi
+    if [ "$n_all" -gt 20 ]; then
+        echo "⛔ 本次暂存 $n_all 个非产物文件，跨主题提交在出问题时报不出这次改了什么。"
+        echo "   正确做法：拆成'一次提交只做一件事'（产物、后端、前端、文档分别成提交）。"
+        echo "   （确要临时停用本项：git config --local hooks.bulkadd.enabled false）"
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------ B3 产物删增成对
+if enabled artifacts; then
+    a_assets=$(count_lines "$(git diff --cached --name-only --diff-filter=A -- server/static/assets 2>/dev/null)")
+    d_assets=$(count_lines "$(git diff --cached --name-only --diff-filter=D -- server/static/assets 2>/dev/null)")
+    if [ "$a_assets" -gt 0 ] || [ "$d_assets" -gt 0 ]; then
+        if [ "$a_assets" != "$d_assets" ]; then
+            echo "⛔ 前端构建产物新增 $a_assets / 删除 $d_assets 不成对。"
+            echo "   产物是 hash 改名，'删旧+增新'必须同一提交，否则历史里每个版本都能装出一个跑不起来的页面。"
+            echo "   （确要临时停用本项：git config --local hooks.artifacts.enabled false）"
+            exit 1
+        fi
+        if [ -z "$(git diff --cached --name-only -- server/static/index.html 2>/dev/null)" ]; then
+            echo "⛔ 换了 server/static/assets 产物却没带上 server/static/index.html（入口仍指向旧 hash，构建等于没生效）。"
+            echo "   正确做法：git add server/static/index.html"
+            echo "   （确要临时停用本项：git config --local hooks.artifacts.enabled false）"
+            exit 1
+        fi
+    fi
+fi
+
+# --------------------------------------------------- B4 凭据 / 本机绝对路径入库
+if enabled secret; then
+    bad=$(git diff --cached -U0 --diff-filter=ACM -- '*.py' '*.js' '*.jsx' '*.ts' '*.vue' '*.json' '*.yaml' '*.yml' ':(exclude)server/static' 2>/dev/null \
+          | grep '^+' | grep -v '^+++' \
+          | grep -F -e 'D:\' -e 'd:\' -e 'C:\Users' -e 'c:\users' -e 'corpsecret' -e 'webhook_url' -e 'wecom_webhook' \
+          | head -8)
+    if [ -n "$bad" ]; then
+        echo "⛔ 代码/配置里出现本机绝对路径或推送凭据字段（只检本次新增行）："
+        printf '%s\n' "$bad" | sed 's/^/      /'
+        echo "   为什么拦：绝对路径让代码只能在这台机器跑；凭据一旦进提交就永久留在历史里。"
+        echo "   正确做法：路径走配置项或环境变量（守护脚本里的硬编码路径留在仓库外），"
+        echo "             webhook 留在已被 .gitignore 排除的 server/wecom_webhook.json 里。"
+        echo "   （确要临时停用本项：git config --local hooks.secret.enabled false）"
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------- B5 文档同步（只提醒）
+if enabled docsync; then
+    code_staged=$(git diff --cached --name-only -- server client-vue/src 2>/dev/null)
+    doc_staged=$(git diff --cached --name-only -- . ':(exclude)server/static' 2>/dev/null \
+                 | grep -E '(^|/)(README|AGENTS|CONTRIBUTING)\.md$|^docs/.*\.md$')
+    if [ -n "$code_staged" ] && [ -z "$doc_staged" ]; then
+        echo "⚠ 本次改了代码但没有 staged 任何文档。AGENTS.md 要求同步检查这几份："
+        echo "      README.md / docs/工程知识库.md / docs/系统更新日志.md"
+        echo "      docs/优化实施计划-2026-10-18.md / docs/选股策略取长补短-2026-10-22.md"
+        echo "   这条不阻断：真拦会诱导'为了过关写一句空话'，反而污染文档。"
+        echo "   自检办法是改完 grep 自己写入的独有关键串，命中 0 就是没落进去（或被另一路会话覆盖了）。"
+    fi
+fi
+
+exit 0
