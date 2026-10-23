@@ -146,6 +146,23 @@ def fetch_day(symbol: str, date: str, retries: int = 3) -> Optional[List[tuple]]
     return None
 
 
+def save_rows(symbol: str, date: str, rows: List[tuple]) -> int:
+    """外部前向源（腾讯 m5）的落库入口：rows = (time, open, high, low, close, volume, amount)。
+
+    分钟线库有两只写入方：baostock 逐只补历史（fetch_day）、腾讯收盘前向采集
+    （minute_forward）。表结构只能有一份定义，所以写入统一走这里，别在外部再建一次表。
+    """
+    if not rows:
+        return 0
+    code = symbol.lower()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload = [(code, date) + tuple(r) + (now,) for r in rows]
+    with _conn() as c:
+        c.executemany('INSERT OR REPLACE INTO minute_5m VALUES (?,?,?,?,?,?,?,?,?,?)', payload)
+        c.commit()
+    return len(payload)
+
+
 def get_day(symbol: str, date: str) -> List[tuple]:
     """取某天分钟线（先查库，没有再拉）。返回按时间升序的 (time,o,h,l,c,vol,amount)。"""
     code = symbol.lower()

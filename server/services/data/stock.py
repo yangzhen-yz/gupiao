@@ -12,6 +12,8 @@ _announcement_cache: Dict[str, Tuple[float, Dict]] = {}  # symbol -> (ts, result
 _analysis_cache: Dict[str, Tuple[float, Dict]] = {}  # symbol -> (ts, result), TTL=3s for 2s polling
 # 2026-07-08 优化：行情 API 10 秒缓存（symbol -> (ts, raw_data)），避免重复 RTT
 _realtime_cache: Dict[str, Tuple[float, str]] = {}
+# 2026-10-23：同花顺热榜备源 120 秒缓存（东财人气榜为空时才用）
+_ths_hot_cache: Dict[str, Tuple[float, list]] = {}
 
 # 利空公告关键词（出现任一即判定为"重大利空 / 减持 / 立案"）
 NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
@@ -453,7 +455,31 @@ async def fetch_eastmoney_hot_list():
 
     def _fetch_popularity_rank() -> list:
         """从东方财富真实人气榜 API 获取前 100 名，返回 [(code, market, rank), ...]。
-        需要 httpx 库（requests 会被 emappdata 服务器拒绝连接）。"""
+        需要 httpx 库（requests 会被 emappdata 服务器拒绝连接）。
+
+        2026-10-23：接入共享熔断，独立 scope 'appdata'。人气榜的 emappdata 与
+        clist/ulist 的 push2delay 不是同一条链路（当天 clist 17/134 成功、
+        appdata 16/16 成功），所以三件事要分开：① 只服从自己的 scope 冷却，
+        不被 push2 的全域闸门连带停掉（`skip(ignore_domain=True)`），否则封禁期
+        热搜榜只能空着；② 成功只复位本 scope，不关全域闸门，避免把 clist 提前
+        放出去探测、给封禁续命；③ 失败按 flaky 只冷却本 scope，不打开全域闸门，
+        避免人气榜的偶发问题误伤其他东财接口。
+        """
+        try:
+            from services.data import eastmoney_guard
+            if eastmoney_guard.skip('appdata', ignore_domain=True):
+                return []
+        except Exception:
+            pass
+
+        def _mark_fail(err=None) -> None:
+            try:
+                from services.data import eastmoney_guard
+                # 固定 flaky：只累计本 scope，不触发全域闸门（见 docstring）
+                eastmoney_guard.fail('appdata', err, kind='flaky')
+            except Exception:
+                pass
+
         try:
             import httpx
         except ImportError:
@@ -475,6 +501,7 @@ async def fetch_eastmoney_hot_list():
                 data = r.json()
                 if not data or data.get('status') != 0 or not data.get('data'):
                     print(f'[热搜榜] 人气榜API返回异常: {data.get("message", "unknown")}')
+                    _mark_fail()
                     return []
                 result = []
                 for item in data['data']:
@@ -483,11 +510,66 @@ async def fetch_eastmoney_hot_list():
                     if len(sc) >= 4:
                         market = sc[:2].lower()  # "sh" or "sz"
                         code = sc[2:]
-                        result.append((code, market, rk))
+                        result.append((code, market, rk, ''))
+                if not result:
+                    _mark_fail()
+                    return []
+                try:
+                    from services.data import eastmoney_guard
+                    eastmoney_guard.ok('appdata', clear_domain=False)
+                except Exception:
+                    pass
                 print(f'[热搜榜] 人气榜API返回 {len(result)} 只')
                 return result
         except Exception as e:
             print(f'[热搜榜] 人气榜API请求失败: {e}')
+            _mark_fail(e)
+            return []
+
+    def _fetch_ths_hot_rank() -> list:
+        """同花顺热股榜（小时榜），东财人气榜不可用时的**备源**（2026-10-23）。
+
+        为什么加：东财出口 IP 被封时，人气榜（appdata）也会被自己的冷却挡住，
+        涨幅/成交额榜（clist）更常空，热搜榜就只剩空壳。同花顺这个榜单免登录、
+        返回前 100 只（实测 85 只沪深主板），带名称/涨跌幅/名次，字段稳定。
+        口径：与东财人气榜一致返回 [(code, market, rank, name), ...]，
+        后续名称/价格仍走本地表 + 腾讯批量行情补齐；本函数只负责"有哪些票、排第几"。
+        失败/为空返回 []，由调用方决定是否保留旧缓存；120 秒缓存避免调度重复打。
+        """
+        now = time.time()
+        hit = _ths_hot_cache.get('hour')
+        if hit and now - hit[0] < 120:
+            return list(hit[1])
+        url = 'https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock'
+        params = {'stock_type': 'a', 'type': 'hour', 'list_type': 'normal'}
+        headers = {
+            'User-Agent': _DEFAULT_HEADERS['User-Agent'],
+            'Referer': 'https://eq.10jqka.com.cn/',
+        }
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            r.raise_for_status()
+            payload = r.json()
+            items = ((payload.get('data') or {}).get('stock_list') or [])
+            out = []
+            for item in items:
+                code = str(item.get('code') or '')
+                if not re.match(r'^\d{6}$', code):
+                    continue
+                market = 'sh' if code.startswith(('600', '601', '603', '605', '688')) else 'sz'
+                try:
+                    rank = int(item.get('order') or 0)
+                except (TypeError, ValueError):
+                    rank = 0
+                out.append((code, market, rank, str(item.get('name') or '').strip()))
+            if not out:
+                print('[热搜榜] 同花顺热榜返回为空')
+                return []
+            _ths_hot_cache['hour'] = (now, out)
+            print(f'[热搜榜] 同花顺热榜返回 {len(out)} 只（备用源）')
+            return list(out)
+        except Exception as e:
+            print(f'[热搜榜] 同花顺热榜请求失败: {e}')
             return []
 
     def _fetch_batch_quotes(symbols: list) -> dict:
@@ -535,9 +617,13 @@ async def fetch_eastmoney_hot_list():
                         except: return d
                     result[sym] = {
                         'name': stock.get('f14', ''),
-                        'price': round(_to_float(stock.get('f2'), 0) / 100, 2),
-                        'changePercent': round(_to_float(stock.get('f3'), 0) / 100, 2),
-                        'change': round(_to_float(stock.get('f4'), 0) / 100, 2),
+                        # 2026-10-23 修正：本请求用 fltt=2，f2/f3/f4 已是真实数值
+                        # （元 / 百分比 / 元），不能再 /100。此前除错，人气榜独有票
+                        # 价格被缩小 100 倍（华瓷股份实际 28.12 → 存成 0.28）。
+                        # 封禁期涨幅/成交额榜为空时全部走这条路径，所以整榜都错。
+                        'price': round(_to_float(stock.get('f2'), 0), 2),
+                        'changePercent': round(_to_float(stock.get('f3'), 0), 2),
+                        'change': round(_to_float(stock.get('f4'), 0), 2),
                     }
         except Exception as e:
             print(f'[热搜榜] 批量行情获取失败: {e}')
@@ -553,6 +639,47 @@ async def fetch_eastmoney_hot_list():
             except Exception:
                 pass
         return result
+
+    def _fetch_tencent_quotes_map(symbols: list) -> dict:
+        """腾讯批量行情备源（2026-10-23）。
+
+        背景：人气榜只给代码/名次，名称与价格要靠 push2 ulist 补；东财封禁期
+        ulist 常被拒（21:03 实拍 ulist streak=1），热搜榜就会整榜价格 0、名称空，
+        ST/退市过滤也会失真。腾讯行情不受东财封禁影响，一次可查几十只，
+        所以只在东财行情缺失时补这一刀，正常行情下不触发、不增加请求。
+        """
+        out = {}
+        syms = [s for s in symbols if re.match(r'^(sh|sz)\d{6}$', s or '')]
+        for i in range(0, len(syms), 60):
+            chunk = syms[i:i + 60]
+            try:
+                r = requests.get(TENCENT_API + ','.join(chunk), timeout=5,
+                                 headers={'User-Agent': _DEFAULT_HEADERS['User-Agent'],
+                                          'Referer': 'https://gu.qq.com/'})
+                r.raise_for_status()
+                r.encoding = 'gbk'
+                for line in r.text.split(';'):
+                    m = re.match(r'\s*v_(sh|sz)(\d{6})="([^"]*)"', line)
+                    if not m:
+                        continue
+                    fields = m.group(3).split('~')
+                    if len(fields) < 33:
+                        continue
+                    try:
+                        price = float(fields[3] or 0)
+                        change = float(fields[31] or 0)
+                        pct = float(fields[32] or 0)
+                    except ValueError:
+                        continue
+                    out[m.group(1) + m.group(2)] = {
+                        'name': fields[1],
+                        'price': round(price, 2),
+                        'changePercent': round(pct, 2),
+                        'change': round(change, 2),
+                    }
+            except Exception as e:
+                print(f'[热搜榜] 腾讯行情补充失败: {e}')
+        return out
 
     def _filter_mainboard(stocks: list, limit: int) -> list:
         """从原始 diff 列表中筛选沪深主板股票，返回前 limit 只。"""
@@ -599,20 +726,38 @@ async def fetch_eastmoney_hot_list():
                         break
         return result
 
+    # 本轮榜单来源（写入 hot_search_meta，便于页面/排查知道用了哪个源）
+    source = {'popularity': ''}
+
     def _sync_fetch():
         try:
             print('[热搜榜] 正在获取东方财富人气榜 + 涨幅榜 + 成交额榜...')
 
-            # 1. 人气榜（真实人气榜 API，最多 100 只全市场）
+            # 1. 人气榜（东财真实人气榜，最多 100 只全市场）
             popularity_data = _fetch_popularity_rank()
-            # 人气榜返回的是全市场前100（含创业板/科创板），需要筛选沪深主板
+            source['popularity'] = 'eastmoney' if popularity_data else ''
+            if not popularity_data:
+                # 2026-10-23：东财被封/人气榜冷却时改用同花顺热榜（免登录、前 100 只）
+                popularity_data = _fetch_ths_hot_rank()
+                if popularity_data:
+                    source['popularity'] = 'ths'
+            # 人气榜返回的是全市场前100（含创业板/科创板），需要筛选沪深主板；
+            # 用列表保序（rank 来自榜单顺序），集合只用于去重。
+            popularity_syms = []
             popularity_codes = set()
-            for code, market, rk in popularity_data:
+            pop_names = {}
+            for code, market, rk, pname in popularity_data:
                 is_sh_main = market == 'sh' and (code.startswith('600') or code.startswith('601') or code.startswith('603') or code.startswith('605'))
                 is_sz_main = market == 'sz' and (code.startswith('000') or code.startswith('001'))
                 if is_sh_main or is_sz_main:
-                    popularity_codes.add(market + code)
-            print(f'[热搜榜] 人气榜沪深主板: {len(popularity_codes)} 只')
+                    sym = market + code
+                    if sym not in popularity_codes:
+                        popularity_codes.add(sym)
+                        popularity_syms.append(sym)
+                    if pname:
+                        pop_names[sym] = pname
+            print(f'[热搜榜] 人气榜沪深主板: {len(popularity_syms)} 只'
+                  f'（来源 {source["popularity"] or "无"}）')
 
             # 2. 涨幅榜（clist fid=f3）
             change_fetch = int(CHANGE_RANK_TOP_N * 1.6)
@@ -640,6 +785,14 @@ async def fetch_eastmoney_hot_list():
 
             # 3a-1. 找出人气榜中不在涨幅/成交额榜的股票，通过 push2 批量行情API补充名称和行情
             missing_syms = [sym for sym in popularity_codes if sym not in all_stocks_map]
+            # 人气榜只给代码/名次；push2 ulist 被熔断时名称为空，ST/退市过滤会失效。
+            # 用本地基础信息补名称（零外部请求），补不到才留空。
+            local_names = {}
+            if any(not (all_stocks_map.get(sym) or {}).get('name') for sym in popularity_codes):
+                try:
+                    local_names = load_stock_basic_info() or {}
+                except Exception as _e:
+                    print(f'[热搜榜] 本地名称补充失败(忽略): {_e}')
             if missing_syms:
                 print(f'[热搜榜] 人气榜独有 {len(missing_syms)} 只，批量补充行情...')
                 # push2 ulist.np 最多支持约 100 只批量查询，分批处理
@@ -652,7 +805,8 @@ async def fetch_eastmoney_hot_list():
                         q = quotes.get(sym, {})
                         s = {
                             'symbol': sym, 'code': code,
-                            'name': q.get('name', ''),
+                            # 同花顺备源自带名称；东财 ulist 被跳过/失败时不能把它丢了
+                            'name': q.get('name', '') or pop_names.get(sym, ''),
                             'market': market,
                             'price': q.get('price', 0),
                             'changePercent': q.get('changePercent', 0),
@@ -662,7 +816,7 @@ async def fetch_eastmoney_hot_list():
                     if i + 80 < len(missing_syms):
                         time.sleep(0.1)
 
-            for sym in popularity_codes:
+            for sym in popularity_syms:
                 if sym not in seen:
                     seen.add(sym)
                     if sym in all_stocks_map:
@@ -671,7 +825,7 @@ async def fetch_eastmoney_hot_list():
                         # 人气榜有但涨幅/成交额榜没有的股票，用人气榜基本信息构造
                         code = sym[2:]
                         market = sym[:2]
-                        s = {'symbol': sym, 'code': code, 'name': '', 'market': market, 'price': 0, 'changePercent': 0, 'change': 0}
+                        s = {'symbol': sym, 'code': code, 'name': pop_names.get(sym, ''), 'market': market, 'price': 0, 'changePercent': 0, 'change': 0}
                     s['hotRank'] = rank
                     merged.append(s)
                     rank += 1
@@ -694,6 +848,30 @@ async def fetch_eastmoney_hot_list():
                     merged.append(s)
                     rank += 1
 
+            # 名称兜底：行情源被熔断时用本地基础信息补，避免空名导致 ST/退市过滤失真
+            if local_names:
+                for s in merged:
+                    if not s.get('name'):
+                        s['name'] = local_names.get(s.get('symbol', ''), '')
+
+            # 行情兜底：ulist 被熔断时价格为 0，用腾讯批量行情补（一次几十只，零东财请求）
+            need_quote = [s['symbol'] for s in merged if not s.get('price')]
+            if need_quote:
+                tq = _fetch_tencent_quotes_map(need_quote)
+                filled = 0
+                for s in merged:
+                    q = tq.get(s.get('symbol', ''))
+                    if not q:
+                        continue
+                    if not s.get('name'):
+                        s['name'] = q.get('name', '')
+                    if not s.get('price'):
+                        s['price'] = q.get('price', 0)
+                        s['changePercent'] = q.get('changePercent', 0)
+                        s['change'] = q.get('change', 0)
+                        filled += 1
+                print(f'[热搜榜] 腾讯行情补齐 {filled}/{len(need_quote)} 只')
+
             print(f'[热搜榜] 合并去重后共 {len(merged)} 只沪深主板股票')
             return merged
         except Exception as e:
@@ -707,6 +885,7 @@ async def fetch_eastmoney_hot_list():
             'updateTime': datetime.now().isoformat(),
             'total': len(result),
             'filteredCount': len(result),
+            'source': source['popularity'],
             'stocks': result
         }
 

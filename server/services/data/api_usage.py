@@ -32,6 +32,14 @@ _HOST_EXACT = {
     'qt.gtimg.cn': ('tencent', 'quote'),        # 腾讯即时行情
     'ifzq.gtimg.cn': ('tencent', 'kline'),      # 腾讯K线
     'hq.sinajs.cn': ('sina', 'quote'),          # 新浪行情备源
+    # 2026-10-23 修误分类：新浪备源实际走的是这个域（今天 736 次全挂在 other 下）
+    'vip.stock.finance.sina.com.cn': ('sina', 'quote'),
+    # 2026-10-23 修误分类：涨停/炸板池真实域名没有中间那个点（239 次挂在 other 下），
+    # 已登记的 push2.ex.eastmoney.com 一并保留，两种写法都归 eastmoney:pools
+    'push2ex.eastmoney.com': ('eastmoney', 'pools'),
+    # 2026-10-23 新备源：同花顺热股榜（东财人气榜为空时接管）
+    'dq.10jqka.com.cn': ('ths', 'hotlist'),
+    'smartbox.gtimg.cn': ('tencent', 'search'),  # 腾讯搜索建议（代码框联想）
     'push2delay.eastmoney.com': ('eastmoney', None),   # 人气榜/涨停池/个股 等同主机不同 path
     'push2.eastmoney.com': ('eastmoney', 'push2'),     # 行情推送主接口
     'push2.ex.eastmoney.com': ('eastmoney', 'pools'), # 涨停/跌停/炸板池
@@ -62,12 +70,17 @@ def _em_path_interface(path: str) -> str:
 PROVIDER_LABEL = {
     'tencent': '腾讯', 'sina': '新浪', 'eastmoney': '东财',
     'wecom': '企业微信', 'baostock': 'Baostock',
+    'ths': '同花顺',            # 2026-10-23：热搜榜备源
     'westock': 'Westock', 'other': '其他',
 }
 INTERFACE_LABEL = {
-    'quote': '行情', 'kline': 'K线', 'clist': '人气榜', 'ulist': '自选列表',
+    # 2026-10-23 把"人气榜"这个叫法归位：东财 clist 是涨幅/成交额排行榜，
+    # 真正的人气榜是 appdata（主源）与同花顺 hotlist（备源）
+    'quote': '行情', 'kline': 'K线', 'clist': '排行榜(涨幅/成交额)', 'ulist': '自选列表',
     'stock': '个股', 'push2': '行情推送', 'pools': '涨停池', 'datacenter': '数据中心',
-    'ann': '公告', 'appdata': 'App数据', 'push': '消息推送', 'chat': 'AI对话',
+    'ann': '公告', 'appdata': '人气榜', 'hotlist': '热股榜',
+    'search': '搜索联想',
+    'push': '消息推送', 'chat': 'AI对话',
     'data': '行情数据', 'fundflow': '资金流',
 }
 
@@ -85,7 +98,10 @@ DEFAULT_LIMITS = {
     'eastmoney:appdata': 1000,
     'tencent:quote': 50000,
     'tencent:kline': 10000,
+    'tencent:search': 500,
     'sina:quote': 20000,
+    # 2026-10-23 新备源：同花顺热股榜（东财人气榜为空时接管，一次/轮、量很小）
+    'ths:hotlist': 1000,
     'wecom:push': 1500,
     'baostock:data': 5000,
     'westock:quote': 4000,
@@ -285,11 +301,74 @@ def _load_limits_into_mem() -> None:
         print(f'[接口用量] 读取上限失败（用默认值）: {e}')
 
 
+# 历史误分类：这些域名在 _HOST_EXACT 补登记之前被归到 other/<域名>（计数没丢，但
+# 归到"其他"就没有中文标签、没有上限预警、也不能跟熔断状态对照，等于分母算错）。
+_LEGACY_OTHER = {
+    'vip.stock.finance.sina.com.cn': ('sina', 'quote'),
+    'push2ex.eastmoney.com': ('eastmoney', 'pools'),
+    'smartbox.gtimg.cn': ('tencent', 'search'),
+}
+
+
+def merge_legacy_other_rows(date: str) -> int:
+    """把 `other/<域名>` 的历史行归位到正确 provider/interface，返回归位行数。
+
+    合并取 **max 而不是相加**：`api_usage_daily` 每行是"当天累计快照"（`flush()` 用
+    upsert 覆盖、不重置计数器），所以同一天里 `other/<域名>` 与正确键描述的往往是
+    **同一批请求**——旧进程内存里的旧键会在它被杀掉前的最后一次 flush 把"其他"行
+    再写回来。相加会翻倍（2026-10-23 实测：新浪 736 被并成 1472），取 max 在任何
+    先后顺序下都幂等。归位后删除 other 行，`_load_today_into_mem()` 才不会又把
+    旧键读进内存、每 60 秒复写一次。
+    """
+    from db.database import get_db_conn
+    conn = get_db_conn()
+    moved = 0
+    try:
+        for host, (provider, interface) in _LEGACY_OTHER.items():
+            rows = conn.execute(
+                'SELECT date, count, ok, fail FROM api_usage_daily '
+                "WHERE provider='other' AND interface=? AND (? IS NULL OR date=?)",
+                (host, date, date)).fetchall()
+            for r in rows:
+                tgt = conn.execute(
+                    'SELECT count, ok, fail FROM api_usage_daily '
+                    'WHERE date=? AND provider=? AND interface=?',
+                    (r['date'], provider, interface)).fetchone()
+                merged = tuple(max(r[i] or 0, (tgt[i] if tgt else 0) or 0)
+                               for i in ('count', 'ok', 'fail'))
+                if tgt:
+                    conn.execute(
+                        'UPDATE api_usage_daily SET count=?, ok=?, fail=? '
+                        'WHERE date=? AND provider=? AND interface=?',
+                        (*merged, r['date'], provider, interface))
+                else:
+                    conn.execute(
+                        'INSERT INTO api_usage_daily (date, provider, interface, count, ok, fail) '
+                        'VALUES (?, ?, ?, ?, ?, ?)',
+                        (r['date'], provider, interface, *merged))
+                conn.execute(
+                    "DELETE FROM api_usage_daily WHERE provider='other' AND interface=? AND date=?",
+                    (host, r['date']))
+                moved += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return moved
+
+
 def _load_today_into_mem() -> None:
     global _counters_date
     today = datetime.now().strftime('%Y-%m-%d')
     _counters_date = today
     _counters.clear()
+    # 先把历史误分类的行归位，再回灌内存：否则旧进程内存里的 other/<域名> 键
+    # 会在每次 flush 时把"其他"行重新写回来，用量页永远修不干净。
+    try:
+        merged = merge_legacy_other_rows(today)
+        if merged:
+            print(f'[接口用量] 启动归位 {merged} 行误分类记录')
+    except Exception as e:
+        print(f'[接口用量] 启动归位失败（不影响统计）: {e}')
     try:
         from db.database import load_api_usage_today
         for r in (load_api_usage_today(today) or []):

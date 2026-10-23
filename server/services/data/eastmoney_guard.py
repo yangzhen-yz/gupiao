@@ -27,6 +27,8 @@ AI 诊断的热点板块、龙虎榜、估值分位等热路径各自带 2 次�
 线程安全：调用方有的在事件循环里、有的在 asyncio.to_thread 的工作线程里，
 状态更新用 threading.Lock 保护（持有时间极短，不会成为新瓶颈）。
 """
+import json
+import os
 import threading
 import time
 
@@ -44,6 +46,65 @@ _DOMAIN_COOLDOWN_MAX_SEC = 4 * 3600
 _lock = threading.Lock()
 _state: dict = {}            # scope -> {'streak': int, 'until': float, 'trips': int}
 _domain = {'streak': 0, 'until': 0.0, 'trips': 0}   # 东财全域（IP 级封禁）状态
+
+# 冷却状态跨进程持久化（2026-10-23）：原先只存在内存里，重启一次就等于把"正在封 IP"
+# 忘掉，下一轮又去敲东财；而重启后的首个情绪请求恰好在 2s 预算里等不到结果，
+# 行动台只能显示空壳。落盘后重启仍直接走兜底，既不续封也能立刻显示最近快照。
+_STATE_FILE = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data', 'eastmoney_guard_state.json'))
+_STATE_MAX_AGE_SEC = 86400  # 超过一天的旧状态不再恢复，避免把陈年退避次数带进来
+
+
+def _save_state_locked() -> None:
+    """把当前冷却状态原子写盘（调用方已持 _lock）。失败只打印，不影响请求。"""
+    try:
+        os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
+        doc = {'saved_at': time.time(),
+               'scopes': {k: dict(v) for k, v in _state.items()},
+               'domain': dict(_domain)}
+        tmp = _STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(tmp, _STATE_FILE)
+    except Exception as e:
+        print(f'[东财熔断] 状态写盘失败(忽略): {e}')
+
+
+def _load_state() -> None:
+    """进程启动时恢复仍在冷却期内的状态；过期状态直接丢弃。"""
+    try:
+        with open(_STATE_FILE, encoding='utf-8') as f:
+            doc = json.load(f)
+        if time.time() - float(doc.get('saved_at') or 0) > _STATE_MAX_AGE_SEC:
+            return
+        now = time.time()
+        with _lock:
+            for scope, st in (doc.get('scopes') or {}).items():
+                if not isinstance(st, dict):
+                    continue
+                until = float(st.get('until') or 0)
+                # 冷却中，或失败计数还没到阈值：都恢复，避免重启后从 0 重新累积、
+                # 让封禁期多挨一轮探测。
+                if until > now or int(st.get('streak') or 0) or int(st.get('bstreak') or 0):
+                    _state[scope] = {'streak': int(st.get('streak') or 0),
+                                     'until': until,
+                                     'trips': int(st.get('trips') or 0),
+                                     'bstreak': int(st.get('bstreak') or 0)}
+            dom = doc.get('domain') or {}
+            until = float(dom.get('until') or 0)
+            if until > now or int(dom.get('streak') or 0):
+                _domain.update({'streak': int(dom.get('streak') or 0),
+                                'until': until,
+                                'trips': int(dom.get('trips') or 0)})
+                if until > now:
+                    print(f'[东财熔断] 从磁盘恢复冷却：全域剩余 {int(until - now)}s')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[东财熔断] 状态恢复失败(忽略): {e}')
+
+
+_load_state()
 
 
 def classify(err) -> str:
@@ -77,24 +138,42 @@ def should_retry(err) -> bool:
     return classify(err) != 'blocked'
 
 
-def skip(scope: str = 'default') -> bool:
-    """该不该跳过东财？scope 自己在冷却，**或全域闸门开着**，都算该跳过。"""
+def skip(scope: str = 'default', ignore_domain: bool = False) -> bool:
+    """该不该跳过东财？scope 自己在冷却，**或全域闸门开着**，都算该跳过。
+
+    `ignore_domain=True` 只给**独立边缘节点**用（2026-10-23 人气榜 appdata）：
+    它和 push2/push2delay 不是同一条链路——10-23 当天 clist 只有 17/134 成功、
+    全域在冷却，而 appdata 仍 16/16 成功。把 appdata 一起停掉，热搜榜在整个封禁期
+    就只能空着；所以它只服从自己的 scope 冷却，失败也只关自己（见 fail(kind='flaky')）。
+    """
     with _lock:
         now = time.time()
         st = _state.get(scope)
         if st and now < st['until']:
             return True
+        if ignore_domain:
+            return False
         return now < _domain['until']
 
 
-def ok(scope: str = 'default') -> None:
-    """一次成功：说明 IP 没被封 —— 清掉本 scope 计数，并关掉全域闸门。"""
+def ok(scope: str = 'default', clear_domain: bool = True) -> None:
+    """一次成功：默认清掉本 scope 计数并关掉全域闸门。
+
+    `clear_domain=False` 供**独立边缘节点**使用（2026-10-23 人气榜 appdata）：
+    它和 push2/push2delay 走的不是同一条链路——10-23 当天 clist 只有 17/134 成功、
+    全域在冷却，而 appdata 仍 16/16 成功。此时若用 appdata 的成功去关全域闸门，
+    会让 clist/ulist 立刻提前探测、给封禁续命；所以它只复位自己的 scope。
+    """
     with _lock:
-        _state.pop(scope, None)
-        if _domain['until'] or _domain['streak']:
+        had = bool(_state.pop(scope, None))
+        if clear_domain and (_domain['until'] or _domain['streak']):
             print(f'[东财熔断] {scope} 请求成功 → 全域闸门解除'
                   f'（此前累计 blocked {_domain["streak"]} 次）')
-        _domain.update({'streak': 0, 'until': 0.0, 'trips': 0})
+            had = True
+        if clear_domain:
+            _domain.update({'streak': 0, 'until': 0.0, 'trips': 0})
+        if had:
+            _save_state_locked()
 
 
 def fail(scope: str = 'default', err=None, kind: str = None) -> None:
@@ -137,17 +216,20 @@ def fail(scope: str = 'default', err=None, kind: str = None) -> None:
                 print(f'[东财熔断] 连接级失败累计 {_domain["streak"]} 次 → **全域闸门开启 {dcool}s**：'
                       f'封的是 IP，涨停池/龙虎榜/公告这些路径同期也不再请求东财，'
                       f'直到某次请求成功或闸门到期')
+        _save_state_locked()
 
 
 def reset(scope: str = 'default') -> None:
     """手动复位（自测/管理用）：只清本 scope。全域用 reset_domain()。"""
     with _lock:
         _state.pop(scope, None)
+        _save_state_locked()
 
 
 def reset_domain() -> None:
     with _lock:
         _domain.update({'streak': 0, 'until': 0.0, 'trips': 0})
+        _save_state_locked()
 
 
 def status(scope: str = 'default') -> dict:

@@ -787,11 +787,13 @@ MARKET_ALERT_RISK_THRESHOLD = 40  # 风险评分 >= 此值时触发预警推送
 # 盘中准实时推送：满足条件的候选股实时推送到企业微信（wecom-cli message aibot send）。
 # chat_id 为授权真人用户的内部 ID（机器人"杨珍的机器人"的授权人），仅内部调用，不对外展示。
 WECOM_PUSH_ENABLED = True
-# 智能机器人（aibot 单聊）总开关。2026-10-14 用户决定：**先只用企业微信群聊推送，
-# 单人单聊后做**。关掉它的实际意义不只是"少一条通道"——aibot 权限目前过期，
-# 每轮推送都要白等一次子进程往返才知道失败；关掉后日志与耗时都干净。
-# 将来点了腾讯托管的授权链接、确认 `message aibot send` 能送达，再把这里改 True。
-WECOM_AIBOT_ENABLED = False
+# 智能机器人（aibot 单聊）总开关。2026-10-22 用户决定翻开：准备给同事接扫码绑定
+# （扫机器人码→发一句话→持仓页认领会话→按人推单聊）。注意 2026-10-22 实拍：
+# 机器人「消息」使用权限已过期（sessions list 返回 errcode=850003），
+# 需机器人创建者点企微返回的授权链接续期后才能真正送达；未续期期间发送链路
+# 会走 push.py 的连续失败熔断并回落 webhook，不会卡住提醒。
+# 将来确认 `message aibot send` 能送达后，这条才承担多用户单聊。
+WECOM_AIBOT_ENABLED = True
 WECOM_CLI_CHAT_ID = os.environ.get('WECOM_CLI_CHAT_ID', 'woo0QVPAAAiTuUXPTA8qH_kjcnk1YCSA')   # 授权人 chat_id（内部，优先环境变量 WECOM_CLI_CHAT_ID）
 # wecom-cli 不在系统 PATH（它装在企微连接器的 connector_runtime/artifacts 下）。
 # 留空则由 services/push.py 自动探测：PATH → %LOCALAPPDATA%/*/User Data/Default/
@@ -892,6 +894,36 @@ REC_SIM_MAX_EXPOSURE_PCT = 0.60     # 同日总敞口上限（持仓＋当天新
 SHADOW_EVAL_ENABLED = True
 SHADOW_EVAL_TIME = '16:25'
 SHADOW_EVAL_MIN_DAYS = 10            # 少于 10 个交易日不下结论（10-14 上线，10-30 窗口闭合）
+
+# ========== 评估基座：因子体检（2026-10-22）==========
+# 每周六盘前跑一次本地日K体检，落 eval_lab_runs。只读 history_kline.db/gupiao.db，
+# 不联网、不改推荐；回答"哪些因子在我们的 2462 只范围内还有横截面预测力"。
+EVAL_LAB_ENABLED = True
+EVAL_LAB_TIME = '08:30'              # 周六 08:30（非交易日，不抢盘中任务）
+EVAL_LAB_WEEKDAY = 5                 # 0=周一 … 5=周六
+
+# ========== 数据采集：09:25 集合竞价快照（2026-10-22）==========
+# 用腾讯批量行情，在 9:25 后取竞价匹配价/量。只采选票范围（2462 只），分批请求，
+# 失败静默降级（不阻塞 09:45 推荐）。这是以后做"弱转强"的最小数据前提。
+AUCTION_SNAPSHOT_ENABLED = True
+AUCTION_SNAPSHOT_TIME = '09:25'
+AUCTION_SNAPSHOT_BATCH = 60          # 每批代码数；腾讯 URL 不宜过长
+
+# 5 分钟线前向采集（2026-10-22）：只采"今天被推荐/持仓/候选"的活跃票，不全市场。
+# baostock 已多次判黑，优先走腾讯 5 分钟接口；默认关，先验证字段与落库口径。
+MINUTE5_FORWARD_ENABLED = False
+MINUTE5_FORWARD_TIME = '15:05'
+
+# ========== 卖出规则统一（2026-10-22）：影子先跑，实盘开关默认关 ==========
+# 三套止损（risk_control / position 分档 / review 明日计划）口径不一致是已知短板。
+# exit_rules 生成"固定/逻辑/时间"三机制的统一建议，先作为 exit_plan 影子字段展示；
+# 只有 LIVE 打开才覆盖页面动作与推送。关掉 = 逐字节回到改造前。
+EXIT_RULES_ENABLED = True
+EXIT_RULES_SHADOW_ENABLED = True
+EXIT_RULES_LIVE_ENABLED = False
+EXIT_RULES_TIME_STOP_DAYS = 5        # 持有满 N 个自然日仍没有 +3% 浮盈 → 时间止损提示
+EXIT_RULES_TIME_STOP_MIN_PNL = 3.0   # 时间止损的"及格线"（%）
+EXIT_RULES_LOGIC_MA_DAYS = 20        # 逻辑止损参考均线（收盘跌破 MA20）
 
 # 双源数据交叉校验（2026-10-19，westock 权威源）：每日收盘后把本地资金流/行情与
 # westock（腾讯自选股）比对，权威值=westock（用户决策"不一致的以 westock 为准"）。
@@ -1062,6 +1094,11 @@ def push_muted_today() -> bool:
 SENTIMENT_ENABLED = True
 SENTIMENT_REFRESH_TTL_SEC = 180       # 盘中情绪刷新间隔（秒）：3~5 分钟，压住东财限流风险
 SENTIMENT_SNAPSHOT_SAVE_SEC = 300     # 情绪快照落库间隔（秒），供影子回测/复盘对照
+# 实时涨停池不可用时，允许沿用多少秒内的当日盘中快照。超过才退收评。
+# 2026-10-23 晚修正：原 90 分钟会在下午长冷却时退回昨日收评，用户明确要求
+# “盘中不要显示昨天”。改成 6 小时覆盖整个交易时段（09:15→15:05）；宁可显示
+# 今早的快照并标注 HH:MM，也不把昨天的连板高度当成今天的。查询仍限当日。
+SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC = 21600
 SENTIMENT_ZT_POOL_PAGESIZE = 600      # 涨停池单页拉取上限（全市场涨停极少超过此数）
 SENTIMENT_PREMIUM_MAX_CODES = 200     # 昨日涨停溢价最多查多少只（与 review 口径一致）
 # 情绪周期 → 精选推荐最低分：改门槛而非改扣分，纪律不该被其他因子平均掉
@@ -1093,6 +1130,23 @@ SENTIMENT_VETO_AFTER_MIN = 10 * 60    # 当日分钟数，10:00
 SENTIMENT_LADDER_COLLAPSE_RATE = 0.5
 SENTIMENT_LEADER_FAIL_CHANGE = -5.0
 SENTIMENT_LADDER_MIN_BASE = 3
+
+# ========== 市场主线/支线板块（2026-10-22，计划 crisp-summit-newt） ==========
+# 五维评分：涨停梯队 0.30 + 主力资金 0.30 + 涨幅持续性 0.20 + 量能 0.10，
+# 情绪周期做市场级门槛不做板块分。各维先在数据源内做分位归一——东财 f62 /
+# 新浪 r0 / 旧快照三套口径的绝对额不可跨源比较，分位单调性才可比。
+# 排除维度（政策催化/产业链/业绩支撑）：本仓库无结构化数据源，进分=把主观包装成分数。
+MAINLINE_ENABLED = False              # 总开关：关＝行动台无 sectors 卡、零执行、返回体等于现状
+MAINLINE_REFRESH_TTL_SEC = 300        # 判定缓存（用户要求 5 分钟级）
+MAINLINE_SNAPSHOT_SAVE_SEC = 300      # 判定落库间隔（market_mainline_snapshots，攒影子数据）
+MAINLINE_WEIGHTS = {'limit': 0.30, 'fund': 0.30, 'persist': 0.20, 'volume': 0.10}
+MAINLINE_MIN_SCORE = 62               # 主线门槛（冰点/退潮档 +8）
+MAINLINE_SUB_MIN_SCORE = 42           # 支线地板；最高分低于它 → "无主线"（空仓哨兵）
+MAINLINE_GAP = 10                     # 第2主线与第1分差≥此值 → 断层，只留1个
+MAINLINE_JUDGE_AFTER_MIN = 10 * 60    # 10:00 前不判 main（与情绪否决同一分钟数）
+MAINLINE_FLOW_STALE_SEC = 7200        # 资金流快照超 2h → 不判 main（旧资金定不了今日主线）
+SECTOR_MIN_MEMBERS = 8                # 板块持续性聚合的最少成员（交集口径），不足 → None
+DESK_SECTOR_CHIPS_IN_SENTIMENT = False  # 情绪条上的 leadSectors chip（名单归一到新卡后默认撤）
 
 # ========== 因子权重学习开关（2026-10-14） ==========
 # 背景：strategy._adjust_weights 自 2026-09-04 起每次抛 AttributeError
