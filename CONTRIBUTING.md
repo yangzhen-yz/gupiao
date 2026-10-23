@@ -22,6 +22,9 @@ fix/<描述>     缺陷修复，同上
   - 要在不动线上的前提下长时间实验，用 `git worktree add` 另开一棵树，但那棵树**不得起 3003**，且 `server/data/`（数据库）不在版本控制里，需要显式指向同一数据目录或另建库——**双树并发写同一个 SQLite 的风险未验证，不作为默认做法**；
   - 改动合入 `main` 后要生效，走既有标志重启：写 `server/data/backend_restart_requested`，看护 ≤5 分钟自己重启。
     不要用 `taskkill` 杀那个进程（它属 SYSTEM，会话里杀不掉；你新起的进程只会因 `[Errno 10048]` 端口占用退出，而日志照样打"startup complete"，看着像重启成功其实还在跑旧代码）。
+  - **合入后先确认 fetch 成功，再切回 `main`**。这台机器到 `github.com:443` 是间歇性不通（实测 2026-10-23 深夜：`api.github.com` 返回 200，但 `git ls-remote origin` 全部 `Failed to connect`），
+    此时本地 `refs/remotes/origin/main` 还是**合并前的旧值**。在这种状态下 `git switch main` 会把工作树换成旧代码，而线上服务直接读这份工作树——等于把刚合入的东西从线上撤掉。
+    判据：`git fetch --prune origin` 必须成功，且 `git log --oneline -3 origin/main` 里能看到预期的合并提交，才允许切回；fetch 不通就停在原分支等网络。
 
 ## 2. PR / MR 前置条件
 
