@@ -81,7 +81,8 @@ def create_user(username: str, password: str, display_name: str = ''
         uid = next_id
         conn.close()
         return True, '注册成功', {'id': uid, 'username': username,
-                                  'displayName': display_name or username}
+                                  'displayName': display_name or username,
+                                  'isAdmin': False}
     except Exception as error:
         return False, f'注册失败: {error}', None
 
@@ -186,7 +187,8 @@ def authenticate(username: str, password: str
                     (_now_utc(), row['id']))
         conn.commit()
         user = {'id': row['id'], 'username': row['username'],
-                'displayName': row['display_name'] or row['username']}
+                'displayName': row['display_name'] or row['username'],
+                'isAdmin': bool(row['is_admin'] or 0)}
         conn.close()
         return user, token, None
     except Exception as error:
@@ -200,7 +202,7 @@ def get_user_by_token(token: str) -> Optional[Dict]:
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute('''SELECT u.id, u.username, u.display_name, s.expires_at
+        cur.execute('''SELECT u.id, u.username, u.display_name, u.is_admin, s.expires_at
                        FROM user_sessions s JOIN users u ON u.id = s.user_id
                        WHERE s.token = ?''', (token,))
         row = cur.fetchone()
@@ -211,7 +213,8 @@ def get_user_by_token(token: str) -> Optional[Dict]:
             logout(token)
             return None
         return {'id': row['id'], 'username': row['username'],
-                'displayName': row['display_name'] or row['username']}
+                'displayName': row['display_name'] or row['username'],
+                'isAdmin': bool(row['is_admin'] or 0)}
     except Exception as error:
         print(f'会话校验失败: {error}')
         return None

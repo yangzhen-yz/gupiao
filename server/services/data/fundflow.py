@@ -696,6 +696,66 @@ def _hidden_key(change_threshold, hot_top_n, hidden_top_n) -> str:
     return f"{change_threshold}|{hot_top_n}|{hidden_top_n}"
 
 
+def peek_sector_flow() -> Dict:
+    """只读板块资金流（2026-10-22，供主线判定）：**零请求、绝不触发新浪全市场扫描**。
+
+    mainline 在行动台热路径上跑，若走 get_fund_flow_summary 可能连带 12~18s 的
+    sweep（9.2s 事故同类）。本函数只按 内存缓存 → _LAST_GOOD → DB 快照 的顺序读，
+    读到什么算什么，返回 {rows, src, ts}；src='none' 时由调用方降级。
+    口径判别：行里带 chgCaliber 的是新浪×本地行业聚合（国标行业名），否则是东财 f62。
+    """
+    for entry in _CACHE.values():
+        sec = (entry.get('data') or {}).get('sectors') or {}
+        if (sec.get('industry') or {}).get('inflow'):
+            return {'rows': sec, 'src': 'cache', 'ts': float(entry.get('ts') or 0)}
+    lg = _LAST_GOOD.get('sectors')
+    if not lg:
+        snap = load_fund_flow_snapshot('sectors')
+        if snap and isinstance(snap, dict) and 'data' in snap:
+            lg = snap
+            _LAST_GOOD['sectors'] = lg
+    if lg and lg.get('data'):
+        return {'rows': lg['data'], 'src': 'lastgood', 'ts': float(lg.get('ts') or 0)}
+    return {'rows': {}, 'src': 'none', 'ts': 0.0}
+
+
+async def soft_refresh_sector_flow(top_n: int = FUND_FLOW_SECTOR_TOP_N) -> bool:
+    """服务端板块保活（2026-10-22，为主线判定供数）：没人开资金流页时板块榜不会自己刷新，
+    主线会一直"资金流缺失/超2小时"。由调度器在主线预热前触发，30 分钟节流：
+    · clist 未熔断 → 2 次 clist（≈4 次/小时，远低于 10-19 那次 840 次/小时的封禁阈值）；
+    · clist 熔断/失败 → 新浪×本地行业聚合（与资金流页 cooling 分支同一兜底；
+      概念无本地分类仍空，行带 chgCaliber、mainline 按源内分位处理口径差异）。
+    失败静默：mainline 会按 peek 的降级矩阵如实处理，绝不拿旧资金装新判定。"""
+    pf = peek_sector_flow()
+    if pf['src'] != 'none' and time.time() - pf['ts'] < 1800:
+        return False
+    s = None
+    if not _clist_circuit_open():
+        try:
+            s = await get_sector_fund_flow_rankings(top_n)
+        except Exception:
+            s = None
+    if not s or not (s.get('industry') or {}).get('inflow'):
+        # sina 兜底。注意：不能用 _sina_sector_rankings 的默认路径——它内部是
+        # "后台起算、本轮最多等 6s 返回 None"的设计（页面轮询场景下不卡响应），
+        # 而调度器是 asyncio.run 的一次性循环，后台任务会随循环退出被杀 → 死循环空转。
+        # 所以这里直接 await 扫描算完（~18s，调度器是独立线程，代价是本轮 tick 晚 18s，
+        # 30 分钟一次可接受）；正有人算时让路，下个 tick 再来。
+        if _SINA_COMPUTING:
+            return False
+        try:
+            await _sina_compute_snapshot()
+            s = await _sina_sector_rankings(top_n)
+        except Exception:
+            s = None
+    if s and ((s.get('industry') or {}).get('inflow') or (s.get('concept') or {}).get('inflow')):
+        now = time.time()
+        _LAST_GOOD['sectors'] = {'data': s, 'ts': now}
+        save_fund_flow_snapshot('sectors', {'data': s, 'ts': now})
+        return True
+    return False
+
+
 async def get_fund_flow_summary(
     stock_top_n: int = FUND_FLOW_STOCK_TOP_N,
     sector_top_n: int = FUND_FLOW_SECTOR_TOP_N,

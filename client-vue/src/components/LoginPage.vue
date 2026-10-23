@@ -6,8 +6,8 @@
         <div class="login-sub">每个账号的持仓独立保存，互不可见</div>
       </div>
 
-      <!-- 登录 / 注册 切换 -->
-      <div class="login-tabs">
+      <!-- 登录 / 注册 切换：注册关闭时只剩一个「登录」，整条不渲染，避免看起来像两个登录按钮 -->
+      <div v-if="allowRegister" class="login-tabs">
         <button :class="['login-tab', { active: mode === 'login' }]" @click="switchMode('login')">登录</button>
         <button
           v-if="allowRegister"
@@ -95,7 +95,9 @@
   const mode = ref('login')
   const busy = ref(false)
   const error = ref('')
-  const allowRegister = ref(true)
+  // 初始按「注册关闭」渲染，等 /api/auth/status 回来再决定是否显示切换条：
+  // 反过来会给出一帧「登录 + 注册」的闪烁，而注册关闭时只剩一个 tab 又没有意义。
+  const allowRegister = ref(false)
   const hasUser = ref(true)
   const firstUserHint = ref(false)
   const existingUsers = ref([])

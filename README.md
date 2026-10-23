@@ -8,7 +8,7 @@
 
 | 分组 | 页面 | 回答的问题 |
 |------|------|------------|
-| 首页 | **行动台** (`tab-desk`) | 现在这个时刻该做什么：买入区/持仓处理/环境否决，情绪周期直接参与硬拦 |
+| 首页 | **行动台** (`tab-desk`) | 现在这个时刻该做什么：买入区/持仓处理/环境否决，情绪周期直接参与硬拦（盘中数据降级时只提示不拦并标注沿用时间；收盘后展示**今日收盘定版**——收评未生成先用今日快照顶住，不拿昨日充今天） |
 | 盘面 | 实时行情 · 股票筛选 · 趋势发现 · 资金流向 | 价、量、形态、板块资金在说什么 |
 | 决策 | 智能推荐 · 持仓管理 · 模拟交易 | 推哪 3 只（含买卖点与买入时机）、手里的怎么处理、不改真钱先验证想法 |
 | 复盘 | 每日收评 · 自动优化 · **口径与开关** | 昨天推得对不对、权重该怎么调、六条选股口径与各项阈值现场改 |
@@ -61,7 +61,7 @@ gupiao/
 │   │                             # fundflow（资金流三级回退）· eastmoney_guard（共享熔断）
 │   │   ├── pick/                     # 选股：candidate_pool（盘前海选）· recommend（13 因子评分）
 │   │   │   └── ...                   # recommend_review（T+1/3/5 复盘 + 黑名单）· strategy_snapshot
-│   │   ├── strategy/                 # 策略：sentiment（情绪周期）· buy_rules（买法矩阵）· trend
+│   │   ├── strategy/                 # 策略：sentiment（情绪周期）· mainline（主线/支线板块）· buy_rules（买法矩阵）· trend
 │   │   │   └── ...                   # rps · risk_control · market（大盘预警）· pattern · factor_ic
 │   │   ├── portfolio/                # 持仓：position · position_watch（止损止盈盯盘）· trade_sim
 │   │   ├── support/                  # 支撑：auth（多用户）· push/push_channel（企微）
@@ -104,6 +104,13 @@ start.bat            # Windows 双击即可：构建前端 → 装依赖 → 起
 > 守护按自己拉起时的命令行（`-c "import uvicorn; ... reload=False"`）判断后端活没活，
 > `run.py` 的 reload 形态守护认不出 → 误判"没在跑"→ 再拉一个 → 抢 3003 端口。
 > 手动起服务用 `server/analysis_out/serve_3003.py`（reload=False，与守护同口径）。
+>
+> ⚠️ **改完代码要让后端重启才能生效，但看护拉起的进程会话杀不掉**（任务计划以 SYSTEM 运行，
+> 非管理员 `taskkill` 直接"拒绝访问"；此时自己再起一个会因 3003 被占而 `[Errno 10048]` 退出，
+> 日志照样打印"启动完成"，看着像重启成功、实际还在跑旧代码——2026-10-23 晚踩过）。
+> 正确做法：写标志文件 `server/data/backend_restart_requested`，看护下一轮（≤5 分钟）读到就
+> 自己杀进程树→拉起新代码→删标志→推企微；工作日 09:10~15:10 之间只推迟不重启，避免打断推荐批次。
+> 重启后务必核对"接口返回里新字段有没有"，不要只看 `/api/health` 200。
 
 访问 <http://localhost:3003> 使用应用；API 文档在 <http://localhost:3003/docs>。
 
@@ -119,7 +126,7 @@ start.bat            # Windows 双击即可：构建前端 → 装依赖 → 起
 4. 「口径与开关」子页里能改配置的是**最早注册的那个账号**（`users` 表没有角色列，
    只能这样定管理员；想指定别人就改 `SETTINGS_WRITE_USER_IDS`）
 
-不想开放自助注册 → `AUTH_ALLOW_REGISTER = False`；想整体关掉登录（回到单用户）→ `AUTH_ENABLED = False`。
+不想开放自助注册 → `AUTH_ALLOW_REGISTER = False`；想整体关掉登录（回到单用户）→ `AUTH_ENABLED = False`。注册关闭时，登录页不会渲染「登录 / 注册」切换条（只剩提交按钮），避免看起来像两个登录。
 
 ### 前端开发模式（可选）
 
@@ -151,8 +158,9 @@ pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 
 | 优先级 | 数据源 | 说明 |
 |--------|--------|------|
-| 主要 | 东方财富热搜榜（`hot_search_daily_snapshot` 表） | 3 类榜单合并：真实人气榜前100 + 涨幅榜前100 + 成交额榜前400，去重后约 470～500 只沪深主板 |
-| 备用 | `HOT_STOCK_POOL` + `stock_basic_info` | 热搜榜为空时的本地股票池 |
+| 主要 | 东方财富热搜榜（`hot_search_daily_snapshot` 表） | 3 类榜单合并：真实人气榜前100 + 涨幅榜前100 + 成交额榜前400，去重后约 470～500 只沪深主板。东财封禁期人气榜（`appdata`）独立可取（约 45～50 只主板）；涨幅/成交额榜冷却时自动降级，空结果不覆盖已有缓存；行情源被熔断时依次用本地基础信息补名称、腾讯批量行情补价格（一次几十只） |
+| 备用1 | 同花顺热股榜（小时榜，`dq.10jqka.com.cn/.../hot_list/v1/stock`） | 东财人气榜为空（冷却/封禁）时自动取它：免登录返回前 100 只（实测沪深主板 85 只），带名称与名次；本轮来源记在 `hot_search_meta.source`（`eastmoney`/`ths`），接口 `/api/hot_search_ranking` 一起返回 |
+| 备用2 | `HOT_STOCK_POOL` + `stock_basic_info` | 热搜榜为空时的本地股票池 |
 
 ### 2. 趋势股入选条件（中短线波段评分，V4.0）
 
@@ -419,6 +427,8 @@ pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 
 **节假日处理**：非交易日不触发自动刷新；前端检测到非交易日时，直接使用缓存数据并显示"休市"。
 
+**涨跌幅展示（2026-10-23）**：趋势卡片在现价下方显示当日涨跌幅，筛选页在手机/窄窗固定保留「名称 / 现价 / 涨跌幅 / 综合评分」四列，统一 A 股红涨绿跌。趋势页的数据来自同一次扫描快照（`details.changePercent`，随 `details_json` 落库）；旧快照没有该字段时用 `recent5Days[-2]`（昨收）与 `latestPrice` 回退，再取不到显示灰色「—」，**不填假 0.00%**。表格列显隐由各 Tab 自己负责，`main.css` 不再按 `nth-child` 全局藏列。
+
 ### 7. 关键配置项（`server/app/config.py`）
 
 | 配置项 | 默认值 | 说明 |
@@ -466,7 +476,7 @@ pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 
 | 频率 | 任务 | 说明 |
 |------|------|------|
-| 每 180 秒（09:15～15:05） | 短线情绪温度计刷新 | 涨停池/炸板池/跌停池/宽度 → 周期档位与弱信号，落 `market_sentiment_snapshots` |
+| 每 180 秒（09:15～15:05） | 短线情绪温度计刷新 | 涨停池/炸板池/跌停池/宽度 → 周期档位与弱信号，落 `market_sentiment_snapshots`；三池明细每 180s 落 `limit_pool_daily`（16:10 收评再按定版覆盖一次）。实时不可用时依次沿用**当日最近盘中快照（≤6 小时，`SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC=21600`，覆盖整个交易时段且仍限当日）**、最近收评；卡片会标"沿用 HH:MM 快照 / 沿用 MM-DD 收评 · 只提示不拦"，兜底值不回写快照表。**收盘后另走定版链**：今日收评 → 今日最近盘中快照（`snapshot_final`）→ 最近收评，`final=True` 只改页面措辞（"收盘定版"），`stale` 仍为真、不给否决权 |
 | 每 60 秒（09:31～14:57） | 达标候选股推送企微 | 范围 = 用户池 ∪ 当日推荐 ∪ 海选前 N；日限额 `WECOM_PUSH_DAILY_LIMIT`；查亏损黑名单 |
 | 每 20 秒（09:30～15:00） | 持仓止损/止盈快反 | 只盯自己的持仓，触发才推（`POSITION_WATCH_*`） |
 
@@ -478,17 +488,21 @@ pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 | 09:00 | 盘前海选（本地日K算 RPS/接近高点，出候选池） | `daily_candidate_pool`（只留最近 2 天） |
 | 09:15 | 推送「明日计划 / T+1 卖出提示」 | 企微 |
 | 09:25 | 推送今日关注池预览 | 企微 |
+| 09:25 | **集合竞价快照**（腾讯批量；严格 09:24～09:31 窗口内才落库，晚到就放弃当天，绝不用盘中价冒充竞价价） | `auction_snapshot`（开关 `auction_snapshot_enabled`） |
 | 09:35 / 10:00 / 10:30 / 13:05 / 14:00 | 大盘风险预警扫描 | `server/market_alert.json`（前端轮询，不入库） |
 | 09:45 / 10:00 / 13:30 / 14:05 / **14:45** | 生成智能推荐（**上午两次、下午三次**；10:00 这一枪是 2026-10-19 加的——09:45 只有开盘 15 分钟，涨幅段还没成形、闸门判不准，而 10-19 当天 09:45 赶上网络故障整批静默失败、第一批拖到 10:18 才出；14:45 是收盘前最终快照。同一 `rec_date` 的记录先删后插，盘中各时点推了什么按 slot 回 `strategy_snapshot` 看） | `daily_recommendations` + `recommend_shadow_log` + **`strategy_snapshot`** |
 | 09:00～15:00 每 30 分钟 | 趋势股扫描（全量替换趋势池） | `trend_scan_results` |
 | 10:00 / 14:00 | 更新东方财富热搜榜 | `hot_search_daily_snapshot` |
 | 15:05 | 用户池 MA10/连跌检查删除 | 用户股票池 |
+| 15:05 | 活跃票 5 分钟线前向采集（**默认关闭** `minute5_forward_enabled`；只采当天推荐/持仓/海选池约百只，不全市场，避免拖住 15:10 收评） | `history_minute.db` 的 `minute_5m` |
 | 15:10 | 生成每日收评（含情绪五维） | `daily_market_reviews` |
 | 15:20 | 回测昨日预测并调整策略权重 | `strategy_factor_weights` |
 | 15:30 | 趋势评分 1/3/5 日回测 | `trend_backtest_records` / `reports` |
 | 15:35 | 自动优化（权重 + 角色门槛 + 周一网格搜索） | `optimization_history` |
 | 16:10 | 推荐复盘：全部历史推荐 T+1/T+3/T+5 与黑名单 | `recommendation_review` |
 | 16:20 | 可成交性日常监控（三入口×两卖法落点，一切"放宽/多推"提案的验收基线） | `rec_sim_daily` |
+| 盘中每 180s（09:15~15:05） | 主线/支线判定（情绪预热之后顺带跑，行动台 sectors 卡的数据源）；**收盘后为定版判定**：用当日涨停池明细重建结构（`close_final`）、接受同日最后一份资金快照、持续性表落后当日时强制重算（10 分钟节流），`final=true / nextJudgeAt=''` | `market_mainline_snapshots` |
+| 09:05 / 20:25 | 板块持续性预热（本地日K×行业聚合近10日等权收益，主线判定的分母）；收盘定版发现表落后会立即补算一次 | `sector_persistence_daily` |
 | 20:30 | 上午档/下午档拆批次回测（名单从快照还原；排在日K同步批次之后，当天名单才不会被判"无当日K线"） | `rec_sim_batch_daily` |
 | 16:25 | 影子对照日常监控（放行 vs 被挡 T+1；满 10 个交易日才给上线判据） | `recommend_shadow_eval` |
 | 16:30 | 双源数据校验（本地 vs westock 权威源；行情不一致告警、资金流记符号冲突） | `westock_snapshot` + `data_cross_check` |
@@ -498,9 +512,11 @@ pnpm install && pnpm run dev     # 代理 /api/* 与 /eastmoney/* 到后端 3003
 | 每周二 03:30 | 行业分类周更（baostock 全量落 `stock_industry_map`；东财被封时资金流向的行业列/板块聚合靠它） | `stock_industry_map` |
 | 每周日 18:30 | 总市值/流通市值刷新（选票范围据此剔小微盘） | `stock_market_cap` |
 | 每周六 03:00 | 清过期缓存 + VACUUM | 防 SQLite 膨胀 |
+| 每周六 08:30 | 本地因子体检（全市场横截面 IC、分组超额、逐月拆分；只读本地日K不联网，约 1 分钟） | `eval_lab_runs` + `analysis_out/factor_lab_*.json` |
 
 > **非交易日一律跳过盘中与当日任务**（`services/data/trading_calendar.is_trading_day`）——
-> 否则周六 15:10 那份"空收评"会把周五的真实收评顶掉。盘后慢变数据另有一套**贴着源头披露周期**的节奏
+> 否则周六 15:10 那份"空收评"会把周五的真实收评顶掉。唯一例外是**周六 08:30 的本地因子体检**：
+> 只读本地库、不联网、不写当日业务数据，选周末跑是为了不占盘中调度线程。盘后慢变数据另有一套**贴着源头披露周期**的节奏
 > （2026-10-19 降频专项，`app/config.py` 的 `SLOW_DATA_*`，重启生效）：股东户数**周一/周四**、基本面**周一**，
 > 财报季（1/3/4/7/8/10 月）自动恢复每日含周末——那几个月周末公告最密，新披露不能等一周；
 > 估值分位**仅交易日**（周末没有新收盘价，拉回来还是同一份）。这三位非刷新日只打一行日志、零请求，
@@ -749,7 +765,7 @@ v2 改判「**当日是否存在突破价成交**」，价位按前收精确算�
 |---|---|---|
 | `REC_SIM_SIZING_V2` | **False** | 总开关。关掉＝上面那行老规则，曲线逐字节不变 |
 | `REC_SIM_RISK_PER_TRADE` | 1.5% | 每笔只让账户承担这么多风险，仓位＝它 ÷ 止损幅度 |
-| `REC_SIM_STOP_PCT` | 8% | 折算用止损幅度（注意线上三套止损还没统一，见任务 #11） |
+| `REC_SIM_STOP_PCT` | 8% | 折算用止损幅度（线上三套止损已统一到 `exit_rules`，默认影子、见 §9.6；回测仍按固定 8% 保守折算） |
 | `REC_SIM_MAX_POSITION_PCT` | 25% | 单票占净值上限，专治"当天只 1 只就押满" |
 | `REC_SIM_MAX_EXPOSURE_PCT` | 60% | 同日总敞口（持仓＋当天新买单），剩下留作现金 |
 
@@ -776,6 +792,95 @@ v2 改判「**当日是否存在突破价成交**」，价位按前收精确算�
 凯利的行为方式：期望越高越该重仓，期望接近零时重仓只是在放大噪声。**这是"10-24 之后要不要采用"的判据**，
 不是现在就改线上：先跑对照，别拿 3 个月单窗口当定论。对照图
 `docs/资金曲线-仓位规则对照.svg`，脚本 `server/analysis_out/position_sizing_compare.py`。
+
+### 9.5 市场主线/支线板块（2026-10-22，行动台 sectors 卡，影子期）
+
+`services/strategy/mainline.py` 把四路**已在内存/本地**的数据合成一份主线判定，
+行动台在"短线情绪"下面渲染"🎯 市场主线"卡（顺序=先情绪→再主线→最后个股）。
+**零新增外部请求**：涨停结构复用 sentiment 缓存（180s），板块资金走
+`fundflow.peek_sector_flow()`（只读缓存/快照；另有 30 分钟节流的服务端保活
+`soft_refresh_sector_flow`：clist 通就 2 次请求，被封改走新浪×本地行业聚合——
+调度器是 asyncio.run 的一次性循环，所以保活里直接 await 扫描算完，不能依赖
+"后台起算本轮返回 None"的页面式设计），持续性读本地日K×行业映射表。
+
+- **五维评分**（各维在数据源内做分位归一——东财 f62/新浪 r0/旧快照三套绝对额不可跨源比）：
+  涨停梯队 0.30（孤军 1 只 ×0.55 惩罚、封单质量修正）＋主力资金 0.30（净流出该维记 0）
+  ＋涨幅持续性 0.20（近 5/10 日成员交集·截尾均值·复利，`sector_persistence_daily`，
+  09:05/20:25 预热）＋量能 0.10；情绪周期做市场级门槛（冰点/退潮主线门槛 +8）不做板块分。
+- **分层**：主线 ≤2（分≥62 且最高连板≥2；与第 2 名断层≥10 只认一条）、支线 ≤5、
+  退潮（昨日主线今日资金转负/梯队清零，绿色 chip）、无主线（最高分<42 → 给 reason，
+  对应游资心法的空仓哨兵）。10:00 前不判、涨停池 degraded 只出候选、资金快照>2h 不判。
+- **收盘定版（2026-10-23 晚）**：休市后不再按盘中闸门挂起——① 情绪走定版链（今日收评 →
+  今日快照 `snapshot_final` → 最近收评），`final=True` 只改页面措辞、不给否决权；
+  ② 主线用 `limit_pool_daily.raw` 重建当日 `leadSectors`（收评只存总量，没有板块清单），
+  资金接受与定版同一交易日的 lastgood（实测 `flowAt=10-23 14:38`、龄期 5 小时仍可用），
+  持续性表落后当日时 10 分钟节流强制重算；③ `meta` 给
+  `final / finalAsOfDate / sources.zt='close_final' / flowAt / nextJudgeAt=''`，行动台显示
+  "收盘定版 · 资金 HH:MM"而不是"下次判定"；④ 行动台并发拉情绪与主线，非交易时段
+  `get_sentiment()` 直接短路 `_final_fallback()` 绕开 singleflight，主线抢锁失败改用
+  `peek_cached(900)` 且不写缓存——否则空壳"刷新中"会污染 180 秒。已知边界：东财行业名
+  "通用设备"与国标"通用设备制造业"映射未成熟，该维缺资金分（61.9 < 62），当日主线落在
+  软件开发 62.3；`sub` 会混入 0 涨停的纯资金候选，属既有评分口径，未改。
+- **跨分类映射**：涨停池 hybk 是东财行业名、持续性表是 baostock 国标名——
+  `sector_taxonomy_vote` 用代表股逐日投票（≥3 票且 share≥60% 才认），映射未成熟
+  宁可"持续性缺维＋dataGaps 点名"，不瞎配。
+- **明确排除**：政策催化/产业链/业绩支撑无结构化数据源，不进分（文档写明，防后人"补上"）。
+- **影子期**：每 300s 落 `market_mainline_snapshots`（保留 90 天）；recommend/cycle_gate/
+  推送一律不消费。≥15 个交易日后按 `factor_ic` 口径做分组单调性/IC 校准，调权走
+  v0.1/v0.2 双写，判据成立才切——禁止改 config 直接变线上。
+- **开关**：`mainline_enabled`（覆盖表·市场主线，live）关掉=行动台无此卡、零执行、
+  返回体逐字节等于改造前；`desk_sector_chips` 可把情绪条的板块 chip 恢复回来。
+  自测 `analysis_out/mainline_selftest.py` 29 项（含零网络硬证明与开关等价性）。
+- 与筛选页 `utils/mainline.js` 的**手维护词库是两套口径**：词库匹配股票名称关键词、
+  标"词库口径·人工维护"；服务端这份才是数据判定。第三阶段计划让词库退役。
+
+### 9.6 可执行超额、因子体检、统一卖出与数据采集（2026-10-23）
+
+这一节是"把评价口径补齐"的一批改动：**不改变线上选股**，先让"推荐到底有没有超额""卖出按什么规则""哪些数据还没采"三件事有数字可查。
+
+**① 可执行超额（次日开盘买，持 N 日开盘卖）**
+
+- 实现 `services/pick/rec_sim.py::open_hold_excess()`，接口 `GET /api/recommend-excess?months=6`（30 分钟缓存，首算约 4 秒）。
+- 口径：推荐日**下一交易日开盘买**，持 1/3/5/10 个交易日**开盘卖**；次日一字涨停买不到跳过；费用双边（佣金万 2.5 + 卖出印花千 1 + 过户万 0.1）；基准＝同一选票范围 1094 只、同买入日同持有期等权，逐条配对后平均。它回答"推荐是否跑赢同范围"，与上方资金曲线（组合层净值）是两件事。
+- 6 个月实测（2026-04-20～10-22，229 条推荐，有效 217/214/210/201 条）：
+
+| 持有 | 扣费后均值 | 同期等权基准 | **超额** | 胜率 |
+|---|---|---|---|---|
+| 1 日 | -1.26% | -0.32% | **-0.94pp** | 41.9% |
+| 3 日 | -2.03% | -0.52% | **-1.51pp** | 39.3% |
+| 5 日 | -3.09% | -0.64% | **-2.46pp** | 40.5% |
+| 10 日 | -4.87% | -0.87% | **-4.00pp** | 35.8% |
+
+逐月看 5/6/8 月超额为正，7 月 -10.59pp 是最大负月。**结论：当前推荐既没有绝对收益、也没有同范围超额；任何"提高胜率"的改动都要拿这张表验收，而不是只看几条漂亮样本。**
+
+**② 因子体检（每周六 08:30，`analysis_out/factor_lab.py`）**
+
+- 全市场 2462 只 × 85 个截面（2025-01-03～2026-09-28）→ 输出 `eval_lab_runs`；接口 `GET /api/eval-lab/latest`（登录可读）、`POST /api/eval-lab/run`（管理员，后台跑）；回测页新增「因子体检」折叠表（按 5 日 IC 降序，列 IC / t / Q5-Q1）。
+- **读结果只查库，跑体检走子进程**：`GET latest` 不再 import `factor_lab.py`，周六任务/手动触发通过 `services/support/eval_lab.py::run_analysis()` 调 `factor_lab.py --store`，自动挑能 `import numpy` 的解释器（可用 `EVAL_LAB_PYTHON` 指定）——2026-10-23 实测服务的 reload worker 里没有 numpy，直接在 web 进程 import 会 500，也不该让 web 进程背 pandas。子进程跑一遍约 47 秒。
+- 首跑关键结果（5 日 IC / t 值）：`rev20` +0.063 / 3.46（**20 日反转是最稳的正 IC**）、`maxret20` +0.061 / 3.29、`lowvol20` +0.056 / 2.23、`vol_shrink` +0.040 / 3.33；负 IC 端 `limit20` -0.067 / -4.81、`liq20` -0.053 / -3.31、`ma20_gap` -0.047 / -2.60、`mom60` -0.042 / -2.45。组合里只有 `rev20+shrink`（5 日超额 +0.12pp）与 `pullback+shrink+weak`（+0.06pp）勉强为正。
+- 这解释了为什么 **RPS 不能直接加权**：RPS 本质是 60 日动量，而 `mom60` 在本段样本 IC 为负。RPS 先落影子（见 ④）。
+
+**③ 统一卖出（`services/portfolio/exit_rules.py`，默认影子）**
+
+- 三机制：固定止损（风控线 vs 移动止盈线取高）、逻辑止损（收盘跌破 MA20）、时间止损（持有 ≥5 个自然日且收益 <3%）；优先级 固定 > 逻辑 > 时间。
+- 默认 `EXIT_RULES_ENABLED=True / SHADOW=True / LIVE=False`：`position.diagnose_position` 返回体多一个 `exit_plan`，只提示不改 `action`；把 live 打开后才覆盖动作（固定→`stop_loss`，逻辑/时间→`reduce`）。总开关关掉时 `exit_plan={enabled:false}`，原有字段逐字节不变。
+- 参数：`EXIT_RULES_TIME_STOP_DAYS=5`、`EXIT_RULES_TIME_STOP_MIN_PNL=3.0`、`EXIT_RULES_LOGIC_MA_DAYS=20`（改 config 需重启；shadow/live 在覆盖表可热改）。
+- ⚠️ 还没做的是"同一批历史推荐上四组合（开盘卖/尾盘卖/移动止盈/止损）的回测对照"——那是决定 live 是否打开的前提。
+
+**④ 影子信号（只记录，不参与评分）**
+
+- `strategy_snapshot.rps_shadow`：每只候选落 `{rps, strong(≥80), pullback(现价相对 MA20 偏离 0～5%), shrink(量比<1), verdict[]}` 三种口径，攒够样本再比分组超额。
+- 涨幅段双买价（`analysis_out/gain_band_dual_price.py`，215 条）：0～3% -4.32%、3～5% -2.73%、**5～7% +2.43%（唯一正档，n=28）**、7～9.5% -1.67%、≥9.5% -4.39%（比参考价口径再差 2.50pp）。线上闸门（砍 0～2%、4.5～9.8%）**不改**：样本太薄，且两套买价不能互相否定；先攒 ≥60 对影子样本。
+
+**⑤ 数据底座（先采集，不消费）**
+
+| 数据 | 落点 | 说明 |
+|---|---|---|
+| 09:25 集合竞价 | `auction_snapshot` | 竞价价/高开幅度/竞量/竞额/买卖一；严格 09:24～09:31 写入；接口 `GET /api/auction/latest` |
+| 涨停/炸板/跌停三池 | `limit_pool_daily` | 180s 采、16:10 定版覆盖；价格转元、`raw` 留原始 JSON |
+| 活跃票 5 分钟线 | `history_minute.db` 的 `minute_5m` | 腾讯 m5 前向采集（默认关）；成交量手→股，接口不返成交额故 `amount` 为空——**不拿 volume×price 估一个数冒充成交额** |
+
+开关：`eval_lab_enabled`（默认开）、`auction_snapshot_enabled`（默认开）、`minute5_forward_enabled`（**默认关**）、`exit_rules_shadow_enabled` / `exit_rules_live_enabled`（默认 1 / 0），均在「复盘 → 口径与开关」热改。
 
 ### 10. 统一评级阈值（`client-vue/src/utils/score.js` `getRating`）
 
@@ -806,6 +911,9 @@ const r = getRating(stock.score)   // { label, short, color }
   - 腾讯财经API：获取股票实时行情和K线数据
   - 东方财富API：获取热搜榜/板块数据，并通过 FastAPI 路由 `/eastmoney/*` 代理推送给前端（统一使用 `requests + asyncio.to_thread`，避免 `httpx.AsyncClient` 直连 `push2.eastmoney.com` 的 Server disconnected 问题）
   - 人气榜API：`emappdata.eastmoney.com/stockrank/getAllCurrentList`（东方财富股吧真实人气榜，需 `httpx` 库 POST 访问，`requests` 会被服务器拒绝连接）
+  - 人气榜熔断：`appdata` 是独立 scope，不受 push2 全域闸门连带停止；成功不关全域、失败只冷自己。热搜榜抓空时保留上一份缓存，不覆盖、不删当日快照；行情源被熔断、名称/价格缺失时，先用本地 `stock_basic_info` 补名称（零外部请求）、再用腾讯批量行情补价格（一次 60 只），避免空名让 ST/退市过滤失真、价格缩水或为 0。另注意 `ulist.np` 用 `fltt=2`，返回的 f2/f3/f4 已是真实数值，不能再除 100
+  - 热搜榜备源：东财人气榜返回空时自动改用同花顺热股榜（`dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock`，`type=hour`，免登录、前 100 只带名称与名次，`Referer: eq.10jqka.com.cn`，120 秒缓存）；本轮用了谁记在 `hot_search_meta.source`（`eastmoney`/`ths`），`/api/hot_search_ranking` 一并返回
+  - 接口用量登记：`api_usage._HOST_EXACT` 里没有的域名不会丢计数，但会挂到"其他"下、没有上限预警（2026-10-23 补齐 `dq.10jqka.com.cn→同花顺·热股榜`、`vip.stock.finance.sina.com.cn→新浪·行情`、`push2ex.eastmoney.com→东财·涨停池`、`smartbox.gtimg.cn→腾讯·搜索联想`，历史 9 行用 `analysis_out/api_usage_reclassify.py` 归位；接新源要同步补登记表与 `DEFAULT_LIMITS`）
 - 数据库：SQLite（`server/gupiao.db`），使用 `sqlite3` 原生连接 + WAL 模式（定义在 `server/db/database.py`；已从 MySQL 迁移，迁移脚本 `migrate_mysql_to_sqlite.py`）
 - 存储：通过 `trend_scan_results` 表持久化，内存缓存加速访问
 - 热加载：修改 `config.py` 后自动生效，无需重启
@@ -816,6 +924,8 @@ const r = getRating(stock.score)   // { label, short, color }
 2. 服务默认端口 3003
 3. 所有配置集中在 `server/config.py`，修改后自动热加载
 4. 修改前端代码后，只需重启 `server/start.bat` 即可（脚本会自动重新 `pnpm run build`）
+5. **协作规则看 [CONTRIBUTING.md](CONTRIBUTING.md)，Agent 约束看 [AGENTS.md](AGENTS.md)，提交前的硬拦截在 [.githooks/](.githooks/README.md)**（落后于远程 / 疑似 `git add .` 批量混提 / 前端产物删增不成对 / 本机绝对路径或 webhook 字段写进代码 → 阻断；改了代码没带文档 → 只提醒。推送非快进被拦）。启用是一次 `git config --local core.hooksPath .githooks`，零第三方依赖
+6. **走分支流程时的本仓特有约束**：`:3003` 由仓库外的计划任务按固定路径拉起，磁盘上是哪个分支的代码线上就跑哪个分支——盘中 09:10~15:10 禁止 `git switch`/`merge`/`rebase`；改动合入 `main` 后靠写 `server/data/backend_restart_requested` 标志让看护自己重启（会话杀不掉那个 SYSTEM 进程）
 
 ## 评分体系架构
 

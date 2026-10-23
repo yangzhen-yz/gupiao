@@ -7,6 +7,7 @@ from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUN
 from db.database import (get_db_conn, load_daily_recommendations, load_trend_scan_results)
 from services.data.stock import fetch_stock_data
 from services.data.fundflow import _BROAD_CONCEPT_BLOCKLIST
+from services.data.limit_pool import save_pools
 
 _EASTMONEY_CLIST_BASE = 'https://push2delay.eastmoney.com/api/qt/clist/get'
 _EM_UT = 'b2884a393a59ad64002292a3e90d46a5'
@@ -779,6 +780,7 @@ async def generate_daily_review() -> Dict:
                       'zt_pool_raw': [], 'zhaban_count': None}
             _fs_all_a = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
             _today_yyyymmdd = datetime.now().strftime('%Y%m%d')
+            _zb_pool: List[Dict] = []          # 涨停池为空时不查炸板池，落库要能拿到空列表
 
             # ---- 涨停股：优先用涨停池专用API ----
             _zt_pool = _em_zt_pool_get(_today_yyyymmdd, pool_type='zt')
@@ -880,6 +882,9 @@ async def generate_daily_review() -> Dict:
                     })
             except Exception as e:
                 print(f'[收评] 主力资金榜请求失败: {e}')
+            # 收盘定版：盘中情绪每 3 分钟写一次，这里用收盘后的池子覆盖。
+            # 首板次日溢价、炸板修复这类因子回测要的就是这份"最后谁封住了"。
+            save_pools(datetime.now().strftime('%Y-%m-%d'), _zt_pool, _zb_pool, _dt_pool)
             return result
         try:
             _stock_data = await asyncio.to_thread(_sync_fetch_stocks)
@@ -1055,6 +1060,13 @@ async def generate_daily_review() -> Dict:
                         f['buyTiming'] = bt
                         timed += 1
                     if q:
+                        # 当日涨跌幅%（2026-10-23 用户要求：明日关注要能直接看到今天涨跌了多少）。
+                        # 收评生成时点拉的即是当日收盘行情，字段随收评一起落库，前端徽章直接展示；
+                        # 历史收评没有该字段，前端会批量拉实时行情兜底。
+                        if q.get('changePercent') is not None:
+                            f['pctChg'] = q['changePercent']
+                        if not f.get('price') and q.get('priceRaw'):
+                            f['price'] = q['priceRaw']
                         plan = _build_tomorrow_plan(
                             q, bt or {}, ref=rec_ref_points.get(f['code']),
                             score=float(f.get('score') or 0))

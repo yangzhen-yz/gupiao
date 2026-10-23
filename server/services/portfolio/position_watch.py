@@ -14,14 +14,18 @@
 纪律（宁可少发，也不能发到用户关推送）
 --------------------------------------
   1. 每只票每种动作每天最多推一次；唯一例外是止损后继续跌
-     （较上次推送价再跌 POSITION_WATCH_REPUSH_DROP_PCT%）才允许重推，并标"续跌"；
+     （较上次推送价再跌 POSITION_WATCH_REPUSH_DROP_PCT%）才允许重推，并标“续跌”；
   2. 一轮扫描里的多只票合并成**一条**消息，不逐只发；
-  3. 情绪转弱（退潮/冰点）每天只推一条市场级提示，一天不重复；
-  4. 去重落在 DB（position_alert_log），重启服务不会把已经推过的再推一遍。
+  3. 市场级提示双向对称（2026-10-23 用户指出“昨天转弱推了、今天由跌反攻却没推”）：
+     转弱（退潮/冰点）当天每周期推一条；转弱之后情绪第一次走出坏周期（修复/回暖向）
+     再推一条“情绪修复”——只在近期推过转弱时才触发，常态回暖日不会天天吵；
+  4. 市场级消息与账号无关，去重标记记在全局账号 0 上——多账号绑同一群时只发一条
+     （2026-10-22 实锤：按账号去重导致群里 10:36:19/:20 连收两条一模一样的转弱）；
+  5. 去重落在 DB（position_alert_log），重启服务不会把已经推过的再推一遍。
 """
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 
 from app.config import (POSITION_WATCH_ENABLED, POSITION_WATCH_INTERVAL_SEC,
@@ -44,6 +48,11 @@ _ALERT_ACTIONS = {
     'giveback': ('📉', '冲高回落'),
 }
 _MARKET_SYMBOL_KEY = '__market__'
+# 市场级消息（情绪转弱/修复）与账号无关，去重记录统一记在虚拟账号 0 上：
+# 多账号绑同一企微群时按各自账号去重会发两条一模一样的（10-22 实锤），全局记一次即发一次。
+_MARKET_USER_ID = 0
+# 情绪周期的“坏方向”：进入即推转弱；走出即可能触发修复推送
+_BAD_CYCLES = ('退潮', '冰点')
 # 按账号节流：调度器主循环已按 POSITION_WATCH_INTERVAL_SEC 控频，这里只防单账号"一轮内重复扫"。
 # 注意不能用模块级单个时间戳——watch_all_users 同一轮会顺序扫所有账号，全局时间戳会让
 # 第一个账号之后的账号全部命中节流被跳过（多账号静默漏推）。
@@ -144,6 +153,39 @@ def _fmt_market_alert(sentiment: Dict) -> str:
     return '\n'.join(lines)
 
 
+def _fmt_market_recover(sentiment: Dict) -> str:
+    """与转弱对称的“情绪修复”文案（2026-10-23）：冰点/退潮走出后的第一次告知。
+
+    由跌反攻的当天，用户需要知道“可以恢复观察/轻仓试错了”，错过修复日第一段
+    与错过止损同样贵 —— 只报坏消息的好人风控是半个风控。
+    """
+    lines = [f'**📈 短线情绪修复 {datetime.now():%H:%M:%S}**', '',
+             f'周期：**{sentiment.get("cycle")}**（{sentiment.get("cycleScore")}分）',
+             f'{sentiment.get("detail") or ""}', '']
+    top = (sentiment.get('leadSectors') or [])[:1]
+    if top:
+        lines.append(f'· 当日涨停最集中：{top[0]["sector"]}（{top[0]["limitUp"]}只，'
+                     f'最高{top[0]["maxLianban"]}板）')
+    advice = sentiment.get('advice') or '情绪修复，轻仓试错主流题材低位股'
+    lines += ['', f'行动：{advice}。']
+    return '\n'.join(lines)
+
+
+def _recent_down_pushed(date_str: str) -> bool:
+    """近 4 天（含今天）有没有推过“转弱”。修复推送只在转弱之后触发：
+    常态回暖日绝不每天报“情绪很好”（那是噪音），它只回答“昨天叫你别动手，
+    现在可以重新看了吗”。4 天窗口是给跨周末兜的：周五冰点 → 周一回暖要能推
+    （自测第 6 项钉死，3 天窗口在周五→周一场景会漏）。
+    """
+    d0 = datetime.strptime(date_str, '%Y-%m-%d')
+    for i in range(4):
+        d = (d0 - timedelta(days=i)).strftime('%Y-%m-%d')
+        for cyc in _BAD_CYCLES:
+            if _get_log(d, _MARKET_USER_ID, _MARKET_SYMBOL_KEY, cyc):
+                return True
+    return False
+
+
 async def watch_positions(user_id: int = 1) -> Dict:
     """一轮持仓快反扫描：诊断持仓 → 找紧急动作 → 去重 → 合并推送。
 
@@ -210,13 +252,27 @@ async def watch_positions(user_id: int = 1) -> Dict:
         _mark(date_str, user_id, sym, act, float(p.get('price') or 0),
               'capped' if capped else '')
 
-    # 市场级：情绪转弱每人每天每周期只推一次（退潮→冰点算升级、可再推一次）
+    # 市场级：情绪转弱全局每天每周期只推一次（退潮→冰点算升级、可再推一次）；
+    # 去重记在全局账号 0 —— 多账号绑同一群时不再各发一条（10-22 重复推送实锤）。
     market_lines = None
-    if sentiment.get('cycle') in ('退潮', '冰点') and not sentiment.get('stale'):
-        if not _get_log(date_str, user_id, _MARKET_SYMBOL_KEY, str(sentiment.get('cycle'))):
+    if sentiment.get('cycle') in _BAD_CYCLES and not sentiment.get('stale'):
+        if not _get_log(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY,
+                        str(sentiment.get('cycle'))):
             market_lines = _fmt_market_alert(sentiment)
-            _mark(date_str, user_id, _MARKET_SYMBOL_KEY, str(sentiment.get('cycle')), 0.0,
+            _mark(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY,
+                  str(sentiment.get('cycle')), 0.0,
                   json.dumps(sentiment.get('weakSignals') or [], ensure_ascii=False))
+
+    # 方向对称（2026-10-23）：转弱之后情绪第一次走出坏周期 → 推“情绪修复”。
+    # 口径：近 3 天推过转弱 + 今天还没推过修复 + 数据新鲜。常态回暖日不触发。
+    recover_lines = None
+    cycle = str(sentiment.get('cycle') or '')
+    if cycle and cycle not in _BAD_CYCLES and not sentiment.get('stale'):
+        if (_recent_down_pushed(date_str)
+                and not _get_log(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY, f'up:{cycle}')):
+            recover_lines = _fmt_market_recover(sentiment)
+            _mark(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY, f'up:{cycle}', 0.0,
+                  f'修复自转弱（{sentiment.get("cycleScore")}分）')
 
     pushed = 0
     if capped:
@@ -236,6 +292,16 @@ async def watch_positions(user_id: int = 1) -> Dict:
         res = send_to_user(user_id, market_lines, personal=False)
         if res.get('ok'):
             pushed += 1
+        else:
+            # 发送失败撤掉全局去重标记，否则这条市场消息当天就永久丢了
+            _unmark(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY,
+                    str(sentiment.get('cycle')))
+    if recover_lines:
+        res = send_to_user(user_id, recover_lines, personal=False)
+        if res.get('ok'):
+            pushed += 1
+        else:
+            _unmark(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY, f'up:{cycle}')
     if pushed:
         print(f'[持仓快反 {datetime.now():%H:%M:%S}] 推送 {pushed} 条，'
               f'涉及动作 {len(alerts)} 只 + 情绪{sentiment.get("cycle")}')

@@ -405,12 +405,17 @@
         <div v-if="review.tomorrowFocus && review.tomorrowFocus.length" class="review-section">
           <div class="section-title-row">
             <div class="section-title-small">🎯 明日重点关注</div>
-            <span class="section-sub">
-              <template v-if="review.focusExpect?.winRate != null">
-                {{ review.tomorrowFocus.length }} 只 · 篮子历史盈利概率 {{ review.focusExpect.winRate }}%
-              </template>
-              <template v-else>{{ review.tomorrowFocus.length }} 只</template>
-            </span>
+            <div class="section-title-actions">
+              <button class="focus-hot-all-btn" @click="addAllFocusToHot(review.tomorrowFocus)">
+                ⭐ 全部加入热门查询
+              </button>
+              <span class="section-sub">
+                <template v-if="review.focusExpect?.winRate != null">
+                  {{ review.tomorrowFocus.length }} 只 · 篮子历史盈利概率 {{ review.focusExpect.winRate }}%
+                </template>
+                <template v-else>{{ review.tomorrowFocus.length }} 只</template>
+              </span>
+            </div>
           </div>
           <div class="section-note-small">
             明日(T+1)按各自的「买入条件 + 价格区间」参与，不今日追高。 每只票给出：什么条件买 · 什么价格买 · 止盈止损 ·
@@ -432,7 +437,19 @@
                 <div class="focus-rank">{{ i + 1 }}</div>
                 <div class="focus-body">
                   <div class="focus-name">{{ s.name }}</div>
-                  <div class="focus-code">{{ s.code }}</div>
+                  <div class="focus-code">
+                    {{ s.code }}
+                    <!-- 当日涨跌幅（2026-10-23）：红涨绿跌。收评落库的 pctChg 优先；
+                         历史收评无此字段时由 loadFocusQuotes 拉实时行情兜底（盘后=当日收盘） -->
+                    <span
+                      v-if="focusPct(s) != null"
+                      class="focus-pct"
+                      :class="focusPctClass(s)"
+                      :title="`当日涨跌幅，现价 ${focusPrice(s) ?? '--'}`"
+                    >
+                      {{ focusPct(s) >= 0 ? '+' : '' }}{{ focusPct(s).toFixed(2) }}%
+                    </span>
+                  </div>
                 </div>
                 <div class="focus-score" v-if="s.score > 0">
                   <div class="focus-score-val">{{ s.score }}</div>
@@ -486,6 +503,24 @@
                   <span class="plan-veto-lbl">⛔ 不买</span>
                   <span class="plan-veto-txt">{{ s.tomorrowPlan.veto.join(' ； ') }}</span>
                 </div>
+              </div>
+
+              <!-- 加入实时行情页「热门股票快捷查询」（2026-10-23）：
+                   focus-card 整体点击是开 K 线，按钮必须 @click.stop 阻断冒泡 -->
+              <div class="focus-hot-row" @click.stop>
+                <button
+                  class="focus-hot-btn"
+                  :class="{ added: isInHotCode(s.code), busy: isHotBusy(s.code) }"
+                  @click.stop="toggleFocusHot(s)"
+                >
+                  {{
+                    isHotBusy(s.code)
+                      ? '提交中…'
+                      : isInHotCode(s.code)
+                        ? '✓ 已在热门查询 · 点击移出'
+                        : '⭐ 加入热门股票快捷查询'
+                  }}
+                </button>
               </div>
             </div>
           </div>
@@ -553,9 +588,10 @@
 </template>
 
 <script setup>
-  import { ref, computed, onMounted, reactive } from 'vue'
-  import { apiFetch } from '../../utils/helpers'
+  import { ref, computed, onMounted, reactive, inject, watch } from 'vue'
+  import { apiFetch, apiFetchText } from '../../utils/helpers'
   import { timingIcon } from '../../utils/timing'
+  import { useStockData } from '../../composables/useStockData'
 
   const emit = defineEmits(['open-kline'])
 
@@ -793,6 +829,176 @@
     emit('open-kline', code)
   }
 
+  // ===== 明日关注 → 实时行情页「热门股票快捷查询」（2026-10-23）=====
+  // quickStocks 是 useStockData 的模块级共享 ref：本页加票后 TabQuote 无需刷新即可看到
+  const { quickStocks, loadQuickStocks } = useStockData()
+  const showNotification = inject('showNotification', () => {})
+  const hotAdding = ref(new Set()) // 提交中的 code，防重复点击
+
+  // 与 openStockKline 同一套标准化逻辑（热门接口只认 sh/sz 开头 6 位）
+  function normalizeSymbol(code) {
+    let c = String(code || '')
+    if (!/^(sh|sz|bj)/i.test(c)) {
+      if (c.startsWith('6')) c = 'sh' + c
+      else if (c.startsWith('0') || c.startsWith('3') || c.startsWith('1')) c = 'sz' + c
+      else if (c.startsWith('4') || c.startsWith('8')) c = 'bj' + c
+    }
+    return c.toLowerCase()
+  }
+
+  function isInHotCode(code) {
+    const c = normalizeSymbol(code)
+    return quickStocks.value.some(s => (s.code || '').toLowerCase() === c)
+  }
+
+  // s.code 可能不带前缀，hotAdding 里存的是标准化后的 code，统一走 normalizeSymbol
+  function isHotBusy(code) {
+    return hotAdding.value.has(normalizeSymbol(code))
+  }
+
+  async function addFocusToHot(s) {
+    const code = normalizeSymbol(s.code)
+    if (!/^(sh|sz)\d{6}$/.test(code)) {
+      showNotification(`${s.name || code} 的代码暂不支持加入热门查询`, 'warning')
+      return false
+    }
+    hotAdding.value.add(code)
+    try {
+      const result = await apiFetch('/api/hot-stocks/add', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, name: s.name || code }),
+      })
+      if (result.success) {
+        showNotification(`已添加 ${s.name || code} 到热门股票查询`)
+      } else {
+        showNotification(result.error || '添加失败')
+      }
+      await loadQuickStocks()
+      return !!result.success
+    } catch (e) {
+      showNotification('添加失败，请稍后重试', 'error')
+      return false
+    } finally {
+      hotAdding.value.delete(code)
+    }
+  }
+
+  async function removeFocusFromHot(code) {
+    const c = normalizeSymbol(code)
+    hotAdding.value.add(c)
+    try {
+      const result = await apiFetch('/api/hot-stocks/remove', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: c }),
+      })
+      if (result.success) showNotification('已移出热门股票查询')
+      await loadQuickStocks()
+    } catch (e) {
+      showNotification('移除失败，请稍后重试', 'error')
+    } finally {
+      hotAdding.value.delete(c)
+    }
+  }
+
+  async function toggleFocusHot(s) {
+    if (isInHotCode(s.code)) await removeFocusFromHot(s.code)
+    else await addFocusToHot(s)
+  }
+
+  // ===== 明日关注：当日涨跌幅（2026-10-23 用户要求）=====
+  // 数据来源优先级：① 后端收评落库的 pctChg（当日生成收评时随行情一起写入）；
+  // ② 历史收评没有该字段 → 批量拉一次腾讯实时行情兜底（盘后即为当日收盘涨跌幅）。
+  const focusQuoteMap = ref({}) // normalizeSymbol(code) -> { pct, price }
+
+  function focusPct(s) {
+    if (s && typeof s.pctChg === 'number') return s.pctChg
+    const q = focusQuoteMap.value[normalizeSymbol(s.code)]
+    return q ? q.pct : null
+  }
+  function focusPrice(s) {
+    const q = focusQuoteMap.value[normalizeSymbol(s.code)]
+    return q ? q.price : s?.price
+  }
+  function focusPctClass(s) {
+    const p = focusPct(s)
+    if (p == null) return ''
+    return p > 0 ? 'up' : p < 0 ? 'down' : 'flat'
+  }
+
+  // 腾讯行情批量返回解析（TabQuote.parseTencentData 的同款最小子集：只取价格/涨跌）
+  function parseQuotePct(raw) {
+    const out = {}
+    for (const line of String(raw || '').split(';')) {
+      const t = line.trim()
+      if (!t.startsWith('v_') || !t.includes('=')) continue
+      const eq = t.indexOf('=')
+      const symbol = t.slice(2, eq).toLowerCase()
+      const fields = t
+        .slice(eq + 1)
+        .replace(/^"|"$/g, '')
+        .split('~')
+      if (fields.length <= 49) continue
+      const price = parseFloat(fields[3]) || 0
+      const prevClose = parseFloat(fields[4]) || 0
+      const changeVal = parseFloat(fields[31]) || price - prevClose
+      const pct = parseFloat(fields[32]) || (prevClose > 0 ? (changeVal / prevClose) * 100 : 0)
+      out[symbol] = { pct, price }
+    }
+    return out
+  }
+
+  // 翻页/切换日期后新收评的明日关注同样要补行情；已补过的不重复请求
+  async function loadFocusQuotes() {
+    const need = []
+    for (const r of reviews.value.slice(0, 3)) {
+      for (const s of r.tomorrowFocus || []) {
+        if (typeof s.pctChg === 'number') continue
+        const c = normalizeSymbol(s.code)
+        if (c && !focusQuoteMap.value[c] && !need.includes(c)) need.push(c)
+      }
+    }
+    if (!need.length) return
+    try {
+      const raw = await apiFetchText(`/api/stocks?symbols=${need.join(',')}`)
+      Object.assign(focusQuoteMap.value, parseQuotePct(raw))
+    } catch {
+      /* 行情兜底失败：徽章不显示，不影响收评其余内容 */
+    }
+  }
+
+  // 批量：串行逐只提交（后端单只去重；并发没有收益还容易误触限流）
+  async function addAllFocusToHot(list) {
+    const targets = (list || []).filter(s => !isInHotCode(s.code))
+    if (!targets.length) {
+      showNotification('全部已在热门查询中')
+      return
+    }
+    let ok = 0
+    let fail = 0
+    for (const s of targets) {
+      const code = normalizeSymbol(s.code)
+      if (!/^(sh|sz)\d{6}$/.test(code)) {
+        fail++
+        continue
+      }
+      try {
+        const result = await apiFetch('/api/hot-stocks/add', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name: s.name || code }),
+        })
+        if (result.success) ok++
+        else fail++
+      } catch {
+        fail++
+      }
+    }
+    await loadQuickStocks()
+    showNotification(`已加入 ${ok} 只${fail ? `，${fail} 只失败` : ''}`, fail ? 'warning' : 'success')
+  }
+
   // 板块成分股行点击：开K线 + 关弹窗（2026-10-17 从模板多语句 inline handler 抽出——
   // prettier 会把 `@click="a(); b()"` 重排成换行且丢分号，Vue 模板表达式解析直接报错）
   function onSectorStockClick(s) {
@@ -890,7 +1096,11 @@
   }
 
   onMounted(() => {
-    loadDailyReviews()
+    loadDailyReviews().then(loadFocusQuotes)
+    // 热门查询当前名单：决定每只票的按钮显示「加入」还是「已在热门」
+    loadQuickStocks()
+    // 翻到历史收评时，该页明日关注的涨跌幅也要补拉
+    watch(currentPage, loadFocusQuotes)
   })
 </script>
 
@@ -1299,6 +1509,31 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
   }
+  /* 明日关注：标题行右侧操作区（批量加入热门查询，2026-10-23） */
+  .section-title-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+  .focus-hot-all-btn {
+    border: 1px solid #6366f1;
+    background: rgba(99, 102, 241, 0.12);
+    color: #6366f1;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .focus-hot-all-btn:hover {
+    background: #6366f1;
+    color: #fff;
+  }
 
   /* 大盘指数 */
   .market-grid-3 {
@@ -1671,6 +1906,29 @@
     color: var(--text-secondary);
     font-family: 'SF Mono', 'JetBrains Mono', monospace;
   }
+  /* 当日涨跌幅徽章（2026-10-23）：A股惯例红涨绿跌，平盘灰 */
+  .focus-pct {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: var(--radius-sm);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.5;
+    vertical-align: baseline;
+  }
+  .focus-pct.up {
+    color: var(--accent-danger);
+    background: var(--accent-danger-bg);
+  }
+  .focus-pct.down {
+    color: var(--accent-success);
+    background: var(--accent-success-bg);
+  }
+  .focus-pct.flat {
+    color: var(--text-tertiary);
+    background: rgba(128, 128, 128, 0.12);
+  }
   /* 收评是明细页：入选理由被压成一行等于没写（2026-10-13 反馈"内容只显示了部分"）。
    单行摘要是行动台的职责，那里本来就有「展开全部」。 */
   .focus-reason {
@@ -1718,6 +1976,38 @@
     font-size: 0.62rem;
     color: var(--text-tertiary);
     font-family: 'SF Mono', 'JetBrains Mono', monospace;
+  }
+
+  /* 明日关注：加入实时行情页「热门股票快捷查询」（2026-10-23） */
+  .focus-hot-row {
+    margin-top: 2px;
+  }
+  .focus-hot-btn {
+    width: 100%;
+    border: 1px dashed var(--border-subtle);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 7px 10px;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .focus-hot-btn:hover:not(:disabled) {
+    border-color: #6366f1;
+    color: #6366f1;
+    background: rgba(99, 102, 241, 0.08);
+  }
+  .focus-hot-btn.added {
+    border-style: solid;
+    border-color: #15803d;
+    color: #15803d;
+    background: rgba(21, 128, 61, 0.08);
+  }
+  .focus-hot-btn.busy {
+    opacity: 0.6;
+    cursor: wait;
   }
 
   /* 明日关注：买入时机徽章（2026-10-12，配色与 TabRecommend 对齐） */
@@ -2225,6 +2515,15 @@
      策略分三个来源量纲不同，横着比本来就不成立。 */
     .focus-score {
       display: none;
+    }
+    /* 明日关注标题行：手机上「全部加入热门查询」按钮与统计文字竖排放，避免挤压 */
+    .section-title-row {
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .section-title-actions {
+      width: 100%;
+      justify-content: flex-start;
     }
   }
 </style>

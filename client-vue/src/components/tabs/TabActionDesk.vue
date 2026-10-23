@@ -1,7 +1,7 @@
 <template>
   <div class="desk">
     <!-- ========== 一句话结论（sticky：办公室窄窗口滚到哪儿都知道该干什么） ========== -->
-    <section :class="['hero', 'hero-' + hero.level]" v-if="data">
+    <section v-if="data" :class="['hero', 'hero-' + hero.level]">
       <div class="hero-phase">
         <span :class="['phase-dot', { live: isLive }]"></span>
         <b>{{ data.phaseLabel }}</b>
@@ -11,9 +11,9 @@
         <span v-else-if="!data.isTradingDay" class="phase-next">今日休市</span>
       </div>
       <h2 class="hero-text">{{ hero.text }}</h2>
-      <p class="hero-sub" v-if="hero.sub">{{ hero.sub }}</p>
+      <p v-if="hero.sub" class="hero-sub">{{ hero.sub }}</p>
 
-      <div class="hero-market" v-if="data.market && (data.market.riskScore || data.market.indexes.length)">
+      <div v-if="data.market && (data.market.riskScore || data.market.indexes.length)" class="hero-market">
         <span class="risk-chip" :class="riskChipClass(data.market.riskScore)">
           大盘风险 {{ data.market.riskScore }}
         </span>
@@ -50,27 +50,28 @@
       <!-- 盘中短线情绪（2026-10-14）：先看周期、再看板块、最后才轮到个股 -->
       <section v-if="sec === 'sentiment'" :class="['block', 'block-sent', 'sent-' + senti.temp]">
         <header class="block-head">
-          <h3>🌡️ 短线情绪</h3>
+          <h3>🌡️ 短线情绪 <span v-if="senti.final" class="final-chip">收盘定版</span></h3>
           <span class="block-meta">
-            <template v-if="senti.stale">数据降级 · 只提示不拦</template>
+            <template v-if="senti.final">{{ senti.cycle }} {{ senti.cycleScore }} 分 · {{ senti.finalLabel }}</template>
+            <template v-else-if="senti.stale">数据降级 · {{ senti.staleLabel }}</template>
             <template v-else>{{ senti.cycle }} {{ senti.cycleScore }} 分</template>
           </span>
         </header>
 
-        <div class="sent-nums" v-if="senti.nums.length">
+        <div v-if="senti.nums.length" class="sent-nums">
           <span v-for="n in senti.nums" :key="n.k" class="sent-num">
             <em>{{ n.k }}</em
             ><b :class="n.cls">{{ n.v }}</b>
           </span>
         </div>
 
-        <p class="sent-rule" v-if="senti.rule">
+        <p v-if="senti.rule" class="sent-rule">
           <span :class="['rule-tag', { hard: senti.vetoEnabled }]">
             {{ senti.vetoEnabled ? '纪律·已生效' : '纪律·提示' }} </span
           >{{ senti.rule }}
         </p>
 
-        <div class="sent-sectors" v-if="senti.sectors.length">
+        <div v-if="senti.sectors.length" class="sent-sectors">
           <span class="sent-mini">当日涨停最集中</span>
           <span v-for="s in senti.sectors" :key="s.sector" class="sector-chip">
             {{ s.sector }} <b>{{ s.limitUp }}只 · 最高{{ s.maxLianban }}板</b>
@@ -83,6 +84,99 @@
         <button v-if="senti.extra.length" class="expand-btn" @click="toggleList('sentiment')">
           {{ expanded.sentiment ? '收起 ↑' : `另有 ${senti.extra.length} 条转弱信号/缺数 ↓` }}
         </button>
+      </section>
+
+      <!-- 主线/支线板块（2026-10-22 影子期）。判断全在服务端 services/strategy/mainline.py，
+           这里只排版：不重算分、不加形容词。1.5 屏预算=卡头1行+主线≤2条+支线chips1行+
+           退潮1行+免责2行；分项/口径点开看。红=涨/看多、绿=跌/退潮（A股约定）。 -->
+      <section v-else-if="sec === 'sectors'" :class="['block', 'block-sent', 'block-ml', { stale: ml.stale }]">
+        <header class="block-head">
+          <h3>🎯 市场主线</h3>
+          <span class="block-meta">
+            <template v-if="ml.final"
+              >收盘定版<template v-if="ml.flowAt"> · 资金 {{ ml.flowAt }}</template></template
+            >
+            <template v-else
+              >{{ ml.caliber }}<template v-if="ml.flowTime"> · {{ ml.flowTime }}</template>
+              <template v-if="ml.nextJudge"> · 下次判定 {{ ml.nextJudge }}</template></template
+            >
+          </span>
+        </header>
+
+        <div v-if="!ml.main.length" class="ml-none">
+          {{ ml.noneReason }}
+          <div v-if="ml.candidates.length" class="sent-sectors" style="margin-top: 4px">
+            <span v-for="c in ml.candidates.slice(0, 3)" :key="c.name" class="sector-chip">
+              {{ c.name }} <b>{{ c.score }}分</b>
+            </span>
+          </div>
+        </div>
+
+        <div v-for="m in ml.main" :key="m.name" class="ml-main">
+          <div class="ml-main-h">
+            <b class="ml-name">{{ m.name }}</b>
+            <span :class="['stage-tag', 'stage-' + m.stageCls]">{{ m.stage }}</span>
+            <span class="ml-score">{{ m.score }}分</span>
+          </div>
+          <div class="sent-nums">
+            <span class="sent-num">
+              <em>今日</em><b :class="numClass(m.chg1d)">{{ fmtPct(m.chg1d) }}</b>
+            </span>
+            <span class="sent-num">
+              <em>近5日*</em><b :class="numClass(m.chg5d)">{{ fmtPct(m.chg5d) }}</b>
+            </span>
+            <span class="sent-num">
+              <em>近10日*</em><b :class="numClass(m.chg10d)">{{ fmtPct(m.chg10d) }}</b>
+            </span>
+            <span class="sent-num">
+              <em>主力</em
+              ><b :class="numClass(m.fundYi)">{{
+                m.fundYi == null ? '—' : (m.fundYi >= 0 ? '+' : '') + m.fundYi + '亿'
+              }}</b>
+            </span>
+            <span class="sent-num">
+              <em>结构</em><b>{{ m.limitUp }}涨停·{{ m.maxLianban }}板·梯队{{ m.tierCount }}档</b>
+            </span>
+          </div>
+          <div v-if="m.leaders && m.leaders.length" class="ml-leaders">
+            代表
+            <span v-for="(ld, li) in m.leaders" :key="ld.code"
+              >{{ ld.name }}({{ ld.lianban }}板){{ li < m.leaders.length - 1 ? '、' : '' }}</span
+            >
+          </div>
+          <div v-if="expanded['ml-' + m.name]" class="sent-extra">
+            <div class="sent-extra-item">
+              五维分项：涨停 {{ m.breakdown && m.breakdown.limit }}｜资金 {{ m.breakdown && m.breakdown.fund }}｜持续性
+              {{ m.breakdown && m.breakdown.persist != null ? m.breakdown.persist : '—（未映射）' }}｜量能
+              {{ m.breakdown && m.breakdown.volume != null ? m.breakdown.volume : '—' }}
+            </div>
+            <div class="sent-extra-item">{{ m.why }}</div>
+          </div>
+          <button class="expand-btn" @click="toggleList('ml-' + m.name)">
+            {{ expanded['ml-' + m.name] ? '收起 ↑' : '分项/依据 ↓' }}
+          </button>
+        </div>
+
+        <div v-if="ml.sub.length" class="sent-sectors">
+          <span class="sent-mini">支线</span>
+          <span v-for="s in shown('mlSub', ml.sub, 3)" :key="s.name" class="sector-chip">
+            {{ s.name }} <b :class="numClass(s.chg1d)">{{ fmtPct(s.chg1d) }}</b
+            >·{{ s.score }}分
+          </span>
+          <button v-if="ml.sub.length > 3" class="expand-btn" @click="toggleList('mlSub')">
+            {{ expanded.mlSub ? '收起 ↑' : `全部 ${ml.sub.length} 个 ↓` }}
+          </button>
+        </div>
+
+        <div v-if="ml.fading.length" class="ml-fading">
+          退潮
+          <span v-for="f in ml.fading" :key="f.name" class="fade-chip">{{ f.name }}（{{ f.reason }}）</span>
+        </div>
+
+        <p class="ml-foot">
+          *持续性为本地日K等权聚合，截至 {{ ml.persistAsOf || '—' }}；资金口径 {{ ml.fundCaliber }}<br />
+          {{ ml.disclaimer }}
+        </p>
       </section>
 
       <!-- 持仓待办 -->
@@ -129,8 +223,8 @@
                 >移动止盈 <b>{{ p.trailingLine }}</b></span
               >
             </div>
-            <p class="act-detail" v-if="p.detail">{{ p.detail }}</p>
-            <div class="act-flags" v-if="p.flags && p.flags.length">
+            <p v-if="p.detail" class="act-detail">{{ p.detail }}</p>
+            <div v-if="p.flags && p.flags.length" class="act-flags">
               <span v-for="f in p.flags" :key="f" class="mini-flag">{{ f }}</span>
             </div>
           </article>
@@ -203,8 +297,8 @@
                 <em>仓位建议</em><b>{{ b.positionSuggest || '按计划' }}</b>
               </div>
             </div>
-            <p class="buy-note" v-if="b.execHint">⚠️ {{ b.execHint }}</p>
-            <p class="buy-logic" v-if="b.logic">{{ b.logic }}</p>
+            <p v-if="b.execHint" class="buy-note">⚠️ {{ b.execHint }}</p>
+            <p v-if="b.logic" class="buy-logic">{{ b.logic }}</p>
           </article>
         </div>
         <button v-if="data.buyNow.length > LIST_LIMIT" class="expand-btn" @click="toggleList('buyNow')">
@@ -247,15 +341,20 @@
               <span class="plan-name"
                 >{{ t.name }}<em>{{ (t.symbol || '').toUpperCase() }}</em></span
               >
-              <span class="plan-win" v-if="t.winRate != null" :title="'同来源同分数段的历史 T+1 盈利概率'"
+              <!-- 当日涨跌幅（2026-10-23）：红涨绿跌。收评落库的 pctChg 优先；
+                   历史收评无此字段时由 loadPlanQuotes 拉实时行情兜底（盘后=当日收盘） -->
+              <span v-if="planPct(t) != null" :class="['plan-pct', numClass(planPct(t))]" title="当日涨跌幅">{{
+                fmtPct(planPct(t))
+              }}</span>
+              <span v-if="t.winRate != null" class="plan-win" :title="'同来源同分数段的历史 T+1 盈利概率'"
                 >盈利概率 {{ t.winRate }}%</span
               >
-              <span :class="['timing-badge', 'timing-' + (t.timingType || 'intraday')]" v-if="t.timingLabel">
+              <span v-if="t.timingLabel" :class="['timing-badge', 'timing-' + (t.timingType || 'intraday')]">
                 {{ timingIcon(t.timingType) }} {{ t.timingLabel }}
               </span>
             </div>
-            <p class="plan-cond" v-if="t.plan && t.plan.condition">{{ t.plan.condition }}</p>
-            <div class="plan-nums" v-if="t.plan">
+            <p v-if="t.plan && t.plan.condition" class="plan-cond">{{ t.plan.condition }}</p>
+            <div v-if="t.plan" class="plan-nums">
               <span v-if="t.plan.buyLow || t.plan.buyHigh"
                 >低吸区 <b>{{ t.plan.buyLow ?? '--' }}~{{ t.plan.buyHigh ?? '--' }}</b></span
               >
@@ -266,7 +365,7 @@
                 >止损 <b class="ok">{{ t.plan.stopLoss }}</b></span
               >
             </div>
-            <p class="plan-veto" v-if="vetoText(t)">🚫 {{ vetoText(t) }}</p>
+            <p v-if="vetoText(t)" class="plan-veto">🚫 {{ vetoText(t) }}</p>
           </article>
           <button v-if="data.tomorrowPlan.length > LIST_LIMIT" class="expand-btn" @click="toggleList('tomorrowPlan')">
             {{
@@ -289,7 +388,7 @@
         </div>
         <article v-else :class="['env-card', 'env-' + (data.tradeWindow.level || 'info')]">
           <div class="env-title">{{ data.tradeWindow.title }}</div>
-          <p class="env-detail" v-if="data.tradeWindow.detail">{{ data.tradeWindow.detail }}</p>
+          <p v-if="data.tradeWindow.detail" class="env-detail">{{ data.tradeWindow.detail }}</p>
           <div class="env-nums">
             <span v-if="data.tradeWindow.totalPnlPct != null">
               账户今日 <b :class="numClass(data.tradeWindow.totalPnlPct)">{{ fmtPct(data.tradeWindow.totalPnlPct) }}</b>
@@ -299,7 +398,7 @@
             >
             <span v-if="data.tradeWindow.suggestedTotal">{{ data.tradeWindow.suggestedTotal }}</span>
           </div>
-          <ul class="env-warns" v-if="data.tradeWindow.warnings && data.tradeWindow.warnings.length">
+          <ul v-if="data.tradeWindow.warnings && data.tradeWindow.warnings.length" class="env-warns">
             <li v-for="(w, wi) in data.tradeWindow.warnings" :key="wi">{{ w }}</li>
           </ul>
         </article>
@@ -360,7 +459,7 @@
 
 <script setup>
   import { ref, computed, onMounted } from 'vue'
-  import { apiFetch } from '../../utils/helpers'
+  import { apiFetch, apiFetchText } from '../../utils/helpers'
   import { usePolling } from '../../composables/usePolling'
   import { navigate } from '../../composables/useHashRoute'
   import { goQuote } from '../../utils/navigation'
@@ -410,17 +509,68 @@
     ;(s.weakSignals || []).forEach(w => extra.push(w))
     ;(s.failedLeaders || []).forEach(f => extra.push(`${f.name}（${f.lianban}板）今日 ${fmtPct(f.change)} —— 龙头失势`))
     ;(s.dataGaps || []).forEach(g => extra.push(`缺数：${g}`))
-    if (s.stale) extra.unshift('情绪接口此刻不可用，以下判断仅供留意，不作为拦截依据')
+    // 收盘定版不是"接口不可用"：final 时不加降级警告，由卡头"收盘定版"说明时点。
+    if (s.stale && !s.final) extra.unshift('情绪接口此刻不可用，以下判断仅供留意，不作为拦截依据')
+    // 兜底来源（2026-10-23）：stale 时只写"数据降级"会让用户把旧数字当今天。
+    // 快照兜底显示「沿用 13:35 快照」，收评兜底显示「沿用 10-22 收评」。
+    const staleLabel = (() => {
+      if (!s.stale) return ''
+      const src = s.source || ''
+      const asOf = String(s.asOf || '')
+      if (src === 'snapshot_fallback' || (src === 'intraday' && asOf.length >= 16)) {
+        const hm = asOf.length >= 16 ? asOf.slice(11, 16) : ''
+        return `${hm ? `沿用 ${hm} 快照` : '沿用盘中快照'} · 只提示不拦`
+      }
+      if (src === 'review_fallback' && asOf) return `沿用 ${asOf.slice(5, 10)} 收评 · 只提示不拦`
+      return '只提示不拦'
+    })()
     return {
       cycle: s.cycle || '未知',
       cycleScore: s.cycleScore,
       temp: SENTI_TEMP[s.cycle] || 'na',
       stale: !!s.stale,
+      staleLabel,
+      // 收盘定版（2026-10-23）：服务端说清楚"这是哪天的定版"，前端只负责显示。
+      final: !!s.final,
+      finalLabel: s.finalLabel || '',
+      finalToday: !!s.finalToday,
       nums,
       rule: s.rule || s.advice || '',
       vetoEnabled: !!s.vetoEnabled,
       sectors: s.leadSectors || [],
       extra,
+    }
+  })
+
+  // 主线/支线卡（2026-10-22）：只做单位换算与配色归类，评分/分层/降级判断全在服务端，
+  // 前端不重算——同一页两套口径正是我们要消灭的东西（参考评分时点那条的教训）。
+  const STAGE_CLS = { 加速: 'hot', 一致: 'mid', 分歧: 'mid', 退潮: 'cold', 退潮中: 'cold' }
+  const ml = computed(() => {
+    const s = (data.value && data.value.sectors) || {}
+    const meta = s.meta || {}
+    const cal = meta.caliber || {}
+    const yi = v => (v === null || v === undefined ? null : Math.round((v / 1e8) * 100) / 100)
+    const mapRow = m => ({ ...m, fundYi: yi(m.fundInflow), stageCls: STAGE_CLS[m.stage] || 'na' })
+    const age = (meta.sources || {}).flowAgeSec
+    // 收盘定版（2026-10-23）：final 时不再显示"下次判定/N分钟前快照"，
+    // 而是明确写"收盘定版 + 资金快照时刻"；日期由服务端的持久化口径给出。
+    const finalMode = !!(meta.final || s.final)
+    return {
+      main: (s.main || []).map(mapRow),
+      sub: (s.sub || []).map(mapRow),
+      fading: s.fading || [],
+      candidates: (s.candidates || []).map(mapRow),
+      stale: !!s.stale,
+      final: finalMode,
+      finalAsOf: meta.finalAsOfDate || '',
+      flowAt: String((meta.sources || {}).flowAt || '').slice(-5),
+      noneReason: (s.none || {}).reason || '暂无法判定',
+      caliber: cal.fund === 'sina_r0' ? '资金=新浪r0' : cal.fund === 'eastmoney_f62' ? '资金=东财f62' : '',
+      flowTime: age == null ? '' : age > 7200 ? `${Math.round(age / 60)}分钟前快照` : '实时',
+      nextJudge: meta.nextJudgeAt || '',
+      persistAsOf: cal.persistAsOfDate || '',
+      fundCaliber: cal.fund === 'sina_r0' ? '仅超大单(r0)' : cal.fund === 'eastmoney_f62' ? '超大+大单(f62)' : '—',
+      disclaimer: s.disclaimer || '',
     }
   })
 
@@ -475,6 +625,8 @@
       const r = await apiFetch('/api/action-desk' + (override ? `?phase=${encodeURIComponent(override)}` : ''))
       if (r && r.success) {
         data.value = r.data
+        // 明日计划补当日涨跌幅（落库 pctChg 缺失的历史收评走实时行情兜底）
+        loadPlanQuotes()
       } else {
         error.value = (r && r.error) || '行动台数据获取失败'
       }
@@ -487,6 +639,62 @@
 
   function goTab(tabId) {
     navigate(tabId)
+  }
+
+  // ===== 明日计划：当日涨跌幅（2026-10-23 用户要求）=====
+  // 数据来源优先级：① 收评落库的 pctChg（生成收评时随行情写入）；
+  // ② 历史收评没有该字段 → 批量拉一次腾讯实时行情兜底（盘后即为当日收盘涨跌幅）。
+  // 轮询会整体替换 data，但 planQuoteMap 按 symbol 缓存 + 60s 节流：
+  // 盘中行情在动，尾盘 30s 轮询也最多每分钟补一次，不会每次轮询都打接口。
+  const planQuoteMap = ref({})
+  const planQuoteTs = ref(0)
+
+  function planPct(t) {
+    if (t && typeof t.pctChg === 'number') return t.pctChg
+    const q = planQuoteMap.value[t.symbol]
+    return q ? q.pct : null
+  }
+
+  // 腾讯行情批量返回最小解析（只取价格/涨跌幅，字段布局同 TabQuote.parseTencentData）
+  function parseQuotePct(raw) {
+    const out = {}
+    for (const line of String(raw || '').split(';')) {
+      const t = line.trim()
+      if (!t.startsWith('v_') || !t.includes('=')) continue
+      const eq = t.indexOf('=')
+      const symbol = t.slice(2, eq).toLowerCase()
+      const fields = t
+        .slice(eq + 1)
+        .replace(/^"|"$/g, '')
+        .split('~')
+      if (fields.length <= 49) continue
+      const price = parseFloat(fields[3]) || 0
+      const prevClose = parseFloat(fields[4]) || 0
+      const changeVal = parseFloat(fields[31]) || price - prevClose
+      const pct = parseFloat(fields[32]) || (prevClose > 0 ? (changeVal / prevClose) * 100 : 0)
+      out[symbol] = { pct, price }
+    }
+    return out
+  }
+
+  async function loadPlanQuotes() {
+    const now = Date.now()
+    if (now - planQuoteTs.value < 60000) return
+    const items = (data.value && data.value.tomorrowPlan) || []
+    const need = []
+    for (const t of items) {
+      if (typeof t.pctChg === 'number') continue
+      const sym = (t.symbol || '').toLowerCase()
+      if (sym && !planQuoteMap.value[sym] && !need.includes(sym)) need.push(sym)
+    }
+    if (!need.length) return
+    planQuoteTs.value = now
+    try {
+      const raw = await apiFetchText(`/api/stocks?symbols=${need.join(',')}`)
+      Object.assign(planQuoteMap.value, parseQuotePct(raw))
+    } catch {
+      /* 行情兜底失败：徽章不显示，不影响行动台其余内容 */
+    }
   }
 
   // A股配色约定：红=涨，绿=跌
@@ -728,6 +936,18 @@
     color: var(--text-tertiary);
     font-variant-numeric: tabular-nums;
   }
+  /* 收盘定版标记（2026-10-23）：与"实时"区分开，但不做成告警色——它不是异常。 */
+  .final-chip {
+    display: inline-block;
+    margin-left: 0.25rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.625rem;
+    font-weight: 600;
+    vertical-align: middle;
+  }
   .block-empty {
     padding: 1.125rem 1rem;
     font-size: 0.8125rem;
@@ -869,6 +1089,32 @@
     border: 1px solid #bbf7d0;
     border-radius: var(--radius-pill);
     padding: 1px 7px;
+  }
+  /* 当日涨跌幅 pill（2026-10-23）：A股红涨绿跌，浅底色不抢「盈利概率」的位 */
+  .plan-pct {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    border-radius: var(--radius-pill);
+    padding: 1px 7px;
+    border: 1px solid transparent;
+  }
+  .plan-pct.up {
+    color: var(--accent-danger);
+    background: var(--accent-danger-bg);
+    border-color: var(--accent-danger-border);
+  }
+  .plan-pct.down {
+    color: var(--accent-success);
+    background: var(--accent-success-bg);
+    border-color: var(--accent-success-border);
+  }
+  .plan-pct.flat {
+    color: var(--text-secondary);
+    background: rgba(128, 128, 128, 0.1);
+  }
+  [data-theme='dark'] .plan-pct.flat {
+    background: rgba(128, 128, 128, 0.18);
   }
   .buy-score {
     margin-left: auto;
@@ -1229,6 +1475,75 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-pill);
+  }
+  /* ===== 主线/支线卡（2026-10-22）：复用 block-sent 外壳，只加自有元素 ===== */
+  .block-ml.stale {
+    border-left-color: var(--accent-warning);
+  }
+  .ml-none {
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+    padding: 2px 0 6px;
+  }
+  .ml-main {
+    padding: 4px 0 2px;
+  }
+  .ml-main + .ml-main {
+    border-top: 1px dashed var(--border-subtle);
+    margin-top: 6px;
+  }
+  .ml-main-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .ml-name {
+    font-size: 0.9375rem;
+  }
+  .stage-tag {
+    font-size: 0.6875rem;
+    padding: 1px 7px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .stage-tag.stage-hot {
+    color: var(--accent-danger);
+    background: var(--accent-danger-bg);
+    border-color: var(--accent-danger-border);
+  }
+  .stage-tag.stage-cold {
+    color: var(--accent-success);
+    background: var(--accent-success-bg);
+    border-color: var(--accent-success-border);
+  }
+  .ml-score {
+    margin-left: auto;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .ml-leaders {
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+    padding: 2px 0;
+  }
+  .ml-fading {
+    font-size: 0.75rem;
+    padding: 4px 0 2px;
+  }
+  .fade-chip {
+    color: var(--accent-success);
+    border: 1px solid var(--accent-success-border);
+    background: var(--accent-success-bg);
+    border-radius: var(--radius-pill);
+    padding: 1px 7px;
+    margin-left: 4px;
+  }
+  .ml-foot {
+    font-size: 0.6875rem;
+    color: var(--text-tertiary);
+    margin: 6px 0 0;
+    line-height: 1.5;
   }
   .sector-chip b {
     color: var(--text-primary);

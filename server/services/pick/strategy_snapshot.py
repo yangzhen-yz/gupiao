@@ -85,6 +85,8 @@ _DDL_ROWS = '''CREATE TABLE IF NOT EXISTS strategy_snapshot (
     concept        TEXT,
     r20            REAL,
     rank_pct       REAL,
+    rps            REAL,
+    rps_shadow     TEXT,
     created_at     TEXT
 )'''
 
@@ -120,7 +122,8 @@ def ensure_tables(conn):
     # 补列：早期版本建的表会缺新字段，INSERT 直接报错。
     # 本仓库常有另一路会话同时在改，加列必须自查而不是指望"大家都是从 DDL 建的"。
     have = {r[1] for r in conn.execute('PRAGMA table_info(strategy_snapshot)').fetchall()}
-    for _col, _typ in (('shadow_note', 'TEXT'), ('mode', 'TEXT')):
+    for _col, _typ in (('shadow_note', 'TEXT'), ('mode', 'TEXT'),
+                       ('rps', 'REAL'), ('rps_shadow', 'TEXT')):
         if _col not in have:
             conn.execute(f'ALTER TABLE strategy_snapshot ADD COLUMN {_col} {_typ}')
     # IF NOT EXISTS 覆盖不到"表已存在但要补索引"的情况，这里都得走一遍
@@ -157,7 +160,7 @@ _COLS = ('snap_date', 'batch', 'symbol', 'name', 'rank', 'stage', 'blocked_by',
          'change_percent', 'price', 'volume_ratio', 'turnover_rate',
          'weibi', 'outer_ratio', 'amplitude', 'factors', 'inputs', 'source',
          'mode', 'role', 'timing', 'matrix', 'matrix_why', 'shadow_note', 'concept',
-         'r20', 'rank_pct', 'created_at')
+         'r20', 'rank_pct', 'rps', 'rps_shadow', 'created_at')
 
 _BC = ('snap_date', 'batch', 'generated_at', 'cycle', 'cycle_score',
        'limit_up', 'limit_down', 'zhaban', 'promotion_rate', 'market_change',
@@ -182,7 +185,8 @@ def _row(s: Dict, date_key: str, batch: str, rank: int, stage: str,
         _j(sc.get('base_scores')), _j(sc.get('factor_values')), source,
         lab.get('mode'), lab.get('role'), lab.get('timing'), lab.get('matrix'), lab.get('matrix_why'),
         lab.get('shadow'),
-        s.get('primary_tag'), _f(pool.get('r20')), _f(pool.get('rank_pct')), now_txt,
+        s.get('primary_tag'), _f(pool.get('r20')), _f(pool.get('rank_pct')),
+        _f(lab.get('rps')), _j(lab.get('rps_shadow')), now_txt,
     )
 
 

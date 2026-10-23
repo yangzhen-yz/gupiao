@@ -680,8 +680,15 @@ def init_db():
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 display_name TEXT DEFAULT '',
+                is_admin INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
                 last_login_at DATETIME DEFAULT '')''')
+        # 管理员标记迁移（2026-10-22 用户定：yz 为管理员账号）：
+        # 机器人会话列表（discover）会暴露全部会话，只允许管理员刷新。
+        _user_cols = [r[1] for r in cursor.execute('PRAGMA table_info(users)')]
+        if 'is_admin' not in _user_cols:
+            cursor.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
+        cursor.execute("UPDATE users SET is_admin = 1 WHERE username = 'yz'")
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_sessions (
                 token TEXT PRIMARY KEY,
@@ -699,6 +706,18 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 principal REAL NOT NULL DEFAULT 0,
                 note TEXT DEFAULT '',
+                updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
+
+        # 每账号的累计已实现盈亏（2026-10-23）：减仓/清仓时按 (卖价-成本)×股数 累加。
+        # 没有这张表，「当前资金」就只能永远等于初始本金——用户清仓后账面赚的钱
+        # 在系统里无处落脚（清仓会整行删除持仓，实现盈亏只留在被删掉的 note 文本里）。
+        # 恒等式：可用现金 = 初始本金 + 累计已实现 - 当前持仓占用成本（买入扣现金、
+        # 卖出按 成本+已实现 回现金，两边一抵即得），见 get_portfolio_diagnosis。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_realized_pnl (
+                user_id INTEGER PRIMARY KEY,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                trades INTEGER NOT NULL DEFAULT 0,
                 updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
 
         # user_positions 增加 user_id。
@@ -1874,6 +1893,42 @@ def save_user_capital(principal: float, user_id: int = 1, note: str = '') -> boo
         return False
 
 
+def get_user_realized_pnl(user_id: int = 1) -> float:
+    """读账号累计已实现盈亏；无记录返回 0（从未减仓/清仓过）"""
+    try:
+        conn = get_db_conn()
+        row = conn.execute('SELECT realized_pnl FROM user_realized_pnl WHERE user_id = ?',
+                           (int(user_id),)).fetchone()
+        conn.close()
+        return round(float(row['realized_pnl'] or 0), 2) if row else 0.0
+    except Exception as error:
+        print(f'读取已实现盈亏失败: {str(error)}')
+        return 0.0
+
+
+def add_user_realized_pnl(delta: float, user_id: int = 1) -> float:
+    """累计一笔已实现盈亏（减仓/清仓时调用），返回累计后的总值；失败返回 None"""
+    if delta is None:
+        return None
+    try:
+        conn = get_db_conn()
+        conn.execute('''INSERT INTO user_realized_pnl (user_id, realized_pnl, trades, updated_at)
+            VALUES (?, ?, 1, datetime('now', '+8 hours'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                realized_pnl=ROUND(realized_pnl + excluded.realized_pnl, 2),
+                trades=trades + 1,
+                updated_at=datetime('now', '+8 hours')''',
+            (int(user_id), round(float(delta), 2)))
+        row = conn.execute('SELECT realized_pnl FROM user_realized_pnl WHERE user_id = ?',
+                           (int(user_id),)).fetchone()
+        conn.commit()
+        conn.close()
+        return round(float(row['realized_pnl'] or 0), 2) if row else None
+    except Exception as error:
+        print(f'累计已实现盈亏失败: {str(error)}')
+        return None
+
+
 _DEFAULT_HOT_STOCKS = [
     {'name': '深科技', 'code': 'sz000021'},
     {'name': '亨通光电', 'code': 'sh600487'},
@@ -2501,6 +2556,7 @@ def load_hot_search_ranking() -> Dict:
             'updateTime': meta.get('updateTime', ''),
             'total': int(meta.get('total', 0)),
             'filteredCount': int(meta.get('filteredCount', 0)),
+            'source': meta.get('source', ''),
             'stocks': stocks
         }
     except Exception as error:
@@ -2511,11 +2567,22 @@ def save_hot_search_ranking(data: Dict) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
+        # 2026-10-23：熔断/降级时抓不到任何榜单，不能拿空结果覆盖上一份可用缓存。
+        # 否则封禁期一次服务重启（启动时会拉热搜）就会把当日榜单清成 0 只，
+        # 连当日快照也一起删掉——数据看起来"更新成功"，实际是把可用数据擦掉。
+        if not (data.get('stocks') or []):
+            existing = cursor.execute('SELECT COUNT(*) FROM hot_search_ranking').fetchone()[0]
+            if existing:
+                conn.close()
+                print(f'[热搜榜] 本轮结果为空（熔断/降级），保留已有 {existing} 只缓存，'
+                      f'不覆盖也不删当日快照')
+                return False
         cursor.execute('DELETE FROM hot_search_ranking')
         cursor.execute('DELETE FROM hot_search_meta')
         for key, value in [('updateTime', data.get('updateTime', '')),
                            ('total', str(data.get('total', 0))),
-                           ('filteredCount', str(data.get('filteredCount', 0)))]:
+                           ('filteredCount', str(data.get('filteredCount', 0))),
+                           ('source', str(data.get('source', '') or ''))]:
             cursor.execute(
                 'INSERT INTO hot_search_meta (meta_key, meta_value) VALUES (?, ?)',
                 (key, value)

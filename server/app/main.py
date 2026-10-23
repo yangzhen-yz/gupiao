@@ -1,6 +1,7 @@
 """app - FastAPI 应用实例、中间件、生命周期"""
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import os, sys, time, asyncio, threading
 from datetime import date, datetime, timedelta
@@ -196,6 +197,13 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票行情、K线图、趋势发现", lifespan=lifespan)
+# GZip 压缩（2026-10-23）：实测服务端此前零压缩——带 Accept-Encoding: gzip 请求
+# index js 仍原样返回 102KB、content-encoding=None。本项目最大响应体
+# /api/daily_recommendations 107.8KB、/api/recommend-sim 68KB、静态产物 1.2MB，
+# JSON/JS 压缩比通常 5~10×。minimum_size=500：健康检查(51B)、tab-scan-config(0.3KB)
+# 这类小响应不压，省 CPU。注意：手机走 cloudflared 隧道时 CF 边缘也会压一遍，
+# 本中间件主要收益在本地/局域网直连与回源段，不是重复劳动。
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source"])
 
 # 注册路由

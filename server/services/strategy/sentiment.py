@@ -36,12 +36,14 @@ from app.config import (SENTIMENT_ENABLED, SENTIMENT_REFRESH_TTL_SEC,
                         SENTIMENT_PREMIUM_MAX_CODES, SENTIMENT_MIN_SCORE,
                         SENTIMENT_VETO_MIN_WEAK_SIGNALS, SENTIMENT_VETO_AFTER_MIN,
                         SENTIMENT_LADDER_COLLAPSE_RATE, SENTIMENT_LEADER_FAIL_CHANGE,
-                        SENTIMENT_LADDER_MIN_BASE, CYCLE_RULES)
+                        SENTIMENT_LADDER_MIN_BASE, CYCLE_RULES,
+                        SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC)
 from db.database import get_db_conn
 from services.ops.review import (_em_zt_pool_get, _em_zb_pool_get, _em_batch_change_percent,
                              _fetch_market_breadth, _calc_lianban_ladder,
                              _calc_sentiment_cycle)
 from services.data.trading_calendar import is_trading_day, get_session_phase
+from services.data.limit_pool import save_pools
 
 # 进程内缓存：情绪是"全市场一个答案"，所有用户/所有 Tab 共用一份即可
 _CACHE: Dict = {'ts': 0.0, 'data': None}
@@ -65,6 +67,10 @@ _YEST_MEMO: Dict = {'date': '', 'pool': []}
 # 它是"67 只票的均值"，日内变化很慢，所以失败时沿用当天早些时候的值，
 # 而不是让周期从"退潮"漂到"分歧"——接口故障不该改变市场对当下的判断。
 _PREMIUM_MEMO: Dict = {'date': '', 'quotes': {}}
+# 三池明细落库节流（2026-10-22）：情绪刷新最快 20 秒，逐票列表没必要跟着刷。
+# 收盘定版由 16:10 的收评任务再写一次并覆盖，那份才是因子回测要用的。
+_POOL_SAVE_TS = 0.0
+_POOL_SAVE_SEC = 180
 
 
 def _ensure_table():
@@ -226,19 +232,19 @@ def _sync_collect() -> Dict:
     except Exception:
         phase = ''
     if phase not in _COLLECT_PHASES:
-        fb = _fallback_from_review()
+        # 非交易时段不是"数据降级"，而是"收盘定版"：优先当日收评；
+        # 收评还没生成（15:00~15:10）或当天失败时，用当日最近盘中快照兜住，
+        # 绝不把上一个交易日的数字直接当成今天的。前端据此显示"收盘定版"。
+        fb = _final_fallback(now)
         if fb:
-            fb = dict(fb)
-            fb['source'] = 'review_fallback'
             return fb
         return _empty_snapshot(f'非交易时段({phase or "未知"})')
 
-    # 2) 东财熔断中：同样走兜底，不硬打
+    # 2) 东财熔断中：不硬打。优先沿用当日最近盘中快照，其次才退收评——
+    #    直接退收评会把昨天的连板高度/炸板率当成今天的（2026-10-23 6板显示5板即此因）。
     if _em_guard().skip('clist'):
-        fb = _fallback_from_review()
+        fb = _fallback_snapshot(now)
         if fb:
-            fb = dict(fb)
-            fb['source'] = 'review_fallback'
             return fb
         return _empty_snapshot('东财冷却中')
 
@@ -254,12 +260,24 @@ def _sync_collect() -> Dict:
     breadth = _fetch_market_breadth()
     ladder = _calc_lianban_ladder(zt_pool)
 
+    # 明细落库（2026-10-22）：聚合快照之外再存逐票名单，供首板/弱转强因子用。
+    # 挂在熔断计数之前：池子拿到了就先存，情绪分算成什么样不影响这份原始数据。
+    global _POOL_SAVE_TS
+    if time.time() - _POOL_SAVE_TS >= _POOL_SAVE_SEC and (zt_pool or zb_pool or dt_pool):
+        _POOL_SAVE_TS = time.time()
+        save_pools(now.strftime('%Y-%m-%d'), zt_pool, zb_pool, dt_pool)
+
     # 熔断计数：涨停池空（重试后仍拿不到）记一次失败；正常拿到即复位。
     # 盘中全市场零涨停基本不存在，误判的代价也只是 5 分钟内走收评兜底，可自愈。
     if zt_pool:
         _em_guard().ok('clist')
     else:
         _em_guard().fail('clist')
+        # 涨停池重试后仍为空：不要拿 0 涨停算出一个假的"冰点"周期。
+        # 先退当日最近盘中快照，再退收评；两者都带 stale，只提示不拦。
+        fb = _fallback_snapshot(now)
+        if fb:
+            return fb
 
     # 昨日涨停股今日表现（赚钱效应）：母数取昨日涨停池，限 200 只控制请求批数
     codes = [str(i.get('c', '')) for i in yest_pool if i.get('c')][:SENTIMENT_PREMIUM_MAX_CODES]
@@ -306,6 +324,7 @@ def _sync_collect() -> Dict:
         # 涨停池取不到时整个周期不可信：打 stale，让所有消费方退回"只提示、不否决"
         'stale': not zt_pool,
         'source': 'intraday',
+        'final': False,                      # 盘中值：每 180 秒还会变
         'dataGaps': gaps,
         'cycle': sent['cycle'],
         'cycleScore': sent['cycleScore'],
@@ -328,21 +347,38 @@ def _sync_collect() -> Dict:
     }
 
 
-def _fallback_from_review() -> Optional[Dict]:
-    """接口全挂时退回"昨日收评"的情绪口径，并打 stale=True（只提示、不否决）"""
+def _fallback_from_review(final: bool = False) -> Optional[Dict]:
+    """退回"最近一次收评"的情绪口径。
+
+    final=False：盘中接口全挂，收评只是旧值兜底 → stale=True，只提示不否决；
+    final=True ：非交易时段，收评就是当天的收盘定版 → 不标降级，由前端显示"收盘定版"。
+                 仍带 stale=True 让下游照旧不给否决权（定版值不参与盘中拦截）。
+    """
     try:
         from db.database import load_daily_market_reviews
         daily = load_daily_market_reviews()
         for rec in daily or []:
             sc = rec.get('sentimentCycle')
             if sc and sc.get('cycle'):
-                return {'asOf': rec.get('date'), 'date': rec.get('date'),
-                        'stale': True, 'source': 'review_fallback',
+                rec_date = rec.get('date')
+                # 定版不写 gap：来源日期由行动台的 finalLabel 承担，
+                # 写进 dataGaps 会被前端渲染成"缺数：…"，反把正常定版说成缺数据。
+                gap = '' if final else f'实时涨停池此刻不可用，数字取自 {rec_date} 收评'
+                # 情绪 JSON 只存了炸板率/连板高度等，涨停/跌停总数在收评主表的
+                # limit_up_count / limit_down_count 列；不并进来，定版卡会少最直观的两个数。
+                inds = dict(sc.get('indicators') or {})
+                if rec.get('limitUpCount') is not None:
+                    inds.setdefault('limitUpCount', rec['limitUpCount'])
+                if rec.get('limitDownCount') is not None:
+                    inds.setdefault('limitDownCount', rec['limitDownCount'])
+                return {'asOf': rec_date, 'date': rec_date,
+                        'stale': True, 'source': 'review_fallback', 'final': bool(final),
                         'cycle': sc.get('cycle'), 'cycleScore': sc.get('cycleScore'),
                         'advice': sc.get('advice'), 'detail': sc.get('detail') or '',
                         'weakSignals': sc.get('weakSignals') or [],
-                        'indicators': sc.get('indicators') or {},
+                        'indicators': inds,
                         'leadSectors': [], 'failedLeaders': [],
+                        'dataGaps': [gap] if gap else [],
                         'rule': CYCLE_RULES.get(sc.get('cycle'), {}),
                         'minScore': SENTIMENT_MIN_SCORE.get(sc.get('cycle'), 60)}
     except Exception as e:
@@ -350,9 +386,91 @@ def _fallback_from_review() -> Optional[Dict]:
     return None
 
 
+def _latest_live_snapshot(now: datetime, final: bool = False) -> Optional[Dict]:
+    """实时涨停池不可用时，取当日最近一次成功落库的盘中快照。
+
+    为什么不能直接退收评（2026-10-23 用户实拍）：服务在 13:45 重启后内存缓存为空，
+    14:00 东财正处全域冷却，收评兜底把 **10-22 的「最高连板 5板」** 挂在了今天卡片上，
+    而今天 13:35 的盘中快照是 6板。当日快照与此刻同一市场，最多旧几十分钟；
+    超过 SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC 才退收评，并明确标注来源时间。
+
+    final=True：收盘后当天收评还没生成时的定版兜底，来源标记为 snapshot_final。
+    """
+    try:
+        _ensure_table()
+        conn = get_db_conn()
+        row = conn.execute(
+            'SELECT ts, payload FROM market_sentiment_snapshots '
+            'WHERE sent_date=? AND stale=0 ORDER BY ts DESC LIMIT 1',
+            (now.strftime('%Y-%m-%d'),)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        ts_str, payload = row['ts'], row['payload']
+        snap_dt = datetime.fromisoformat(ts_str)
+        age = (now - snap_dt).total_seconds()
+        if age < 0 or age > SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC:
+            return None
+        snap = json.loads(payload)
+        if not isinstance(snap, dict):
+            return None
+        snap = dict(snap)
+        snap['stale'] = True                 # 兜底值一律只提示、不否决
+        snap['source'] = 'snapshot_final' if final else 'snapshot_fallback'
+        snap['final'] = bool(final)          # 盘中兜底是当日盘中值；收盘兜底才是定版
+        snap['snapshotAgeSec'] = int(age)
+        mins = int(age // 60)
+        age_txt = f'（已 {mins} 分钟未更新）' if mins >= 1 else ''
+        # 收盘定版兜底不写"实时涨停池不可用"——那会让用户以为数据是坏的；
+        # 真正要说的是"今日收评还没生成，先用今天最接近收盘的快照"。
+        # 也过滤掉快照里自带的旧 gap，避免同一句话叠两遍。
+        gaps = [g for g in (snap.get('dataGaps') or [])
+                if '盘中快照' not in str(g)]
+        # 定版来源由行动台 finalLabel 说明（"收评未生成 · 沿用 HH:MM 快照"），
+        # 不再塞进 dataGaps —— 那里会被渲染成"缺数"，语义正好反了。
+        if not final:
+            gaps.append(f'实时涨停池此刻不可用，沿用 {snap_dt.strftime("%H:%M")} 盘中快照{age_txt}')
+        snap['dataGaps'] = gaps
+        snap['rule'] = dict(snap.get('rule') or {})
+        snap['rule']['veto_roles'] = ()
+        return snap
+    except Exception as e:
+        print(f'[情绪] 盘中快照兜底失败: {e}')
+        return None
+
+
+def _final_fallback(now: datetime) -> Optional[Dict]:
+    """非交易时段的定版口径：今日收评 → 今日最近的盘中快照 → 最近一次收评。
+
+    第二条专治 15:00~15:10 收评尚未生成、或当天收评任务失败：宁可显示今天
+    14:38 的快照并注明"收评尚未生成"，也不把昨天的连板高度当成今天的。
+    """
+    today = now.strftime('%Y-%m-%d')
+    rev = _fallback_from_review(final=True)
+    if rev and rev.get('date') == today:
+        return rev
+    snap = _latest_live_snapshot(now, final=True)
+    if snap:
+        return snap
+    return rev
+
+
+def _fallback_snapshot(now: datetime, final: bool = False) -> Optional[Dict]:
+    """实时数据不可用时的兜底顺序：当日最近盘中快照 → 最近一次收评。
+
+    盘中调用（默认 final=False）优先拿当日快照并标降级；非交易时段走
+    `_final_fallback()`，不会经过这里。
+    """
+    return _latest_live_snapshot(now) or _fallback_from_review(final=final)
+
+
 def _maybe_save(data: Dict):
     global _LAST_SAVE_TS
-    if not data or time.time() - _LAST_SAVE_TS < SENTIMENT_SNAPSHOT_SAVE_SEC:
+    # 兜底快照不回写：它的 asOf 是原快照时间，INSERT OR REPLACE 会把同一条 live 行
+    # 覆盖成 stale=1，几次冷却之后当天快照就被自己吃光了。
+    if not data or data.get('stale'):
+        return
+    if time.time() - _LAST_SAVE_TS < SENTIMENT_SNAPSHOT_SAVE_SEC:
         return
     _LAST_SAVE_TS = time.time()
     try:
@@ -371,7 +489,8 @@ def _maybe_save(data: Dict):
 
 def _empty_snapshot(reason: str) -> Dict:
     """拿不到情绪时的统一空壳：cycle='未知'，rule 为空，因此对所有消费方都是"只提示不拦" """
-    return {'stale': True, 'source': reason, 'cycle': '未知', 'cycleScore': None,
+    return {'stale': True, 'source': reason, 'final': False,
+            'cycle': '未知', 'cycleScore': None,
             'advice': f'情绪数据不可用（{reason}）', 'detail': '', 'weakSignals': [],
             'indicators': {}, 'leadSectors': [], 'failedLeaders': [], 'rule': {},
             'minScore': 60, 'asOf': '', 'date': datetime.now().strftime('%Y-%m-%d')}
@@ -408,6 +527,19 @@ async def get_sentiment(force: bool = False) -> Dict:
     if not SENTIMENT_ENABLED:
         return _empty_snapshot('已关闭')
 
+    # 非交易时段：定版口径不参与缓存/singleflight 竞争。
+    # 2026-10-23 实拍：行动台并发发起 sentiment 与 mainline，mainline 抢锁失败拿到
+    # _empty_snapshot('刷新中')（没有 final 字段），于是把今天的结构判成"不可用"并
+    # 缓存 180 秒。定版只读一次收评表，直接给，既快又不受并发态污染。
+    now = datetime.now()
+    try:
+        phase = get_session_phase(now).get('phase', '')
+    except Exception:
+        phase = ''
+    if phase not in _COLLECT_PHASES:
+        fb = _final_fallback(now)
+        return fb or _empty_snapshot(f'非交易时段({phase or "未知"})')
+
     cached = _CACHE.get('data')
     if cached and not force and time.time() - _CACHE['ts'] < SENTIMENT_REFRESH_TTL_SEC:
         return cached
@@ -430,9 +562,13 @@ async def get_sentiment(force: bool = False) -> Dict:
         return data
     except Exception as e:
         print(f'[情绪] 盘中情绪刷新失败，降级: {e}')
-        fb = cached or _fallback_from_review()
+        fb = cached or _fallback_snapshot(datetime.now())
         if fb:
             fb = dict(fb)
+            if cached and not cached.get('stale'):
+                gaps = list(fb.get('dataGaps') or [])
+                gaps.append('刚刚刷新失败，沿用上一次盘中值')
+                fb['dataGaps'] = gaps
             fb['stale'] = True
             fb.setdefault('cycle', '未知')
             # 降级值不给否决权限：接口故障不该被当成"市场恐慌"而清空买入区

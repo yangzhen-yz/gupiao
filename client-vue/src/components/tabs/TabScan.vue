@@ -51,10 +51,10 @@
             <br />
             <small style="color: #94a3b8; font-weight: 400">{{ r.symbol.toUpperCase() }}</small>
           </span>
-          <span class="price" :style="{ color: r.change >= 0 ? '#dc2626' : '#16a34a' }">{{ r.price }}</span>
-          <span class="change-pct" :style="{ color: r.change >= 0 ? '#dc2626' : '#16a34a', fontWeight: 600 }"
-            >{{ r.change >= 0 ? '+' : '' }}{{ r.changePercent.toFixed(2) }}%</span
-          >
+          <span class="price" :style="{ color: changeColor(r.change ?? r.changePercent) }">{{ r.price }}</span>
+          <span class="change-pct" :style="{ color: changeColor(r.change ?? r.changePercent), fontWeight: 600 }">{{
+            formatChangePct(r.changePercent)
+          }}</span>
           <span class="volume-ratio">{{ r.volumeRatio.toFixed(2) }}</span>
           <span class="turnover">{{ r.turnoverRate.toFixed(2) }}%</span>
           <span
@@ -257,6 +257,20 @@
 
   function goToQuote(symbol) {
     if (navigateToQuote) navigateToQuote(symbol)
+  }
+
+  // 涨跌幅（2026-10-23）：字段偶发缺失时显示「—」，不再整行报错；红涨绿跌、平盘灰
+  function changeColor(v) {
+    const n = Number(v)
+    if (!Number.isFinite(n) || n === 0) return '#64748b'
+    return n > 0 ? '#dc2626' : '#16a34a'
+  }
+
+  function formatChangePct(v) {
+    if (v === null || v === undefined || v === '') return '—'
+    const n = Number(v)
+    if (!Number.isFinite(n)) return '—'
+    return `${n > 0 ? '+' : ''}${n.toFixed(2)}%`
   }
 
   // 预期涨幅：(目标价 - 现价) / 现价 * 100
@@ -529,7 +543,9 @@
     background: rgba(29, 78, 216, 0.15);
     border-color: rgba(191, 219, 254, 0.3);
   }
-  @media (max-width: 640px) {
+  /* 2026-10-23：断点从 640 提到 768，接管原先全局 nth-child 藏列的窄屏区间；
+     手机/窄窗固定保留 名称/现价/涨跌幅/综合评分 四列，不再把涨跌幅整列藏掉。 */
+  @media (max-width: 768px) {
     .stock-table-header,
     .stock-table-row {
       grid-template-columns: 2fr 1fr 1fr 1.2fr;

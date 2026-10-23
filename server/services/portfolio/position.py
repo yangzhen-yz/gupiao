@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 from app.config import (KLINE_HISTORY_ENABLED, KLINE_HISTORY_DB_PATH,
                         TREND_LIMIT_UP_THRESHOLD, CYCLE_RULES)
-from db.database import load_user_positions, load_trend_scan_results, load_daily_recommendations, load_daily_market_reviews, get_user_capital
+from db.database import load_user_positions, load_trend_scan_results, load_daily_recommendations, load_daily_market_reviews, get_user_capital, get_user_realized_pnl
 from services.data.stock import fetch_with_retry, parse_tencent_batch_data
 from services.strategy.strategy import calc_stock_score_v2
 from services.strategy.risk_control import calc_risk_control
@@ -194,6 +194,7 @@ def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
     out['market_value'] = round(price * shares, 2)
 
     # 简版评分 + 风控止损（基于成本价）；2026-10-13 起补齐 trend_result 走死猫反弹门控
+    tr = None
     try:
         from services.strategy.trend import compute_trend_result
         tr = compute_trend_result(sym, price)
@@ -279,6 +280,24 @@ def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
         if pools['in_today_rec'] or pools['in_trend_pool']:
             detail += '；该股今日仍在推荐/趋势池，可多一分耐心'
         out['detail'] = detail
+
+    # 统一卖出计划（2026-10-22）：三机制并列。默认只挂 exit_plan 展示，
+    # 不改变上述任何动作；只有 exit_rules_live_enabled=True 才接管。
+    try:
+        from services.portfolio.exit_rules import plan_exit
+        plan = plan_exit(symbol=sym, cost=cost, price=price, buy_date=buy_date,
+                         stop_price=stop_price, target_price=out['target_price'],
+                         trailing=trailing, trend_result=tr)
+        out['exit_plan'] = plan
+        if plan.get('enabled') and plan.get('live') and plan.get('action') == 'exit' \
+                and out.get('action') != 'stop_loss':
+            # 映射到现有推送动作集合：固定止损=stop_loss，逻辑/时间止损=reduce；
+            # 不新增动作 key，避免 position_watch / action_desk 的集合漏接。
+            out['action'] = 'stop_loss' if plan.get('hit') == 'fixed' else 'reduce'
+            out['action_label'] = plan.get('action_label') or '离场'
+            out['detail'] = f"{plan.get('reason')}（exit_rules 实盘接管）"
+    except Exception as e:
+        out['exit_plan'] = {'enabled': False, 'why': f'{type(e).__name__}: {e}'}
     return out
 
 
@@ -457,6 +476,9 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
     # 初始本金：仓位口径的分母。没设本金时下面一律回退成"市值/持仓市值"，
     # 也就是老行为（单票必然接近 100%），并在 warnings 里提醒用户去设。
     principal = get_user_capital(user_id=user_id)
+    # 累计已实现盈亏（2026-10-23）：减仓/清仓落账的那部分。没有它，"当前资金"
+    # 只能永远等于初始本金，用户清仓后账面对不上账。
+    realized_pnl = get_user_realized_pnl(user_id=user_id)
 
     async def _fetch_market():
         """大盘实时涨跌 + 开盘涨跌（今开/昨收，用于开盘形态修正）"""
@@ -484,6 +506,11 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
         market_change, market_open_change = await _fetch_market()
         env_advice = calc_trading_advice(market_change, open_change=market_open_change,
                                          sentiment=await _resolve_sentiment())
+        # 已实现盈亏 + 当前资金（2026-10-23）：清仓后本金口径必须跟着已实现的钱走，
+        # 否则用户落袋 +890 元后页面还显示 3.25 万，"总盈亏"对不上账。
+        realized = get_user_realized_pnl(user_id=user_id)
+        # 空仓：现金 = 本金 + 全部已实现（无在途成本），当前资金同值
+        current_capital = round(principal + realized, 2) if principal > 0 else None
         # 空仓也要把本金带出去：用户往往是先设好本金、再买第一笔，
         # 若这里返回 portfolio=None，前端就没有地方显示和保存本金。
         return {'has_positions': False, 'market_change': round(market_change, 2),
@@ -493,7 +520,10 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
                               'capital_set': principal > 0,
                               'base_label': '本金' if principal > 0 else '总成本',
                               'position_pct': 0.0,
-                              'free_cash': round(principal, 2) if principal > 0 else None,
+                              'free_cash': round(principal + realized, 2) if principal > 0 else None,
+                              'realized_pnl': round(realized, 2),
+                              'current_capital': current_capital,
+                              'total_pnl_all': round(realized, 2),
                               'capital_hint': ('先去持仓页设一次初始本金，之后买入就能按本金算仓位、看整体收益'
                                                if principal <= 0 else ''),
                               'advice': _total_position_advice(market_change),
@@ -551,6 +581,14 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
     total_value = sum(d['market_value'] for d in diag_list)
     total_pnl = total_value - total_cost
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    # 总盈亏 = 已实现（减仓/清仓落账）+ 浮动（持仓市值-成本）。
+    # 当前资金 = 初始本金 + 总盈亏；可用现金 = 初始本金 + 已实现 - 在途成本
+    # （买入扣现金、卖出按 成本+已实现 回现金，恒等式见 database.py 表注释）。
+    # 注意 free_cash 老口径是 principal - total_value（把浮盈也当现金），
+    # 浮盈没落袋就不是钱——用户清仓前看到的"可用"会虚高，这里按真实现金算。
+    total_pnl_all = total_pnl + realized_pnl
+    current_capital = round(principal + total_pnl_all, 2) if principal > 0 else None
+    free_cash = round(principal + realized_pnl - total_cost, 2) if principal > 0 else None
 
     # 仓位基数：设了本金就按本金算（"这票占我全部资金的几成"才是用户想看的），
     # 没设就退回总成本 —— 那是老口径，只持一只票时必然接近 100%，超配告警等于废话，
@@ -560,7 +598,6 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
     for d in diag_list:
         d['pos_pct'] = round(d['market_value'] / base * 100, 1) if base > 0 else 0.0
     position_pct = round(total_value / base * 100, 1) if base > 0 else 0.0
-    free_cash = round(principal - total_value, 2) if principal > 0 else None
 
     advice = _total_position_advice(market_change)
 
@@ -599,6 +636,12 @@ async def get_portfolio_diagnosis(user_id: int = 1) -> Dict:
             'base_label': base_label,
             'position_pct': position_pct,
             'free_cash': free_cash,
+            # 2026-10-23：已实现盈亏 / 当前资金 / 总盈亏（已实现+浮动）。
+            # 本金未设时 current_capital 为 None（前端隐藏），realized/total_pnl_all 仍给。
+            'realized_pnl': round(realized_pnl, 2),
+            'current_capital': current_capital,
+            'total_pnl_all': round(total_pnl_all, 2),
+            'total_pnl_all_pct': round(total_pnl_all / principal * 100, 2) if principal > 0 else None,
             'capital_hint': capital_hint,
             'advice': advice,
             'warnings': warnings,

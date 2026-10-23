@@ -39,6 +39,9 @@ from app.config import (SLOW_DATA_HOLDER_NUM_WEEKDAYS, SLOW_DATA_FUNDAMENTAL_WEE
                         SLOW_DATA_DAILY_MONTHS, SLOW_DATA_VALUATION_TRADING_ONLY)
 # 双源数据交叉校验（2026-10-19，westock 权威源）
 from app.config import WESTOCK_CROSSCHECK_TIME
+from app.config import EVAL_LAB_ENABLED, EVAL_LAB_TIME, EVAL_LAB_WEEKDAY
+from app.config import AUCTION_SNAPSHOT_ENABLED, AUCTION_SNAPSHOT_TIME, AUCTION_SNAPSHOT_BATCH
+from app.config import MINUTE5_FORWARD_ENABLED, MINUTE5_FORWARD_TIME
 
 
 # 盘后数据自检的告警去重：同一天+同一"库内最新日期"只轰一次，否则每轮重跑都发一条
@@ -325,6 +328,22 @@ def run_scheduler():
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 拆档回测落库失败: {e}')
 
+    def job_sector_persistence():
+        """板块持续性预热（2026-10-22，主线判定的分母）。
+
+        一次 SQL 读本地日K近11个交易日全市场（~2.7万行，1-2s），按国标行业聚合
+        截尾均值复利收益，落 sector_persistence_daily。排两个点：09:05（昨收日线
+        已由昨晚 18:15~20:15 同步到位，盘前主线要用）与 20:25（末批同步 20:15 之后，
+        当天数据进窗口，明早读到的就是含今天的）。失败只掉持续性维，不拖别的。"""
+        if not _today_is_trading():
+            return
+        try:
+            from services.strategy.mainline import compute_sector_persistence
+            n = len(compute_sector_persistence(force=True))
+            print(f'[板块持续性] 计算完成：{n} 个行业板块入库')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 板块持续性预热失败: {e}')
+
     def job_shadow_eval_daily():
         """影子对照日常监控（2026-10-18，实施计划"工具：影子对照脚本"）：
         把"影子挡掉的票 T+1 是不是真的更差"每天存一个点，第1批 P0-2 的上线判据。
@@ -348,6 +367,63 @@ def run_scheduler():
             mod.record_daily()
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 影子对照失败: {e}')
+
+    def job_eval_lab_weekly():
+        """每周六跑一次本地因子体检（2026-10-22）。
+
+        只读 history_kline.db / gupiao.db，不联网。选周六是因为它要读全市场 140 万行日K，
+        约 1 分钟；放盘中会占调度线程，放周末零代价。结果落 eval_lab_runs，页面/接口
+        直接读最近一次，不必每次现算。
+
+        2026-10-23 改：不再在调度线程里 import factor_lab（它依赖 numpy/pandas，
+        服务的 reload worker 解释器不一定带，曾实测 500 No module named numpy）。
+        改走 services.support.eval_lab.run_analysis() 的**子进程**，解释器自动探测，
+        web 进程不背 pandas，也不让周六任务静默失败。
+        """
+        if datetime.now().weekday() != EVAL_LAB_WEEKDAY:
+            return
+        try:
+            from services.support import app_settings
+            if not app_settings.value('eval_lab_enabled'):
+                print('[因子体检] 开关已关闭，本轮跳过')
+                return
+            from services.support.eval_lab import run_analysis
+            r = run_analysis()
+            rec5 = ((r.get('recommendations') or {}).get('ret5') or {}).get('excessMean')
+            print(f"[因子体检] {r.get('runDate')} 完成（{r.get('interpreter')}）："
+                  f"范围 {r.get('universe')} 只 / {r.get('rebalances')} 个截面；"
+                  f"推荐 5 日超额 {rec5}%")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 因子体检失败: {type(e).__name__}: {e}')
+
+    def job_auction_snapshot():
+        """09:25 集合竞价快照（2026-10-22）。失败只少一天数据，不阻塞推荐。"""
+        if not _today_is_trading():
+            return
+        try:
+            from services.support import app_settings
+            if not app_settings.value('auction_snapshot_enabled'):
+                return
+            from services.data.auction import snapshot_universe
+            r = snapshot_universe(batch=AUCTION_SNAPSHOT_BATCH)
+            print(f"[竞价快照] {r.get('date')} 落库 {r.get('rows')} 只"
+                  f"（范围 {r.get('scope')}，失败批次 {r.get('failedBatches')}）")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 竞价快照失败: {e}')
+
+    def job_minute5_forward():
+        """收盘后采集活跃票 5 分钟线（默认关）。"""
+        if not _today_is_trading():
+            return
+        try:
+            from services.support import app_settings
+            if not app_settings.value('minute5_forward_enabled'):
+                return
+            from services.data.minute_forward import collect_active
+            r = collect_active()
+            print(f"[5分钟前向] 落库 {r.get('rows')} 行 / {r.get('symbols')} 只")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 5分钟前向采集失败: {e}')
 
     def job_westock_crosscheck_daily():
         """双源数据交叉校验（2026-10-19，westock 权威源）：每日收盘后跑。
@@ -752,9 +828,25 @@ def run_scheduler():
     # 当天名单才不会被判"无当日K线"；落 rec_sim_batch_daily
     schedule.every().day.at('20:30').do(_warp_trading_only(job_rec_sim_batch_daily))
 
+    # 板块持续性预热（2026-10-22，主线判定的分母）：09:05 供盘前用、20:25 收当天
+    schedule.every().day.at('09:05').do(_warp_trading_only(job_sector_persistence))
+    schedule.every().day.at('20:25').do(_warp_trading_only(job_sector_persistence))
+
     # 影子对照日常监控（2026-10-18，实施计划"工具"）：16:25 日K已同步，
     # 把「影子挡掉的票 T+1 是不是真的更差」存成每天一个点 —— 第1批 P0-2 的上线判据
     schedule.every().day.at(SHADOW_EVAL_TIME).do(_warp_trading_only(job_shadow_eval_daily))
+
+    # 09:25 集合竞价快照（2026-10-22）：只在竞价窗口内写，晚跑宁可不写；
+    # 采 2462 只约 41 次请求、10 秒内完成，9:45 推荐前早已结束
+    schedule.every().day.at(AUCTION_SNAPSHOT_TIME).do(_warp_trading_only(job_auction_snapshot))
+
+    # 收盘后 5 分钟线前向采集（2026-10-22，默认关）：只采当天推荐/持仓/海选池活跃票，
+    # 15:05 跑完不耽误 15:10 收评；替代已被 baostock 判黑卡住的逐只分钟线
+    schedule.every().day.at(MINUTE5_FORWARD_TIME).do(_warp_trading_only(job_minute5_forward))
+
+    # 因子体检周任务（2026-10-22）：job 内部再按 EVAL_LAB_WEEKDAY 判断，
+    # 注册在每天 08:30 是为了跨进程重启后不用重新算"下一个周六"
+    schedule.every().day.at(EVAL_LAB_TIME).do(job_eval_lab_weekly)
 
     # 双源数据交叉校验（2026-10-19）：16:30 本地 vs westock（权威源），
     # 落 westock_snapshot + data_cross_check，行情不一致告警、资金流记录符号冲突
@@ -825,12 +917,20 @@ def run_scheduler():
           f'一切"放宽/多推"提案的验收基线）')
     print(f'[定时任务]   - 20:30: 上午档/下午档拆批次回测（名单从 strategy_snapshot 还原，'
           f'落 rec_sim_batch_daily；10-19 起才有快照）')
+    print(f'[定时任务]   - 09:05/20:25: 板块持续性预热（本地日K×行业聚合近10日收益，'
+          f'主线判定的分母，落 sector_persistence_daily）')
     print(f'[定时任务]   - {INDUSTRY_SYNC_WEEKDAY} {INDUSTRY_SYNC_TIME}: 行业分类周更'
           f'（baostock 全量落 stock_industry_map；东财被封时资金流向的行业列/板块聚合靠它）')
     print(f'[定时任务]   - {SHADOW_EVAL_TIME}: 影子对照日常监控（放行 vs 被挡 T+1，'
           f'落 recommend_shadow_eval；满 {SHADOW_EVAL_MIN_DAYS} 个交易日才给上线判据）')
     print(f'[定时任务]   - {WESTOCK_CROSSCHECK_TIME}: 双源数据校验（本地 vs westock 权威源，'
           f'落 westock_snapshot + data_cross_check；行情不一致告警、资金流记符号冲突）')
+    print(f'[定时任务]   - {AUCTION_SNAPSHOT_TIME}: 集合竞价快照（腾讯批量，落 auction_snapshot；'
+          f'仅竞价窗口 09:24~09:31 写入，晚跑拒写）')
+    print(f'[定时任务]   - {MINUTE5_FORWARD_TIME}: 5分钟线前向采集（活跃票，落 minute_5m；'
+          f'{"已启用" if MINUTE5_FORWARD_ENABLED else "默认关"}）')
+    print(f'[定时任务]   - 每周{"一二三四五六日"[EVAL_LAB_WEEKDAY]} {EVAL_LAB_TIME}: '
+          f'因子体检（本地日K横截面 IC，落 eval_lab_runs；只读不联网）')
     print(f'[定时任务]   - {SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME}: 收盘前推荐快照（最终生成并自动保存，仅交易日）')
     print(f'[定时任务]   - {SHAREHOLDER_UPDATE_TIME}: 更新股东人数筹码面数据'
           f'（月度披露；刷新节奏 {_weekday_names(SLOW_DATA_HOLDER_NUM_WEEKDAYS)}，'
@@ -903,6 +1003,26 @@ def run_scheduler():
                           f'｜{_s.get("detail")}')
                 except Exception as _sent_err:
                     print(f'[情绪 {_now:%H:%M:%S}] 刷新失败: {_sent_err}')
+                # 主线判定预热（2026-10-22）：紧跟情绪之后，行动台请求永远命中缓存。
+                # 全走内存/本地表（零外部请求），一次 ~50ms；开关关则整个跳过。
+                try:
+                    from services.strategy.mainline import get_mainline, _setting as _ml_setting
+                    from app.config import MAINLINE_ENABLED
+                    if _ml_setting('mainline_enabled', MAINLINE_ENABLED):
+                        # 板块资金流保活（内部自判：clist 熔断中/快照<30min 直接跳过，
+                        # 满足条件也只 2 次请求）——没人开资金流页时主线才不会永远"无主线"
+                        try:
+                            from services.data.fundflow import soft_refresh_sector_flow
+                            asyncio.run(soft_refresh_sector_flow())
+                        except Exception:
+                            pass
+                        _m = asyncio.run(get_mainline())
+                        _mm = _m.get('main') or []
+                        print(f'[主线 {_now:%H:%M:%S}] '
+                              + ('｜'.join(f"{x['name']} {x['score']}分 {x.get('stage','')}" for x in _mm)
+                                 if _mm else f"无主线：{(_m.get('none') or {}).get('reason','')}"))
+                except Exception as _ml_err:
+                    print(f'[主线 {_now:%H:%M:%S}] 预热失败: {_ml_err}')
 
             # ---- 持仓快反推送（2026-10-14，止损/止盈不等用户打开页面）----
             # 时窗/交易日/午休判定在 watch_all_users 内部再做一次，这里只控频率。

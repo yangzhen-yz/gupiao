@@ -1393,6 +1393,60 @@ async def auto_generate_recommendations_task():
                 for _sym, _m in (modes or {}).items():
                     if _sym:
                         _labs.setdefault(_sym, {})['mode'] = _m
+                # RPS 影子标签（2026-10-22）：只落快照、**不参与评分**。
+                # 背景：rps.py 早就算出了全市场 RPS，但 recommend 从未把 rps_data 传进
+                # calc_stock_score_v2，第 13 因子一直是常数。本轮先把真实值与三种待验口径
+                # （单因子强 / 强+回踩MA20 / 强+缩量）落下来，等快照攒够两周再决定是否进评分。
+                # 因子体检显示 60 日动量类 IC 为负，所以绝不能在没对照前直接加正向权重。
+                try:
+                    from services.strategy.rps import get_rps_map
+                    _rps_map = await get_rps_map()
+                except Exception as _e:
+                    _rps_map = {}
+                    print(f'[策略快照] RPS 读取失败（rps 列留空）: {type(_e).__name__}: {_e}')
+                for _s in all_results:
+                    _sym = (_s.get('symbol') or '').lower()
+                    if not _sym:
+                        continue
+                    _v = _rps_map.get(_sym)
+                    if _v is None:
+                        _v = _rps_map.get(_sym[-6:])       # 带 sh/sz 前缀时退回裸码
+                    if _v is None:
+                        continue
+                    _tr = trend_map.get(_sym) or {}
+                    _ma = None
+                    try:
+                        _mas = _tr.get('ma20') or []
+                        if _mas and _mas[-1] is not None:
+                            _ma = float(_mas[-1])
+                    except (TypeError, ValueError):
+                        _ma = None
+                    try:
+                        _px = float(_s.get('priceRaw') or _s.get('price') or 0)
+                    except (TypeError, ValueError):
+                        _px = 0.0
+                    try:
+                        _vr = float(_s.get('volumeRatio') or 0)
+                    except (TypeError, ValueError):
+                        _vr = 0.0
+                    _pull = round((_px / _ma - 1) * 100, 2) if (_ma and _px) else None
+                    _tag = {'rps': round(float(_v), 1)}
+                    _strong = float(_v) >= 80
+                    _pull_ok = _pull is not None and 0 <= _pull <= 5
+                    _shrink = _vr > 0 and _vr < 1
+                    if _strong:
+                        _tag['strong'] = True
+                    if _pull is not None:
+                        _tag['pullbackPct'] = _pull
+                        _tag['pullback'] = _pull_ok
+                    if _vr:
+                        _tag['volRatio'] = _vr
+                        _tag['shrink'] = _shrink
+                    _tag['verdict'] = ([k for k, ok in (
+                        ('strong', _strong), ('strong+pullback', _strong and _pull_ok),
+                        ('strong+shrink', _strong and _shrink)) if ok])
+                    _labs.setdefault(_sym, {})['rps'] = _tag['rps']
+                    _labs[_sym]['rps_shadow'] = _tag
                 if shadow_payload:
                     def _lab(_sym):
                         return _labs.setdefault(_sym, {}) if _sym else {}
