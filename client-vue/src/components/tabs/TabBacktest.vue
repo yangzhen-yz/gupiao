@@ -331,6 +331,105 @@
             </p>
           </div>
         </details>
+
+        <details class="bt-det" :open="!!excess">
+          <summary>
+            次日开盘买入、拿 1/3/5/10 天：扣费后到底跑赢没有
+            <em v-if="excess && excess.byDay['5']" :class="signCls(excess.byDay['5'].excess)">
+              5 日超额 {{ pct(excess.byDay['5'].excess) }}
+            </em>
+            <em v-else-if="excessError" class="bt-ex-err">{{ excessError }}</em>
+            <em v-else>正在算（约 4 秒）…</em>
+          </summary>
+          <template v-if="excess && excess.byDay['1']">
+            <table class="bt-table bt-ex-table">
+              <thead>
+                <tr>
+                  <th>持有</th>
+                  <th>样本</th>
+                  <th>扣费后均值</th>
+                  <th>同期等权基准</th>
+                  <th>超额</th>
+                  <th>胜率</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="n in ['1', '3', '5', '10']" :key="'ex' + n">
+                  <template v-if="excess.byDay[n]">
+                    <td>{{ n }} 日</td>
+                    <td>{{ excess.byDay[n].n }}</td>
+                    <td :class="signCls(excess.byDay[n].avg)">{{ pct(excess.byDay[n].avg) }}</td>
+                    <td :class="signCls(excess.byDay[n].benchAvg)">{{ pct(excess.byDay[n].benchAvg) }}</td>
+                    <td :class="signCls(excess.byDay[n].excess)">{{ pct(excess.byDay[n].excess) }}</td>
+                    <td>{{ excess.byDay[n].winRate }}%</td>
+                  </template>
+                </tr>
+              </tbody>
+            </table>
+            <div class="bt-why">
+              <p>
+                这条回答的是"<b>这些票拿几天到底行不行</b>"，买价统一用<b>推荐日下一交易日开盘</b>，
+                不是推荐时的参考价 —— 后者混着推荐当天已经涨过的那段，算出来会好看得不真实。
+                基准是选股范围内<b>全部票</b>在同一买入日、同一持有期等权，逐条配对后平均，
+                所以超额不是"策略均值减指数涨幅"这种假 alpha。
+              </p>
+              <p class="bt-fine">
+                窗口 {{ excess.since }} ~ {{ excess.until }} / {{ excess.recCount }} 条推荐
+                （固定 6 个月，与上方曲线窗口无关）；当日封死涨停的票按"次日竞价能买"处理，
+                次日一字涨停买不到跳过 {{ excess.skipped['次日一字涨停买不到'] || 0 }} 条，
+                其余 K 线不足的样本单独计数、不进分母。
+              </p>
+              <p v-if="monthly5" class="bt-fine">逐月 5 日超额：{{ monthly5 }}</p>
+              <p class="bt-fine">
+                负超额的意思很直接：这批推荐次日开盘追进去、拿住，扣完费还不如同日买范围内一篮子。
+                它和上面六条曲线不矛盾 —— 上面回答"次日就卖"，这里回答"拿几天"。
+              </p>
+            </div>
+          </template>
+        </details>
+
+        <details class="bt-det" :open="false">
+          <summary>
+            因子体检（每周六 08:30，本地库离线跑）
+            <em v-if="labView" :class="signCls(labView.recExcess)"> 5 日超额 {{ pct(labView.recExcess) }} </em>
+            <em v-else-if="labError" class="bt-ex-err">{{ labError }}</em>
+            <em v-else>暂无体检结果</em>
+          </summary>
+          <template v-if="labView">
+            <table class="bt-table bt-ex-table">
+              <thead>
+                <tr>
+                  <th>因子</th>
+                  <th>5 日 IC</th>
+                  <th>t 值</th>
+                  <th>Q5-Q1</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="f in labRows" :key="'lab' + f.k">
+                  <td>{{ f.label }}</td>
+                  <td :class="signCls(f.ic)">{{ f.ic > 0 ? '+' : '' }}{{ f.ic.toFixed(3) }}</td>
+                  <td>{{ f.t > 0 ? '+' : '' }}{{ f.t.toFixed(2) }}</td>
+                  <td :class="signCls(f.q)">{{ f.q > 0 ? '+' : '' }}{{ f.q.toFixed(2) }}%</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="bt-why">
+              <p>
+                横截面 Spearman IC，|t|&gt;2 才算有点信号。这份样本里
+                <b>20 日反转最稳，缩量与最大单日涨幅取负也过 |t|&gt;3；</b>
+                <b>负 IC 端最强的是涨停数与流动性</b>
+                —— RPS 本质就是 60 日动量，所以只落影子、不直接加权。因子好不代表改评分就能赚钱， 还要过"同范围超额 +
+                回撤不恶化"那道门槛。
+              </p>
+              <p class="bt-fine">
+                窗口 {{ (labView.window || [])[0] }} ~ {{ (labView.window || [])[1] }} / {{ labView.rebalances }} 个截面
+                / {{ labView.universe }} 只范围；推荐 {{ labView.recN }} 条，5 日扣费均值 {{ pct(labView.recMean) }}、
+                超额 {{ pct(labView.recExcess) }}。只读本地日K、不联网，结果落 <code>eval_lab_runs</code>。
+              </p>
+            </div>
+          </template>
+        </details>
       </section>
     </template>
   </div>
@@ -350,6 +449,10 @@
   const modeBoard = ref({})
   const sh = ref({ rows: [], note: '', minDays: 10 })
   const readIdx = ref(null)
+  const excess = ref(null)         // 次日开盘持有 N 日的可执行超额（独立接口，后到）
+  const excessError = ref('')
+  const lab = ref(null) // 最近一次因子体检（每周六离线跑）
+  const labError = ref('')
 
   const W = 760,
     H = 230,
@@ -565,6 +668,77 @@
   async function loadBench() {
     await loadSim(true)
   }
+  // 可执行超额单独请求：它要 4 秒算全范围基准，不能让主曲线等它。
+  // 失败在折叠标题上明说，不静默当成"没有这条"。
+  async function loadExcess() {
+    excessError.value = ''
+    try {
+      const d = await apiFetch('/api/recommend-excess?months=6')
+      excess.value = d.data
+    } catch (e) {
+      excessError.value = '超额没算出来：' + (e.message || e)
+    }
+  }
+  // 因子体检是周更的离线结果，读最近一次即可；读不到就在标题上说明，不静默隐藏
+  async function loadLab() {
+    labError.value = ''
+    try {
+      const d = await apiFetch('/api/eval-lab/latest')
+      lab.value = (d && d.data) || null
+    } catch (e) {
+      labError.value = '体检结果读不到：' + (e.message || e)
+    }
+  }
+  const monthly5 = computed(() => {
+    const bm = (excess.value && excess.value.byMonth) || {}
+    return Object.keys(bm)
+      .sort()
+      .filter(m => bm[m] && bm[m]['5'])
+      .map(m => `${m.slice(5)}月 ${pct(bm[m]['5'].excess)}`)
+      .join(' · ')
+  })
+  const LAB_LABELS = {
+    rev20: '20日反转',
+    rev5: '5日反转',
+    mom60: '60日动量',
+    prox60: '距60日高点',
+    ma20_gap: '偏离MA20',
+    lowvol20: '20日低波',
+    vol_shrink: '缩量',
+    maxret20: '20日最大单日',
+    liq20: '20日流动性',
+    limit20: '20日涨停数',
+  }
+  // 按 IC 从高到低排：正 IC 在上、负 IC 在下，一眼能看出"该加谁、该躲谁"
+  const labRows = computed(() => {
+    const fs = (lab.value && lab.value.factors) || {}
+    return Object.keys(fs)
+      .map(k => {
+        const f5 = (fs[k] && fs[k].fwd5) || {}
+        const q = (fs[k] && fs[k].q5) || {}
+        return {
+          k,
+          label: LAB_LABELS[k] || k,
+          ic: Number(f5.meanIC ?? 0),
+          t: Number(f5.t ?? 0),
+          q: Number(q.q5_q1 ?? 0),
+        }
+      })
+      .sort((a, b) => b.ic - a.ic)
+  })
+  // 把推荐段拉平，模板里不用层层可选链
+  const labView = computed(() => {
+    const d = lab.value
+    if (!d || !d.available) return null
+    const r = d.recommendations || {}
+    const ret5 = r.ret5 || {}
+    return {
+      ...d,
+      recN: r.n ?? 0,
+      recMean: ret5.mean ?? 0,
+      recExcess: ret5.excessMean ?? 0,
+    }
+  })
   function setMonths(m) {
     months.value = m
     loadSim(!!bench.value)
@@ -572,6 +746,8 @@
 
   onMounted(async () => {
     loadSim(false)
+    loadExcess()
+    loadLab()
     try {
       const d = await apiFetch('/api/recommend-review?days=120')
       const by = (d.data && d.data.by_date) || {}
@@ -833,6 +1009,22 @@
     cursor: pointer;
     font-size: 12px;
     color: var(--text-secondary);
+  }
+  .bt-det summary em {
+    margin-left: 8px;
+    font-style: normal;
+    font-weight: 600;
+  }
+  .bt-det summary em.bt-ex-err {
+    color: var(--accent-warning);
+    font-weight: 500;
+  }
+  .bt-ex-table {
+    max-width: 560px;
+  }
+  .bt-ex-table th:first-child,
+  .bt-ex-table td:first-child {
+    text-align: left;
   }
   .bt-table {
     width: 100%;

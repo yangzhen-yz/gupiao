@@ -1793,10 +1793,10 @@ body {
 }
 
 /* 股票池表格：2026-10-13 改用自有 class（pool-head / pool-row）。
-   原先复用 .stock-table-header / .stock-table-row，而这两个全局类在
+   原先复用 .stock-table-header / .stock-table-row，而这两个全局类当时在
    @media (max-width:768px) 和 (max-width:480px) 里挂着 nth-child 隐藏规则 ——
    它们是为趋势卡列表写的，却顺带把股票池的「5日线」「操作」「连涨/跌」整列藏掉，
-   手机上只剩一串串没有标题的数字。 */
+   手机上只剩一串串没有标题的数字。（那些全局规则已于 2026-10-23 整体删除。） */
 .pool-head,
 .pool-row {
   display: grid;
@@ -3234,29 +3234,11 @@ body {
     grid-template-columns: 1fr;
   }
 
-  .stock-table-header,
-  .stock-table-row {
-    grid-template-columns: 1.5fr 0.8fr 0.8fr 1.2fr;
-  }
-
-  .stock-table-header span:nth-child(4),
-  .stock-table-header span:nth-child(5),
-  .stock-table-header span:nth-child(6),
-  .stock-table-row span:nth-child(4),
-  .stock-table-row span:nth-child(5),
-  .stock-table-row span:nth-child(6) {
-    display: none;
-  }
-
-  /* 资金流向页例外（2026-10-21）：上面的 nth-child 藏列是给趋势卡 7 列写的，
-     顺带把 TabFlow 的「涨跌幅/主力净流入/行业」也藏了——用户手机实拍"看不到资金"。
-     .flow-col 里的表恢复第4(净流入)/5(行业)列；趋势卡等其余复用者不受影响。 */
-  .flow-col .stock-table-header span:nth-child(4),
-  .flow-col .stock-table-header span:nth-child(5),
-  .flow-col .stock-table-row span:nth-child(4),
-  .flow-col .stock-table-row span:nth-child(5) {
-    display: block;
-  }
+  /* 表格列显隐改由各 Tab 自己负责（2026-10-23）：
+     - TabScan：scoped @media 保留 名称/现价/涨跌幅/综合评分；
+     - TabFlow：内联 grid 列定义，本来就自己控制。
+     这里原先按 nth-child 藏列的规则是给旧趋势表写的，趋势页早已改为卡片布局，
+     却把手机上的「股票筛选」第 3 列（涨跌幅）整列藏掉——用户只能看到现价。 */
 
   .score-details {
     grid-template-columns: 1fr;
@@ -3295,30 +3277,7 @@ body {
     padding-bottom: 52px;
   }
 
-  .stock-table-header,
-  .stock-table-row {
-    grid-template-columns: 1.8fr 1fr 1.2fr;
-  }
-
-  .stock-table-header span:nth-child(3),
-  .stock-table-header span:nth-child(4),
-  .stock-table-header span:nth-child(5),
-  .stock-table-header span:nth-child(6),
-  .stock-table-row span:nth-child(3),
-  .stock-table-row span:nth-child(4),
-  .stock-table-row span:nth-child(5),
-  .stock-table-row span:nth-child(6) {
-    display: none;
-  }
-
-  /* 资金流向页例外（同上，≤480px）：恢复第3(涨跌幅)/4(主力净流入)列——资金页的主角；
-     第5列行业在手机上仍隐藏（列名长、400px 放不下）。板块表4列（板块/涨跌幅/净流入/涨跌家数）全部恢复。 */
-  .flow-col .stock-table-header span:nth-child(3),
-  .flow-col .stock-table-header span:nth-child(4),
-  .flow-col .stock-table-row span:nth-child(3),
-  .flow-col .stock-table-row span:nth-child(4) {
-    display: block;
-  }
+  /* 表格列显隐同上：交给 TabScan/TabFlow 自己控制，避免再按 nth-child 误伤涨跌幅 */
 
   .price-points {
     grid-template-columns: 1fr;

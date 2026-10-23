@@ -126,6 +126,35 @@
           <button class="capital-edit" @click="startEditCapital">
             {{ data.portfolio.capital_set ? '修改' : '设置' }}
           </button>
+          <!-- 当前资金 / 总盈亏（2026-10-23）：初始本金是死数，清仓后赚的钱只体现在这里。
+               总盈亏 = 已实现（减仓/清仓落账）+ 浮动（持仓市值-成本），不依赖本金设置；
+               当前资金 = 初始本金 + 总盈亏，要设了本金才有分母。 -->
+          <span
+            v-if="data.portfolio.capital_set || (data.portfolio.total_pnl_all || 0) !== 0"
+            class="capital-sub-row"
+            :title="`已实现 ${fmtMoney(data.portfolio.realized_pnl || 0)} · 浮动 ${fmtMoney(
+              (data.portfolio.total_pnl_all || 0) - (data.portfolio.realized_pnl || 0)
+            )}`"
+          >
+            <span v-if="data.portfolio.capital_set" class="capital-sub-item">
+              当前资金 <b>{{ fmtMoney(data.portfolio.current_capital) }}</b>
+            </span>
+            <span
+              class="capital-sub-item"
+              :style="{
+                color: (data.portfolio.total_pnl_all || 0) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)',
+              }"
+            >
+              总盈亏<small>（含已实现）</small>
+              <b
+                >{{ (data.portfolio.total_pnl_all || 0) >= 0 ? '+' : ''
+                }}{{ fmtMoney(data.portfolio.total_pnl_all || 0) }}</b
+              ><small v-if="data.portfolio.total_pnl_all_pct != null">
+                （{{ (data.portfolio.total_pnl_all_pct || 0) >= 0 ? '+' : ''
+                }}{{ data.portfolio.total_pnl_all_pct }}%）</small
+              >
+            </span>
+          </span>
         </template>
         <div v-else class="capital-edit-wrap">
           <input
@@ -376,6 +405,15 @@
           <span class="pos-action">
             <span class="action-badge" :class="'action-' + p.action">{{ p.action_label }}</span>
             <small class="pos-detail">{{ p.detail }}</small>
+            <!-- 统一卖出计划（2026-10-22）：默认影子展示，不覆盖上方动作；实盘开关打开后才是“实盘” -->
+            <small
+              v-if="p.exit_plan?.enabled"
+              class="exit-plan"
+              :class="{ hit: p.exit_plan.hit }"
+              :title="p.exit_plan.reason"
+            >
+              {{ p.exit_plan.live ? '实盘卖出' : '影子卖出' }}：{{ exitPlanText(p.exit_plan) }}
+            </small>
           </span>
           <span class="pos-ops">
             <button class="op-btn" @click="startAdjust(p, 'add')">加仓</button>
@@ -694,6 +732,21 @@
     if (abs >= 1e8) return `${(n / 1e8).toFixed(2)}亿`
     if (abs >= 1e4) return `${(n / 1e4).toFixed(abs >= 1e5 ? 1 : 2)}万`
     return `${n.toFixed(0)}元`
+  }
+
+  // 统一卖出计划的一句话摘要：触发就说触发哪条，没触发就把三条的当前线摆出来。
+  function exitPlanText(p) {
+    if (!p || !p.enabled) return ''
+    if (p.hit) return `${p.action_label}：${p.reason}`
+    const mechs = p.mechanisms || []
+    const fixed = mechs.find((m) => m.id === 'fixed')
+    const logic = mechs.find((m) => m.id === 'logic')
+    const time = mechs.find((m) => m.id === 'time')
+    const parts = []
+    if (fixed?.available) parts.push(`固定线${fixed.line}`)
+    if (logic?.available) parts.push(`MA20 ${logic.line}`)
+    if (time?.available) parts.push(`持${p.daysHeld}天`)
+    return `三机制未触发（${parts.join(' / ') || '数据不足'}）`
   }
 
   function startEditCapital() {
@@ -1052,6 +1105,27 @@
   .capital-free {
     font-size: 0.75rem;
     color: #64748b;
+  }
+  /* 当前资金 / 总盈亏（2026-10-23）：跟本金行同组，flex-basis 100% 独占一行，
+     回答"清仓后我的钱变成多少"——初始本金是死数，已实现盈亏才是活的。 */
+  .capital-sub-row {
+    flex-basis: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.125rem 0.875rem;
+    margin-top: 0.25rem;
+    font-size: 0.75rem;
+    color: #64748b;
+    cursor: help;
+  }
+  .capital-sub-item b {
+    font-size: 0.9375rem;
+    margin: 0 0.125rem;
+  }
+  .capital-sub-item small {
+    font-size: 0.6875rem;
+    color: #94a3b8;
   }
   .capital-edit {
     font-size: 0.75rem;
@@ -1492,6 +1566,15 @@
     font-size: 0.6875rem;
     color: #64748b;
     line-height: 1.4;
+  }
+  .exit-plan {
+    font-size: 0.6875rem;
+    color: #94a3b8;
+    line-height: 1.4;
+  }
+  .exit-plan.hit {
+    color: #b45309;
+    font-weight: 600;
   }
   .pos-ops {
     display: flex;

@@ -237,6 +237,7 @@
                   <span class="score-bar-text">{{ scoreResult.score }}%</span>
                 </div>
               </div>
+              <div class="score-time">评分时点 {{ lastUpdateTime }} · 按最新行情现算（推荐页的分数是批次现场快照，两者可以不同）</div>
               <div class="score-details">
                 <div v-for="d in scoreResult.details" :key="d.label" class="score-detail-item">
                   <span>{{ d.label }}</span>
@@ -772,6 +773,12 @@
 </script>
 
 <style scoped>
+  /* 评分时点行（2026-10-21）：评分按最新行情现算，与推荐批次快照分可能不同，标出来防误读 */
+  .score-time {
+    font-size: 10px;
+    color: var(--text-tertiary);
+    margin: 4px 0 2px;
+  }
   /* 行情来源标记：腾讯挂掉走新浪兜底时，避免用户把"缺字段的 0"当成真实值 */
   .quote-source-badge {
     display: inline-block;

@@ -74,12 +74,13 @@
         <thead>
           <tr>
             <th>名称</th>
+            <th>现价</th>
+            <th>盈亏</th>
             <th>股数</th>
             <th>成本</th>
-            <th>现价</th>
             <th>市值</th>
-            <th>盈亏</th>
             <th>占比</th>
+            <th class="ops">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -87,15 +88,42 @@
             <td class="nm">
               <b>{{ p.name }}</b
               ><small class="mono">{{ p.symbol }}</small>
+              <small
+                v-if="p.advice"
+                class="pos-advice"
+                :class="p.advice.action"
+                :title="p.advice.detail || p.advice.lockedReason"
+              >
+                {{ p.advice.locked ? '今日买入 · 明日可卖' : p.advice.label }}
+              </small>
             </td>
-            <td class="num">{{ p.shares }}</td>
-            <td class="num">{{ p.costPrice }}</td>
             <td class="num">{{ p.price }}</td>
-            <td class="num">{{ fmtNum(p.marketValue) }}</td>
             <td class="num" :class="p.pnl >= 0 ? 'up' : 'down'">
               {{ p.pnl >= 0 ? '+' : '' }}{{ fmtNum(p.pnl) }} ({{ p.pnlPct }}%)
             </td>
+            <td class="num">{{ p.shares }}</td>
+            <td class="num">{{ p.costPrice }}</td>
+            <td class="num">{{ fmtNum(p.marketValue) }}</td>
             <td class="num">{{ p.weight }}%</td>
+            <td class="ops">
+              <button
+                v-if="halfQty(p) > 0"
+                class="mini"
+                :disabled="busy || p.advice?.locked"
+                :title="p.advice?.locked ? p.advice.lockedReason : '卖出一半，取整到 100 股'"
+                @click="onSell(p, halfQty(p))"
+              >
+                半仓
+              </button>
+              <button
+                class="mini sell"
+                :disabled="busy || p.advice?.locked"
+                :title="p.advice?.locked ? p.advice.lockedReason : '按现价卖出全部持仓'"
+                @click="onSell(p, p.shares)"
+              >
+                清仓
+              </button>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -196,7 +224,15 @@
   const fetchedAt = ref('')
 
   function srcLabel(s) {
-    return { recommend: '智能推荐', tomorrow_plan: '明日计划', diagnosis: '持仓诊断', screener: '筛选选中' }[s] || s
+    return (
+      {
+        recommend: '智能推荐',
+        tomorrow_plan: '明日计划',
+        diagnosis: '持仓诊断',
+        screener: '筛选选中',
+        manual: '手动卖出',
+      }[s] || s
+    )
   }
   function stLabel(s) {
     return { pending: '待执行', filled: '已成交', rejected: '已拒绝' }[s] || s
@@ -215,7 +251,7 @@
   }
   async function onGenerate() {
     if (!sources.value.length) {
-      toastError('请至少选择一个信号源')
+      showNotification('请至少选择一个信号源', 'error')
       return
     }
     busy.value = true
@@ -230,7 +266,7 @@
         body: JSON.stringify({ sources: sources.value, symbols }),
       })
       if (d.success) {
-        showNotification(`已生成 ${d.created_count} 条建议，${d.rejected_count} 条被护栏拦截`)
+        showNotification(`已生成 ${d.created_count ?? 0} 条建议，${d.rejected_count ?? 0} 条被护栏拦截`)
         await load()
       }
     } catch (e) {
@@ -244,11 +280,44 @@
     try {
       const d = await apiFetch('/api/sim/execute', { method: 'POST' })
       if (d.success) {
-        showNotification(`成交 ${d.filled_count} 条，拦截 ${d.rejected_count} 条`)
+        showNotification(`成交 ${d.filled_count ?? 0} 条，拦截 ${d.rejected_count ?? 0} 条`)
         await load()
       }
     } catch (e) {
       showNotification('成交失败：' + (e.message || e), 'error')
+    } finally {
+      busy.value = false
+    }
+  }
+  // 半仓数量：取整到 100 股；不足一手返回 0，按钮不出现
+  function halfQty(p) {
+    return Math.floor(((p && p.shares) || 0) / 2 / 100) * 100
+  }
+  // 手动卖出（2026-10-23）：给模拟持仓一个按现价直接了结的出口，
+  // 不用等诊断触发止损/止盈才生成卖单。qty 由按钮算好，后端仍做 T+1 与持仓校验。
+  async function onSell(p, qty) {
+    qty = Number(qty) || 0
+    if (qty <= 0) {
+      showNotification('可卖数量不足一手', 'error')
+      return
+    }
+    const all = qty >= (p.shares || 0)
+    if (!confirm(`按现价${all ? '清仓' : '卖出一半'}：${p.name} ${qty} 股？（纯模拟，不影响真钱）`)) return
+    busy.value = true
+    try {
+      const d = await apiFetch('/api/sim/sell', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: p.symbol, qty }),
+      })
+      if (d.success) {
+        showNotification(`已卖出 ${d.name} ${d.qty} 股 @ ${d.price}`)
+        await load()
+      } else {
+        showNotification(d.detail || d.message || '卖出失败', 'error')
+      }
+    } catch (e) {
+      showNotification('卖出失败：' + (e.message || e), 'error')
     } finally {
       busy.value = false
     }
@@ -416,6 +485,10 @@
 
   .sim-section {
     margin-bottom: 22px;
+    /* 持仓表加了"操作"列后列数变多：容器兜一层横向滚动。
+       原来只在 ≤699px 生效，但 700–900px 的窄桌面也可能放不下，统一放到基础样式，
+       表格能放下时不会出现滚动条，放不下时才可横向拖。 */
+    overflow-x: auto;
   }
   .sec-title {
     font-size: 15px;
@@ -466,6 +539,59 @@
   .sim-table .mono {
     font-family: ui-monospace, monospace;
   }
+  /* 模拟持仓的卖出操作（2026-10-23）：小按钮，避免把表格撑得过宽 */
+  .sim-table .ops {
+    white-space: nowrap;
+  }
+  .sim-table .mini {
+    padding: 4px 8px;
+    margin: 0 2px;
+    font-size: 11px;
+    font-family: inherit;
+    color: var(--text-secondary, #64748b);
+    background: var(--bg-primary, #fff);
+    border: 1px solid var(--border-medium, #d1d5db);
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .sim-table .mini.sell {
+    color: #dc2626;
+    border-color: #fca5a5;
+    background: #fef2f2;
+  }
+  .dark .sim-table .mini.sell {
+    color: #fca5a5;
+    border-color: #7f1d1d;
+    background: #2a1515;
+  }
+  .sim-table .mini:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .sim-table .nm .pos-advice {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  /* 动作配色与真实持仓页的 .action-* 徽章保持一致：止损红、止盈红、减仓橙、
+     冲高回落黄、止损上移蓝、持有/观察灰。 */
+  .sim-table .nm .pos-advice.stop_loss,
+  .sim-table .nm .pos-advice.take_profit {
+    color: #dc2626;
+  }
+  .sim-table .nm .pos-advice.reduce {
+    color: #d97706;
+  }
+  .sim-table .nm .pos-advice.giveback {
+    color: #a16207;
+  }
+  .sim-table .nm .pos-advice.hold_trailing {
+    color: #1d4ed8;
+  }
+  .sim-table .nm .pos-advice.watch,
+  .sim-table .nm .pos-advice.hold {
+    color: var(--text-tertiary, #94a3b8);
+    font-weight: 400;
+  }
   .sim-table .reason {
     text-align: left;
     color: var(--text-secondary, #64748b);
@@ -474,9 +600,6 @@
   /* 手机上 7 列表格会撑破 420px 视口（实测右边界 431px）：收窄内边距，
    再给容器兜一层横向滚动，避免"内容被屏幕切掉又没滚动条"那种看不全的情况。 */
   @media (max-width: 699px) {
-    .sim-section {
-      overflow-x: auto;
-    }
     .sim-table {
       font-size: 12px;
     }
@@ -486,6 +609,21 @@
     }
     .sim-table .reason {
       max-width: 220px;
+    }
+    /* 手机上按钮别缩成点不中的小点：保留足够触控面积 */
+    .sim-table .mini {
+      padding: 6px 8px;
+    }
+    /* 8 列在手机上一定放不下：把「操作」列钉在右侧，横向拖动时卖出按钮始终可见 */
+    .sim-table .ops {
+      position: sticky;
+      right: 0;
+      z-index: 1;
+      background: var(--bg-secondary, #fff);
+      box-shadow: -4px 0 6px rgba(15, 23, 42, 0.06);
+    }
+    .sim-table th.ops {
+      background: var(--bg-tertiary, #f8fafc);
     }
     /* 徽章被挤成竖排（"已成交"三个字一行一个）比宽列更糟：先锁住不换行 */
     .sim-table .st,

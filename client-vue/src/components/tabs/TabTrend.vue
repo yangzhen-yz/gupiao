@@ -188,8 +188,9 @@
               <div class="trend-card-name">{{ stock.name }}</div>
               <div class="trend-card-code">{{ (stock.symbol || stock.code || '').toUpperCase() }}</div>
             </div>
-            <div class="trend-card-price">
-              <span class="trend-price-val" style="color: #dc2626">{{ stock.latestPrice || stock.price }}</span>
+            <div class="trend-card-price" :class="trendChangeClass(stock)">
+              <span class="trend-price-val">{{ stock.latestPrice || stock.price }}</span>
+              <span class="trend-change-val">{{ formatTrendChange(stock) }}</span>
             </div>
             <div class="trend-card-consecutive">
               <span class="trend-consecutive-badge" :class="getConsecutiveClass(stock)"
@@ -688,6 +689,27 @@
     if (days >= 3) return 'hot'
     if (days >= 1) return 'warm'
     return 'cool'
+  }
+
+  // 涨跌幅（2026-10-23）：用同一次扫描快照的 changePercent；缺失返回 null，
+  // 页面显示「—」而不是假 0.00%（旧快照没有该字段时后端会按昨收回退算）。
+  function trendChangeValue(stock) {
+    const v = stock?.changePercent
+    if (v === null || v === undefined || v === '') return null
+    const n = Number(v)
+    return Number.isFinite(n) ? n : null
+  }
+
+  function trendChangeClass(stock) {
+    const v = trendChangeValue(stock)
+    if (v === null) return 'flat'
+    return v > 0 ? 'up' : v < 0 ? 'down' : 'flat'
+  }
+
+  function formatTrendChange(stock) {
+    const v = trendChangeValue(stock)
+    if (v === null) return '—'
+    return `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
   }
 
   function getScoreColor(stock) {
@@ -1356,5 +1378,36 @@
     color: #c2410c;
     border: 0.5px solid #fed7aa;
     cursor: help;
+  }
+
+  /* 价格 + 涨跌幅（2026-10-23）：纵向排列，A股红涨绿跌；旧快照缺字段显示灰色「—」 */
+  .trend-card-price {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+    line-height: 1.25;
+  }
+  .trend-card-price .trend-price-val {
+    color: #475569;
+    font-variant-numeric: tabular-nums;
+  }
+  .trend-change-val {
+    font-size: 0.75rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #64748b;
+  }
+  .trend-card-price.up .trend-price-val,
+  .trend-card-price.up .trend-change-val {
+    color: #dc2626;
+  }
+  .trend-card-price.down .trend-price-val,
+  .trend-card-price.down .trend-change-val {
+    color: #16a34a;
+  }
+  .trend-card-price.flat .trend-price-val,
+  .trend-card-price.flat .trend-change-val {
+    color: #64748b;
   }
 </style>
