@@ -1138,6 +1138,23 @@ SENTIMENT_LADDER_COLLAPSE_RATE = 0.5
 SENTIMENT_LEADER_FAIL_CHANGE = -5.0
 SENTIMENT_LADDER_MIN_BASE = 3
 
+# ========== P0-2 周期 → 模式调度（2026-10-24 按实施计划 §4 实现，默认关）==========
+# 计划原文"11-02 起，前提：影子结论支持"。机制已按计划实现到 recommend 主链路，
+# 但截至 2026-10-24 影子仅 7 个交易日、单组事件 6~16（闸门要求 ≥10 日 + 单组 ≥20），
+# 故 RECOMMEND_CYCLE_SCHEDULE_ENABLED 默认 False（False 时主链路行为与改造前一致）。
+# 影子达标后改 True 即上线；回滚也只需改回 False。
+RECOMMEND_CYCLE_SCHEDULE_ENABLED = False
+RECOMMEND_MIN_SCORE_BASE = 60           # 原 recommend.py 主链路硬编码 MIN_RECOMMEND_SCORE=60 上移
+CYCLE_MAX_RECOMMEND = {'冰点': 1, '退潮': 1, '分歧': 2, '回暖': 3, '发酵': 3, '高潮': 2}
+CYCLE_ALLOW_EMPTY = ('退潮', '高潮')     # 仅这两个周期允许 0 只推荐（空仓哨兵）
+CYCLE_EXTREME_HOT_LIMIT_UPS = 120       # 涨停 > 120 家 = 极热档：只留打板形态、至多 1 只
+# 极热档"仅限主线"的判定来源：读最新主线快照的板块名，与股票概念标签/名称做子串匹配；
+# 快照缺失或过期(>MAINLINE_SNAPSHOT_STALE_SEC)视为无主线 → 空仓哨兵（与计划"无主线时空仓哨兵"一致）
+CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC = 7200
+# 大盘否决位（2026-10-24，策略分析新增，与周期调度同框架）：severe crash 日不出新买入推荐，
+# 直接写空仓哨兵。此前 check_market_crash 只是前端展示、对推荐无否决权。
+RECOMMEND_MARKET_VETO_ENABLED = False
+
 # ========== 市场主线/支线板块（2026-10-22，计划 crisp-summit-newt） ==========
 # 五维评分：涨停梯队 0.30 + 主力资金 0.30 + 涨幅持续性 0.20 + 量能 0.10，
 # 情绪周期做市场级门槛不做板块分。各维先在数据源内做分位归一——东财 f62 /

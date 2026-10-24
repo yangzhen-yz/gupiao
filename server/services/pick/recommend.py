@@ -2,7 +2,7 @@
 import asyncio, json, re, requests, time
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE)
+from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE, RECOMMEND_CYCLE_SCHEDULE_ENABLED, RECOMMEND_MIN_SCORE_BASE, CYCLE_MAX_RECOMMEND, CYCLE_ALLOW_EMPTY, CYCLE_EXTREME_HOT_LIMIT_UPS, CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC, RECOMMEND_MARKET_VETO_ENABLED)
 from db.database import (load_daily_recommendations, save_daily_recommendations, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry)
 from services.data.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy.strategy import calc_stock_score_v2, apply_industry_neutralization
@@ -887,6 +887,27 @@ def _attach_matrix(items, sent):
     return items
 
 
+def _cycle_info(gate, cycle_name, cycle_max, cash):
+    """P0-2（2026-10-24）：给推荐记录附"今日模式"信息，前端常驻横幅的数据源。
+    gate=None（调度关或情绪获取失败）时返回体仍完整，只是规则字段为空。"""
+    try:
+        from app.config import CYCLE_RULES as _cr
+        _note = (_cr.get(cycle_name) or {}).get('note', '')
+    except Exception:
+        _note = ''
+    _g = gate or {}
+    return {
+        'cycle': cycle_name,
+        'note': _note,
+        'maxRecommend': int(cycle_max),
+        'vetoEnabled': bool(_g.get('vetoEnabled')),
+        'minScore': _g.get('minScore') if _g.get('vetoEnabled') else None,
+        'vetoRoles': list(_g.get('vetoRoles') or []),
+        'allowChase': bool(_g.get('allowChase', True)),
+        'cash': bool(cash),
+    }
+
+
 async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
                                market_change, live_min_score, zone_dropped=None):
     """影子精选：同一份候选池，按"情绪周期门槛 + 角色否决 + 不追高"再选一遍，只落库不替换线上。
@@ -1254,7 +1275,30 @@ async def auto_generate_recommendations_task():
         all_results.sort(key=lambda x: x['score']['total'], reverse=True)
 
         # ===== 5. 行业分散 + 过滤取前3（P2） =====
-        MIN_RECOMMEND_SCORE = 60
+        # P0-2（2026-10-24，默认关）：门槛上移 config；周期调度启用时按 gate 抬门槛。
+        MIN_RECOMMEND_SCORE = RECOMMEND_MIN_SCORE_BASE
+        # 周期调度（实施计划 §4）：gate/minScore/vetoRoles/allowChase 用 live 口径
+        # （vetoEnabled 才生效，过 10:00 + ≥2 弱信号，见 sentiment.cycle_gate 四前提）；
+        # 关闭时 gate=None、行为与改造前逐字节一致。
+        gate = None
+        cycle_name = None
+        cycle_max = 3
+        if RECOMMEND_CYCLE_SCHEDULE_ENABLED:
+            try:
+                from services.strategy.sentiment import get_sentiment, cycle_gate as _cg
+                _sent_live = await get_sentiment()
+                gate = _cg(_sent_live)
+                cycle_name = _sent_live.get('cycle')
+                cycle_max = int(CYCLE_MAX_RECOMMEND.get(cycle_name, 3))
+                if gate.get('vetoEnabled') and gate.get('minScore'):
+                    MIN_RECOMMEND_SCORE = max(RECOMMEND_MIN_SCORE_BASE, int(gate['minScore']))
+                print(f'[周期调度] 启用：{cycle_name}·veto={gate.get("vetoEnabled")} '
+                      f'门槛={MIN_RECOMMEND_SCORE} 推荐上限={cycle_max} '
+                      f'vetoRoles={gate.get("vetoRoles") or ()} allowChase={gate.get("allowChase", True)}')
+            except Exception as e:
+                print(f'[周期调度] 情绪/闸门获取失败（按基础门槛与上限 3 走）: {e}')
+                gate = None
+                cycle_max = 3
         # 快照用：每只票"没往下走的那一步"是被哪条规则挡的。
         # 门槛之下的（score<60）不进这里 —— 快照读的时候按 min_score 一筛就有，
         # 给几百只都写一句"低于门槛"只会把真正有意思的拦截原因淹掉。
@@ -1366,6 +1410,138 @@ async def auto_generate_recommendations_task():
                       f'（弱势区 0~{_zone_c["weak_max"]:g}%、死亡区 '
                       f'{_zone_c["chase_min"]:g}~{_zone_c["chase_max"]:g}%）')
 
+        # ===== 4.9 周期调度·角色否决 / 不追高 / 极热模式禁令 / 大盘否决（P0-2，2026-10-24，默认关） =====
+        # 实施计划 §4：RECOMMEND_CYCLE_SCHEDULE_ENABLED=False 时本节整体跳过，
+        # 主链路行为与改造前一致；每条挡掉的票都写 blocked 快照，事后可回放。
+        # 口径与影子 _log_shadow_selection 一致：角色 = bsp.stockType 子串命中 vetoRoles、
+        # 不追高 = not allowChase 且当日涨幅 ≥5%（影子里用的是 advisory 口径，这里用
+        # live 口径 = gate.vetoEnabled 才生效，见 sentiment.cycle_gate 的四前提）。
+        cash_reason: Optional[str] = None   # 非空 → 本批写空仓哨兵、不出买入推荐
+        if RECOMMEND_CYCLE_SCHEDULE_ENABLED:
+            # --- 大盘否决位：severe crash 日不出新买入推荐 ---
+            if RECOMMEND_MARKET_VETO_ENABLED:
+                try:
+                    from services.strategy.market import check_market_crash
+                    _mc = await check_market_crash()
+                    if _mc.get('crashLevel') == 'severe':
+                        cash_reason = '大盘预警·severe（指数跌超 -3%，当日不出新买入推荐）'
+                        print(f'[周期调度] {cash_reason}，本批只写空仓哨兵')
+                except Exception as e:
+                    print(f'[周期调度] 大盘预警检查失败（不否决，按周期规则走）: {e}')
+
+            if cash_reason is None and gate is not None:
+                # --- 角色否决 + 不追高（与影子同口径） ---
+                _veto_roles = tuple(gate.get('vetoRoles') or ())
+                _no_chase = not gate.get('allowChase', True)
+                _veto_n = _chase_n = 0
+                if _veto_roles or _no_chase:
+                    _safe4 = []
+                    for s in candidates:
+                        _sym = (s.get('symbol') or '').lower()
+                        _t = trend_map.get(_sym) or {}
+                        try:
+                            _bsp = calc_buy_sell_points(
+                                s, score_result=s.get('score'),
+                                trend_details=(_t or {}).get('details'),
+                                market_change=market_change)
+                        except Exception:
+                            _bsp = {}
+                        _role = _bsp.get('stockType') or ''
+                        _hit = next((r for r in _veto_roles if r and r in _role), None)
+                        _chg = float(s.get('changePercent') or 0)
+                        if _hit:
+                            _blk(_sym, f'{cycle_name}·{_hit}不接力')
+                            _veto_n += 1
+                            continue
+                        if _no_chase and _chg >= 5:
+                            _blk(_sym, f'{cycle_name}·涨幅{_chg:.1f}%不追高')
+                            _chase_n += 1
+                            continue
+                        _safe4.append(s)
+                    candidates = _safe4
+                    if _veto_n or _chase_n:
+                        print(f'[周期调度] {cycle_name}：角色否决 {_veto_n} 只 / 不追高 {_chase_n} 只')
+
+                # --- 极热模式级规则（非一刀切）：涨停 >120 且非 stale → 禁低吸/追高形态，
+                #     打板保留（1094 口径：极热档全体买入 42.6%/-0.28% 最差，封板接力仍
+                #     67.1%/+2.06%，957 样本）；打板仅限主线内且当日最多 1 只，无主线 → 哨兵 ---
+                _limit_ups = None
+                try:
+                    from services.strategy.sentiment import get_sentiment as _gs
+                    _s2 = await _gs()
+                    if not _s2.get('stale'):
+                        _limit_ups = (_s2.get('indicators') or {}).get('limitUpCount')
+                except Exception:
+                    _limit_ups = None
+                if isinstance(_limit_ups, (int, float)) and _limit_ups > CYCLE_EXTREME_HOT_LIMIT_UPS:
+                    print(f'[周期调度] 极热档（涨停{_limit_ups:.0f}家>{CYCLE_EXTREME_HOT_LIMIT_UPS}）：'
+                          f'禁低吸/追高形态，只留主线内打板、至多 1 只')
+                    # 主线名集合：最新主线快照（缺失/过期 → 视为无主线 → 空仓哨兵）
+                    _ml_names = []
+                    try:
+                        import sqlite3 as _sq
+                        from app.config import SQLITE_DB_PATH as _dbp
+                        _c = _sq.connect(_dbp, timeout=10)
+                        _r = _c.execute("SELECT payload, ts FROM market_mainline_snapshots "
+                                        "ORDER BY main_date DESC, ts DESC LIMIT 1").fetchone()
+                        _c.close()
+                        if _r and _r[0]:
+                            _ts = str(_r[1] or '')
+                            import datetime as _dtmod
+                            _fresh = False
+                            try:
+                                _fresh = (datetime.now() - _dtmod.datetime.fromisoformat(_ts)
+                                          ).total_seconds() <= CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC
+                            except Exception:
+                                _fresh = False
+                            if _fresh:
+                                _pl = json.loads(_r[0])
+                                _ml_names = [m.get('name', '') for m in (_pl.get('main') or [])]
+                    except Exception as e:
+                        print(f'[周期调度] 主线快照读取失败（视为无主线）: {e}')
+                        _ml_names = []
+                    if not _ml_names:
+                        cash_reason = (f'极热档·涨停{_limit_ups:.0f}家且无可用主线'
+                                       f'（打板仅限主线内，无主线 → 空仓）')
+                        print(f'[周期调度] {cash_reason}')
+                    else:
+                        from services.strategy.buy_rules import classify as _cls2
+                        _tags_raw = load_stock_concept_tags() or {}
+                        _tags = {k.lower(): v for k, v in _tags_raw.items()}
+                        _pb = _prev_bars([s.get('symbol') for s in candidates])
+                        _keep, _daban = [], []
+                        for s in candidates:
+                            _sym = (s.get('symbol') or '').lower()
+                            _chg = float(s.get('changePercent') or 0)
+                            try:
+                                _v = (_cls2({'changePercent': s.get('changePercent'),
+                                             'volumeRatio': s.get('volumeRatio')},
+                                            _pb.get(_sym[-6:]),
+                                            {'limitUp': _limit_ups}) or {}).get('verdict')
+                            except Exception:
+                                _v = None
+                            # 主线内：概念标签或名称与主线板块名子串互含
+                            _name = s.get('name') or ''
+                            _stock_tags = _tags.get(_sym) or []
+                            _in_ml = any((n and (n in _name or any(n in t for t in _stock_tags if t)))
+                                         for n in _ml_names)
+                            if _v == '可打板' and _in_ml:
+                                _daban.append(s)
+                            else:
+                                _why = '极热·非主线' if _v == '可打板' else f'极热·禁{_v or "未判定"}形态'
+                                _blk(_sym, _why)
+                        if _daban:
+                            _daban.sort(key=lambda x: (x.get('score') or {}).get('total', 0), reverse=True)
+                            for s in _daban[1:]:
+                                _blk((s.get('symbol') or '').lower(), '极热·打板当日限 1 只')
+                            candidates = _daban[:1]
+                            print(f'[周期调度] 极热档保留主线内打板 1 只：'
+                                  f'{candidates[0].get("name")}（主线：{"、".join(_ml_names[:3])}）')
+                        else:
+                            cash_reason = f'极热档·无主线内可打板形态（涨停{_limit_ups:.0f}家）'
+                            print(f'[周期调度] {cash_reason} → 空仓哨兵')
+                            candidates = []
+
         # 概念分散：每种「有标签的」概念取最高分的一只，最多 3 只。
         # 2026-10-15 修正：'其他' 不再参与去重。stock_concept_tags 只覆盖 55 只票，
         # 其余全落到 '其他' —— 旧写法等于"第一只无标签票入选后，所有无标签票一起出局"。
@@ -1380,11 +1556,13 @@ async def auto_generate_recommendations_task():
             top3.append(s)
             if tag != '其他':
                 seen_tags.add(tag)
-            if len(top3) >= 3:
+            # P0-2：推荐数上限随周期（默认关时 cycle_max=3，行为不变）
+            if len(top3) >= cycle_max:
                 break
 
         # 如果行业分散后不足3只，从剩余中按分数补足（允许同概念）
-        if len(top3) < 3:
+        # P0-2：周期调度启用时**不补足**——退潮日 1 只就是 1 只，空缺即纪律（计划 §4）
+        if len(top3) < 3 and not RECOMMEND_CYCLE_SCHEDULE_ENABLED:
             remaining = [s for s in candidates if s not in top3]
             top3.extend(remaining[:3 - len(top3)])
 
@@ -1514,7 +1692,35 @@ async def auto_generate_recommendations_task():
                 print(f'[策略快照] 落库失败（不影响本次推荐）: {type(e).__name__}: {e}')
 
         if not top3:
-            print(f'[智能推荐] 无评分>={MIN_RECOMMEND_SCORE}的股票，跳过')
+            # P0-2 空仓哨兵（默认关时维持原"跳过"行为）：退潮/高潮允许 0 只推荐；
+            # 极热无主线（cash_reason）与大盘 severe 否决同样直接哨兵。
+            if RECOMMEND_CYCLE_SCHEDULE_ENABLED and (cash_reason or cycle_name in CYCLE_ALLOW_EMPTY):
+                try:
+                    from app.config import CYCLE_RULES as _cr
+                    _note = (_cr.get(cycle_name) or {}).get('note', '')
+                except Exception:
+                    _note = ''
+                _reason = cash_reason or f'{cycle_name}·{_note}'
+                _sentinel = {
+                    'name': '空仓观望', 'symbol': 'CASH',
+                    'price': '', 'change': 0, 'changePercent': 0, 'score': 0,
+                    # buy 留空：复盘按非数值买入价自动跳过，不会给哨兵算假收益
+                    'buySellPoints': {'buy': '', 'current': '', 'sell': ''},
+                    'reason': _reason,
+                    'isCash': True,
+                }
+                _date_key = now.date().isoformat()
+                _existing = load_daily_recommendations()
+                _existing = [r for r in _existing if r.get('date') != _date_key]
+                _existing.insert(0, {'date': _date_key,
+                                     'daily_recommendations': [_sentinel],
+                                     'cycleInfo': _cycle_info(gate, cycle_name, cycle_max, True)})
+                if len(_existing) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
+                    _existing = _existing[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
+                save_daily_recommendations(_existing)
+                print(f'[周期调度] 空仓哨兵已写入：{_reason}')
+            else:
+                print(f'[智能推荐] 无评分>={MIN_RECOMMEND_SCORE}的股票，跳过')
             await _capture_snapshot()
             return
 
@@ -1583,6 +1789,9 @@ async def auto_generate_recommendations_task():
             'date': date_key,
             'daily_recommendations': rec_items,
         }
+        # P0-2：周期调度启用时给记录带"今日模式"信息，前端常驻横幅（默认关时无此键）
+        if RECOMMEND_CYCLE_SCHEDULE_ENABLED:
+            record['cycleInfo'] = _cycle_info(gate, cycle_name, cycle_max, False)
         existing = load_daily_recommendations()
         existing = [r for r in existing if r.get('date') != date_key]
         existing.insert(0, record)
@@ -1614,6 +1823,10 @@ async def auto_generate_recommendations_task():
             print(f'[智能推荐] 生成完成: {symbols_str}，评分: {scores_str}')
         else:
             print('[智能推荐] 保存失败')
+        # P0-2：带 cycleInfo 让前端横幅即时更新（调度关时无此键，前端不渲染横幅）
+        if RECOMMEND_CYCLE_SCHEDULE_ENABLED:
+            return {"recommendations": rec_items,
+                    "cycleInfo": _cycle_info(gate, cycle_name, cycle_max, False)}
         return {"recommendations": rec_items}
     except Exception as error:
         print(f'[智能推荐] 自动生成失败: {str(error)}')
