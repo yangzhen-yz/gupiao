@@ -349,7 +349,11 @@
   function scheduleRefresh() {
     stopRefresh()
     const tick = async () => {
-      if (props.symbol) await fetchData(props.symbol, klineType.value)
+      // 2026-10-24：可见性门禁——弹窗开着但浏览器标签页切走/最小化时跳过本轮
+      // 拉取与 setOption 重绘（后台标签页里这是纯浪费；回来自动续上，数据滞后
+      // 最多一个轮询间隔，分时 5s / 日K 15s，感知不到）。
+      const pageHidden = typeof document !== 'undefined' && document.hidden
+      if (props.symbol && !pageHidden) await fetchData(props.symbol, klineType.value)
       // 2026-07-20 A3：分时图实时变化 → 5秒；日K历史一天不变 → 15秒（后端已做 SQLite 缓存，历史不必高频重拉）
       const interval =
         klineType.value === 'minute'

@@ -154,7 +154,8 @@
           v-show="activeTab === 'tab-api-usage'"
           v-if="mountedTabs.has('tab-api-usage')"
         >
-          <TabApiUsage />
+          <!-- 2026-10-24：传 active，配合组件内 usePolling；此前裸 setInterval 切走也在打接口 -->
+          <TabApiUsage :active="activeTab === 'tab-api-usage'" />
         </div>
       </div>
     </div>
@@ -457,6 +458,17 @@
     showNotification(`欢迎，${user.displayName || user.username}`, 'success')
     // 登录后回到登录前想看的页面（门禁期间 hash 已经解析好了，这里只需补挂载）
     if (!location.hash) navigate('desk')
+    // 2026-10-24：空闲时预取 K线弹窗 chunk（echarts 按需后仍 ~550KB/gzip ~150KB）。
+    // KlineModal 是 v-if 条件挂载 + 异步组件，此前首次点"K线图"要现场下载整包，
+    // 内网/隧道下有可感知白等；登录成功后机器空闲时拉好，点击即开。
+    try {
+      const idle = window.requestIdleCallback || (cb => setTimeout(cb, 3000))
+      idle(() => {
+        import('./components/KlineModal.vue').catch(() => {})
+      })
+    } catch (e) {
+      /* 预取失败不影响任何功能 */
+    }
     // 切换账号后立即重载持仓，避免残留上一个账号的数据
     nextTick(() => {
       if (tabPositionRef.value && tabPositionRef.value.loadPositions) {
