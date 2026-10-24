@@ -7,14 +7,14 @@ from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_TH
 from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry, list_user_ids)
 from services.data.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, parse_realtime_fields, fetch_stock_data, get_stock_name,
-    parse_tencent_batch_data, has_negative_announcement)
+    parse_tencent_batch_data, has_negative_announcement, split_batch_raw)
 from services.strategy.strategy import calc_stock_score_v2, load_strategy_factor_weights, apply_industry_neutralization
 from services.strategy.pattern import detect_volume_price_pattern
 from services.pick.early_signals import detect_early_signals
 from services.data.kline_history import history_available, get_engine
 
 
-async def _load_kline_for_scan(symbol: str):
+async def _load_kline_for_scan(symbol: str, realtime_raw_prefetched: Optional[str] = None):
     """趋势扫描取数：优先本地前复权日K库（秒级、免腾讯限流），失败回退腾讯原逻辑。
 
     返回 (kline, realtime_raw)：
@@ -22,6 +22,10 @@ async def _load_kline_for_scan(symbol: str):
       - realtime_raw：实时行情原始字符串（供 parse_tencent_batch_data 复用）
     仅替换"历史K线来源"，实时行情合并逻辑 1:1 复制 get_kline_data（stock.py:570-593），
     保证盘中最新价/涨幅与现网一致。三层回退：本地库未就绪 / 新股不足 30 根 / 异常 → 腾讯原逻辑。
+
+    2026-10-24（性能）：新增 realtime_raw_prefetched——扫描主流程已为板块动量
+    100 只/批拉过全池行情，拆串后的单码原始串从这里传入，免去每票一次的
+    单码腾讯请求（~1300 次/扫描）。传入为空时行为不变（现拉）。
     """
     today = date.today().isoformat()
     if KLINE_HISTORY_ENABLED:
@@ -34,7 +38,8 @@ async def _load_kline_for_scan(symbol: str):
                     # 1:1 复制 get_kline_data 实时合并（只补实时 bar，不重拉全量历史）
                     realtime_raw = None
                     try:
-                        realtime_raw = await fetch_with_retry(symbol)
+                        # 优先用扫描开头批量拉好的单码原始串（2026-10-24），拉不到再现拉
+                        realtime_raw = realtime_raw_prefetched or await fetch_with_retry(symbol)
                         if realtime_raw:
                             fields = parse_realtime_fields(realtime_raw)
                             if fields and fields['price']:
@@ -1752,14 +1757,20 @@ async def scan_trend_scan_results(force: bool = False):
             print(f'[趋势扫描] 大盘状态分类失败（降级为range）: {e}')
         print(f'[趋势扫描] 大盘状态: {market_regime} (大盘涨跌{market_change:.2f}%)')
 
-        # ===== 板块动量预计算（2026-06-30）=====
+        # ===== 全池批量行情预取 + 板块动量预计算（2026-06-30 / 2026-10-24）=====
         # 基于个股概念标签(stock_concept_tags)的同题材平均涨幅，构建 symbol → sector_change 映射
         # 后续 is_up_trend 调用时注入，实现"热门题材+5%/冷门题材-5%"的环境修正
+        # 2026-10-24（性能）：批量行情改为无论有无概念标签都拉（~1300 只 ÷ 100/批
+        # ≈ 13 次请求），拆串成 symbol_raw_map 传给 _load_kline_for_scan 复用，
+        # 替代此前每票一次的单码腾讯请求（~1300 次/扫描）。行情快照取自扫描开始
+        # 时刻，对 30 分钟一轮的趋势扫描时效足够；批量拉取失败时 map 为空，
+        # 逐票自动回退现拉，零回归。
         sector_change_map: Dict[str, float] = {}
+        symbol_raw_map: Dict[str, str] = {}
         try:
             concept_tags_raw = load_stock_concept_tags()
             concept_tags = {k.lower(): v for k, v in concept_tags_raw.items()}
-            if concept_tags and scan_pool:
+            if scan_pool:
                 # 性能优化（2026-07-02）：串行批量改 asyncio.gather 并发，5 RTT → 1 RTT
                 symbol_change_map: Dict[str, float] = {}
                 _batch_sz = 100
@@ -1767,6 +1778,7 @@ async def scan_trend_scan_results(force: bool = False):
                 async def _fetch_change_batch(_batch):
                     try:
                         _raw = await fetch_with_retry(','.join(_batch))
+                        symbol_raw_map.update(split_batch_raw(_raw))
                         return parse_tencent_batch_data(_raw)
                     except Exception:
                         return []
@@ -1783,23 +1795,25 @@ async def scan_trend_scan_results(force: bool = False):
                         sym = s.get('symbol', '').lower()
                         if sym:
                             symbol_change_map[sym] = s.get('changePercent', 0)
-                # 按题材标签分组求平均涨幅
-                tag_changes: Dict[str, List[float]] = {}
-                for sym, tags in concept_tags.items():
-                    cp = symbol_change_map.get(sym)
-                    if cp is None:
-                        continue
-                    for tag in tags:
-                        tag_changes.setdefault(tag, []).append(cp)
-                tag_avg = {t: sum(cps) / len(cps) for t, cps in tag_changes.items() if cps}
-                # 个股 sector_change = 其所有标签平均涨幅的均值
-                for sym in scan_pool:
-                    tags = concept_tags.get(sym.lower())
-                    if tags:
-                        avg_list = [tag_avg[t] for t in tags if t in tag_avg]
-                        if avg_list:
-                            sector_change_map[sym.lower()] = sum(avg_list) / len(avg_list)
-                print(f'[趋势扫描] 板块动量预计算：{len(sector_change_map)} 只有板块数据，{len(tag_avg)} 个题材')
+                if concept_tags:
+                    # 按题材标签分组求平均涨幅
+                    tag_changes: Dict[str, List[float]] = {}
+                    for sym, tags in concept_tags.items():
+                        cp = symbol_change_map.get(sym)
+                        if cp is None:
+                            continue
+                        for tag in tags:
+                            tag_changes.setdefault(tag, []).append(cp)
+                    tag_avg = {t: sum(cps) / len(cps) for t, cps in tag_changes.items() if cps}
+                    # 个股 sector_change = 其所有标签平均涨幅的均值
+                    for sym in scan_pool:
+                        tags = concept_tags.get(sym.lower())
+                        if tags:
+                            avg_list = [tag_avg[t] for t in tags if t in tag_avg]
+                            if avg_list:
+                                sector_change_map[sym.lower()] = sum(avg_list) / len(avg_list)
+                    print(f'[趋势扫描] 板块动量预计算：{len(sector_change_map)} 只有板块数据，{len(tag_avg)} 个题材')
+                print(f'[趋势扫描] 批量行情预取：{len(symbol_raw_map)}/{len(scan_pool)} 只单码行情可复用')
         except Exception as e:
             print(f'[趋势扫描] 板块动量预计算失败（不影响扫描）: {e}')
 
@@ -1843,7 +1857,9 @@ async def scan_trend_scan_results(force: bool = False):
                     # 趋势扫描取数（2026-09-25 优化）：优先本地前复权日K库（秒级、免腾讯限流），
                     # 实时行情合并逻辑 1:1 复制 get_kline_data，保证与现网一致；
                     # 三层回退：本地库未就绪 / 新股不足 30 根 / 异常 → 自动走腾讯原逻辑，零回归。
-                    kline, realtime_raw = await _load_kline_for_scan(symbol)
+                    # 2026-10-24：优先传入扫描开头批量拉好的单码行情原始串，免单码请求。
+                    kline, realtime_raw = await _load_kline_for_scan(
+                        symbol, symbol_raw_map.get(symbol.lower()))
                     if not kline:
                         return None
 

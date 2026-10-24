@@ -46,6 +46,13 @@ SCAN_CONCURRENCY = 25  # 扫描并发数
 SCAN_KLINE_TIMEOUT = 12.0  # 扫描K线超时时间
 SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 
+# 2026-10-24（性能）：asyncio.to_thread 全项目共用 asyncio 默认线程池
+# （min(32, CPU+4)，本机 12 核 = 16 线程），而趋势扫描并发 25、每票至少占
+# 2 次 to_thread（本地日K + 行情），扫描期间线程池被打满，全站 to_thread
+# 请求排队（实测扫描中连 401 拒绝都要 20s+）。此处为 lifespan 扩容上限，
+# 扫描是 IO 密集（等腾讯/新浪响应），线程数放大不挤占 CPU。
+TO_THREAD_POOL_MAX_WORKERS = 48
+
 # ========== 股票筛选 Tab 过滤配置（2026-07-08）==========
 # 第二个 Tab "股票筛选"（/api/hot-stocks-scan）的可选过滤模式
 # 用户在前端可切换：all(全部) / bull_only(仅看涨) / bull_and_hold(观望以上) / min_score(自定义分)

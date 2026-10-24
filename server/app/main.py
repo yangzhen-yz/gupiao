@@ -106,6 +106,19 @@ def _lazy_start_scheduler():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _last_scan_result, _last_scan_date, _last_scan_ts
+    # 2026-10-24（性能）：扩容 asyncio.to_thread 默认线程池。
+    # 默认池 min(32, CPU+4)（本机 12 核 = 16 线程）会被趋势扫描打满
+    # （并发 25 × 每票 ≥2 次 to_thread），扫描期间全站 to_thread 请求排队，
+    # 实测连鉴权 401 拒绝都要 20s+。扫描是 IO 密集，放大线程数不挤占 CPU；
+    # 上限走 config.TO_THREAD_POOL_MAX_WORKERS 可调。
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=_cfg.TO_THREAD_POOL_MAX_WORKERS,
+                               thread_name_prefix='to_thread'))
+        print(f'[初始化] to_thread 线程池已扩容: max_workers={_cfg.TO_THREAD_POOL_MAX_WORKERS}')
+    except Exception as e:
+        print(f'[初始化] to_thread 线程池扩容失败（沿用默认池）: {e}')
     init_db()
     # 接口用量统计：在 scheduler 启动前接管所有出站 HTTP（requests/httpx/urllib），
     # 这样首屏热搜榜拉取、盘后同步等全部被计入，避免遗漏。失败不影响主流程。
