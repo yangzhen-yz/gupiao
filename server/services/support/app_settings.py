@@ -488,6 +488,19 @@ SPEC: List[Dict[str, Any]] = [
 
 _SPEC_INDEX = {s['key']: s for s in SPEC}
 _OVERRIDES: Optional[Dict[str, str]] = None
+_SCOPE_KEYS: Optional[set] = None
+
+
+def _invalidates_scope(key: str) -> bool:
+    """改这一项要不要清「选股范围」的进程内缓存。
+
+    只有「选股范围」组的项会改变 universe/liquidity/market_cap 的输入；
+    其他项（推送、快照、纯界面偏好）改了不影响范围，没必要跟着把热缓存打掉。
+    """
+    global _SCOPE_KEYS
+    if _SCOPE_KEYS is None:
+        _SCOPE_KEYS = {k for k, s in _SPEC_INDEX.items() if s.get('group') == '选股范围'}
+    return key in _SCOPE_KEYS
 
 
 def _ensure_table(conn) -> None:
@@ -671,16 +684,19 @@ def set_value(key: str, incoming: Any, user: str = '') -> Dict[str, Any]:
     finally:
         conn.close()
     invalidate()
-    # 范围相关的进程内缓存必须一起打掉，否则界面改了、算出来的还是旧范围
-    for mod in ('services.data.universe', 'services.data.liquidity', 'services.data.market_cap'):
-        try:
-            import importlib
-            m = importlib.import_module(mod)
-            for fn in ('invalidate_cache', 'clear_cache'):
-                if hasattr(m, fn):
-                    getattr(m, fn)()
-        except Exception as e:
-            print(f'[配置覆盖] {mod} 缓存清理跳过: {type(e).__name__}: {e}')
+    # 范围相关的进程内缓存必须一起打掉，否则界面改了、算出来的还是旧范围。
+    # 2026-10-24：只有「选股范围」组的项才需要清——当天把「筛选页最低分」也照清了一次，
+    # 结果下一次扫描丢掉热缓存，从 1.5s 变成 20.2s，同时打开的配置页被拖过 10s 超时。
+    if _invalidates_scope(key):
+        for mod in ('services.data.universe', 'services.data.liquidity', 'services.data.market_cap'):
+            try:
+                import importlib
+                m = importlib.import_module(mod)
+                for fn in ('invalidate_cache', 'clear_cache'):
+                    if hasattr(m, fn):
+                        getattr(m, fn)()
+            except Exception as e:
+                print(f'[配置覆盖] {mod} 缓存清理跳过: {type(e).__name__}: {e}')
     return {'ok': True, 'key': key, 'value': val_or_err, 'live': spec(key)['live']}
 
 
@@ -698,14 +714,16 @@ def reset_value(key: str, user: str = '') -> Dict[str, Any]:
     finally:
         conn.close()
     invalidate()
-    for mod in ('services.data.universe', 'services.data.liquidity', 'services.data.market_cap'):
-        try:
-            import importlib
-            m = importlib.import_module(mod)
-            if hasattr(m, 'invalidate_cache'):
-                m.invalidate_cache()
-        except Exception:
-            pass
+    # 同 set_value：只有「选股范围」组才需要清范围缓存，纯界面项别把热缓存打掉
+    if _invalidates_scope(key):
+        for mod in ('services.data.universe', 'services.data.liquidity', 'services.data.market_cap'):
+            try:
+                import importlib
+                m = importlib.import_module(mod)
+                if hasattr(m, 'invalidate_cache'):
+                    m.invalidate_cache()
+            except Exception:
+                pass
     return {'ok': True, 'key': key, 'value': default_value(key)}
 
 
