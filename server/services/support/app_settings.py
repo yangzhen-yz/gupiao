@@ -36,9 +36,19 @@ _DDL = '''CREATE TABLE IF NOT EXISTS app_settings (
 # 注册表：只有列在这里的项能被界面改。每一项都说清"是什么、范围多少、改了影响谁"。
 #   kind: bool | int | float
 #   cfg : app/config.py 里的默认值变量名（改了默认值不用动这里）
+#         没有 cfg 的项用 'default' 直接给出厂默认值（2026-10-24 起，纯界面项走这条）
 #   live: 是否已经做成"用的时候现读"（见模块文档）
 #   impact: 影响预览函数名（在 _preview_* 里实现），None 就只显示说明
 SPEC: List[Dict[str, Any]] = [
+    # 2026-10-24：用户要求"别把默认 60 写死在 config.py，直接在配置页改"。
+    # 出厂默认留在这里（60），运行时以 app_settings 覆盖表为准；/api/tab-scan-config 每次现读。
+    {
+        'key': 'tab_scan_default_min_score', 'default': 60, 'kind': 'int',
+        'label': '筛选页「自定义最低分」默认值', 'group': '股票筛选页', 'live': True,
+        'min': 0, 'max': 100, 'step': 1, 'unit': '分',
+        'note': '股票筛选 Tab 打开时，过滤条里的最低分取这个值；在筛选页直接改数字也会写回这里'
+                '（只有管理员能改），刷新和手机端都按它显示。0~100，常用 40~70。',
+    },
     {
         'key': 'universe_main_board_only', 'cfg': 'UNIVERSE_MAIN_BOARD_ONLY', 'kind': 'bool',
         'label': '只做沪深主板', 'group': '选股范围', 'live': True,
@@ -541,9 +551,12 @@ def spec(key: str) -> Dict[str, Any]:
 
 
 def default_value(key: str) -> Any:
-    """config.py 里的默认值（数值项会按 scale 换算成"界面上的单位"）。"""
+    """出厂默认值（数值项会按 scale 换算成"界面上的单位"）。
+
+    2026-10-24：优先读 config.py 的 cfg 变量；纯界面项没有 cfg，用 SPEC 里的 'default'。
+    """
     s = spec(key)
-    raw = getattr(cfg, s['cfg'])
+    raw = getattr(cfg, s['cfg']) if s.get('cfg') else s['default']
     if s['kind'] == 'enum':
         return str(raw)
     if s.get('scale') == 100:          # 0.90 这种比例 → 显示成 90

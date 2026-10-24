@@ -61,10 +61,11 @@ TO_THREAD_POOL_MAX_WORKERS = 48
 # 背景：扫描宇宙扩大后弱势票（跟风/杂毛）占比高（实测 93%），用户只需高预期优质票。
 # leaders_only 规则：去掉 跟风/杂毛 角色，且预期涨幅 ≥ TAB_SCAN_LEADERS_MIN_GAIN。
 # 2026-09-10 调整为默认"自定义最低分 60"，让用户一进页面就看到相对高分的股票（观望/看涨），避免弱票刷屏。
+# 2026-10-24 该默认值移出本文件：改由「配置 → 股票筛选页」的 tab_scan_default_min_score 管理
+# （注册表在 services/support/app_settings.py，live 即时生效，/api/tab-scan-config 每次现读）。
 TAB_SCAN_FILTER_MODES = ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
 TAB_SCAN_LEADERS_MIN_GAIN = 3.0  # 仅优质龙头模式的最低预期涨幅(%)
 TAB_SCAN_DEFAULT_MODE = 'min_score'  # 默认模式：自定义最低分
-TAB_SCAN_DEFAULT_MIN_SCORE = 60  # 自定义最低分模式默认值
 TAB_SCAN_BULL_MIN_SCORE = 70  # "看涨"区间的最低分（≥ 此值为看涨）
 TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌）
 # 区间划分：score < BEAR_MAX(40) 为看跌，BEAR_MAX(40) ≤ score < BULL_MIN(70) 为观望，score ≥ BULL_MIN(70) 为看涨

@@ -131,19 +131,21 @@ async def get_hot_search_ranking_api():
 @router.get("/api/tab-scan-config", tags=["配置数据"])
 async def get_tab_scan_config():
     """股票筛选 Tab 过滤配置（2026-07-08）
-    前端下拉框/阈值从后端读取，避免硬编码；与 config.py 单一源保持一致
+    前端下拉框/阈值从后端读取，避免硬编码；与 config.py 单一源保持一致。
+    2026-10-24：最低分默认值改由配置页（app_settings）管理，这里每次现读。
     """
     from app.config import (
         TAB_SCAN_FILTER_MODES, TAB_SCAN_DEFAULT_MODE,
         TAB_SCAN_BULL_MIN_SCORE, TAB_SCAN_BEAR_MAX_SCORE,
-        TAB_SCAN_LEADERS_MIN_GAIN, TAB_SCAN_DEFAULT_MIN_SCORE,
+        TAB_SCAN_LEADERS_MIN_GAIN,
     )
+    from services.support import app_settings as A
     return {
         "success": True,
         "data": {
             "filterModes": TAB_SCAN_FILTER_MODES,
             "defaultMode": TAB_SCAN_DEFAULT_MODE,
-            "defaultMinScore": TAB_SCAN_DEFAULT_MIN_SCORE,
+            "defaultMinScore": A.value('tab_scan_default_min_score'),
             "bullMinScore": TAB_SCAN_BULL_MIN_SCORE,
             "bearMaxScore": TAB_SCAN_BEAR_MAX_SCORE,
             "leadersMinGain": TAB_SCAN_LEADERS_MIN_GAIN,
