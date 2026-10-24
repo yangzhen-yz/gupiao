@@ -99,6 +99,11 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
         )
         # 合并所有批次的 diff 列表
         items: List[Dict] = []
+        # 2026-10-24 修：批次异常以前被下面的 `continue` 静默吞掉，结果是
+        # "页面显示 0/58、日志里一行错误都没有、熔断器也不记账"——冷却永远不触发，
+        # 用户每刷一次页面就重新硬打一次东财，反而给封禁续命（10-24 上午实拍：
+        # api_usage 记到 ulist 3 次失败，guard 的 ulist streak 却停在昨天的 5 没动）。
+        batch_errs = [r for r in batch_results if isinstance(r, Exception)]
         for r in batch_results:
             if isinstance(r, Exception) or not r:
                 continue
@@ -121,14 +126,28 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
                 'industry': industry,
             }
         print(f'[资金流向] 靶向获取 {len(found)}/{len(codes)} 只股票数据 (分 {len(batches)} 批)')
+        # 失败要留痕并交给熔断器记账：全批失败才算这个接口真的不可用（flaky/blocked 由
+        # guard 自己分级），部分失败只打印不动熔断——避免一次网络抖动就把接口关 30 分钟
+        if batch_errs:
+            print(f'[资金流向] 其中 {len(batch_errs)}/{len(batches)} 批失败: '
+                  f'{type(batch_errs[0]).__name__}: {batch_errs[0]}')
+            if not found:
+                try:
+                    from services.data import eastmoney_guard
+                    eastmoney_guard.fail('ulist', batch_errs[0])
+                except Exception:
+                    pass
         # 2026-08-31 性能优化：写入内存缓存（TTL 20s）
         _FUND_FLOW_BATCH_CACHE[_ck] = {'ts': time.time(), 'data': found}
         if found:
-            try:
-                from services.data import eastmoney_guard
-                eastmoney_guard.ok('ulist')
-            except Exception:
-                pass
+            # 2026-10-24：ok 会清掉本 scope 的失败计数与冷却，所以只有**过半成功**才算接口恢复。
+            # 原来只要有一批返回就记 ok —— 120 只里只拿到 1 只也会把冷却解除，等于自己把熔断关掉
+            if len(found) >= len(codes) * 0.5:
+                try:
+                    from services.data import eastmoney_guard
+                    eastmoney_guard.ok('ulist')
+                except Exception:
+                    pass
         return found
     except Exception as e:
         print(f'[资金流向] 靶向获取失败: {e}')
