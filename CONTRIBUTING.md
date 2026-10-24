@@ -14,8 +14,10 @@ fix/<描述>     缺陷修复，同上
 ```
 
 - 分支名只用小写英文 + 短横线，禁止中文与空格（`feat/hot-search-ths-backup` 这种，不要 `feat/同花顺备源`）。
-- 现状说明：`origin/dev` 与 `origin/feat/action-desk` 相对 `origin/main` 实测都是 0 commits ahead，即**已完全并入的遗留分支**。
-  `dev` 按本模型正式启用为集成分支；`feat/action-desk` 建议删除（删除动作由仓库所有者在网页做，删前把 sha 记进 `docs/系统更新日志.md`）。
+- 现状说明（2026-10-24 更新）：`origin/dev` 已快进到与 `origin/main` 同点（`076a156`，`git rev-list --count origin/dev..origin/main` 实测 0），是干净的集成分支；
+  `feat/action-desk` 与两条待审 docs 分支已于同日删除，当前远端只剩 `main` 与 `dev`。
+- **`dev` 无独有提交时才允许直接快进对齐**（2026-10-24 实测过一次：`git push origin main:dev`，属快进、非强推，不产生新提交也不引入未审内容）；
+  一旦 `dev` 上有独有提交，就必须回到本模型的 PR 流程（feat/fix → dev → main），不得直推。
 - **本仓特有的硬规则：服务只在 `main` 上运行。** `:3003` 由仓库外的计划任务（SYSTEM 账户）以固定路径
   `D:\Desktop\guizhou\gupiao\server` 拉起，磁盘上换成哪个分支的代码，线上就立刻跑哪个分支。因此：
   - 盘中 **09:10~15:10 禁止 `git switch` / `git merge` / `git rebase`**（会打断 09:45 / 10:00 / 13:30 / 14:05 / 14:45 批次与情绪快循环）；
