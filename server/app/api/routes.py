@@ -33,7 +33,10 @@ MAX_RETRIES = 2
 
 # ========== 批量扫描结果内存缓存（2026-08-31 性能优化） ==========
 _HOT_SCAN_CACHE: Dict[str, Dict] = {}
-_HOT_SCAN_CACHE_TTL = 15  # 秒
+# 2026-10-24：15s→45s。前端 30s 轮询下单用户 15s TTL 永不命中（每次都过期），
+# 每轮触发全量重扫（120 只行情+资金流+评分）；45s > 30s 轮询间隔，交替命中，
+# 全量重扫频率减半，缓存数据最旧 45s（30s 一轮的筛选页可接受）。
+_HOT_SCAN_CACHE_TTL = 45  # 秒
 
 def _invalidate_hot_scan_cache():
     """清空批量扫描缓存（添加/移除自选股后调用，避免脏缓存）"""
@@ -128,19 +131,21 @@ async def get_hot_search_ranking_api():
 @router.get("/api/tab-scan-config", tags=["配置数据"])
 async def get_tab_scan_config():
     """股票筛选 Tab 过滤配置（2026-07-08）
-    前端下拉框/阈值从后端读取，避免硬编码；与 config.py 单一源保持一致
+    前端下拉框/阈值从后端读取，避免硬编码；与 config.py 单一源保持一致。
+    2026-10-24：最低分默认值改由配置页（app_settings）管理，这里每次现读。
     """
     from app.config import (
         TAB_SCAN_FILTER_MODES, TAB_SCAN_DEFAULT_MODE,
         TAB_SCAN_BULL_MIN_SCORE, TAB_SCAN_BEAR_MAX_SCORE,
-        TAB_SCAN_LEADERS_MIN_GAIN, TAB_SCAN_DEFAULT_MIN_SCORE,
+        TAB_SCAN_LEADERS_MIN_GAIN,
     )
+    from services.support import app_settings as A
     return {
         "success": True,
         "data": {
             "filterModes": TAB_SCAN_FILTER_MODES,
             "defaultMode": TAB_SCAN_DEFAULT_MODE,
-            "defaultMinScore": TAB_SCAN_DEFAULT_MIN_SCORE,
+            "defaultMinScore": A.value('tab_scan_default_min_score'),
             "bullMinScore": TAB_SCAN_BULL_MIN_SCORE,
             "bearMaxScore": TAB_SCAN_BEAR_MAX_SCORE,
             "leadersMinGain": TAB_SCAN_LEADERS_MIN_GAIN,
@@ -1893,8 +1898,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         except Exception as e:
             print(f'[批量扫描] 股票范围过滤失败(不过滤): {e}')
 
-        # 2026-08-31 性能优化：15s 内存缓存，覆盖前端 30s 轮询的重复请求。
-        # 命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
+        # 2026-08-31 性能优化：内存缓存覆盖前端 30s 轮询的重复请求（2026-10-24 TTL 15s→45s，
+        # 15s 时单用户每轮必过期）。命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
         cache_key = ','.join(sorted(set(codes_list)))
         _now_ts = time.time()
         _cached = _HOT_SCAN_CACHE.get(cache_key)
@@ -2044,8 +2049,9 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             industry_map = {sym: (ff or {}).get('industry', '') for sym, ff in fund_flow_map.items()}
             apply_industry_neutralization(all_results, industry_map)
             # 持久化行业映射（增量更新，失败不阻塞）
+            # 2026-10-24：SQLite 写包 to_thread，避免写锁等待冻住事件循环（该接口 30s 轮询）
             try:
-                save_stock_industry(industry_map)
+                await asyncio.to_thread(save_stock_industry, industry_map)
             except Exception as e:
                 print(f'[批量扫描] 行业映射持久化失败（不影响评分）: {e}')
 
@@ -2094,7 +2100,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
                 'holder_structure': score_data.get('base_scores', {}).get('holder_structure', 0),
             })
         if predictions:
-            save_predictions(predictions)
+            # 2026-10-24：SQLite 写包 to_thread，避免写锁等待冻住事件循环
+            await asyncio.to_thread(save_predictions, predictions)
         if PREDICT_SAVE_QUALITY_GATE and skipped:
             print(f'[扫描] 质量门槛v2过滤 {skipped} 只看涨信号（非涨停且评分<{PREDICT_SAVE_MIN_SCORE}），保留 {len(predictions)} 条')
         

@@ -116,8 +116,16 @@
 </template>
 
 <script setup>
-  import { ref, computed, onMounted, onUnmounted } from 'vue'
+  import { ref, computed } from 'vue'
   import { apiFetch } from '../../utils/helpers'
+  import { usePolling } from '../../composables/usePolling'
+
+  // 2026-10-24：active 由 App 传入（仅该 Tab 可见时轮询）。
+  // 此前是裸 setInterval：点开过一次后，切到任何别的 Tab / 最小化窗口，
+  // 它都照样每 30s 打一次 /api/api-usage（带 history 序列），全应用唯一漏网。
+  const props = defineProps({
+    active: { type: Boolean, default: true },
+  })
 
   const loading = ref(false)
   const loaded = ref(false)
@@ -126,8 +134,6 @@
   const history = ref({ dates: [], series: {}, okSeries: {}, failSeries: {} })
   const alertThreshold = ref(80)
   const writeIds = ref([])
-
-  let timer = null
 
   const summary = computed(() => {
     const list = items.value
@@ -231,13 +237,8 @@
     }
   }
 
-  onMounted(async () => {
-    await load()
-    timer = setInterval(load, 30000)
-  })
-  onUnmounted(() => {
-    if (timer) clearInterval(timer)
-  })
+  // 30s 自动刷新（usePolling：页面隐藏/切走该 Tab 时停发请求，回来自动补一次）
+  usePolling(load, { interval: 30000, active: () => props.active })
 </script>
 
 <style scoped>

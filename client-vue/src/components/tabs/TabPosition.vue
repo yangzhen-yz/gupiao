@@ -1721,4 +1721,96 @@
       grid-column: 1 / -1;
     }
   }
+
+  /* ===== 暗色主题止血（2026-10-24）=====
+     本页 scoped 样式历史上大量硬编码浅色底与 slate 系浅文字，main.css 的全局
+     暗色补丁够不着 scoped，导致暗色主题下"白底卡片浮在黑页面上"、
+     #64748b/#475569 文字在暗底接近不可读（pos_wide_dark.png 实锤）。
+     这里按语义把主要浅底/浅文字映射到暗色（能用自动翻转令牌的用令牌）；
+     根治仍需整页令牌化（待另立批次分 Tab 推进），届时本块可整体删除。 */
+  /* --- 环境横幅（五档情绪）--- */
+  [data-theme='dark'] .env-aggressive { background: #2a1414; border-color: #5f2121; }
+  [data-theme='dark'] .env-normal { background: #12202b; border-color: #1e3a5f; }
+  [data-theme='dark'] .env-cautious { background: #2a2013; border-color: #6b5426; }
+  [data-theme='dark'] .env-defensive { background: #232013; border-color: #5c5426; }
+  [data-theme='dark'] .env-avoid { background: #271322; border-color: #5f2150; }
+  [data-theme='dark'] .env-aggressive .env-title,
+  [data-theme='dark'] .env-aggressive .env-pct b { color: #fca5a5; }
+  [data-theme='dark'] .env-normal .env-title,
+  [data-theme='dark'] .env-normal .env-pct b { color: #93c5fd; }
+  [data-theme='dark'] .env-cautious .env-title,
+  [data-theme='dark'] .env-cautious .env-pct b { color: #fdba74; }
+  [data-theme='dark'] .env-defensive .env-title,
+  [data-theme='dark'] .env-defensive .env-pct b { color: #fde047; }
+  [data-theme='dark'] .env-avoid .env-title,
+  [data-theme='dark'] .env-avoid .env-pct b { color: #f9a8d4; }
+  [data-theme='dark'] .env-notes,
+  [data-theme='dark'] .env-pct { color: var(--text-tertiary); }
+  /* --- 实战操作指南卡 --- */
+  [data-theme='dark'] .guide-box { background: var(--bg-tertiary); border-color: var(--border-subtle); }
+  [data-theme='dark'] .guide-header { color: var(--text-primary); }
+  [data-theme='dark'] .guide-toggle { color: var(--text-tertiary); }
+  [data-theme='dark'] .guide-title { color: var(--text-primary); }
+  [data-theme='dark'] .guide-item { color: var(--text-secondary); }
+  [data-theme='dark'] .guide-table th,
+  [data-theme='dark'] .guide-table td { border-color: var(--border-subtle); color: var(--text-secondary); }
+  [data-theme='dark'] .guide-table th { background: var(--bg-hover); color: var(--text-primary); }
+  /* --- 组合指标卡（浅蓝渐变底）--- */
+  [data-theme='dark'] .portfolio-box {
+    background: linear-gradient(135deg, #12202b 0%, #1a2733 100%);
+    border-color: #1e3a5f;
+  }
+  [data-theme='dark'] .capital-row { border-bottom-color: #1e3a5f; }
+  [data-theme='dark'] .capital-label,
+  [data-theme='dark'] .capital-pct,
+  [data-theme='dark'] .capital-free,
+  [data-theme='dark'] .capital-sub-row { color: var(--text-tertiary); }
+  [data-theme='dark'] .capital-value,
+  [data-theme='dark'] .capital-pct b { color: #93c5fd; }
+  [data-theme='dark'] .capital-value.unset,
+  [data-theme='dark'] .capital-pct small,
+  [data-theme='dark'] .capital-sub-item small,
+  [data-theme='dark'] .capital-hint,
+  [data-theme='dark'] .portfolio-updated { color: var(--text-tertiary); }
+  [data-theme='dark'] .capital-edit { background: var(--bg-secondary); border-color: #1e3a5f; color: #93c5fd; }
+  [data-theme='dark'] .warn-chip { color: #fcd34d; background: #2a2313; border-color: #6b5426; }
+  /* --- 添加持仓表单 / 智能搜索下拉 --- */
+  [data-theme='dark'] .pos-form-box { background: var(--bg-tertiary); border-color: var(--border-subtle); }
+  [data-theme='dark'] .form-title { color: var(--text-primary); }
+  [data-theme='dark'] .form-label { color: var(--text-tertiary); }
+  [data-theme='dark'] .form-input { background: var(--bg-secondary); border-color: var(--border-medium); color: var(--text-primary); }
+  [data-theme='dark'] .form-input:focus { border-color: #3b82f6; }
+  [data-theme='dark'] .form-input.readonly { background: var(--bg-hover); color: var(--text-secondary); }
+  [data-theme='dark'] .combo-dropdown { background: var(--bg-elevated); border-color: var(--border-subtle); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+  [data-theme='dark'] .combo-item:hover { background: var(--bg-hover); }
+  [data-theme='dark'] .combo-item.combo-searching,
+  [data-theme='dark'] .combo-code { color: var(--text-tertiary); }
+  /* --- 持仓列表 --- */
+  [data-theme='dark'] .empty-box { background: var(--bg-tertiary); border-color: var(--border-subtle); color: var(--text-tertiary); }
+  [data-theme='dark'] .pos-table-header { background: var(--bg-hover); color: var(--text-secondary); }
+  [data-theme='dark'] .pos-table-row { background: var(--bg-secondary); border-color: var(--border-subtle); }
+  [data-theme='dark'] .pos-price small,
+  [data-theme='dark'] .pos-pnl small,
+  [data-theme='dark'] .pos-stop small,
+  [data-theme='dark'] .exit-plan { color: var(--text-tertiary); }
+  [data-theme='dark'] .exit-plan.hit { color: #fcd34d; }
+  [data-theme='dark'] .pos-detail { color: var(--text-tertiary); }
+  /* --- 徽章（信号 chip / 行动建议）--- */
+  [data-theme='dark'] .flag-chip { background: #2a1414; color: #fca5a5; border-color: #5f2121; }
+  [data-theme='dark'] .flag-chip.ok { background: #122a18; color: #86efac; border-color: #1f5130; }
+  [data-theme='dark'] .action-stop_loss { background: #2a1414; color: #fca5a5; border-color: #5f2121; }
+  [data-theme='dark'] .action-take_profit { background: #2a1418; color: #fda4af; border-color: #5f2130; }
+  [data-theme='dark'] .action-reduce { background: #2a2013; color: #fdba74; border-color: #6b5426; }
+  [data-theme='dark'] .action-giveback { background: #26220f; color: #fde047; border-color: #5c5426; }
+  [data-theme='dark'] .action-hold_trailing { background: #12202b; color: #93c5fd; border-color: #1e3a5f; }
+  [data-theme='dark'] .action-hold { background: var(--bg-hover); color: var(--text-secondary); border-color: var(--border-subtle); }
+  [data-theme='dark'] .action-watch { background: #232013; color: #fde047; border-color: #5c5426; }
+  /* --- 操作按钮 / 加减仓展开条 --- */
+  [data-theme='dark'] .op-btn { background: var(--bg-secondary); border-color: var(--border-medium); color: var(--text-secondary); }
+  [data-theme='dark'] .op-btn:hover { background: var(--bg-hover); }
+  [data-theme='dark'] .op-btn.danger { color: #fca5a5; border-color: #5f2121; }
+  [data-theme='dark'] .op-btn.danger:hover { background: #2a1414; }
+  [data-theme='dark'] .adj-bar { background: var(--bg-tertiary); border-color: var(--border-medium); }
+  [data-theme='dark'] .adj-preview { color: #93c5fd; }
+  [data-theme='dark'] .adj-note-line { color: #fcd34d; }
 </style>

@@ -16,9 +16,10 @@
         v-model.number="customMinScore"
         type="number"
         min="0"
-        :max="tabConfig.bullMinScore"
+        max="100"
         class="filter-input"
-        @change="resetPage"
+        title="改这个数会保存为默认最低分（需管理员），刷新与手机端一致"
+        @change="onMinScoreChange"
       />
       <span v-if="filterMode !== 'all'" class="filter-info"> ({{ filteredCount }} / {{ scanResults.length }} 只) </span>
     </div>
@@ -63,7 +64,7 @@
               color:
                 r.rps != null
                   ? r.rps >= 90
-                    ? '#dc2626'
+                    ? 'var(--accent-danger)'
                     : r.rps >= 70
                       ? '#f59e0b'
                       : r.rps >= 50
@@ -76,7 +77,7 @@
           >
           <span
             class="score-cell"
-            :style="{ color: r.score >= 70 ? '#dc2626' : r.score >= 40 ? '#f59e0b' : '#16a34a' }"
+            :style="{ color: r.score >= 70 ? 'var(--accent-danger)' : r.score >= 40 ? '#f59e0b' : 'var(--accent-success)' }"
           >
             {{ r.score }}<br /><span :class="r.score >= 70 ? 'tag-bull' : r.score < 40 ? 'tag-bear' : 'tag-hold'">{{
               r.score >= 70 ? '看涨' : r.score < 40 ? '看跌' : '观望'
@@ -129,7 +130,7 @@
 </template>
 
 <script setup>
-  import { ref, computed, onMounted, inject } from 'vue'
+  import { ref, computed, onMounted, inject, watch } from 'vue'
   import {
     apiFetch,
     isTradingTime,
@@ -178,7 +179,9 @@
     },
   })
   const filterMode = ref('min_score')
-  const customMinScore = ref(60) // 自定义模式默认 60 分
+  const customMinScore = ref(60) // 最低分：以服务端配置页的值为准，出厂兜底 60
+  // 上次从服务端拿到的默认值：用来判断"配置页改过没有"，只有真变了才覆盖输入框
+  const serverMinScore = ref(null)
 
   // 异步加载后端配置（不阻塞 onMounted 主流程；失败用默认值兜底）
   async function loadTabConfig() {
@@ -187,12 +190,70 @@
       if (r && r.success && r.data) {
         tabConfig.value = { ...tabConfig.value, ...r.data }
         filterMode.value = r.data.defaultMode || 'min_score'
-        customMinScore.value = r.data.defaultMinScore ?? 60
+        const ms = Number(r.data.defaultMinScore)
+        if (Number.isFinite(ms)) {
+          serverMinScore.value = ms
+          customMinScore.value = ms
+        }
       }
     } catch (e) {
       console.warn('加载 tab-scan-config 失败，使用默认值:', e.message)
     }
   }
+
+  // 最低分默认值由配置页管理（复盘 → 口径与开关 → 股票筛选页），存在服务端 app_settings。
+  // 在筛选页直接改这个数字＝把默认值改掉：保存成功后刷新、手机端都一致；
+  // 非管理员接口回 403，则只对本次浏览生效，并明确提示"没保存"，不假装成功。
+  async function onMinScoreChange() {
+    resetPage()
+    const raw = Number(customMinScore.value)
+    if (!Number.isFinite(raw)) return
+    const val = Math.min(Math.max(Math.round(raw), 0), 100)
+    if (val === serverMinScore.value) {
+      customMinScore.value = val
+      return
+    }
+    try {
+      const res = await apiFetch('/api/settings/tab_scan_default_min_score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: val }),
+      })
+      if (res && res.success) {
+        serverMinScore.value = val
+        customMinScore.value = val
+        showNotification(`最低分默认值已改为 ${val} 分（刷新与手机端一致）`, 'success')
+      } else {
+        // 403 的 detail 是给管理员看的排查说明（含账号 id），手机上会撑满一屏；
+        // toast 只给结论，原文留在控制台。其他校验错误通常很短，照原样显示。
+        const detail = String((res && res.detail) || '')
+        if (detail) console.warn('保存最低分默认值失败:', detail)
+        const reason = /无权修改/.test(detail) ? '当前账号无权修改（只有管理员能改）' : (detail || '保存失败')
+        showNotification(`未能保存默认值：${reason}；本次仅临时生效`, 'error')
+      }
+    } catch (e) {
+      showNotification(`未能保存默认值（${e.message || e}）；本次仅临时生效`, 'error')
+    }
+  }
+
+  // 切回本 Tab 时同步一次配置页的改动（组件用 v-show 保活，不会重新挂载）。
+  // 只在服务端值真的变了才覆盖输入框，避免冲掉用户刚敲的临时值。
+  watch(
+    () => props.active,
+    async on => {
+      if (!on) return
+      try {
+        const r = await apiFetch('/api/tab-scan-config')
+        const ms = Number(r && r.success && r.data && r.data.defaultMinScore)
+        if (Number.isFinite(ms) && ms !== serverMinScore.value) {
+          serverMinScore.value = ms
+          customMinScore.value = ms
+        }
+      } catch (e) {
+        /* 同步失败不影响筛选，保持当前值 */
+      }
+    }
+  )
 
   const PAGE_SIZE = 10
   const currentPage = ref(1)
@@ -260,10 +321,11 @@
   }
 
   // 涨跌幅（2026-10-23）：字段偶发缺失时显示「—」，不再整行报错；红涨绿跌、平盘灰
+  // 2026-10-24：红绿改用语义令牌（CSS 变量在暗色主题自动翻亮色变体）
   function changeColor(v) {
     const n = Number(v)
     if (!Number.isFinite(n) || n === 0) return '#64748b'
-    return n > 0 ? '#dc2626' : '#16a34a'
+    return n > 0 ? 'var(--accent-danger)' : 'var(--accent-success)'
   }
 
   function formatChangePct(v) {

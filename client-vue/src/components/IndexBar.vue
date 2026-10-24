@@ -17,9 +17,10 @@
 </template>
 
 <script setup>
-  import { ref, computed, onMounted, onUnmounted } from 'vue'
+  import { ref, computed } from 'vue'
   import { apiFetch } from '../utils/helpers'
   import { isTradingTime, getNextRefreshDelay, getTradingStatusText } from '../utils/helpers'
+  import { usePolling } from '../composables/usePolling'
 
   const indexes = ref([
     { code: 'sh000001', name: '上证', price: '', change: 0, changeText: '' },
@@ -36,8 +37,6 @@
     if (t.includes('休市')) return 'rest'
     return 'idle'
   })
-
-  let timer = null
 
   async function loadIndexBar() {
     // 2026-10-17 性能：原来每 5 秒打 3 个 `/api/stock/{code}`（3 次 RTT、且裸 fetch 无超时），
@@ -58,22 +57,13 @@
     }
   }
 
-  function scheduleRefresh() {
-    if (timer) clearTimeout(timer)
-    const delay = isTradingTime() ? 5000 : getNextRefreshDelay()
-    timer = setTimeout(async () => {
+  // 2026-10-24：迁 usePolling——页面隐藏时停发请求，回前台超 5s 自动补一次。
+  // 间隔保持原口径：交易时段 5s，休市顺延到下一时段；usePolling 自带挂载即首拉与卸载清理。
+  usePolling(
+    async () => {
       tradingStatus.value = getTradingStatusText().replace(/^[^\u4e00-\u9fa5]+\s*/, '')
       await loadIndexBar()
-      scheduleRefresh()
-    }, delay)
-  }
-
-  onMounted(() => {
-    loadIndexBar()
-    scheduleRefresh()
-  })
-
-  onUnmounted(() => {
-    if (timer) clearTimeout(timer)
-  })
+    },
+    { interval: () => (isTradingTime() ? 5000 : getNextRefreshDelay()) }
+  )
 </script>

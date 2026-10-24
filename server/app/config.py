@@ -46,6 +46,13 @@ SCAN_CONCURRENCY = 25  # 扫描并发数
 SCAN_KLINE_TIMEOUT = 12.0  # 扫描K线超时时间
 SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 
+# 2026-10-24（性能）：asyncio.to_thread 全项目共用 asyncio 默认线程池
+# （min(32, CPU+4)，本机 12 核 = 16 线程），而趋势扫描并发 25、每票至少占
+# 2 次 to_thread（本地日K + 行情），扫描期间线程池被打满，全站 to_thread
+# 请求排队（实测扫描中连 401 拒绝都要 20s+）。此处为 lifespan 扩容上限，
+# 扫描是 IO 密集（等腾讯/新浪响应），线程数放大不挤占 CPU。
+TO_THREAD_POOL_MAX_WORKERS = 48
+
 # ========== 股票筛选 Tab 过滤配置（2026-07-08）==========
 # 第二个 Tab "股票筛选"（/api/hot-stocks-scan）的可选过滤模式
 # 用户在前端可切换：all(全部) / bull_only(仅看涨) / bull_and_hold(观望以上) / min_score(自定义分)
@@ -54,10 +61,11 @@ SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
 # 背景：扫描宇宙扩大后弱势票（跟风/杂毛）占比高（实测 93%），用户只需高预期优质票。
 # leaders_only 规则：去掉 跟风/杂毛 角色，且预期涨幅 ≥ TAB_SCAN_LEADERS_MIN_GAIN。
 # 2026-09-10 调整为默认"自定义最低分 60"，让用户一进页面就看到相对高分的股票（观望/看涨），避免弱票刷屏。
+# 2026-10-24 该默认值移出本文件：改由「配置 → 股票筛选页」的 tab_scan_default_min_score 管理
+# （注册表在 services/support/app_settings.py，live 即时生效，/api/tab-scan-config 每次现读）。
 TAB_SCAN_FILTER_MODES = ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
 TAB_SCAN_LEADERS_MIN_GAIN = 3.0  # 仅优质龙头模式的最低预期涨幅(%)
 TAB_SCAN_DEFAULT_MODE = 'min_score'  # 默认模式：自定义最低分
-TAB_SCAN_DEFAULT_MIN_SCORE = 60  # 自定义最低分模式默认值
 TAB_SCAN_BULL_MIN_SCORE = 70  # "看涨"区间的最低分（≥ 此值为看涨）
 TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌）
 # 区间划分：score < BEAR_MAX(40) 为看跌，BEAR_MAX(40) ≤ score < BULL_MIN(70) 为观望，score ≥ BULL_MIN(70) 为看涨
@@ -1130,6 +1138,23 @@ SENTIMENT_VETO_AFTER_MIN = 10 * 60    # 当日分钟数，10:00
 SENTIMENT_LADDER_COLLAPSE_RATE = 0.5
 SENTIMENT_LEADER_FAIL_CHANGE = -5.0
 SENTIMENT_LADDER_MIN_BASE = 3
+
+# ========== P0-2 周期 → 模式调度（2026-10-24 按实施计划 §4 实现，默认关）==========
+# 计划原文"11-02 起，前提：影子结论支持"。机制已按计划实现到 recommend 主链路，
+# 但截至 2026-10-24 影子仅 7 个交易日、单组事件 6~16（闸门要求 ≥10 日 + 单组 ≥20），
+# 故 RECOMMEND_CYCLE_SCHEDULE_ENABLED 默认 False（False 时主链路行为与改造前一致）。
+# 影子达标后改 True 即上线；回滚也只需改回 False。
+RECOMMEND_CYCLE_SCHEDULE_ENABLED = False
+RECOMMEND_MIN_SCORE_BASE = 60           # 原 recommend.py 主链路硬编码 MIN_RECOMMEND_SCORE=60 上移
+CYCLE_MAX_RECOMMEND = {'冰点': 1, '退潮': 1, '分歧': 2, '回暖': 3, '发酵': 3, '高潮': 2}
+CYCLE_ALLOW_EMPTY = ('退潮', '高潮')     # 仅这两个周期允许 0 只推荐（空仓哨兵）
+CYCLE_EXTREME_HOT_LIMIT_UPS = 120       # 涨停 > 120 家 = 极热档：只留打板形态、至多 1 只
+# 极热档"仅限主线"的判定来源：读最新主线快照的板块名，与股票概念标签/名称做子串匹配；
+# 快照缺失或过期(>MAINLINE_SNAPSHOT_STALE_SEC)视为无主线 → 空仓哨兵（与计划"无主线时空仓哨兵"一致）
+CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC = 7200
+# 大盘否决位（2026-10-24，策略分析新增，与周期调度同框架）：severe crash 日不出新买入推荐，
+# 直接写空仓哨兵。此前 check_market_crash 只是前端展示、对推荐无否决权。
+RECOMMEND_MARKET_VETO_ENABLED = False
 
 # ========== 市场主线/支线板块（2026-10-22，计划 crisp-summit-newt） ==========
 # 五维评分：涨停梯队 0.30 + 主力资金 0.30 + 涨幅持续性 0.20 + 量能 0.10，

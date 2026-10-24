@@ -51,7 +51,7 @@
     <div class="quote-section">
       <div v-if="loading" class="price-card" style="text-align: center">
         <div class="loading-spinner"></div>
-        <div style="font-size: 0.9rem; font-weight: 500; color: var(--text-2)">正在加载数据...</div>
+        <div style="font-size: 0.9rem; font-weight: 500; color: var(--text-secondary)">正在加载数据...</div>
       </div>
       <div v-else-if="error" class="price-card" style="text-align: center; padding: 2rem">
         <div style="font-size: 1.1rem; color: var(--accent-danger); margin-bottom: 0.5rem">{{ error }}</div>
@@ -355,22 +355,22 @@
             <div :class="['analysis-card', analysis.type]" style="margin-bottom: 0">
               <div class="analysis-desc">
                 <div style="margin-bottom: 6px; font-weight: 700">{{ analysis.desc }}</div>
-                <div v-if="analysis.reason" style="font-size: 0.75rem; color: var(--text-3); margin-bottom: 4px">
+                <div v-if="analysis.reason" style="font-size: 0.75rem; color: var(--text-tertiary); margin-bottom: 4px">
                   {{ analysis.reason }}
                 </div>
-                <div v-if="analysis.position" style="font-size: 0.75rem; color: var(--text-3); margin-bottom: 4px">
+                <div v-if="analysis.position" style="font-size: 0.75rem; color: var(--text-tertiary); margin-bottom: 4px">
                   位置：{{ analysis.position }}
                 </div>
-                <div v-if="analysis.volumeDesc" style="font-size: 0.75rem; color: var(--text-3); margin-bottom: 4px">
+                <div v-if="analysis.volumeDesc" style="font-size: 0.75rem; color: var(--text-tertiary); margin-bottom: 4px">
                   量能：{{ analysis.volumeDesc }}
                 </div>
                 <div
                   style="
                     font-size: 0.8rem;
-                    color: var(--text-2);
+                    color: var(--text-secondary);
                     margin-top: 8px;
                     padding: 8px 10px;
-                    background: var(--bg-muted);
+                    background: var(--bg-tertiary);
                     border-radius: 8px;
                   "
                 >

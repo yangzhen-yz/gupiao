@@ -5,6 +5,18 @@
       基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示 · 每日 09:45 / 10:00 / 13:30 /
       14:05 自动生成，14:45 收盘前快照；页面名单每次生成会覆盖当天旧批次，上午推过什么看下方「当日批次」
     </div>
+    <!-- P0-2 今日模式横幅（2026-10-24）：后端周期调度开启时常驻展示；关闭时无 cycleInfo、不渲染 -->
+    <div v-if="cycleInfo" class="cycle-banner" :class="{ cash: cycleInfo.cash }">
+      <span class="cycle-banner-cycle">今日模式 · {{ cycleInfo.cycle || '--' }}</span>
+      <span class="cycle-banner-note">{{ cycleInfo.note || (cycleInfo.cash ? '空仓观望' : '') }}</span>
+      <span class="cycle-banner-meta">
+        推荐上限 {{ cycleInfo.maxRecommend }} 只<template v-if="cycleInfo.vetoEnabled && cycleInfo.minScore">
+          · 门槛 {{ cycleInfo.minScore }} 分</template
+        ><template v-if="cycleInfo.vetoRoles && cycleInfo.vetoRoles.length">
+          · 禁角色：{{ cycleInfo.vetoRoles.join('、') }}</template
+        ><template v-if="!cycleInfo.allowChase"> · 不追高（当日涨幅 ≥5% 不推）</template>
+      </span>
+    </div>
     <div
       class="scan-controls"
       style="background: #f8fafc; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; margin-bottom: 24px"
@@ -18,7 +30,7 @@
         <span>🎯</span> {{ generating ? '生成中...' : '生成今日推荐' }}
       </button>
       <button
-        v-if="todayRecommend.length > 0"
+        v-if="visibleRecommend.length > 0"
         class="btn-secondary"
         style="padding: 12px 24px"
         @click="saveRecommendations"
@@ -108,8 +120,15 @@
           </div>
         </div>
       </div>
+      <!-- P0-2 空仓哨兵卡片（2026-10-24）：周期调度允许空仓（退潮/高潮/极热无主线/大盘 severe），
+           空仓也是正式输出，不显示凑数票 -->
+      <div v-if="cashItem" class="cash-sentinel-card">
+        <div class="cash-title">🅿️ 空仓观望</div>
+        <div class="cash-reason">{{ cashItem.reason || '当前周期不出新买入推荐' }}</div>
+        <div class="cash-sub">空仓是正式输出，不是故障 —— 周期调度生效中</div>
+      </div>
       <div
-        v-if="todayRecommend.length === 0"
+        v-if="visibleRecommend.length === 0 && !cashItem"
         style="
           text-align: center;
           padding: 4rem 2rem;
@@ -123,7 +142,7 @@
         ✨ 准备就绪，点击上方按钮生成今日潜力股
       </div>
       <div
-        v-for="(r, idx) in todayRecommend"
+        v-for="(r, idx) in visibleRecommend"
         :key="r.symbol"
         :class="['recommend-card', `top-${idx + 1}`]"
         @click="openKlineFor(r, todayDate)"
@@ -401,6 +420,11 @@
   const todayRecommend = ref([])
   const historyRecommend = ref([])
   const todayDate = ref('--')
+  // P0-2 周期调度（2026-10-24）：后端 RECOMMEND_CYCLE_SCHEDULE_ENABLED 开启时推荐记录带
+  // cycleInfo（今日模式横幅）；空仓哨兵 isCash 单独渲染，不进普通卡片流。关闭时横幅不渲染。
+  const cycleInfo = ref(null)
+  const cashItem = computed(() => todayRecommend.value.find(r => r && r.isCash) || null)
+  const visibleRecommend = computed(() => todayRecommend.value.filter(r => r && !r.isCash))
 
   // 当日批次折叠区（2026-10-21）：数据来自 /api/recommend-batches（strategy_snapshot 按批次）
   const dayBatches = ref([])
@@ -456,6 +480,7 @@
       if (result.success) {
         todayRecommend.value = result.recommendations || []
         todayDate.value = new Date().toLocaleDateString('zh-CN')
+        if (result.cycleInfo !== undefined) cycleInfo.value = result.cycleInfo
         showNotification('推荐生成成功')
       } else {
         showNotification(result.error || '生成失败')
@@ -511,6 +536,7 @@
         if (today) {
           todayRecommend.value = today.stocks || today.daily_recommendations || []
           todayDate.value = today.date
+          cycleInfo.value = today.cycleInfo || null
         }
         historyRecommend.value = result.data.filter(d => !d.isToday)
       }
@@ -820,5 +846,63 @@
   }
   .kline-hint-btn:hover {
     background: #dbeafe;
+  }
+
+  /* ===== P0-2 周期调度（2026-10-24）：今日模式横幅 + 空仓哨兵卡片 =====
+     全部走主题令牌（亮暗自适应）；调度关闭时这两个元素不渲染，样式是死代码但无害 */
+  .cycle-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.375rem 0.875rem;
+    padding: 0.625rem 1rem;
+    margin-bottom: 0.875rem;
+    border-radius: 10px;
+    background: var(--accent-info-bg);
+    border: 1px solid var(--accent-info-border);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+  }
+  .cycle-banner.cash {
+    background: var(--accent-warning-bg);
+    border-color: var(--accent-warning-border);
+  }
+  .cycle-banner-cycle {
+    font-weight: 700;
+    color: var(--accent-info);
+  }
+  .cycle-banner.cash .cycle-banner-cycle {
+    color: var(--accent-warning);
+  }
+  .cycle-banner-note {
+    color: var(--text-secondary);
+    flex: 1 1 16rem;
+  }
+  .cycle-banner-meta {
+    color: var(--text-tertiary);
+    font-size: 0.75rem;
+  }
+  .cash-sentinel-card {
+    text-align: center;
+    padding: 2.5rem 2rem;
+    margin: 1rem 0;
+    border-radius: 16px;
+    background: var(--bg-tertiary);
+    border: 2px dashed var(--border-medium);
+  }
+  .cash-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--accent-warning);
+    margin-bottom: 0.5rem;
+  }
+  .cash-reason {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.375rem;
+  }
+  .cash-sub {
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
   }
 </style>

@@ -33,6 +33,14 @@
 
     <div v-if="loading" class="loading">读取配置…</div>
 
+    <!-- 2026-10-24：冷启动或正好赶上盘中扫描时，/api/settings 可能十几秒才回；
+         只弹一个 3 秒 toast 会留下整页空白，这里给一个常驻的错误块 + 重试。 -->
+    <div v-else-if="loadError" class="load-error">
+      <div>读取配置失败：{{ loadError }}</div>
+      <div class="hint">盘中扫描正在跑时可能要十几秒，稍等再试。</div>
+      <button class="retry" @click="load">重试</button>
+    </div>
+
     <section v-for="g in groups" :key="g.name" class="group">
       <h3 @click="toggle(g.name)">
         {{ g.name }}
@@ -122,6 +130,7 @@
 
   const loading = ref(true)
   const loaded = ref(false)
+  const loadError = ref('')
   const canWrite = ref(false)
   const items = ref([])
   const summary = ref(null)
@@ -144,8 +153,12 @@
 
   async function load() {
     loading.value = true
+    loadError.value = ''
     try {
-      const res = await apiFetch('/api/settings')
+      // 配置页的冷路径要算"选票范围 + 预览一致性"（两个线程并行，冷时 3~6s），
+      // 若同时赶上盘中扫描（实测 20.2s 那一次）会被拖到 10s 默认超时之外。
+      // 这里单独放宽到 30s，失败则显示常驻错误块 + 重试，而不是留一页空白。
+      const res = await apiFetch('/api/settings', { timeout: 30000 })
       const d = res.data || {}
       items.value = (d.items || []).map(it => ({ ...it, saving: false, preview: null, error: '' }))
       summary.value = d.summary || null
@@ -153,6 +166,7 @@
       canWrite.value = !!d.canWrite
       loaded.value = true
     } catch (e) {
+      loadError.value = e.message || String(e)
       showNotification('读取配置失败：' + (e.message || e), 'error')
     } finally {
       loading.value = false
@@ -163,6 +177,12 @@
   //  · 布尔项：展示**反方**预览（"关掉这一条会放回多少只"），这是决定要不要拨它的依据；
   //  · 数值项：边输边预览（@input 防抖），拨到某个阈值前先看见代价。
   async function fetchPreview(it, incoming) {
+    // 没有声明影响预览函数的项（纯界面偏好等）不打预览接口：
+    // scope_count 不认识这个 key，只会回一个"1094 → 1094、+0"的假结论。
+    if (!it.impact) {
+      it.preview = null
+      return
+    }
     try {
       const res = await apiFetch(`/api/settings/preview?key=${it.key}&value=${encodeURIComponent(incoming)}`)
       it.preview = res.data || null
@@ -319,6 +339,33 @@
     font-size: 12px;
     color: var(--text-tertiary);
     padding: var(--spacing-sm);
+  }
+
+  .load-error {
+    padding: var(--spacing-md);
+    margin: var(--spacing-sm) 0;
+    border-radius: 10px;
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  .load-error .hint {
+    margin-top: 4px;
+    color: var(--text-tertiary);
+    font-size: 11px;
+  }
+
+  .load-error .retry {
+    margin-top: 10px;
+    padding: 6px 16px;
+    border-radius: 8px;
+    border: 1px solid rgba(239, 68, 68, 0.5);
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
   }
   .group {
     margin-bottom: var(--spacing-sm);

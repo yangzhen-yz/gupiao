@@ -892,6 +892,25 @@ async def fetch_eastmoney_hot_list():
     except Exception as error:
         print(f'[热搜榜] 获取失败: {str(error)}')
         raise error
+def split_batch_raw(raw: str) -> Dict[str, str]:
+    """把批量行情原始串按单码拆开：{'sh600000': 'v_sh600000="..."', ...}
+
+    2026-10-24（性能）：趋势扫描已为板块动量把整池 100 只/批拉过一遍行情，
+    但结果只用了涨跌幅就丢弃，process_one_stock 又逐只单拉 ~1300 次腾讯请求
+    （_realtime_cache 按整串 key 缓存，单码 key 命不中）。拆串后单码原始串
+    可直接作为 realtime_raw 传参复用，格式与单码请求完全同构（v_XX="~分隔"），
+    parse_realtime_fields / parse_tencent_batch_data 均可直接消费单段。
+    """
+    out: Dict[str, str] = {}
+    if not raw:
+        return out
+    for piece in re.split(r'[\n;]+', raw.strip()):
+        piece = piece.strip()
+        if piece.startswith('v_') and '=' in piece:
+            eq_idx = piece.index('=')
+            out[piece[2:eq_idx].lower()] = piece
+    return out
+
 def parse_realtime_fields(data: str) -> Optional[Dict]:
     try:
         lines = data.split(';')

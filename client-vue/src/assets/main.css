@@ -508,7 +508,7 @@ body {
   font-size: 1.1rem;
   font-weight: 700;
   color: #fff;
-  font-family: 'SF Mono', 'JetBrains Mono', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   letter-spacing: -0.02em;
 }
 
@@ -845,7 +845,7 @@ body {
 .last-update {
   font-size: 0.8125rem;
   color: var(--text-tertiary);
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   background: var(--bg-tertiary);
   padding: var(--spacing-xs) var(--spacing-md);
   border-radius: 100px;
@@ -893,7 +893,7 @@ body {
   font-size: 0.875rem;
   color: var(--text-tertiary);
   font-weight: 500;
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .stock-price-section {
@@ -903,7 +903,7 @@ body {
 .stock-price {
   font-size: 2.5rem;
   font-weight: 700;
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   letter-spacing: -0.02em;
 }
 
@@ -962,7 +962,7 @@ body {
   font-size: 1.125rem;
   font-weight: 700;
   color: var(--text-primary);
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 /* Orderbook Card */
@@ -1023,7 +1023,7 @@ body {
 .side-value {
   font-size: 1.5rem;
   font-weight: 800;
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .side-value.buy {
@@ -1891,7 +1891,7 @@ body {
   .pool-row .pool-code-sub {
     display: inline;
     margin-left: 6px;
-    font-family: 'SF Mono', 'Courier New', monospace;
+    font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
     font-size: 0.6875rem;
     font-weight: 600;
     letter-spacing: 0.3px;
@@ -1944,7 +1944,7 @@ body {
 }
 
 .pool-stock-code {
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   font-weight: 700;
   letter-spacing: 0.3px;
   text-align: center;
@@ -2028,16 +2028,18 @@ body {
 }
 
 .pool-btn-remove {
-  background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(239, 68, 68, 0.04));
-  color: #ef4444;
-  border-color: rgba(239, 68, 68, 0.22);
+  /* 2026-10-24：红绿统一到语义令牌（原先 #ef4444/#10b981 与 token 的 #dc2626/#16a34a
+     是两套红两套绿，同屏深浅不一致；token 在暗色主题自动翻亮色变体） */
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.1), rgba(220, 38, 38, 0.04));
+  color: var(--accent-danger);
+  border-color: var(--accent-danger-border);
 }
 
 .pool-btn-remove:hover {
-  background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(239, 68, 68, 0.1));
-  border-color: rgba(239, 68, 68, 0.45);
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.2), rgba(220, 38, 38, 0.1));
+  border-color: rgba(220, 38, 38, 0.45);
   transform: translateY(-1px);
-  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.18);
+  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.18);
 }
 
 .pool-btn:active {
@@ -2045,7 +2047,7 @@ body {
 }
 
 .pool-stock-price {
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   text-align: center;
@@ -2069,10 +2071,10 @@ body {
 }
 
 .pool-stock-price.price-up {
-  color: #ef4444;
+  color: var(--accent-danger); /* 2026-10-24：#ef4444 → 语义令牌，与 .stock-price.up 同源 */
 }
 .pool-stock-price.price-down {
-  color: #10b981;
+  color: var(--accent-success); /* 2026-10-24：#10b981 → 语义令牌 */
 }
 .pool-stock-price.price-neutral {
   color: var(--text-secondary);
@@ -2089,15 +2091,16 @@ body {
 }
 
 .trend-badge.up {
-  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.05));
-  color: #ef4444;
-  border: 1px solid rgba(239, 68, 68, 0.3);
+  /* 2026-10-24：#ef4444/#10b981 → 语义令牌，暗色主题自动翻亮色变体 */
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.15), rgba(220, 38, 38, 0.05));
+  color: var(--accent-danger);
+  border: 1px solid rgba(220, 38, 38, 0.3);
 }
 
 .trend-badge.down {
-  background: linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(16, 185, 129, 0.05));
-  color: #10b981;
-  border: 1px solid rgba(16, 185, 129, 0.3);
+  background: linear-gradient(135deg, rgba(22, 163, 74, 0.15), rgba(22, 163, 74, 0.05));
+  color: var(--accent-success);
+  border: 1px solid rgba(22, 163, 74, 0.3);
 }
 
 .trend-badge.neutral {
@@ -2195,7 +2198,7 @@ body {
 
 .stock-table-row .price {
   font-weight: 700;
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .stock-table-row .score-cell {
@@ -2378,13 +2381,13 @@ body {
 .recommend-code-text {
   font-size: 0.85rem;
   color: var(--text-tertiary);
-  font-family: 'SF Mono', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .recommend-price-large {
   font-size: 1.5rem;
   font-weight: 800;
-  font-family: 'SF Mono', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .recommend-stats-grid {
@@ -2454,7 +2457,7 @@ body {
 .recommend-point-value {
   font-size: 1rem;
   font-weight: 700;
-  font-family: 'SF Mono', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .recommend-reason-box {
@@ -2586,7 +2589,7 @@ body {
 
 .history-price-val {
   font-weight: 700;
-  font-family: 'SF Mono', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   text-align: right;
 }
 
@@ -2842,7 +2845,7 @@ body {
 .history-stock-code {
   font-size: 0.75rem;
   color: var(--text-tertiary);
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 .history-price-grid {
@@ -2869,7 +2872,7 @@ body {
 .history-price-value {
   font-size: 0.9375rem;
   font-weight: 700;
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   color: var(--text-primary);
 }
 
@@ -3065,7 +3068,7 @@ body {
   border: 1px solid #a7f3d0;
 }
 .toast-success .toast-icon {
-  background: #10b981;
+  background: var(--accent-success); /* 2026-10-24：与涨跌色同源令牌 */
   color: #fff;
 }
 
@@ -3076,7 +3079,7 @@ body {
   border: 1px solid #fecaca;
 }
 .toast-error .toast-icon {
-  background: #ef4444;
+  background: var(--accent-danger); /* 2026-10-24：与涨跌色同源令牌 */
   color: #fff;
 }
 
@@ -3140,16 +3143,16 @@ body {
   border-color: rgba(16, 185, 129, 0.3);
 }
 [data-theme='dark'] .toast-success .toast-icon {
-  background: #10b981;
+  background: var(--accent-success); /* 2026-10-24：token 化后暗色自动翻亮绿，本行仅为保底 */
 }
 
 [data-theme='dark'] .toast-error {
-  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15) 0%, rgba(239, 68, 68, 0.08) 100%);
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.15) 0%, rgba(220, 38, 38, 0.08) 100%);
   color: #fca5a5;
-  border-color: rgba(239, 68, 68, 0.3);
+  border-color: rgba(220, 38, 38, 0.3);
 }
 [data-theme='dark'] .toast-error .toast-icon {
-  background: #ef4444;
+  background: var(--accent-danger);
 }
 
 [data-theme='dark'] .toast-warning {
@@ -3884,7 +3887,7 @@ body {
   font-size: 1.1rem;
   font-weight: 700;
   color: var(--text-primary);
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   margin-bottom: var(--spacing-xs);
 }
 
@@ -3926,7 +3929,7 @@ body {
   font-size: 1.2rem;
   font-weight: 700;
   color: var(--text-primary);
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
 /* Empty State */
@@ -3985,7 +3988,7 @@ body {
 }
 
 .search-result-item .stock-code {
-  font-family: 'SF Mono', 'Courier New', monospace;
+  font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
   color: #666;
   font-size: 0.9rem;
 }
