@@ -492,6 +492,41 @@ async def get_stocks(symbols: str):
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"批量获取失败: {str(error)}")
 
+def attach_rec_count_shadow(records) -> int:
+    """给"当日推荐只数 ≠ 满编"的那些天挂一个**影子标注**字段，返回标注条数。
+
+    来历（2026-10-27）：用户提出「回测曲线里所有模式，当推荐数量不等于 3 时说明当天行情不好，
+    当天推荐一律不采纳（盘中低吸、次日交易都算），直接空仓」。按这个判据把 2026-06-01 起
+    82 个交易日离线复算，**方向与预期相反**：不足 3 只的 17 天（26 条样本）次日开盘买持 3/5 日
+    +1.22%/+0.71%、胜率 60%，满 3 只的 65 天反而 1/3/5 日全负（−0.60%/−2.24%/−4.04%）。
+    所以这一层**只标注、不拦截**——把现场留在页面上，等样本攒够 ≥60 对再裁决要不要真上线。
+
+    关掉 `rec_below_full_shadow_label` 时一个字段都不下发，前端也就不会多出任何 DOM：
+    关掉的代价严格等于改造前。复算脚本 `server/analysis_out/rec_count_vs_winrate.py`
+    （该目录被 .gitignore 排除，不在版本控制里）。
+    """
+    from services.support import app_settings as A
+    if not bool(A.value('rec_below_full_shadow_label')):
+        return 0
+    full = int(A.value('recommend_full_pick_count') or 3)
+    hit = 0
+    for record in records or []:
+        stocks = record.get('daily_recommendations') or record.get('stocks') or []
+        n = len(stocks)
+        if n == full:
+            continue
+        record['shadow'] = {
+            'count': n, 'full': full,
+            'label': f'本日 {n} 只（满编 {full}）· 影子观察',
+            'note': (f'你定的规则：只数≠{full} 的当天不采纳、直接空仓。当前只做标注，不拦截任何动作。'
+                     '82 个交易日离线复算方向相反：不足 3 只那 17 天次日开盘买持 3/5 日 +1.22%/+0.71%'
+                     '（胜率 60%），满 3 只的 65 天 1/3/5 日全负（−0.60%/−2.24%/−4.04%）。'
+                     '样本仅 26 条，±5pp 内是噪声，攒够 ≥60 对样本外再裁决。'),
+        }
+        hit += 1
+    return hit
+
+
 async def _build_daily_recs_payload() -> Dict:
     """实际构建"历史推荐记录 + 实时盈亏"响应体（原 get_daily_recommendations 函数体抽出）
 
@@ -590,6 +625,12 @@ async def _build_daily_recs_payload() -> Dict:
                 if buy_price > 0:
                     s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
 
+    try:
+        attach_rec_count_shadow(daily_recommendations)
+    except Exception as _e:
+        # 标注这层挂了不能连累推荐数据本身（历史上"影子层拖垮主链路"是踩过的坑）
+        print(f'[历史推荐] 只数影子标注没接上（不影响推荐数据）: {_e}')
+
     return {"success": True, "data": daily_recommendations}
 
 
@@ -682,7 +723,7 @@ async def get_recommend_review_api(days: int = 30):
         raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
 
 _REC_SIM_CACHE: Dict = {}          # {(months, capital, gap, lots, bench): {ts, data}}
-_EXCESS_CACHE: Dict = {}           # 可执行超额单独一份：它要 4 秒，别把 0.2 秒的曲线缓存挤掉
+_EXCESS_CACHE: Dict = {}           # 可执行超额单独一份：冷算实测 7.4s，别把 0.2 秒的曲线缓存挤掉
 _REC_SIM_TTL = 1800                # 秒：底层一天才变一次（14:45 推荐 + 16:10 复盘），算一次 0.2s
 
 @router.get("/api/recommend-sim", tags=["推荐记录"])
@@ -788,7 +829,8 @@ async def get_recommend_excess_api(months: int = 6):
     """次日开盘买入、持有 1/3/5/10 日的**可执行超额**（2026-10-22，P0 评估基座）。
 
     为什么不塞进 /api/recommend-sim：主曲线 0.2 秒，这里要多算一遍选股范围等权基准
-    （6 个月矩阵法约 3.8 秒），同一个响应会让曲线白屏等它。页面并行请求，
+    （6 个月矩阵法**冷算实测 7.4 秒**，2026-10-27 单进程复测；早期写的 3.8 秒是推荐条数还少
+    时量的，已不作数），同一个响应会让曲线白屏等它。页面并行请求，
     曲线先出来、这张表后补；30 分钟缓存，底层一天才变一次。
 
     口径固定为"推荐日下一交易日开盘买、持 N 个交易日开盘卖"，次日一字涨停买不到就跳过；
@@ -809,6 +851,21 @@ async def get_recommend_excess_api(months: int = 6):
         _EXCESS_CACHE.clear()
     _EXCESS_CACHE[key] = {'ts': _t.time(), 'data': data}
     return {'success': True, 'data': data, 'cached': False}
+
+
+def prewarm_recommend_excess(months: int = 6) -> float:
+    """启动预热用：提前把这份 7.4 秒的冷算结果塞进 `_EXCESS_CACHE`，返回耗时秒数。
+
+    为什么需要它（2026-10-27 实拍）：服务重启会清掉进程内缓存，重启后第一个打开
+    「回测曲线」页的人就要现等冷算；前端默认 10s 超时，实测那次直接报
+    「超额没算出来：请求超时（10s）」。预热放后台线程跑，失败不致命（首次请求仍会现算）。
+    """
+    import time as _t
+    from services.pick import rec_sim
+    t0 = _t.time()
+    data = rec_sim.open_hold_excess(months=months)
+    _EXCESS_CACHE[(months,)] = {'ts': _t.time(), 'data': data}
+    return _t.time() - t0
 
 
 @router.get("/api/shadow-eval", tags=["推荐记录"])
