@@ -1,4 +1,4 @@
-import { onUnmounted, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, getCurrentInstance, watch } from 'vue'
 
 /**
  * 轮询治理（2026-10-13 行动台改造）
@@ -12,6 +12,13 @@ import { onUnmounted, watch } from 'vue'
  *
  * 沿用原有 setTimeout 自重排风格（而非 setInterval）：慢请求不会堆叠，
  * 间隔可在运行时变化（行动台按时段返回 nextPollMs）。
+ *
+ * **启动契约（2026-10-27 补，别再踩）**：不传 `immediate:false` 的调用方 = "挂载即开始轮询"，
+ * 由本函数自己在 mounted 兜底启动，不需要（也不应该）再手写 `start()`；
+ * 只有"要等自己的首屏数据/登录态就绪后再开始"的组件才传 `immediate:false` 并显式 `start()`。
+ * 为什么加这条兜底：`start()` 原来只能靠调用方记得调，忘了就**静默不轮询**、页面看起来
+ * 只是"没数据"——10-24 的轮询治理收尾（`2c66dc0`）把 IndexBar 与 TabApiUsage 迁过来时
+ * 就漏了，顶部指数条从那天起一直显示 `--`（接口本身 0.01s 就返回，属纯前端断链）。
  *
  * @param {() => Promise<void>} fn  一次轮询要做的事（异常会被吞掉，不打断轮询）
  * @param {object} [opts]
@@ -131,6 +138,17 @@ export function usePolling(fn, opts = {}) {
       document.removeEventListener('visibilitychange', onVisibility)
     }
   })
+
+  // 兜底启动：没传 immediate:false 的调用方 = "挂载即轮询"（见文件头的启动契约）。
+  // nextTick 里再判一次 started：组件自己的 onMounted 若已显式 start() 过，这里就不会重复跑；
+  // start() 本身也幂等。传了 immediate:false 的 7 个调用方行为完全不变。
+  if (opts.immediate !== false && getCurrentInstance()) {
+    onMounted(() =>
+      nextTick(() => {
+        if (!started) start()
+      })
+    )
+  }
 
   return { start, stop, refresh, schedule }
 }
