@@ -19,6 +19,8 @@
 - 一次提交只做一件事：前端产物与对应源码同提交（`server/static/assets` 的删增必须成对，并带上 `server/static/index.html`），后端、文档、配置分别成提交。
 - 凭据与本机绝对路径不得写进代码或提交：webhook 留在已被 `.gitignore` 排除的 `server/wecom_webhook.json`；路径走配置项，仓库外的守护脚本自己持有绝对路径。
 - 分支与 PR 流程见 `CONTRIBUTING.md`（完整步骤：建分支 → 逐路径提交 → 推送 → 网页 PR → 合并后 fetch/快进/删分支 → dev 对齐，见其第 6 节）；本地硬拦截见 `.githooks/README.md`（启用是一次性 `git config --local core.hooksPath .githooks`）。
+- **推送分支后必须当场生成 PR 标题与描述并贴回会话**（模板与硬性要求见 `CONTRIBUTING.md` 第 7 节：标题一行中文带 scope、描述五段"这个 PR 做什么 / 逐项说明 / 验证 / 文件构成 / 合并后还需注意"，数字必须实测、影子与未做状态不许写成已上线、产物与源码文件数要对账）。
+  这是默认动作，不等用户问"这里写啥"；用户合并之前的清理（快进 `main`、删分支、对齐 `dev`）等用户回来说"合并了"再做。
 
 ## 同一工作树并发约束（本仓特有，比分支规则更要紧）
 
