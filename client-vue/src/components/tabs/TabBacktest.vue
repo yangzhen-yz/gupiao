@@ -238,10 +238,9 @@
           <summary>影子规则对照（第1批「周期门槛线上化」的上线判据）· {{ shVerdict }}</summary>
           <p class="bt-fine">
             每天的推荐任务都会用"周期门槛 + 角色否决 + 不追高"这三条规则<b>另选一遍但不下单</b>，
-            这里比的是<b>被它挡掉的票</b>和<b>它放行的票</b>第二天谁涨得好。
-            挡掉的确实更差 → 值得搬到线上；反过来更好 → 这套规则在削收益，不能上。
-            判定要攒满 {{ sh.minDays || 10 }} 个<b>有真放行名单</b>的交易日（名单是 10-18 才开始整份存的），
-            不够就只报数不给结论。
+            这里比的是<b>被它挡掉的票</b>和<b>它放行的票</b>第二天谁涨得好。 挡掉的确实更差 → 值得搬到线上；反过来更好 →
+            这套规则在削收益，不能上。 判定要攒满 {{ sh.minDays || 10 }} 个<b>有真放行名单</b>的交易日（名单是 10-18
+            才开始整份存的）， 不够就只报数不给结论。
           </p>
           <table class="bt-daily-t">
             <thead>
@@ -269,8 +268,8 @@
             </tbody>
           </table>
           <p class="bt-fine">
-            口径：当日复权收盘 → 次日复权收盘（两组同成本基准才可比）。
-            实现在 <code>server/scripts/shadow_eval.py</code>，命令行跑
+            口径：当日复权收盘 → 次日复权收盘（两组同成本基准才可比）。 实现在
+            <code>server/scripts/shadow_eval.py</code>，命令行跑
             <code>python scripts/shadow_eval.py</code> 得到同一批数。
           </p>
         </details>
@@ -339,7 +338,7 @@
               5 日超额 {{ pct(excess.byDay['5'].excess) }}
             </em>
             <em v-else-if="excessError" class="bt-ex-err">{{ excessError }}</em>
-            <em v-else>正在算（约 4 秒）…</em>
+            <em v-else>正在算（冷启动约 8 秒）…</em>
           </summary>
           <template v-if="excess && excess.byDay['1']">
             <table class="bt-table bt-ex-table">
@@ -368,16 +367,15 @@
             </table>
             <div class="bt-why">
               <p>
-                这条回答的是"<b>这些票拿几天到底行不行</b>"，买价统一用<b>推荐日下一交易日开盘</b>，
-                不是推荐时的参考价 —— 后者混着推荐当天已经涨过的那段，算出来会好看得不真实。
+                这条回答的是"<b>这些票拿几天到底行不行</b>"，买价统一用<b>推荐日下一交易日开盘</b>， 不是推荐时的参考价
+                —— 后者混着推荐当天已经涨过的那段，算出来会好看得不真实。
                 基准是选股范围内<b>全部票</b>在同一买入日、同一持有期等权，逐条配对后平均，
                 所以超额不是"策略均值减指数涨幅"这种假 alpha。
               </p>
               <p class="bt-fine">
-                窗口 {{ excess.since }} ~ {{ excess.until }} / {{ excess.recCount }} 条推荐
-                （固定 6 个月，与上方曲线窗口无关）；当日封死涨停的票按"次日竞价能买"处理，
-                次日一字涨停买不到跳过 {{ excess.skipped['次日一字涨停买不到'] || 0 }} 条，
-                其余 K 线不足的样本单独计数、不进分母。
+                窗口 {{ excess.since }} ~ {{ excess.until }} / {{ excess.recCount }} 条推荐 （固定 6
+                个月，与上方曲线窗口无关）；当日封死涨停的票按"次日竞价能买"处理， 次日一字涨停买不到跳过
+                {{ excess.skipped['次日一字涨停买不到'] || 0 }} 条， 其余 K 线不足的样本单独计数、不进分母。
               </p>
               <p v-if="monthly5" class="bt-fine">逐月 5 日超额：{{ monthly5 }}</p>
               <p class="bt-fine">
@@ -449,7 +447,7 @@
   const modeBoard = ref({})
   const sh = ref({ rows: [], note: '', minDays: 10 })
   const readIdx = ref(null)
-  const excess = ref(null)         // 次日开盘持有 N 日的可执行超额（独立接口，后到）
+  const excess = ref(null) // 次日开盘持有 N 日的可执行超额（独立接口，后到）
   const excessError = ref('')
   const lab = ref(null) // 最近一次因子体检（每周六离线跑）
   const labError = ref('')
@@ -530,8 +528,7 @@
   const hueOf = c => HUE[c.mode] || 'var(--text-tertiary)'
   const dashOf = c => DASH[c.entry]
   const lineStyle = linestyleOf
-  const short = c =>
-    (c.sideLabel ? `${c.sideLabel}·${c.modeLabel}` : `${c.entryLabel.split('（')[0]}·${c.modeLabel}`)
+  const short = c => (c.sideLabel ? `${c.sideLabel}·${c.modeLabel}` : `${c.entryLabel.split('（')[0]}·${c.modeLabel}`)
 
   /* ---------- 资金曲线（坐标换算全在 utils/chart.js，那边有 Node 断言） ---------- */
   const BOX = { w: W, h: H, pl: PAD_L, pr: PAD_R, pt: PAD_T, pb: PAD_B }
@@ -668,15 +665,29 @@
   async function loadBench() {
     await loadSim(true)
   }
-  // 可执行超额单独请求：它要 4 秒算全范围基准，不能让主曲线等它。
-  // 失败在折叠标题上明说，不静默当成"没有这条"。
+  // 可执行超额单独请求：它冷算实测 7.4 秒（6 个月 × 全范围等权基准），不能让主曲线等它。
+  // 超时单独放宽到 30s 并自动重试一次（2026-10-27）：默认 10s 在服务冷启动时必然超时——
+  // 手机实拍「超额没算出来：请求超时（10s）」，而第二次请求命中服务端缓存只要几毫秒。
+  // 注意 `apiFetch` **只在网络错误/超时/401 抛异常，HTTP 500 是 resolve 一个 {detail} 对象的**
+  // （09:28 实测：桩一个 500 只发出一次请求、页面也没有红字），所以"算失败"必须自己判结构：
+  // 不判就会把 undefined 塞进 excess，标题永远挂着"正在算（冷启动约 8 秒）…"骗人。
   async function loadExcess() {
     excessError.value = ''
-    try {
-      const d = await apiFetch('/api/recommend-excess?months=6')
-      excess.value = d.data
-    } catch (e) {
-      excessError.value = '超额没算出来：' + (e.message || e)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let d = null
+      let why = ''
+      try {
+        d = await apiFetch('/api/recommend-excess?months=6', { timeout: 30000 })
+      } catch (e) {
+        why = e.message || String(e)
+      }
+      if (d && d.success && d.data) {
+        excess.value = d.data
+        excessError.value = ''
+        return
+      }
+      why = why || (d && (d.detail || d.error)) || '服务端返回结构不对'
+      if (attempt === 2) excessError.value = '超额没算出来：' + why
     }
   }
   // 因子体检是周更的离线结果，读最近一次即可；读不到就在标题上说明，不静默隐藏
