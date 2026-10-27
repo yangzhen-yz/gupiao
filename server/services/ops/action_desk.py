@@ -606,6 +606,10 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
                           # 当日涨跌幅%（2026-10-23 用户要求：明日计划也要能看到当天涨跌了多少）。
                           # 收评落库时随行情写入；历史收评无此字段，前端批量拉实时行情兜底。
                           'pctChg': f.get('pctChg'),
+                          # 现价（2026-10-26 用户要求：只有涨跌幅和推荐价没法判断"现在离低吸区多远"）。
+                          # 这里是**收评生成时刻的价格**（盘后即当日收盘价），只作兜底：
+                          # 前端会再拉一次实时行情覆盖它，拿不到才退回这个值并在 title 里标明来源。
+                          'price': f.get('price'),
                           # 入选依据（同来源同分数段的历史 T+1 胜率）——名单就是按它排的
                           'winRate': f.get('expectedWinRate'),
                           'avgRet': f.get('expectedAvgRet'),
