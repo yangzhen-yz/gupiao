@@ -195,6 +195,18 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] universe 预热失败（不致命，首次请求会现算）: {e}')
     threading.Thread(target=_prewarm_universe, daemon=True, name='prewarm-universe').start()
 
+    # 可执行超额预热（2026-10-27）：`/api/recommend-excess` 冷算实测 7.4s，而前端默认 10s
+    # 超时——重启后第一个开「回测曲线」页的人正好撞上（当天实拍：超额没算出来：请求超时（10s））。
+    # 放后台线程预热一次，让第一个请求命中缓存；失败不致命（页面还有 30s 超时 + 一次重试兜底）。
+    def _prewarm_excess():
+        try:
+            from app.api import routes
+            sec = routes.prewarm_recommend_excess()
+            print(f'[预热 {datetime.now():%H:%M:%S}] 可执行超额缓存完成（冷算 {sec:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 超额预热失败（不致命，首次请求会现算）: {e}')
+    threading.Thread(target=_prewarm_excess, daemon=True, name='prewarm-excess').start()
+
     # 区间带宽波动率预热（2026-10-19 动态区间宽度）：这份缓存是一次"全市场近 6 个已收盘
     # 交易日收盘序列"的**同步** SQLite 查询。不预热的话，09:45 批次里第一只票会在 asyncio
     # 事件循环上等它几百毫秒——偏偏那一刻正是"开盘后第一时间出推荐"的关键路径（同一个坑

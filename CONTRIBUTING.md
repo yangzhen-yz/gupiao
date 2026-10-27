@@ -72,3 +72,71 @@ Settings → Branches → Add branch protection rule，分支名 `main`（然后
 
 开完把日期与结果写进 `docs/系统更新日志.md`。这一层命令行验证不了：hook 只能保证"这台机器推不出非快进"，
 别人用别的克隆直连 API 仍能强推——所以**这两层都要有**，不是二选一。
+
+## 6. 日常改动的标准流程（提交 → 推送 → PR → 合并 → 清理）
+
+> 2026-10-26 按实际走过的几次 PR 固化。命令都在仓库根目录执行；盘中 **09:10～15:10 只做第 ① 步**，切分支、合并、rebase 一律放到收盘后。
+
+**① 改与自测**
+
+- 改前先读文件；改后用本次独有的关键串 grep 回查，命中 0 视为被并行会话覆盖——停下如实报告，不整节重写回去。
+- 自测脚本放 `server/analysis_out/`（该目录不入库）；失败要显式报错，不静默降级。
+- 同步受影响文档（至少 README、工程知识库、系统更新日志、优化实施计划、选股策略取长补短）。
+- 改完后端代码要生效：写 `server/data/backend_restart_requested` 让看护重启，不要 taskkill。
+
+**② 建分支、逐路径暂存、提交**
+
+```sh
+git fetch origin main
+git switch -c docs/<描述>          # 或 feat/ fix/
+git add <逐个文件路径>              # 禁止 git add . / -A
+git commit -m "docs(scope): 描述"
+```
+
+提交时 hook 会拦：落后 origin、疑似批量暂存、前端产物删增不成对、新增行含本机路径或凭据；文档没同步只提醒不阻断。被拦就按提示改对，禁止 `--no-verify`。
+
+**③ 推送**
+
+```sh
+git push -u origin <分支>
+```
+
+**④ 网页开 PR（本机没装 gh CLI）**
+
+打开 `https://github.com/yangzhen-yz/zzlt/pull/new/<分支>`，base 选 `main`；一个 PR 只做一件事，标题与提交信息同风格。
+
+**⑤ 合并后清理**
+
+```sh
+git fetch --prune origin
+git log --oneline -1 origin/main     # 必须能看到 Merge pull request #N
+git merge --ff-only origin/main
+git branch -d <分支>                  # GitHub 通常已在合并时删掉远程分支；本地 -d 属正常删除
+git remote prune origin               # 远程已删时清掉本地跟踪引用
+git status -sb                        # 期望 ## main...origin/main，无脏文件
+```
+
+- GitHub 没自动删远程分支：`git push origin --delete <分支>`。
+- 远程已删却报 `remote ref does not exist`：说明合并时已删，`git remote prune origin` 即可。
+- 合并提交在 `origin/main` 上还看不到时**先别删分支**，fetch 成功再判断。
+
+**⑥ dev 对齐**
+
+```sh
+git rev-list --count origin/dev..origin/main          # 落后几个提交
+git merge-base --is-ancestor origin/dev origin/main   # 退出码 0 = 纯祖先
+git push origin main:dev                              # 仅纯祖先时允许快进
+```
+
+`dev` 上有独有提交时禁止最后一条，必须走 feat/fix → dev → main 的 PR。
+
+**⑦ 合并后校验**
+
+- 纯文档：核对关键文件行数、新增关键串命中数；md 全 CRLF、`**` 粗体成对；数值区间用全角 ～ 或"至"。
+- 动了后端：`/api/health` 200，并在日志里找到本次新增的启动行或字段，确认真的换了新进程。
+- 失败了先查 `git status` 与 `git log origin/main`，别用 reset/force 掩盖问题。
+
+**失败处理**
+
+- `fetch` 不通：停在当前分支等网络，**不要切回 `main`**——工作树就是线上代码，切回旧提交等于把刚合入的内容撤掉。
+- 本地分支还指着旧的 `origin/main`：先 `git fetch --prune`，确认 `git log --oneline -3 origin/main` 里有合并提交，再继续。

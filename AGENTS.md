@@ -18,7 +18,7 @@
 - **禁止 `git add .` / `git add -A`**，只逐路径暂存本次明确改过的文件。本仓常有几十个未跟踪文件与构建产物删增对，`git add .` 会把它们一并带入提交。
 - 一次提交只做一件事：前端产物与对应源码同提交（`server/static/assets` 的删增必须成对，并带上 `server/static/index.html`），后端、文档、配置分别成提交。
 - 凭据与本机绝对路径不得写进代码或提交：webhook 留在已被 `.gitignore` 排除的 `server/wecom_webhook.json`；路径走配置项，仓库外的守护脚本自己持有绝对路径。
-- 分支与 PR 流程见 `CONTRIBUTING.md`；本地硬拦截见 `.githooks/README.md`（启用是一次性 `git config --local core.hooksPath .githooks`）。
+- 分支与 PR 流程见 `CONTRIBUTING.md`（完整步骤：建分支 → 逐路径提交 → 推送 → 网页 PR → 合并后 fetch/快进/删分支 → dev 对齐，见其第 6 节）；本地硬拦截见 `.githooks/README.md`（启用是一次性 `git config --local core.hooksPath .githooks`）。
 
 ## 同一工作树并发约束（本仓特有，比分支规则更要紧）
 

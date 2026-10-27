@@ -355,6 +355,11 @@
             </div>
             <p v-if="t.plan && t.plan.condition" class="plan-cond">{{ t.plan.condition }}</p>
             <div v-if="t.plan" class="plan-nums">
+              <!-- 现价（2026-10-26 用户要求）：只有推荐价/低吸区时判断不了"现在离区间多远"。
+                   实时行情优先，没拉到才退回收评时价格（title 里写明来源与较低吸区的距离） -->
+              <span v-if="planPrice(t) != null" :title="planPriceTitle(t)"
+                >现价 <b :class="numClass(planPct(t))">{{ planPrice(t).toFixed(2) }}</b></span
+              >
               <span v-if="t.plan.buyLow || t.plan.buyHigh"
                 >低吸区 <b>{{ t.plan.buyLow ?? '--' }}~{{ t.plan.buyHigh ?? '--' }}</b></span
               >
@@ -625,7 +630,7 @@
       const r = await apiFetch('/api/action-desk' + (override ? `?phase=${encodeURIComponent(override)}` : ''))
       if (r && r.success) {
         data.value = r.data
-        // 明日计划补当日涨跌幅（落库 pctChg 缺失的历史收评走实时行情兜底）
+        // 明日计划补当日涨跌幅与现价（落库字段缺失的历史收评走实时行情兜底）
         loadPlanQuotes()
       } else {
         error.value = (r && r.error) || '行动台数据获取失败'
@@ -655,6 +660,30 @@
     return q ? q.pct : null
   }
 
+  // 现价（2026-10-26 用户要求）：① 实时行情（loadPlanQuotes 拉的腾讯价，盘中就是真现价）；
+  // ② 拉不到才用后端下发的收评时价格（盘后即当日收盘价），并在 title 里标明来源，
+  //    免得第二天上午盯着昨天的收盘价判断"能不能进低吸区"。
+  function planPrice(t) {
+    if (!t) return null
+    const q = planQuoteMap.value[(t.symbol || '').toLowerCase()]
+    if (q && q.price > 0) return q.price
+    const n = Number(t.price)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+
+  function planPriceTitle(t) {
+    const q = planQuoteMap.value[(t.symbol || '').toLowerCase()]
+    const src = q && q.price > 0 ? '实时行情' : '收评时价格'
+    const p = planPrice(t)
+    const low = Number(t && t.plan && t.plan.buyLow)
+    const high = Number(t && t.plan && t.plan.buyHigh)
+    if (!(p > 0) || !(low > 0) || !(high > 0)) return src
+    if (p <= high && p >= low) return `${src}｜已在低吸区内（${low}～${high}）`
+    const ref = p > high ? high : low
+    const pct = ref > 0 ? ((p - ref) / ref) * 100 : 0
+    return `${src}｜${p > high ? '高于' : '低于'}低吸区 ${Math.abs(pct).toFixed(1)}%（区间 ${low}～${high}）`
+  }
+
   // 腾讯行情批量返回最小解析（只取价格/涨跌幅，字段布局同 TabQuote.parseTencentData）
   function parseQuotePct(raw) {
     const out = {}
@@ -681,11 +710,13 @@
     const now = Date.now()
     if (now - planQuoteTs.value < 60000) return
     const items = (data.value && data.value.tomorrowPlan) || []
+    // 每次都按当前名单重拉（2026-10-26 改）：以前"这只票补过就不补"，
+    // 结果现价在页面停留期间会一直冻结在首次加载那一刻——盘中看现价必须是会动的现价。
+    // 频率由上面的 60s 节流兜住，且本函数只在轮询里被调（切走 Tab 就不轮询了）。
     const need = []
     for (const t of items) {
-      if (typeof t.pctChg === 'number') continue
       const sym = (t.symbol || '').toLowerCase()
-      if (sym && !planQuoteMap.value[sym] && !need.includes(sym)) need.push(sym)
+      if (sym && !need.includes(sym)) need.push(sym)
     }
     if (!need.length) return
     planQuoteTs.value = now

@@ -2,8 +2,8 @@
   <div>
     <div class="section-title">AI智能选股推荐</div>
     <div class="section-subtitle">
-      基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示 · 每日 09:45 / 10:00 / 13:30 /
-      14:05 自动生成，14:45 收盘前快照；页面名单每次生成会覆盖当天旧批次，上午推过什么看下方「当日批次」
+      基于综合评分模型，每日精选3支最具上涨潜力的股票，附精准买卖点提示 · 每日 09:45 / 10:00 / 13:30 / 14:05
+      自动生成，14:45 收盘前快照；页面名单每次生成会覆盖当天旧批次，上午推过什么看下方「当日批次」
     </div>
     <!-- P0-2 今日模式横幅（2026-10-24）：后端周期调度开启时常驻展示；关闭时无 cycleInfo、不渲染 -->
     <div v-if="cycleInfo" class="cycle-banner" :class="{ cash: cycleInfo.cash }">
@@ -94,6 +94,13 @@
       <div class="section-header">
         <div class="section-subtitle-small">今日推荐股票</div>
         <span class="section-stats">{{ todayDate }}</span>
+      </div>
+      <!-- 只数影子标注（2026-10-27）：用户规则"只数≠满编当天不采纳、直接空仓"。
+           82 日离线复算方向相反，所以这一层只挂标签、不拦截任何动作；
+           字段由后端在开关打开时才下发，关掉就一行 DOM 都不存在。 -->
+      <div v-if="todayShadow" class="shadow-line" :title="todayShadow.note">
+        <span class="shadow-tag">影子</span>{{ todayShadow.label }}
+        <em>只标注、不拦截（悬停看离线复算结论）</em>
       </div>
       <!-- 当日批次折叠区（2026-10-21）：推荐表先删后插只留末批，各批次名单从 strategy_snapshot 回看 -->
       <div v-if="dayBatches.length" class="batch-fold">
@@ -230,16 +237,16 @@
         <!-- 执行诚实化（2026-10-18，P0-1）：低吸区间是系统真正的 edge（历史 T+1 胜率 60.4%），
              所以它做成默认那颗按钮；"按现价买"这颗才是被置灰的对象（43.2% 那个口径）。 -->
         <div v-if="buyRange(r)" class="recommend-exec">
-          <button class="exec-btn primary" @click="copyPlan(r, 'low')">
-            挂低吸单 {{ buyRange(r) }}
-          </button>
-          <button class="exec-btn chase" :class="{ off: isChase(r) }" :disabled="isChase(r)"
-            @click="copyPlan(r, 'now')">
+          <button class="exec-btn primary" @click="copyPlan(r, 'low')">挂低吸单 {{ buyRange(r) }}</button>
+          <button
+            class="exec-btn chase"
+            :class="{ off: isChase(r) }"
+            :disabled="isChase(r)"
+            @click="copyPlan(r, 'now')"
+          >
             {{ isChase(r) ? '现价追高 · 已置灰' : '按现价 ' + nowPrice(r) }}
           </button>
-          <span class="exec-meta">
-            现价{{ overTxt(r) }}；今天最多付到 {{ r.buySellPoints.buyTiming.limitPrice }}
-          </span>
+          <span class="exec-meta"> 现价{{ overTxt(r) }}；今天最多付到 {{ r.buySellPoints.buyTiming.limitPrice }} </span>
           <!-- 区间类型（2026-10-19 影子口径）：上面那颗「挂低吸单」用的核心区间一个字没改，
                这一行只补一句"愿意多付一点的话可达范围到哪"。成交判定、统计口径、
                按钮的置灰逻辑全都还看核心区间——它是对照，不是新默认。 -->
@@ -276,7 +283,12 @@
         暂无历史记录
       </div>
       <div v-for="record in pagedHistoryRecommend" :key="record.date" class="history-item">
-        <div class="history-date-header">📅 {{ record.date }}</div>
+        <div class="history-date-header">
+          📅 {{ record.date }}
+          <span v-if="record.shadow" class="shadow-tag" :title="record.shadow.note">
+            {{ record.shadow.label }}
+          </span>
+        </div>
         <div class="history-stock-grid">
           <div
             v-for="r in record.daily_recommendations || record.stocks"
@@ -423,6 +435,8 @@
   // P0-2 周期调度（2026-10-24）：后端 RECOMMEND_CYCLE_SCHEDULE_ENABLED 开启时推荐记录带
   // cycleInfo（今日模式横幅）；空仓哨兵 isCash 单独渲染，不进普通卡片流。关闭时横幅不渲染。
   const cycleInfo = ref(null)
+  // 只数影子标注（2026-10-27）：后端开关关掉时不下发该字段，这里永远是 null
+  const todayShadow = ref(null)
   const cashItem = computed(() => todayRecommend.value.find(r => r && r.isCash) || null)
   const visibleRecommend = computed(() => todayRecommend.value.filter(r => r && !r.isCash))
 
@@ -537,6 +551,7 @@
           todayRecommend.value = today.stocks || today.daily_recommendations || []
           todayDate.value = today.date
           cycleInfo.value = today.cycleInfo || null
+          todayShadow.value = today.shadow || null
         }
         historyRecommend.value = result.data.filter(d => !d.isToday)
       }

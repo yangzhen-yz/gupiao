@@ -449,6 +449,11 @@
                     >
                       {{ focusPct(s) >= 0 ? '+' : '' }}{{ focusPct(s).toFixed(2) }}%
                     </span>
+                    <!-- 现价（2026-10-26 用户要求）：光看涨跌幅和买入价判断不了"现在离买入价多远"。
+                         实时行情优先，拉不到才用收评落库价，title 里写明来源与距买入价的距离 -->
+                    <span v-if="focusPrice(s) != null" class="focus-now" :title="focusPriceTitle(s)"
+                      >现价 {{ focusPrice(s).toFixed(2) }}</span
+                    >
                   </div>
                 </div>
                 <div class="focus-score" v-if="s.score > 0">
@@ -919,7 +924,24 @@
   }
   function focusPrice(s) {
     const q = focusQuoteMap.value[normalizeSymbol(s.code)]
-    return q ? q.price : s?.price
+    if (q && q.price > 0) return q.price
+    const n = Number(s?.price)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  // title 说清"这个现价是哪来的"和"离买入价多远"：盘后看到的是收评时价格，
+  // 第二天上午看到的才是实时价，两者不区分就会拿旧价做新决策。
+  function focusPriceTitle(s) {
+    const q = focusQuoteMap.value[normalizeSymbol(s.code)]
+    const src = q && q.price > 0 ? '实时行情' : '收评时价格'
+    const p = focusPrice(s)
+    const plan = (s && s.tomorrowPlan) || {}
+    const low = Number(plan.buyLow)
+    const high = Number(plan.buyHigh)
+    if (!(p > 0) || !(low > 0) || !(high > 0)) return src
+    if (p <= high && p >= low) return `${src}｜已在买入区间（${low}～${high}）`
+    const ref = p > high ? high : low
+    const pct = ref > 0 ? ((p - ref) / ref) * 100 : 0
+    return `${src}｜${p > high ? '高于' : '低于'}买入区间 ${Math.abs(pct).toFixed(1)}%（区间 ${low}～${high}）`
   }
   function focusPctClass(s) {
     const p = focusPct(s)
@@ -949,17 +971,22 @@
     return out
   }
 
-  // 翻页/切换日期后新收评的明日关注同样要补行情；已补过的不重复请求
+  // 翻页/切换日期后新收评的明日关注同样要补行情。
+  // 60s 节流（2026-10-26）：现在涨跌幅齐了也要拉现价，不节流就会变成"每翻一页打一次接口"。
+  const focusQuoteTs = ref(0)
   async function loadFocusQuotes() {
+    const now = Date.now()
+    if (now - focusQuoteTs.value < 60000) return
     const need = []
     for (const r of reviews.value.slice(0, 3)) {
       for (const s of r.tomorrowFocus || []) {
-        if (typeof s.pctChg === 'number') continue
+        // 每次按当前可见名单重拉（2026-10-26）：现价得是会动的现价，不能冻结在首次加载那一刻
         const c = normalizeSymbol(s.code)
-        if (c && !focusQuoteMap.value[c] && !need.includes(c)) need.push(c)
+        if (c && !need.includes(c)) need.push(c)
       }
     }
     if (!need.length) return
+    focusQuoteTs.value = now
     try {
       const raw = await apiFetchText(`/api/stocks?symbols=${need.join(',')}`)
       Object.assign(focusQuoteMap.value, parseQuotePct(raw))
@@ -1905,6 +1932,14 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
     font-family: 'SF Mono', 'JetBrains Mono', monospace;
+  }
+  /* 现价（2026-10-26）：跟涨跌幅徽章同一行，颜色保持中性——涨跌方向徽章已经说了，
+     这里再上一次色就等于同一件事两种说法；等宽数字才不会和代码行错位 */
+  .focus-now {
+    margin-left: 6px;
+    color: var(--text-primary);
+    font-weight: 600;
+    white-space: nowrap;
   }
   /* 当日涨跌幅徽章（2026-10-23）：A股惯例红涨绿跌，平盘灰 */
   .focus-pct {
