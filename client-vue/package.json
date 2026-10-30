@@ -14,7 +14,6 @@
   },
   "dependencies": {
     "echarts": "^5.4.3",
-    "sortablejs": "^1.15.0",
     "vue": "^3.4.0"
   },
   "devDependencies": {

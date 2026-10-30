@@ -12,8 +12,6 @@
       <span class="cycle-banner-meta">
         推荐上限 {{ cycleInfo.maxRecommend }} 只<template v-if="cycleInfo.vetoEnabled && cycleInfo.minScore">
           · 门槛 {{ cycleInfo.minScore }} 分</template
-        ><template v-if="cycleInfo.vetoRoles && cycleInfo.vetoRoles.length">
-          · 禁角色：{{ cycleInfo.vetoRoles.join('、') }}</template
         ><template v-if="!cycleInfo.allowChase"> · 不追高（当日涨幅 ≥5% 不推）</template>
       </span>
     </div>

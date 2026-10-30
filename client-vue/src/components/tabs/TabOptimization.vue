@@ -35,7 +35,7 @@
     </div>
 
     <div class="opt-grid">
-      <!-- 左列：D1-D4权重 -->
+      <!-- 单列：D1-D4 权重（2026-10-28 角色面板删除后由双列改为单列） -->
       <div class="opt-panel">
         <div class="panel-header">
           <span>📐 D1-D4 维度权重</span>
@@ -70,41 +70,6 @@
             <span class="history-detail">{{ parseWeightDetail(h) }}</span>
           </div>
           <div v-if="weightHistory.length === 0" class="history-empty">暂无调整记录（系统运行后将自动生成）</div>
-        </div>
-      </div>
-
-      <!-- 右列：角色表现 + 网格搜索 -->
-      <div class="opt-panel">
-        <div class="panel-header">
-          <span>🏷️ 角色分类表现</span>
-          <span class="panel-hint">近7天各角色胜率与超额收益</span>
-        </div>
-
-        <div class="role-table">
-          <div class="role-row role-head">
-            <span class="rc-role">角色</span>
-            <span class="rc-samples">样本</span>
-            <span class="rc-wr">胜率</span>
-            <span class="rc-excess">超额收益</span>
-          </div>
-          <div v-for="r in roleList" :key="r.role" class="role-row">
-            <span class="rc-role">{{ roleName(r.role) }}</span>
-            <span class="rc-samples">{{ r.total }}</span>
-            <span class="rc-wr" :class="wrClass(r.win_rate)">{{ r.win_rate?.toFixed(1) || '-' }}%</span>
-            <span class="rc-excess" :class="excessClass(r.excess_return)">
-              {{ r.excess_return != null ? (r.excess_return > 0 ? '+' : '') + r.excess_return.toFixed(1) + '%' : '-' }}
-            </span>
-          </div>
-          <div v-if="roleList.length === 0" class="history-empty">暂无数据（运行后将自动生成）</div>
-        </div>
-
-        <!-- 角色门槛当前值 -->
-        <div class="section-title" style="margin-top: 1.2rem">🎯 角色门槛（自动调优）</div>
-        <div class="threshold-grid">
-          <div v-for="t in thresholdList" :key="t.role" class="threshold-item">
-            <span class="th-role">{{ roleName(t.role) }}</span>
-            <span class="th-param">{{ t.desc }}</span>
-          </div>
         </div>
       </div>
     </div>
@@ -163,21 +128,11 @@
     { key: 'd3', label: 'D3', desc: '量能配合', color: '#2563eb' },
     { key: 'd4', label: 'D4', desc: '风险回撤', color: '#7c3aed' },
   ]
-  const roleLabels = {
-    total_leader: '总龙头',
-    sector_leader: '板块龙头',
-    core_trend: '中军',
-    sentiment_vanguard: '情绪先锋',
-    catch_up: '补涨龙',
-    follower: '跟风',
-    marginal: '杂毛',
-  }
+  // 2026-10-28 角色体系下线：删除 roleLabels（7 级角色名映射）
 
   const currentWeights = ref({ d1: { weight: 1.0 }, d2: { weight: 1.0 }, d3: { weight: 1.0 }, d4: { weight: 1.0 } })
   const stats = ref({})
   const weightHistory = ref([])
-  const rolePerformance = ref([])
-  const roleThresholds = ref({})
   const gridHistory = ref([])
   const pageSize = ref(0)
   const optimizing = ref(false)
@@ -202,60 +157,7 @@
     return '→'
   }
 
-  // 角色列表
-  const roleList = computed(() => {
-    const map = {}
-    for (const r of rolePerformance.value) {
-      if (!map[r.role]) map[r.role] = { role: r.role, total: 0, win_rate: 0, excess_return: 0 }
-      map[r.role].total += r.total
-      map[r.role].win_rate = Math.max(map[r.role].win_rate, r.win_rate)
-      map[r.role].excess_return = Math.max(map[r.role].excess_return, r.excess_return)
-    }
-    return Object.values(map).sort((a, b) => (roleLabels[a.role] || a.role).localeCompare(roleLabels[b.role] || b.role))
-  })
-
-  // 门槛列表
-  const thresholdList = computed(() => {
-    const items = []
-    const tl = roleThresholds.value
-    if (tl.total_leader)
-      items.push({
-        role: 'total_leader',
-        desc: `连板≥${tl.total_leader.min_boards} 涨停≥${tl.total_leader.min_limitups}`,
-      })
-    if (tl.sector_leader)
-      items.push({
-        role: 'sector_leader',
-        desc: `连板≥${tl.sector_leader.min_boards} 涨停≥${tl.sector_leader.min_limitups}`,
-      })
-    if (tl.core_trend)
-      items.push({
-        role: 'core_trend',
-        desc: `市值≥${(tl.core_trend.min_mv / 1e8).toFixed(0)}亿 评分≥${tl.core_trend.min_score}`,
-      })
-    if (tl.sentiment_vanguard)
-      items.push({ role: 'sentiment_vanguard', desc: `换手率≥${tl.sentiment_vanguard.min_turnover}%` })
-    if (tl.catch_up) items.push({ role: 'catch_up', desc: `位置分位<${tl.catch_up.max_position}` })
-    if (tl.follower)
-      items.push({ role: 'follower', desc: `涨幅≥${tl.follower.min_change}% 量比≥${tl.follower.min_vol_ratio}` })
-    return items
-  })
-
-  function roleName(r) {
-    return roleLabels[r] || r
-  }
-
-  function wrClass(v) {
-    if (v >= 60) return 'wr-high'
-    if (v >= 45) return 'wr-mid'
-    return 'wr-low'
-  }
-  function excessClass(v) {
-    if (v == null) return ''
-    if (v > 2) return 'wr-high'
-    if (v < -2) return 'wr-low'
-    return 'wr-mid'
-  }
+  // 2026-10-28 角色体系下线：删除 roleList / thresholdList / roleName / wrClass / excessClass
 
   function formatTime(ts) {
     if (!ts) return ''
@@ -290,11 +192,9 @@
       ])
       if (statusRes.success) {
         currentWeights.value = statusRes.data.dimensionWeights || {}
-        roleThresholds.value = statusRes.data.roleThresholds || {}
       }
       if (trendRes.success) {
         weightHistory.value = trendRes.data.weightHistory || []
-        rolePerformance.value = trendRes.data.rolePerformance || []
         gridHistory.value = trendRes.data.gridHistory || []
         stats.value = trendRes.data.stats || {}
       }
@@ -320,7 +220,6 @@
         const r = res.data
         const parts = []
         if (r.dimension_weights) parts.push(r.dimension_weights.summary)
-        if (r.role_thresholds) parts.push(r.role_thresholds.summary)
         if (r.grid_search) parts.push(r.grid_search.summary)
         triggerMsg.value = '✅ 优化完成: ' + parts.join(' | ')
         await fetchData()
@@ -416,7 +315,7 @@
   /* 双列网格 */
   .opt-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 1rem;
   }
 
@@ -534,38 +433,7 @@
     font-size: 0.85rem;
   }
 
-  /* 角色表格 */
-  .role-table {
-    font-size: 0.85rem;
-  }
-  .role-row {
-    display: grid;
-    grid-template-columns: 100px 60px 70px 90px;
-    gap: 0.3rem;
-    padding: 0.35rem 0;
-    border-bottom: 1px solid var(--border-muted);
-    align-items: center;
-  }
-  .role-head {
-    font-weight: 600;
-    color: var(--text-tertiary);
-    font-size: 0.75rem;
-  }
-  .rc-role {
-    color: var(--text-primary);
-  }
-  .rc-samples {
-    text-align: center;
-    color: var(--text-secondary);
-  }
-  .rc-wr {
-    text-align: right;
-    font-weight: 600;
-  }
-  .rc-excess {
-    text-align: right;
-    font-weight: 600;
-  }
+  /* 2026-10-28 角色体系下线：删除角色表格与角色门槛网格样式 */
   .wr-high {
     color: #dc2626;
   }
@@ -574,29 +442,6 @@
   }
   .wr-low {
     color: #6b7280;
-  }
-
-  /* 门槛网格 */
-  .threshold-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.4rem;
-  }
-  .threshold-item {
-    display: flex;
-    gap: 0.4rem;
-    font-size: 0.78rem;
-    padding: 0.3rem 0.5rem;
-    background: var(--bg-input);
-    border-radius: 6px;
-  }
-  .th-role {
-    font-weight: 600;
-    color: var(--text-primary);
-    flex-shrink: 0;
-  }
-  .th-param {
-    color: var(--text-secondary);
   }
 
   /* 网格搜索表 */

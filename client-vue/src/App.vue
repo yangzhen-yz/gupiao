@@ -39,6 +39,8 @@
           </div>
         </nav>
       </header>
+      <!-- 本次加载耗时（2026-10-30）：一行细条，切页后自动重新计时，点开看逐接口明细 -->
+      <LoadTiming />
       <!-- 弹层必须 Teleport 到 body：.tab-bar 为了窄屏横向滚动写了 overflow-x:auto，
            这会让 overflow-y 的计算值从 visible 变成 auto，绝对定位的下拉菜单被自己裁掉 ——
            2026-10-13 手机上点「明细」"没反应"就是这个原因（菜单开了，但看不见）。 -->
@@ -212,6 +214,8 @@
   import { useTheme } from './composables/useTheme'
   import LoginPage from './components/LoginPage.vue'
   import IndexBar from './components/IndexBar.vue'
+  import LoadTiming from './components/LoadTiming.vue'
+  import { startPage } from './utils/perf'
 
   // 2026-08-31 性能优化：非默认 Tab 与弹窗改为动态导入（配合懒挂载）。
   // 2026-10-13：默认页换成「行动台」，实时行情降为普通 Tab，首屏只下载 desk chunk。
@@ -419,6 +423,17 @@
   const authReady = ref(false)
   const currentUser = ref(getAuthUser())
   const tabPositionRef = ref(null)
+
+  // 2026-10-30 页面加载耗时：切页或登录就绪时重置计时。
+  // flush:'sync' 是必须的——子页面靠 active prop 的 watcher 触发重新请求，
+  // 那个 watcher 在渲染补丁里跑，比默认的 pre 更晚；这里先重置才不会把上页的请求算进来。
+  watch(
+    [() => activeTab.value, () => authReady.value, () => !!currentUser.value],
+    ([tab, ready, hasUser]) => {
+      if (ready && hasUser) startPage(tab, TAB_LABELS[tab] || tab)
+    },
+    { immediate: true, flush: 'sync' }
+  )
 
   // 轮询必须声明在 currentUser 之后：usePolling 建 watch 时会立刻读一次 active，
   // 提前引用处于 TDZ 的 const 会让整个 App setup 抛错（2026-10-13 首屏白屏的成因）。

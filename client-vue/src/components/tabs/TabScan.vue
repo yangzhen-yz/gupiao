@@ -87,9 +87,6 @@
             <template v-if="expectedGain(r) !== null">
               <div class="target-price">{{ parseFloat(r.buySellPoints.sell).toFixed(2) }}</div>
               <div class="gain-val">+{{ expectedGain(r).toFixed(1) }}%</div>
-              <div v-if="r.buySellPoints.stockType" class="stock-type-tag" :class="roleClass(r)">
-                {{ r.buySellPoints.stockType }}
-              </div>
             </template>
             <span v-else class="na-val">—</span>
           </span>
@@ -164,14 +161,12 @@
   // "观望以上" = score ≥ bearMaxScore（包含 40-69 观望区 + ≥70 看涨区，排除 <40 看跌）
   const tabConfig = ref({
     // 后端配置缓存
-    filterModes: ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score'],
+    filterModes: ['all', 'bull_only', 'bull_and_hold', 'min_score'],
     defaultMode: 'min_score',
     defaultMinScore: 60,
     bullMinScore: 70,
     bearMaxScore: 40,
-    leadersMinGain: 3.0,
     modeLabels: {
-      leaders_only: '仅优质龙头',
       all: '全部',
       bull_only: '仅看涨',
       bull_and_hold: '观望以上',
@@ -266,18 +261,7 @@
   // 阈值全部读自 tabConfig（后端单一源），不在前端硬编码
   const sortedResults = computed(() => {
     const sorted = [...scanResults.value].sort((a, b) => b.score - a.score)
-    const { bullMinScore, bearMaxScore, leadersMinGain } = tabConfig.value
-    if (filterMode.value === 'leaders_only') {
-      // 仅优质龙头（2026-08-31 默认模式）：去掉 跟风/杂毛 弱势票，且预期涨幅达标。
-      // 实测扫描宇宙中 93% 是跟风/杂毛，用户只需高预期龙头/先锋/中军。
-      const minGain = leadersMinGain ?? 3.0
-      return sorted.filter(r => {
-        const role = r.buySellPoints?.stockType || ''
-        if (/跟风|杂毛/.test(role)) return false
-        const g = expectedGain(r)
-        return g !== null && g >= minGain
-      })
-    }
+    const { bullMinScore, bearMaxScore } = tabConfig.value
     if (filterMode.value === 'all') return sorted
     if (filterMode.value === 'bull_only') {
       // 仅看涨：score >= bullMinScore（看涨区）
@@ -345,18 +329,7 @@
     return ((sell - r.price) / r.price) * 100
   }
 
-  // 角色 CSS 类（7级分类）
-  function roleClass(r) {
-    const t = r.buySellPoints?.stockType || ''
-    if (t.includes('总龙头')) return 'role-total-leader'
-    if (t.includes('板块龙头')) return 'role-sector-leader'
-    if (t.includes('中军')) return 'role-core-trend'
-    if (t.includes('情绪先锋')) return 'role-vanguard'
-    if (t.includes('补涨龙')) return 'role-catch-up'
-    if (t.includes('跟风')) return 'role-follower'
-    if (t.includes('杂毛')) return 'role-marginal'
-    return 'role-marginal'
-  }
+  // 2026-10-28 角色体系下线：删除 roleClass（7 级角色徽标与配色）
 
   async function startScan(silent = false) {
     if (scanning.value) return
@@ -472,94 +445,6 @@
   .target-cell .gain-val {
     color: var(--scan-gain-color, #dc2626);
     font-weight: 600;
-  }
-  .stock-type-tag {
-    display: inline-block;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 3px;
-    margin-top: 2px;
-    color: #475569;
-    background: #f1f5f9;
-    border: 0.5px solid #e2e8f0;
-  }
-  /* 7级角色配色 */
-  .stock-type-tag.role-total-leader {
-    color: #b91c1c;
-    background: #fef2f2;
-    border-color: #fecaca;
-  }
-  .stock-type-tag.role-sector-leader {
-    color: #c2410c;
-    background: #fff7ed;
-    border-color: #fed7aa;
-  }
-  .stock-type-tag.role-core-trend {
-    color: #1d4ed8;
-    background: #eff6ff;
-    border-color: #bfdbfe;
-  }
-  .stock-type-tag.role-vanguard {
-    color: #7e22ce;
-    background: #faf5ff;
-    border-color: #e9d5ff;
-  }
-  .stock-type-tag.role-catch-up {
-    color: #0e7490;
-    background: #ecfeff;
-    border-color: #a5f3fc;
-  }
-  .stock-type-tag.role-follower {
-    color: #475569;
-    background: #f1f5f9;
-    border-color: #e2e8f0;
-  }
-  .stock-type-tag.role-marginal {
-    color: #78716c;
-    background: #f5f5f4;
-    border-color: #d6d3d1;
-  }
-  /* 暗色模式 */
-  :root[data-theme='dark'] .stock-type-tag {
-    color: #94a3b8;
-    background: rgba(71, 85, 105, 0.15);
-    border-color: rgba(226, 232, 240, 0.2);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-total-leader {
-    color: #fca5a5;
-    background: rgba(185, 28, 28, 0.15);
-    border-color: rgba(254, 202, 202, 0.3);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-sector-leader {
-    color: #fdba74;
-    background: rgba(194, 65, 12, 0.15);
-    border-color: rgba(254, 215, 170, 0.3);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-core-trend {
-    color: #93c5fd;
-    background: rgba(29, 78, 216, 0.15);
-    border-color: rgba(191, 219, 254, 0.3);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-vanguard {
-    color: #d8b4fe;
-    background: rgba(126, 34, 206, 0.15);
-    border-color: rgba(233, 213, 255, 0.3);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-catch-up {
-    color: #67e8f9;
-    background: rgba(14, 116, 144, 0.15);
-    border-color: rgba(165, 243, 252, 0.3);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-follower {
-    color: #94a3b8;
-    background: rgba(71, 85, 105, 0.15);
-    border-color: rgba(226, 232, 240, 0.2);
-  }
-  :root[data-theme='dark'] .stock-type-tag.role-marginal {
-    color: #a8a29e;
-    background: rgba(120, 113, 108, 0.15);
-    border-color: rgba(214, 211, 209, 0.2);
   }
   .stoploss-cell .loss-val {
     color: var(--scan-loss-color, #16a34a);

@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { beginRequest, endRequest } from './perf'
 
 // 判断是否为交易日（2026年A股休市日历，来源：沪深北交易所公告）
 const HOLIDAYS_2026 = [
@@ -197,6 +198,12 @@ export async function apiFetch(url, options = {}) {
   const { timeout = API_TIMEOUT_MS, expectText = false, ...rest } = options
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
+  // 2026-10-30：把每个请求的耗时记进 utils/perf.js（内存态，页面耗时条用它）。
+  // 服务端处理时间来自 X-Process-Time，缺失时为 null（差额即传输/隧道排队）。
+  const _t0 = performance.now()
+  const _tok = beginRequest(url)
+  let _status = 0
+  let _serverMs = null
   try {
     const opts = { ...rest, signal: ctrl.signal }
     const token = getToken()
@@ -204,6 +211,9 @@ export async function apiFetch(url, options = {}) {
       opts.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` }
     }
     const resp = await fetch(url, opts)
+    _status = resp.status
+    const _proc = resp.headers.get('X-Process-Time')
+    if (_proc !== null) _serverMs = Number(_proc)
     if (resp.status === 401 && !url.startsWith('/api/auth/')) {
       clearAuth()
       if (_unauthorizedHandler) _unauthorizedHandler()
@@ -224,6 +234,12 @@ export async function apiFetch(url, options = {}) {
     throw e
   } finally {
     clearTimeout(timer)
+    endRequest(_tok, {
+      ms: performance.now() - _t0,
+      status: _status,
+      serverMs: _serverMs,
+      ok: _status >= 200 && _status < 400,
+    })
   }
 }
 
