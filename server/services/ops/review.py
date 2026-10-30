@@ -944,18 +944,17 @@ async def generate_daily_review() -> Dict:
                 seen_codes.add(code)
                 source_tags[code] = '智能推荐'
                 score = r.get('score', 0) or 0
-                # 记录买入时机（含角色判定，最准；明日关注直接复用）
+                # 记录买入时机（最准；明日关注直接复用）
                 bsp = r.get('buySellPoints') or {}
                 bt = bsp.get('buyTiming')
                 if bt:
                     rec_buy_timing[code] = bt
-                # 记录买卖点/止损参考（智能推荐已算好角色+位置修正，明日计划优先复用）
+                # 记录买卖点/止损参考（智能推荐已算好位置修正，明日计划优先复用）
                 if bsp or r.get('riskControl'):
                     rec_ref_points[code] = {
                         'buy': bsp.get('buy'),
                         'sell': bsp.get('sell'),
                         'stop': (r.get('riskControl') or {}).get('stop_loss'),
-                        'stockType': bsp.get('stockType'),
                         'position': (r.get('riskControl') or {}).get('position_suggest'),
                     }
                 tomorrow_focus.append({

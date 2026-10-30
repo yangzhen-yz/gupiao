@@ -112,12 +112,12 @@ from services.support import push as P                          # noqa: E402
 
 
 def _push_stock(chg):
-    """一只除涨幅段以外全部合规的票（评分/角色/量比/预期涨幅都过线）。"""
+    """一只除涨幅段以外全部合规的票（评分/量比/预期涨幅都过线）。"""
     price = 10.0
     return {'symbol': 'sh900001', 'name': '闸门测试', 'price': price,
             'changePercent': chg, 'volumeRatio': 2.0, 'gain20': 5.0,
             'score': 82,
-            'buySellPoints': {'stockType': '龙头', 'sell': price * 1.05}}
+            'buySellPoints': {'sell': price * 1.05}}
 
 
 _dead = _push_stock(6.0)

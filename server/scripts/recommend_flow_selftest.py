@@ -81,13 +81,14 @@ async def _fake_sent():
     return {'cycle': '回暖', 'cycleScore': 61, 'stale': False, 'detail': '测试',
             'indicators': {'limitUpCount': 38, 'limitDownCount': 2, 'zhabanCount': 9,
                            'promotionRate': 28.0},
-            'weakSignals': [], 'rule': {'veto_roles': ('跟风',), 'allow_chase': True,
+            'weakSignals': [], 'rule': {'allow_chase': True,
                                         'allow_relay': True},
             'minScore': 60}
 
 
 def _fake_gate(_sent):
-    return {'advisoryMinScore': 55, 'advisoryChase': True, 'vetoRoles': ('跟风',),
+    # 2026-10-28 角色体系下线：vetoRoles 恒空，自测只为保持返回体形状
+    return {'advisoryMinScore': 55, 'advisoryChase': True, 'vetoRoles': (),
             'allowChase': True, 'allowRelay': True}
 
 

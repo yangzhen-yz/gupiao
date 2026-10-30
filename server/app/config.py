@@ -57,14 +57,11 @@ TO_THREAD_POOL_MAX_WORKERS = 48
 # 第二个 Tab "股票筛选"（/api/hot-stocks-scan）的可选过滤模式
 # 用户在前端可切换：all(全部) / bull_only(仅看涨) / bull_and_hold(观望以上) / min_score(自定义分)
 # 注意：当前后端默认仍返回全量，前端按此配置做客户端过滤；如需服务端过滤可将 FILTER_MODE 设为 'all' 之外的任意值并改 hot-stocks-scan 路由
-# 2026-08-31 选股策略优化：新增 leaders_only（仅优质龙头）过滤并设为默认。
-# 背景：扫描宇宙扩大后弱势票（跟风/杂毛）占比高（实测 93%），用户只需高预期优质票。
-# leaders_only 规则：去掉 跟风/杂毛 角色，且预期涨幅 ≥ TAB_SCAN_LEADERS_MIN_GAIN。
-# 2026-09-10 调整为默认"自定义最低分 60"，让用户一进页面就看到相对高分的股票（观望/看涨），避免弱票刷屏。
+# 2026-09-10 默认改为"自定义最低分 60"，让用户一进页面就看到相对高分的股票（观望/看涨），避免弱票刷屏。
 # 2026-10-24 该默认值移出本文件：改由「配置 → 股票筛选页」的 tab_scan_default_min_score 管理
 # （注册表在 services/support/app_settings.py，live 即时生效，/api/tab-scan-config 每次现读）。
-TAB_SCAN_FILTER_MODES = ['leaders_only', 'all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
-TAB_SCAN_LEADERS_MIN_GAIN = 3.0  # 仅优质龙头模式的最低预期涨幅(%)
+# 2026-10-28 删除 leaders_only（仅优质龙头）模式：角色体系整体下线，筛选只剩分档，不再按角色筛票。
+TAB_SCAN_FILTER_MODES = ['all', 'bull_only', 'bull_and_hold', 'min_score']  # 前端下拉选项
 TAB_SCAN_DEFAULT_MODE = 'min_score'  # 默认模式：自定义最低分
 TAB_SCAN_BULL_MIN_SCORE = 70  # "看涨"区间的最低分（≥ 此值为看涨）
 TAB_SCAN_BEAR_MAX_SCORE = 40  # "看跌"区间的最高分（< 此值为看跌）
@@ -348,9 +345,9 @@ RISK_CONTROL_STOP_LOSS_VOL_MULT = 1.5  # 止损幅度 = 当日振幅 × 此系�
 RISK_CONTROL_SCORE_HIGH_RISK = 55   # 评分 < 此值 → 高风险
 RISK_CONTROL_SCORE_MID_RISK = 65    # 评分 < 此值 → 中风险，否则低风险
 
-# ========== 买卖点位置+角色感知修正（V4.3，2026-08-17）==========
-# 在 V4.1 振幅动态调整基础上，叠加位置高低/角色分类/评分置信度三维修正。
-# 止盈倍率 = 位置倍率 × 角色倍率 × 评分倍率，封顶 BUY_SELL_MAX_TARGET_PCT。
+# ========== 买卖点位置感知修正（V4.3，2026-08-17；V4.6 2026-10-28 去角色）==========
+# 在 V4.1 振幅动态调整基础上，叠加位置高低/评分置信度两维修正。
+# 止盈倍率 = 位置倍率 × 评分倍率，封顶 BUY_SELL_MAX_TARGET_PCT。
 # 位置信息优先取 trend_details.positionPct（精确年度分位），fallback 用 base_scores['position']（5/10/15 粗估）。
 
 # 位置分位门限（年度分位 0-100）
@@ -367,66 +364,11 @@ BUY_SELL_TARGET_POSITION_HIGH_MULT = 0.7    # 高位：收缩 30%
 BUY_SELL_TARGET_SCORE_HIGH_MULT = 1.1       # 评分≥80：放大 10%
 BUY_SELL_TARGET_SCORE_LOW_MULT = 0.8        # 评分<55：收缩 20%
 
-# ===== 6级角色分类（V4.3，替换原龙头/跟风二分法）=====
-# 角色判定条件（按优先级从高到低匹配，命中即停）
-# 1. total_leader    总龙头：连板≥5 + 涨停次数≥4（全市场最高标）
-# 2. sector_leader   板块龙头：连板≥3 + 涨停次数≥2（板块内连板最高之一）
-# 3. core_trend      中军：大市值(≥300亿) + 连板≤1 + 评分≥65（趋势型权重股）
-# 4. sentiment_vanguard 情绪先锋：今日涨停 + 连板=1 + 高换手(≥5%)（率先试盘的弹性小票）
-# 5. catch_up        补涨龙：低位(分位<50) + 近期涨停(1-2板)（龙头高位后的低位新领涨）
-# 6. follower        跟风：涨幅≥3% + 量比≥1 + 评分≥50（被动跟随）
-# 7. marginal        杂毛：其余（辨识度最低、逻辑最弱）
-
-# 角色止盈倍率（叠在位置倍率之上）
-BUY_SELL_ROLE_TARGET_MULT = {
-    'total_leader':       1.4,   # 总龙头：预期上限放大 40%（容错率最高，穿越分歧）
-    'sector_leader':      1.25,  # 板块龙头：放大 25%
-    'core_trend':         1.15,  # 中军：放大 15%（稳趋势，不靠连板）
-    'sentiment_vanguard': 1.05,  # 情绪先锋：放大 5%（波动大，快进快出）
-    'catch_up':           0.95,  # 补涨龙：收缩 5%（高度通常低于初代龙头）
-    'follower':           0.8,   # 跟风：收缩 20%（无独立行情）
-    'marginal':           0.6,   # 杂毛：收缩 40%（盈亏比极差）
-}
-
-# 角色止损倍率（叠在位置倍率之上）
-BUY_SELL_ROLE_STOP_MULT = {
-    'total_leader':       1.2,   # 总龙头：止损放宽 20%（回撤后恢复概率最高）
-    'sector_leader':      1.1,   # 板块龙头：放宽 10%
-    'core_trend':         1.0,   # 中军：标准（大市值波动小）
-    'sentiment_vanguard': 0.8,   # 情绪先锋：收紧 20%（波动极大，转弱最先被杀）
-    'catch_up':           0.9,   # 补涨龙：收紧 10%（龙头崩盘易跟随崩）
-    'follower':           0.85,  # 跟风：收紧 15%（破位快）
-    'marginal':           0.8,   # 杂毛：收紧 20%（无主力运作，下跌最快）
-}
-
-# 角色中文标签（前端展示）
-BUY_SELL_ROLE_LABELS = {
-    'total_leader':       '总龙头',
-    'sector_leader':      '板块龙头',
-    'core_trend':         '中军',
-    'sentiment_vanguard': '情绪先锋',
-    'catch_up':           '补涨龙',
-    'follower':           '跟风',
-    'marginal':           '杂毛',
-}
-
-# 角色判定条件参数
-BUY_SELL_ROLE_TOTAL_LEADER_BOARDS = 5       # 总龙头最低连板数
-BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS = 4     # 总龙头最低涨停次数
-BUY_SELL_ROLE_SECTOR_LEADER_BOARDS = 3      # 板块龙头最低连板数
-BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS = 2    # 板块龙头最低涨停次数
-BUY_SELL_ROLE_CORE_TREND_MV = 300e8         # 中军最低流通市值（300亿，单位元）
-BUY_SELL_ROLE_CORE_TREND_SCORE = 65         # 中军最低评分
-BUY_SELL_ROLE_VANGUARD_TURNOVER = 5.0       # 情绪先锋最低换手率(%)
-BUY_SELL_ROLE_CATCHUP_POSITION_MAX = 50     # 补涨龙最高位置分位
-BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN = 3.0     # 跟风最低涨幅(%)
-BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN = 1.0  # 跟风最低量比
-BUY_SELL_ROLE_FOLLOWER_SCORE_MIN = 50       # 跟风最低评分
-
-# 无 trend_details 时的 fallback 龙头判定（保持向后兼容）
-BUY_SELL_LEADER_FALLBACK_CHANGE_PCT = 5.0   # 涨幅≥此值 + 量比≥2 = 龙头
-BUY_SELL_LEADER_FALLBACK_VOL_RATIO = 2.0    # 量比阈值
-BUY_SELL_LEADER_SCORE_GATE = 80             # 评分≥此值且非高位 = 龙头
+# ===== 角色体系已于 2026-10-28 整体删除 =====
+# 用户原话："所有的角色都去掉吧，像什么龙头、跟风、杂毛，这些所有的都去掉吧。"
+# 不再按角色分类计算止盈倍率 / 止损倍率 / 推送否决 / 周期否决 / 前端标签；
+# 卖出目标与止损只按 **位置分位 + 综合评分** 两维修正（原角色倍率与判定门槛全部移除）。
+# 涨停股的止盈基准统一取原七档的中值 4%（原先 2%~7% 按角色分档）。
 
 # 止盈/止损封顶
 BUY_SELL_MAX_TARGET_PCT = 0.15              # 止盈上限封顶 15%
@@ -764,10 +706,11 @@ BUY_RANGE_VOL_BARS = 5               # 取最近 5 个已收盘交易日的日�
 BUY_RANGE_VOL_K = 1.0                # 扩展带宽 = BASE + K×vol5（K=1、vol5=2% → 带宽 3%）
 BUY_RANGE_VOL_CACHE_SEC = 600        # 波动率是日级慢变量，盘中 10 分钟一份就够
 
-# ========== 智能推荐：买入时机判定（2026-10-12，区分早盘/尾盘买入） ==========
-# 回答"这只票今天该什么时候买"：涨停→次日竞价；强势情绪股→早盘；
-# 高振幅/冲高回落/高位追高→尾盘确认；低位趋势股→回踩低吸；其余→盘中灵活。
-BUY_TIMING_STRONG_CHANGE_MIN = 5.0    # 强势角色+涨幅≥此值 → 早盘买入
+# ========== 智能推荐：买入时机判定（V4.6 2026-10-28 去角色，只剩四条） ==========
+# 回答"这只票今天该什么时候买"：涨停封板→次日竞价；
+# 高振幅/冲高回落/高位追高→尾盘确认；低位/中低位→回踩低吸；其余→盘中灵活。
+# 原「强势角色+涨幅≥5% → 早盘买入」已随角色体系下线删除（且强势股次日追买实测为负），
+# 复盘口径 review.py 仍保留自己的本地常量 _SBT_STRONG，与本文件无关。
 BUY_TIMING_TAIL_AMPLITUDE_MIN = 5.0   # 振幅≥此值 → 尾盘确认（日内不确定性大）
 BUY_TIMING_TAIL_DRAWDOWN_MIN = 2.0    # 自日内高点回落≥此值 → 尾盘确认
 BUY_TIMING_HIGH_CHASE_CHANGE_MIN = 3.0  # 高位+涨幅≥此值 → 不追高，尾盘或放弃
@@ -832,7 +775,7 @@ WECOM_PUSH_MIN_SCORE = 70           # 综合评分 >= 此值
 WECOM_PUSH_MIN_GAIN = 3.0           # 预期涨幅 >= 此值（%）
 WECOM_PUSH_MIN_VOL_RATIO = 1.0      # 量比 >= 此值
 WECOM_PUSH_MAX_CHANGE = 9.8         # 涨幅 < 此值（未涨停，保留买入空间）
-WECOM_PUSH_EXCLUDE_ROLES = ('跟风', '杂毛')  # 排除的角色关键词（stockType 中命中即排除）
+# 2026-10-28：删除 WECOM_PUSH_EXCLUDE_ROLES —— 角色体系下线，推送只按"评分+未涨停+预期涨幅+量比"筛。
 
 # ---- 盘中连续扫描的股票范围（2026-10-16 用户要求："把推荐池也塞进每 60 秒的连续扫描里"）----
 # 改造前这条链路只扫用户自选池（8~10 只），于是"9:45 那批推荐"生成后就再没人看了：
@@ -1112,22 +1055,22 @@ SENTIMENT_PREMIUM_MAX_CODES = 200     # 昨日涨停溢价最多查多少只（�
 # 情绪周期 → 精选推荐最低分：改门槛而非改扣分，纪律不该被其他因子平均掉
 SENTIMENT_MIN_SCORE = {'冰点': 72, '退潮': 68, '分歧': 65, '回暖': 60, '发酵': 60, '高潮': 64}
 # 情绪周期 → 操作纪律。env_shift 是在"大盘涨跌幅档位"上的升降档；
-# allow_chase=是否允许追高（涨幅已过 5% 的票）；allow_relay=是否允许接力高位连板；
-# veto_roles=硬否决角色（命中即不进"此时机可介入"，移入"稍后时机"并写原因）。
+# allow_chase=是否允许追高（涨幅已过 5% 的票）；allow_relay=是否允许接力高位连板。
+# 2026-10-28：删除 veto_roles（角色硬否决）—— 角色体系下线，周期只按"追高/接力"两条纪律约束。
 # 高潮期 allow_chase=False 是"卖在一致"：越是人人赚钱越不追第一，防接最后一棒。
 CYCLE_RULES = {
     '冰点': {'env_shift': -2, 'allow_chase': False, 'allow_relay': False,
-             'veto_roles': ('跟风', '杂毛', '补涨龙'), 'note': '情绪冰点：严禁接力，只做超跌低吸或空仓等待'},
+             'note': '情绪冰点：严禁接力，只做超跌低吸或空仓等待'},
     '退潮': {'env_shift': -1, 'allow_chase': False, 'allow_relay': False,
-             'veto_roles': ('跟风', '杂毛'), 'note': '亏钱效应扩散：规避高位股，有利润即刻走，不补仓不格局'},
+             'note': '亏钱效应扩散：规避高位股，有利润即刻走，不补仓不格局'},
     '分歧': {'env_shift': 0, 'allow_chase': False, 'allow_relay': False,
-             'veto_roles': ('杂毛',), 'note': '多空拉锯：降低操作频率，等方向明确'},
+             'note': '多空拉锯：降低操作频率，等方向明确'},
     '回暖': {'env_shift': 0, 'allow_chase': True, 'allow_relay': False,
-             'veto_roles': ('杂毛',), 'note': '情绪修复：积极低吸主流题材低位股'},
+             'note': '情绪修复：积极低吸主流题材低位股'},
     '发酵': {'env_shift': 1, 'allow_chase': True, 'allow_relay': True,
-             'veto_roles': ('杂毛',), 'note': '情绪主升：可跟随主线龙头，注意仓位节奏'},
+             'note': '情绪主升：可跟随主线，注意仓位节奏'},
     '高潮': {'env_shift': 0, 'allow_chase': False, 'allow_relay': True,
-             'veto_roles': ('跟风', '杂毛'), 'note': '一致看多：不追第一，逐步兑现，谨防高位分歧'},
+             'note': '一致看多：不追第一，逐步兑现，谨防高位分歧'},
 }
 # 硬否决的确认条件：单指标假信号多（炸板率高但涨停数也高 = 分歧而非退潮），
 # 要求至少 2 个弱信号同向，且过 10:00 才启用（9:35 涨停数天然少，会把回暖日误判成冰点）

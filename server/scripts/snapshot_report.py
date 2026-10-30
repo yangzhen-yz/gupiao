@@ -39,7 +39,7 @@ from db.database import get_db_conn            # noqa: E402
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-DIMS = ('stage', 'score带', '情绪', '入口', '时机', '矩阵', '角色', '影子判定', '被挡原因')
+DIMS = ('stage', 'score带', '情绪', '入口', '时机', '矩阵', '影子判定', '被挡原因')
 
 
 def _band(score):
@@ -170,7 +170,6 @@ def main():
                     '入口': r['source'] or '未标记',
                     '时机': r['timing'] or '无标签',
                     '矩阵': r['matrix'] or '未判定',
-                    '角色': r['role'] or '无标签',
                     '影子判定': r['shadow_note'] or '未评估(不在影子前15只里)',
                     '被挡原因': (r['blocked_by'] or '未被挡').split('；')[0]}
             for d in DIMS:

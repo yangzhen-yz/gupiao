@@ -42,7 +42,7 @@ def ck(cond, msg):
 
 def _item(sym, name, chg, score, verdict=None, reasons=None):
     it = {'symbol': sym, 'name': name, 'score': score, 'changePercent': chg,
-          'volumeRatio': 1.2, 'role': '高位总龙头', 'timing': '', 'tag': '测试'}
+          'volumeRatio': 1.2, 'timing': '', 'tag': '测试'}
     if verdict:
         it['matrix'] = {'verdict': verdict, 'why': '用例'}
     if reasons:

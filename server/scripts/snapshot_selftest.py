@@ -51,7 +51,7 @@ def _payload(scored, cand, top3, batch='09:45', **kw):
                     'sh601111': ['亏损黑名单(近30天)']},
         'sources': {'sz000002': '热搜+海选', 'sh600000': '趋势'},
         'pool_info': {'sz000002': {'r20': 41.2, 'rank_pct': 3.1}},
-        'labels': {'sh600001': {'role': '总龙头', 'timing': '竞价低吸',
+        'labels': {'sh600001': {'timing': '竞价低吸',
                                 'matrix': '可接力', 'matrix_why': '昨日封板+今日高开'}},
         'market_change': 0.42,
         'sent': {'cycle': '主升', 'cycleScore': 78, 'stale': False,
@@ -76,7 +76,7 @@ ck(n == 5, f'5 只全落库（实得 {n}）')
 
 conn = sqlite3.connect(_TMP)
 rows = conn.execute('SELECT symbol, stage, rank, blocked_by, score, trend_score, source, '
-                    'role, timing, matrix, r20, factors, inputs, concept, price '
+                    'timing, matrix, r20, factors, inputs, concept, price '
                     'FROM strategy_snapshot ORDER BY rank').fetchall()
 ck([r[0] for r in rows] == ['sh600001', 'sz000002', 'sh600000', 'sh601111', 'sz000003'],
    'rank 按分数从高到低')
@@ -85,9 +85,9 @@ ck(rows[0][1] == 'recommended' and rows[1][1] == 'candidate' and rows[4][1] == '
 ck(rows[1][3] == '炸板', f'blocked_by 记录被挡原因（{rows[1][3]}）')
 ck(rows[4][3] == '低于门槛60', f'门槛之下自动补原因（{rows[4][3]}）')
 ck(rows[0][6] is None and rows[1][6] == '热搜+海选', '入口标记按 src_map 落库')
-ck(rows[0][7] == '总龙头' and rows[0][9] == '可接力', '角色/时机/矩阵标签写入')
-ck(abs(rows[1][10] - 41.2) < 1e-6, '海选 r20 一并落库')
-ck(rows[0][11].startswith('{"outer_ratio"') and 'main_capital_inflow' in rows[0][12],
+ck(rows[0][7] == '竞价低吸' and rows[0][8] == '可接力', '时机/矩阵标签写入')
+ck(abs(rows[1][9] - 41.2) < 1e-6, '海选 r20 一并落库')
+ck(rows[0][10].startswith('{"outer_ratio"') and 'main_capital_inflow' in rows[0][11],
    '13 因子得分与输入值以 JSON 落库')
 
 hdr = conn.execute('SELECT * FROM strategy_snapshot_batch').fetchall()

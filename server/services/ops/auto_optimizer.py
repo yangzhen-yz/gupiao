@@ -1,9 +1,10 @@
 """auto_optimizer.py - 系统自动优化引擎（V4.4）
 
-三大自进化机制：
+两大自进化机制：
 1. 趋势 D1-D4 维度权重反馈闭环（每日回测后运行）
-2. 角色分类门槛自动优化（每日回测后运行）
-3. 网格搜索最优参数组合（每周运行）
+2. 网格搜索最优参数组合（每周运行）
+
+2026-10-28：角色体系整体下线，原"角色分类门槛自动优化"（Feature 2）随之删除。
 
 设计原则：
 - 所有优化都是渐进式的（每次微调，不突变）
@@ -13,7 +14,7 @@
 import json
 from datetime import datetime
 from typing import Dict
-from db.database import (get_db_conn, load_trend_dimension_weights, save_trend_dimension_weights, load_role_thresholds, save_role_thresholds, save_role_performance, save_optimization_history)
+from db.database import (get_db_conn, load_trend_dimension_weights, save_trend_dimension_weights, save_optimization_history)
 
 # ========== 常量 ==========
 
@@ -31,11 +32,6 @@ WEIGHT_ADJUST_STEP = 0.05                       # 每次调整步长(×1.05 或 
 WEIGHT_MIN = 0.7                                # 权重下限
 WEIGHT_MAX = 1.3                                # 权重上限
 WEIGHT_MIN_SAMPLE = 20                          # 最小样本数
-
-# 角色优化参数
-ROLE_MIN_SAMPLE = 5                             # 最小样本数
-ROLE_WINRATE_BENCHMARK = 55.0                   # 基准胜率(%)
-ROLE_ADJUST_THRESHOLD = 10.0                    # 偏离基准多少百分点才调整
 
 # 网格搜索参数
 GRID_SEARCH_LOOKBACK_DAYS = 30                  # 回看天数
@@ -272,194 +268,7 @@ async def optimize_trend_dimension_weights() -> Dict:
         return {'adjustments': [], 'summary': f'优化失败: {e}', 'error': str(e)}
 
 
-# ========== Feature 2: 角色门槛自动优化 ==========
-
-async def optimize_role_thresholds() -> Dict:
-    """角色分类门槛自动优化
-
-    算法：
-    1. 加载最近30天已验证的趋势回测记录（含 role 字段）
-    2. 对每个角色计算：样本数、胜率、平均超额收益
-    3. 对比各角色实际表现与预期：
-       - 龙头系(总龙头/板块龙头)表现差 → 收紧门槛（提高连板/涨停要求）
-       - 龙头系表现好 → 放宽门槛
-       - 中军表现差 → 提高评分/市值要求
-       - 情绪先锋表现差 → 提高换手率要求
-       - 跟风/杂毛表现好 → 放宽（可能门槛太严把好票挡在外面）
-    4. 每次调整幅度：±1（连板数）或 ±0.5%（换手率/涨幅）或 ±50亿（市值）
-    5. 保存到 DB
-
-    Returns:
-        {'adjustments': [...], 'summary': str}
-    """
-    try:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-
-        # 加载最近30天已验证1日的回测记录（含 role）
-        cursor.execute('''
-            SELECT role, is_correct_1d, actual_change_1d, market_change_1d
-            FROM trend_backtest_records
-            WHERE verified_1d = 1
-              AND role IS NOT NULL AND role != ''
-              AND predict_date >= date('now', '-30 days')
-            ORDER BY predict_date DESC
-        ''')
-        rows = cursor.fetchall()
-        conn.close()
-
-        if len(rows) < ROLE_MIN_SAMPLE:
-            return {
-                'adjustments': [],
-                'summary': f'样本不足({len(rows)}/{ROLE_MIN_SAMPLE})，跳过角色门槛优化',
-            }
-
-        # 按角色分组统计
-        role_stats: Dict[str, Dict] = {}
-        for r in rows:
-            role = r['role']
-            if role not in role_stats:
-                role_stats[role] = {
-                    'total': 0, 'win': 0,
-                    'actual_sum': 0.0, 'market_sum': 0.0,
-                }
-            role_stats[role]['total'] += 1
-            role_stats[role]['win'] += r['is_correct_1d'] == 1
-            role_stats[role]['actual_sum'] += r['actual_change_1d'] or 0
-            role_stats[role]['market_sum'] += r['market_change_1d'] or 0
-
-        # 保存角色表现统计
-        perf_data = {}
-        for role, stats in role_stats.items():
-            win_rate = stats['win'] / stats['total'] * 100 if stats['total'] > 0 else 0
-            avg_actual = stats['actual_sum'] / stats['total'] if stats['total'] > 0 else 0
-            avg_market = stats['market_sum'] / stats['total'] if stats['total'] > 0 else 0
-            excess = avg_actual - avg_market
-            perf_data[role] = {
-                'total': stats['total'],
-                'win': stats['win'],
-                'win_rate': round(win_rate, 2),
-                'avg_change': round(avg_actual, 2),
-                'avg_market': round(avg_market, 2),
-                'excess_return': round(excess, 2),
-            }
-        save_role_performance(perf_data)
-
-        # 加载当前门槛
-        thresholds = load_role_thresholds()
-        adjustments = []
-
-        # ---- 角色门槛调整逻辑 ----
-
-        def _adjust(role: str, param_key: str, current_val: float,
-                    direction: str, step: float, min_val: float, max_val: float,
-                    reason: str):
-            """通用调整函数
-            direction: 'up' 提高门槛, 'down' 降低门槛
-            """
-            if direction == 'up':
-                new_val = min(max_val, current_val + step)
-            else:
-                new_val = max(min_val, current_val - step)
-            if new_val == current_val:
-                return None
-            thresholds[role][param_key] = new_val
-            return {
-                'role': role, 'param': param_key,
-                'old_value': current_val, 'new_value': new_val,
-                'direction': direction, 'reason': reason,
-            }
-
-        # 总龙头 & 板块龙头：预期高胜率 + 高超额收益
-        for role in ['total_leader', 'sector_leader']:
-            stats = perf_data.get(role)
-            if not stats or stats['total'] < ROLE_MIN_SAMPLE:
-                continue
-            boards_key = 'min_boards'
-            limitups_key = 'min_limitups'
-            current_boards = thresholds[role][boards_key]
-            current_limitups = thresholds[role][limitups_key]
-
-            if stats['win_rate'] < ROLE_WINRATE_BENCHMARK - ROLE_ADJUST_THRESHOLD:
-                # 胜率太低 → 收紧门槛
-                adj = _adjust(role, boards_key, current_boards, 'up', 1, 3, 8,
-                              f'胜率{stats["win_rate"]:.0f}%<基准{ROLE_WINRATE_BENCHMARK-ROLE_ADJUST_THRESHOLD}%，提高连板要求')
-                if adj:
-                    adjustments.append(adj)
-            elif stats['win_rate'] > ROLE_WINRATE_BENCHMARK + ROLE_ADJUST_THRESHOLD:
-                # 胜率很高 → 略放宽门槛（纳入更多候选）
-                adj = _adjust(role, boards_key, current_boards, 'down', 1, 3, 8,
-                              f'胜率{stats["win_rate"]:.0f}%>基准{ROLE_WINRATE_BENCHMARK+ROLE_ADJUST_THRESHOLD}%，适当放宽连板要求')
-                if adj:
-                    adjustments.append(adj)
-
-        # 中军：预期稳定超额收益
-        core_stats = perf_data.get('core_trend')
-        if core_stats and core_stats['total'] >= ROLE_MIN_SAMPLE:
-            current_score = thresholds['core_trend']['min_score']
-            if core_stats['excess_return'] < -2:
-                adj = _adjust('core_trend', 'min_score', current_score, 'up', 2, 60, 80,
-                              f'超额收益{core_stats["excess_return"]:.1f}%为负，提高评分门槛')
-                if adj:
-                    adjustments.append(adj)
-            elif core_stats['excess_return'] > 3:
-                adj = _adjust('core_trend', 'min_score', current_score, 'down', 2, 60, 80,
-                              f'超额收益{core_stats["excess_return"]:.1f}%优秀，适当降低评分门槛')
-                if adj:
-                    adjustments.append(adj)
-
-        # 情绪先锋：预期正超额收益，但波动大
-        vanguard_stats = perf_data.get('sentiment_vanguard')
-        if vanguard_stats and vanguard_stats['total'] >= ROLE_MIN_SAMPLE:
-            current_turnover = thresholds['sentiment_vanguard']['min_turnover']
-            if vanguard_stats['excess_return'] < -2:
-                adj = _adjust('sentiment_vanguard', 'min_turnover', current_turnover, 'up', 0.5, 3.0, 15.0,
-                              f'超额收益{vanguard_stats["excess_return"]:.1f}%为负，提高换手率要求')
-                if adj:
-                    adjustments.append(adj)
-            elif vanguard_stats['excess_return'] > 3:
-                adj = _adjust('sentiment_vanguard', 'min_turnover', current_turnover, 'down', 0.5, 3.0, 15.0,
-                              f'超额收益{vanguard_stats["excess_return"]:.1f}%优秀，适当放宽换手率要求')
-                if adj:
-                    adjustments.append(adj)
-
-        # 跟风：如果表现好，降低门槛纳入更多
-        follower_stats = perf_data.get('follower')
-        if follower_stats and follower_stats['total'] >= ROLE_MIN_SAMPLE:
-            current_change_min = thresholds['follower']['min_change']
-            if follower_stats['win_rate'] > ROLE_WINRATE_BENCHMARK + ROLE_ADJUST_THRESHOLD:
-                adj = _adjust('follower', 'min_change', current_change_min, 'down', 0.5, 1.0, 10.0,
-                              f'胜率{follower_stats["win_rate"]:.0f}%高于基准，放宽涨幅要求纳入更多')
-                if adj:
-                    adjustments.append(adj)
-            elif follower_stats['win_rate'] < 30:
-                adj = _adjust('follower', 'min_change', current_change_min, 'up', 0.5, 1.0, 10.0,
-                              f'胜率{follower_stats["win_rate"]:.0f}%过低，收紧涨幅要求')
-                if adj:
-                    adjustments.append(adj)
-
-        # 保存门槛
-        save_role_thresholds(thresholds)
-
-        # 记录优化历史
-        save_optimization_history(
-            module='role_thresholds',
-            parameter_set=json.dumps({k: v for k, v in thresholds.items()}, ensure_ascii=False),
-            metric_name='roles_analyzed',
-            metric_value=len(perf_data),
-            old_value=None,
-            new_value=len(adjustments),
-            details=json.dumps({'performance': perf_data, 'adjustments': adjustments}, ensure_ascii=False),
-        )
-
-        summary = f'角色门槛优化完成: {len(adjustments)} 项调整, 分析 {len(perf_data)} 个角色'
-        print(f'[自动优化] {summary}')
-        return {'adjustments': adjustments, 'performance': perf_data, 'summary': summary}
-
-    except Exception as e:
-        print(f'[自动优化] 角色门槛优化失败: {e}')
-        return {'adjustments': [], 'summary': f'优化失败: {e}', 'error': str(e)}
-
+# ========== Feature 2: 角色门槛自动优化（2026-10-28 随角色体系删除） ==========
 
 # ========== Feature 3: 网格搜索最优参数 ==========
 
@@ -610,8 +419,7 @@ async def run_auto_optimization(run_grid: bool = False) -> Dict:
     # Feature 1: D1-D4 权重反馈
     results['dimension_weights'] = await optimize_trend_dimension_weights()
 
-    # Feature 2: 角色门槛优化
-    results['role_thresholds'] = await optimize_role_thresholds()
+    # Feature 2（角色门槛优化）已于 2026-10-28 随角色体系删除
 
     # Feature 3: 网格搜索（可选）
     if run_grid:

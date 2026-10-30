@@ -431,8 +431,8 @@ def _latest_live_snapshot(now: datetime, final: bool = False) -> Optional[Dict]:
         if not final:
             gaps.append(f'实时涨停池此刻不可用，沿用 {snap_dt.strftime("%H:%M")} 盘中快照{age_txt}')
         snap['dataGaps'] = gaps
+        # 2026-10-28 角色体系下线：不再写/读 veto_roles（旧快照里的同名字段已无人读取）
         snap['rule'] = dict(snap.get('rule') or {})
-        snap['rule']['veto_roles'] = ()
         return snap
     except Exception as e:
         print(f'[情绪] 盘中快照兜底失败: {e}')
@@ -572,8 +572,8 @@ async def get_sentiment(force: bool = False) -> Dict:
             fb['stale'] = True
             fb.setdefault('cycle', '未知')
             # 降级值不给否决权限：接口故障不该被当成"市场恐慌"而清空买入区
+            # （2026-10-28 角色体系下线后已无 veto_roles 读取方，这里只保留 rule 的独立副本）
             fb['rule'] = dict(fb.get('rule') or {})
-            fb['rule']['veto_roles'] = ()
             return fb
         return _empty_snapshot('接口失败')
     finally:
@@ -585,6 +585,9 @@ def cycle_gate(sentiment: Dict, now: Optional[datetime] = None) -> Dict:
 
     返回 {'vetoRoles':..., 'allowChase':..., 'allowRelay':..., 'minScore':...,
           'envShift':..., 'vetoEnabled':..., 'reason':...}
+
+    2026-10-28：角色体系整体下线，'vetoRoles'/'gatedBy' 两个键只为兼容前端而保留，
+    恒为空（周期只剩"追高 / 接力"两条纪律约束，不再按龙头/跟风/杂毛否决）。
 
     vetoEnabled 的四个前提（缺一个就只提示不拦）：
       1. 情绪源不是 stale（接口故障 ≠ 冰点），且用的是 5 分钟内的值；
@@ -608,7 +611,7 @@ def cycle_gate(sentiment: Dict, now: Optional[datetime] = None) -> Dict:
     return {
         'cycle': sentiment.get('cycle'),
         'cycleScore': sentiment.get('cycleScore'),
-        'vetoRoles': tuple(rule.get('veto_roles') or ()) if enabled else (),
+        'vetoRoles': (),
         'allowChase': bool(rule.get('allow_chase', True)) or not enabled,
         'allowRelay': bool(rule.get('allow_relay', True)) or not enabled,
         'advisoryChase': bool(rule.get('allow_chase', True)),
@@ -617,7 +620,7 @@ def cycle_gate(sentiment: Dict, now: Optional[datetime] = None) -> Dict:
         'advisoryMinScore': sentiment.get('minScore') or 60,
         'envShift': int(rule.get('env_shift', 0)) if enabled else 0,
         'vetoEnabled': enabled,
-        'gatedBy': list(rule.get('veto_roles') or ()) if not enabled else (),
+        'gatedBy': [],
         'reason': rule.get('note') or '',
         'stale': bool(sentiment.get('stale')),
         'cacheAgeSec': age,

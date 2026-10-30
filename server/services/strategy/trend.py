@@ -2013,15 +2013,7 @@ async def scan_trend_scan_results(force: bool = False):
                 if r.get('strategyScore') and r.get('realtimeData'):
                     score_data = r['strategyScore']
                     realtime_data = r['realtimeData']
-                    # 2026-09-01 记录角色（总龙头/板块龙头/中军/情绪先锋/补涨龙/跟风/杂毛），
-                    # 供趋势回测按角色验证（role 列此前一直为空，无法做角色级回测）。
-                    try:
-                        from services.pick.recommend import _classify_stock_role
-                        _role = _classify_stock_role(realtime_data, score_data, r.get('details'))[1]
-                        r['stockRole'] = _role
-                    except Exception as _e:
-                        print(f'[趋势扫描] 角色计算失败 {r.get("symbol")}: {type(_e).__name__}: {_e}')
-                        r['stockRole'] = ''
+                    # 2026-10-28：角色体系整体下线，这里不再算 stockRole（原先只为角色级回测）
                     if score_data['predict_direction'] == 'bull':
                         predictions.append({
                             'predict_date': today,
@@ -2056,7 +2048,6 @@ async def scan_trend_scan_results(force: bool = False):
                     'ma10': r['ma10'],
                     'ma20': r['ma20'],
                     'recent5Days': r['recent5Days'],
-                    'stockRole': r.get('stockRole', ''),
                 }
                 cleaned_results.append(cleaned_r)
             

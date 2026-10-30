@@ -188,12 +188,12 @@ def _build_buy_items(group: Dict, quote_map: Dict[str, Dict], allowed: tuple,
     与持仓页/个股决策卡同一口径，避免"同一只票两个页面两个止损"。
 
     gate（情绪周期规则）命中时是**硬否决**：票不删除、不进 buyNow，而是带原因移入
-    "稍后时机"。这样复盘时仍能看见当天错过了什么，也不会让"退潮不接力"这条纪律
+    "稍后时机"。这样复盘时仍能看见当天错过了什么，也不会让"退潮不追高"这条纪律
     被高评分平均掉（纪律如果被打分项稀释，就等于没有）。
+    2026-10-28 角色体系下线后，硬否决只剩"不追高"一条（角色不接力整块移除）。
     """
     buy_now, deferred = [], []
     _gate = gate or {}
-    veto_roles = tuple(_gate.get('vetoRoles') or ())
     cycle = _gate.get('cycle') or ''
     for rec in group.get('stocks') or []:
         bsp = rec.get('buySellPoints') or {}
@@ -224,20 +224,15 @@ def _build_buy_items(group: Dict, quote_map: Dict[str, Dict], allowed: tuple,
             'stop': round(float(rc.get('stop_loss') or 0), 2) or None,
             'riskLevel': rc.get('risk_level') or '',
             'positionSuggest': rc.get('position_suggest') or '',
-            'role': bsp.get('stockType') or '',
             'logic': (rec.get('reason') or '')[:180],
             'recDate': group.get('date'),
         }
         veto_reason = ''
         if ttype in allowed:
-            role = item['role']
-            hit_role = next((r for r in veto_roles if r and r in role), None)
             chasing = (_gate.get('allowChase') is False
                        and ttype in ('early', 'intraday')
                        and item['changePercent'] >= 5)
-            if hit_role:
-                veto_reason = f'情绪{cycle}·{hit_role}不接力'
-            elif chasing:
+            if chasing:
                 veto_reason = f'情绪{cycle}·涨幅已过5%不追高'
         if ttype in allowed and not veto_reason:
             buy_now.append(item)
@@ -547,7 +542,7 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'weakSignals': (sentiment.get('weakSignals') or [])[:4],
             'rule': gate.get('reason') or '',
             'vetoEnabled': bool(gate.get('vetoEnabled')),
-            'vetoRoles': list(gate.get('vetoRoles') or []),
+            # 2026-10-28 角色体系下线：不再下发 vetoRoles（原"禁角色"文案已删）
             'allowChase': gate.get('allowChase'),
             'allowRelay': gate.get('allowRelay'),
             'minScore': gate.get('minScore'),

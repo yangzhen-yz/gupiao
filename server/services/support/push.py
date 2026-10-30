@@ -1,14 +1,14 @@
 """services/push.py - 企业微信选股推送（盘中准实时）
 
 2026-09-01 新增：
-- 盘中每 1 分钟扫描候选，满足条件的股票（评分高 + 龙头/中军 + 未涨停 + 预期涨幅够 + 有量能）
+- 盘中每 1 分钟扫描候选，满足条件的股票（评分高 + 未涨停 + 预期涨幅够 + 有量能）
   通过企业微信推给授权人。
 - 2026-10-16 扫描范围从"只有用户自选池（8~10 只）"扩成 **用户池 ∪ 推荐池**
   （盘前海选前 60 只 + 当日已生成推荐前 5 只）：否则 9:45 那批推荐生成后就再没人看，
   快照那一刻涨 1.1% 的票涨到 7% 也不会提醒。开关见 config.WECOM_PUSH_SCAN_RECOMMEND_POOL。
 - 去重：同一只股票当天首次达标才推，之后不再重复推送；每天另有额度上限
   （config.WECOM_PUSH_DAILY_LIMIT），用满就只记不推。
-- 开盘前 9:25 推送"今日关注池"预览（评分达标 + 非跟风/杂毛）。
+- 开盘前 9:25 推送"今日关注池"预览（评分达标）。
 
 依赖：
 - wecom-cli（企业微信 CLI，已在 PATH，位于 connector_runtime artifacts）
@@ -31,7 +31,6 @@ from app.config import (WECOM_PUSH_ENABLED, WECOM_AIBOT_ENABLED, WECOM_CLI_CHAT_
                         WECOM_WEBHOOK_MSGTYPE,
                         WECOM_PUSH_MIN_SCORE,
                         WECOM_PUSH_MIN_GAIN, WECOM_PUSH_MIN_VOL_RATIO, WECOM_PUSH_MAX_CHANGE,
-                        WECOM_PUSH_EXCLUDE_ROLES,
                         WECOM_PUSH_SCAN_RECOMMEND_POOL, WECOM_PUSH_POOL_TOP_N, WECOM_PUSH_REC_TOP_N,
                         WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_MATRIX_VETO, WECOM_PUSH_MATRIX_LABEL,
                         WECOM_PUSH_APPLY_LOSER_BLACKLIST)
@@ -430,17 +429,14 @@ def _expected_gain(stock) -> float | None:
 
 def _pass_filter(stock) -> bool:
     """是否满足推送条件（与用户确认方案）：
-    评分≥阈值 + 角色非跟风/杂毛 + 未涨停 + 预期涨幅≥阈值 + 量比≥阈值。
+    评分≥阈值 + 未涨停 + 预期涨幅≥阈值 + 量比≥阈值。
+    （2026-10-28 起删掉"角色非跟风/杂毛"一条：角色体系整体下线）
     """
     try:
         score = float(stock.get('score') or 0)
     except (TypeError, ValueError):
         return False
     if score < WECOM_PUSH_MIN_SCORE:
-        return False
-
-    role = (stock.get('buySellPoints') or {}).get('stockType') or ''
-    if any(kw in role for kw in WECOM_PUSH_EXCLUDE_ROLES):
         return False
 
     try:
@@ -641,11 +637,10 @@ def _fmt_markdown(stocks: list, title: str) -> str:
         price = s.get('price', 0)
         change = s.get('changePercent', 0)
         score = s.get('score', 0)
-        role = (s.get('buySellPoints') or {}).get('stockType', '')
         gain = _expected_gain(s)
         vr = s.get('volumeRatio', 0)
         lines.append(f'{i}. **{name}**（{code}）')
-        lines.append(f'   💰 现价 {price}｜涨幅 {change}%｜评分 {score}｜{role}')
+        lines.append(f'   💰 现价 {price}｜涨幅 {change}%｜评分 {score}')
         lines.append(f'   🎯 预期涨幅 {gain:.1f}%｜量比 {vr:.1f}')
         if WECOM_PUSH_MATRIX_LABEL:
             m = matrix_of(s)
@@ -705,7 +700,7 @@ async def push_candidates_task():
 
 
 async def push_daily_preview_task():
-    """开盘前 9:25 推送"今日关注池"预览：评分≥阈值 且 非跟风/杂毛（竞价阶段涨幅/量比参考意义弱，放宽）。
+    """开盘前 9:25 推送"今日关注池"预览：评分≥阈值（竞价阶段涨幅/量比参考意义弱，放宽）。
     预览不占用去重名额，盘中达标仍会推。"""
     if not WECOM_PUSH_ENABLED:
         return
@@ -719,8 +714,7 @@ async def push_daily_preview_task():
                 score = float(s.get('score') or 0)
             except (TypeError, ValueError):
                 continue
-            role = (s.get('buySellPoints') or {}).get('stockType', '')
-            if score >= WECOM_PUSH_MIN_SCORE and not any(kw in role for kw in WECOM_PUSH_EXCLUDE_ROLES):
+            if score >= WECOM_PUSH_MIN_SCORE:
                 preview.append(s)
         if not preview:
             print(f'[推送 {datetime.now():%H:%M:%S}] 今日关注池预览无达标股')

@@ -2,7 +2,7 @@
 import asyncio, json, re, requests, time
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_STRONG_CHANGE_MIN, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, BUY_SELL_ROLE_TARGET_MULT, BUY_SELL_ROLE_LABELS, BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS, BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS, BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE, BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX, BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN, BUY_SELL_ROLE_FOLLOWER_SCORE_MIN, BUY_SELL_LEADER_FALLBACK_CHANGE_PCT, BUY_SELL_LEADER_FALLBACK_VOL_RATIO, BUY_SELL_LEADER_SCORE_GATE, RECOMMEND_CYCLE_SCHEDULE_ENABLED, RECOMMEND_MIN_SCORE_BASE, CYCLE_MAX_RECOMMEND, CYCLE_ALLOW_EMPTY, CYCLE_EXTREME_HOT_LIMIT_UPS, CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC, RECOMMEND_MARKET_VETO_ENABLED)
+from app.config import (QUERY_DAILY_RECOMMENDATIONS_LIMIT, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HOT_LIST_API, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_INTRADAY_FILTER_ENABLED, RECOMMEND_LIMIT_UP_PCT, RECOMMEND_BOARD_BREAK_DRAWDOWN, RECOMMEND_MAX_DRAWDOWN_FROM_HIGH, BUY_TIMING_TAIL_AMPLITUDE_MIN, BUY_TIMING_TAIL_DRAWDOWN_MIN, BUY_TIMING_HIGH_CHASE_CHANGE_MIN, RECOMMEND_LOSER_LOOKBACK_DAYS, RECOMMEND_LOSER_LOSS_THRESHOLD, RECOMMEND_EXEC_HINT_ENABLED, RECOMMEND_EXEC_HINT, BUY_SELL_POSITION_LOW_GATE, BUY_SELL_POSITION_MIDLOW_GATE, BUY_SELL_POSITION_HIGH_GATE, BUY_SELL_TARGET_POSITION_LOW_MULT, BUY_SELL_TARGET_POSITION_MIDLOW_MULT, BUY_SELL_TARGET_POSITION_HIGH_MULT, BUY_SELL_TARGET_SCORE_HIGH_MULT, BUY_SELL_TARGET_SCORE_LOW_MULT, BUY_SELL_MAX_TARGET_PCT, RECOMMEND_CYCLE_SCHEDULE_ENABLED, RECOMMEND_MIN_SCORE_BASE, CYCLE_MAX_RECOMMEND, CYCLE_ALLOW_EMPTY, CYCLE_EXTREME_HOT_LIMIT_UPS, CYCLE_EXTREME_HOT_MAINLINE_STALE_SEC, RECOMMEND_MARKET_VETO_ENABLED)
 from db.database import (load_daily_recommendations, save_daily_recommendations, load_hot_stock_buttons, load_trend_scan_results, load_stock_concept_tags, save_stock_industry)
 from services.data.stock import fetch_stock_data, fetch_with_retry, parse_tencent_batch_data
 from services.strategy.strategy import calc_stock_score_v2, apply_industry_neutralization
@@ -159,35 +159,20 @@ async def fetch_batch_fund_flow(codes: List[str]) -> Dict[str, Dict]:
         return {}
 
 
-def _classify_stock_role(stock: Dict, score_result: Optional[Dict],
-                         trend_details: Optional[Dict]) -> tuple:
-    """6级角色分类（V4.3，替换原龙头/跟风二分法）
+def _position_context(score_result: Optional[Dict],
+                      trend_details: Optional[Dict]) -> tuple:
+    """位置分位与标签（2026-10-28 起只保留位置，不再做角色分类）。
 
-    按优先级从高到低匹配，命中即停：
-    1. total_leader       总龙头：连板≥5 + 涨停次数≥4（全市场最高标）
-    2. sector_leader      板块龙头：连板≥3 + 涨停次数≥2（板块内连板最高之一）
-    3. core_trend         中军：大市值(≥300亿) + 连板≤1 + 评分≥65（趋势型权重股）
-    4. sentiment_vanguard 情绪先锋：今日涨停 + 连板=1 + 高换手(≥5%)（率先试盘的弹性小票）
-    5. catch_up           补涨龙：低位(分位<50) + 近期涨停(1-2板)（龙头高位后的低位新领涨）
-    6. follower           跟风：涨幅≥3% + 量比≥1 + 评分≥50（被动跟随）
-    7. marginal           杂毛：其余（辨识度最低、逻辑最弱）
+    位置判定：优先 trend_details.positionPct（年度分位 0-100），
+    fallback 用 base_scores['position'] 三档近似（≤5 高位 / ≥15 低位 / 其余中位）。
+    原先这里还有 6 级角色分类（总龙头/板块龙头/中军/情绪先锋/补涨龙/跟风/杂毛），
+    用户 2026-10-28 要求整体删除：止盈、止损、推送、周期都不再读角色。
 
-    Returns: (position_pct: Optional[float], role: str, position_label: str)
+    Returns: (position_pct: float, position_label: str)
     """
     base_scores = {}
-    factor_values = {}
-    stock_score = 0.0
-
     if score_result and isinstance(score_result, dict):
         base_scores = score_result.get('base_scores', {}) or {}
-        factor_values = score_result.get('factor_values', {}) or {}
-        stock_score = float(score_result.get('total', 0) or 0)
-
-    # 兼容 stock 自带 score dict（hot-stocks-scan 路径 stock['score'] 是 dict）
-    if not stock_score and isinstance(stock.get('score'), dict):
-        stock_score = float(stock['score'].get('total', 0) or 0)
-        base_scores = stock['score'].get('base_scores', {}) or {}
-        factor_values = stock['score'].get('factor_values', {}) or {}
 
     # ---- 位置分位 ----
     position_pct = None
@@ -212,153 +197,51 @@ def _classify_stock_role(stock: Dict, score_result: Optional[Dict],
         position_label = '高位'
     else:
         position_label = '中位'
-
-    # ---- 提取分类所需数据 ----
-    # 连板数：优先 maxConsecutiveBoards（精确最大连板），fallback consecutiveUpDays（连涨天数）
-    max_boards = 0
-    limit_up_count = 0
-    if trend_details and isinstance(trend_details, dict):
-        max_boards = int(trend_details.get('maxConsecutiveBoards', 0) or
-                         trend_details.get('consecutiveUpDays', 0) or 0)
-        limit_up_count = int(trend_details.get('limitUpCount20d', 0) or 0)
-
-    # 当日涨幅、量比、换手率、流通市值
-    change_pct = abs(float(factor_values.get('change_percent', 0) or stock.get('changePercent', 0) or 0))
-    vol_ratio = float(factor_values.get('volume_ratio', 0) or stock.get('volumeRatio', 0) or 0)
-    turnover_rate = float(stock.get('turnoverRate', 0) or 0)
-    circ_mv = float(stock.get('circ_mv', 0) or stock.get('flowMarketCap', 0) or 0)
-
-    is_limit_up_today = change_pct >= TREND_LIMIT_UP_THRESHOLD
-
-    # ---- 缓存角色门槛（V4.4：自动优化引擎）----
-    _ROLE_THRESHOLDS = None
-    try:
-        from db.database import load_role_thresholds
-        _ROLE_THRESHOLDS = load_role_thresholds()
-    except Exception:
-        _ROLE_THRESHOLDS = {}
-
-    def _get_threshold(role: str, key: str, default_val):
-        return _ROLE_THRESHOLDS.get(role, {}).get(key, default_val)
-
-    # ---- 6级分类（按优先级从高到低） ----
-
-    # 1. 总龙头
-    tl_boards = _get_threshold('total_leader', 'min_boards', BUY_SELL_ROLE_TOTAL_LEADER_BOARDS)
-    tl_limitups = _get_threshold('total_leader', 'min_limitups', BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS)
-    if max_boards >= tl_boards and limit_up_count >= tl_limitups:
-        return position_pct, 'total_leader', position_label
-
-    # 2. 板块龙头
-    sl_boards = _get_threshold('sector_leader', 'min_boards', BUY_SELL_ROLE_SECTOR_LEADER_BOARDS)
-    sl_limitups = _get_threshold('sector_leader', 'min_limitups', BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS)
-    if max_boards >= sl_boards and limit_up_count >= sl_limitups:
-        return position_pct, 'sector_leader', position_label
-
-    # 3. 中军
-    ct_mv = _get_threshold('core_trend', 'min_mv', BUY_SELL_ROLE_CORE_TREND_MV)
-    ct_score = _get_threshold('core_trend', 'min_score', BUY_SELL_ROLE_CORE_TREND_SCORE)
-    if circ_mv >= ct_mv and max_boards <= 1 and stock_score >= ct_score:
-        return position_pct, 'core_trend', position_label
-
-    # 4. 情绪先锋
-    vg_turnover = _get_threshold('sentiment_vanguard', 'min_turnover', BUY_SELL_ROLE_VANGUARD_TURNOVER)
-    if is_limit_up_today and max_boards == 1 and turnover_rate >= vg_turnover:
-        return position_pct, 'sentiment_vanguard', position_label
-
-    # 5. 补涨龙
-    cp_max_pos = _get_threshold('catch_up', 'max_position', BUY_SELL_ROLE_CATCHUP_POSITION_MAX)
-    if position_pct < cp_max_pos and 1 <= max_boards <= 2:
-        return position_pct, 'catch_up', position_label
-
-    # 6. 跟风
-    fl_change = _get_threshold('follower', 'min_change', BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN)
-    fl_vol = _get_threshold('follower', 'min_vol_ratio', BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN)
-    fl_score = _get_threshold('follower', 'min_score', BUY_SELL_ROLE_FOLLOWER_SCORE_MIN)
-    if (change_pct >= fl_change and vol_ratio >= fl_vol and stock_score >= fl_score):
-        return position_pct, 'follower', position_label
-
-    # ---- fallback：无 trend_details 时用涨停/涨幅+量比/高分判定 ----
-    if max_boards == 0 and limit_up_count == 0:
-        # 涨停 + 高换手 → 情绪先锋
-        if is_limit_up_today and turnover_rate >= BUY_SELL_ROLE_VANGUARD_TURNOVER:
-            return position_pct, 'sentiment_vanguard', position_label
-        # 涨停 → 板块龙头（单日涨停至少是板块级别领涨）
-        if is_limit_up_today:
-            return position_pct, 'sector_leader', position_label
-        # 涨幅≥5% + 量比≥2 → 板块龙头
-        if change_pct >= BUY_SELL_LEADER_FALLBACK_CHANGE_PCT and vol_ratio >= BUY_SELL_LEADER_FALLBACK_VOL_RATIO:
-            return position_pct, 'sector_leader', position_label
-        # 高分 + 非高位 → 中军（趋势型强势股）
-        if stock_score >= BUY_SELL_LEADER_SCORE_GATE and position_pct < BUY_SELL_POSITION_HIGH_GATE:
-            return position_pct, 'core_trend', position_label
-
-    # 7. 杂毛：其余
-    return position_pct, 'marginal', position_label
+    return position_pct, position_label
 
 
-def _build_stock_type(role: str, position_label: str) -> str:
-    """构建股票类型标签，如 '低位总龙头' / '高位跟风' / '杂毛'"""
-    role_label = BUY_SELL_ROLE_LABELS.get(role, '杂毛')
-    return f'{position_label}{role_label}' if position_label else role_label
-
-
-def _build_expectation_note(role: str, position_label: str, score: float, sell_pct: float) -> str:
-    """构建预期说明文字（V4.3 6级角色版）"""
-    role_label = BUY_SELL_ROLE_LABELS.get(role, '杂毛')
+def _build_expectation_note(position_label: str, score: float, sell_pct: float) -> str:
+    """构建预期说明文字（2026-10-28 起只剩位置+评分口径，不再带角色文案）"""
     parts = []
     if position_label:
         parts.append(position_label)
-    parts.append(role_label)
     if score >= 80:
         parts.append('高分确认')
     elif score < 55:
         parts.append('低分谨慎')
-    type_str = ''.join(parts)
+    type_str = ''.join(parts) or '评分中性'
     note = f'{type_str}，预期涨幅{sell_pct*100:.1f}%'
-
-    # 角色专属建议
-    if role in ('total_leader', 'sector_leader') and position_label in ('低位', '中低位'):
-        note += '，上行空间较大'
-    elif role == 'sentiment_vanguard':
-        note += '，快进快出，波动极大'
-    elif role == 'catch_up':
-        note += '，注意龙头崩盘风险'
-    elif role == 'core_trend' and position_label in ('低位', '中低位'):
-        note += '，趋势稳健，适合格局'
-    elif role == 'follower' and position_label == '高位':
-        note += '，快进快出'
-    elif role == 'marginal':
-        note += '，盈亏比极差，建议回避'
-    elif position_label == '高位':
+    if position_label == '高位':
         note += '，注意控制仓位'
+    elif position_label in ('低位', '中低位'):
+        note += '，位置相对安全'
     return note
 
 
 def calc_buy_timing(stock: Dict, change_pct: float, amplitude: float,
-                    role: str, position_label: str,
+                    position_label: str,
                     score: float = 0.0, market_change: float = 0.0) -> Dict:
     """买入时机判定（2026-10-12）：回答"这只票今天该什么时候买"
 
-    A股实战规则（按优先级）：
+    2026-10-28 起不再按角色分档（原"总龙头/板块龙头/情绪先锋 → 早盘买入"整条分支删除），
+    只按 涨停封板 / 振幅与回落 / 位置 / 大盘 四条判定：
+
     1. 已涨停封板    → 次日竞价：当日场内基本买不到，次日 9:15-9:25 竞价参与
-    2. 强势情绪股    → 早盘买入：总龙头/板块龙头/情绪先锋 + 涨幅≥5%，情绪溢价最高在早盘
-    3. 高不确定性    → 尾盘买入：振幅≥5% / 自高点回落≥2% / 高位追高，14:30 后确认全天形态再买
-    4. 低位趋势股    → 回踩低吸：中军/补涨龙低位，不追高，等回踩至买入参考价
-    5. 其余          → 盘中灵活：日内均价线附近介入，不追尾盘急拉
+    2. 高不确定性    → 尾盘买入：振幅≥5% / 自高点回落≥2% / 高位追高，14:30 后确认全天形态再买
+    3. 低位趋势股    → 回踩低吸：低位/中低位，不追高，等回踩至买入参考价
+    4. 其余          → 盘中灵活：日内均价线附近介入，不追尾盘急拉
 
     Args:
         stock: 行情 dict（用 highRaw/priceRaw 算回落幅度）
         change_pct: 当日涨幅%
         amplitude: 当日振幅%
-        role: _classify_stock_role 的角色
         position_label: 位置标签（低位/中低位/中位/高位）
         score: 综合评分
         market_change: 大盘涨跌幅%（弱市下强势股也降级为谨慎）
 
     Returns:
-        {'type': 'auction'|'early'|'tail'|'pullback'|'intraday',
-         'label': '次日竞价'|'早盘买入'|'尾盘买入'|'回踩低吸'|'盘中灵活',
+        {'type': 'auction'|'tail'|'pullback'|'intraday',
+         'label': '次日竞价'|'尾盘买入'|'回踩低吸'|'盘中灵活',
          'note': '操作说明'}
     """
     # 自日内高点回落幅度（缺数据时为 0）
@@ -378,20 +261,7 @@ def calc_buy_timing(stock: Dict, change_pct: float, amplitude: float,
             'note': '今日已封板场内难买入，排队性价比低；次日 9:15-9:25 竞价参与，高开 5% 以上不追，防一字/T字诱多'
         }
 
-    # 2. 强势情绪股 → 早盘
-    if role in ('total_leader', 'sector_leader', 'sentiment_vanguard') \
-            and change_pct >= BUY_TIMING_STRONG_CHANGE_MIN:
-        if market_change <= -0.5:
-            return {
-                'type': 'early', 'label': '早盘买入',
-                'note': f'大盘弱({market_change:+.1f}%)，早盘冲高易回落；轻仓试错或改尾盘确认，严格止损'
-            }
-        return {
-            'type': 'early', 'label': '早盘买入',
-            'note': '情绪溢价最高在早盘，尽量 10:00 前决策；只低吸强势回踩，不追直线拉升'
-        }
-
-    # 3. 高不确定性 → 尾盘确认
+    # 2. 高不确定性 → 尾盘确认
     high_chase = position_label == '高位' and change_pct >= BUY_TIMING_HIGH_CHASE_CHANGE_MIN
     if amplitude >= BUY_TIMING_TAIL_AMPLITUDE_MIN or drawdown >= BUY_TIMING_TAIL_DRAWDOWN_MIN or high_chase:
         if high_chase:
@@ -404,14 +274,14 @@ def calc_buy_timing(stock: Dict, change_pct: float, amplitude: float,
             note += '；大盘弱，宁可错过不可做错'
         return {'type': 'tail', 'label': '尾盘买入', 'note': note}
 
-    # 4. 低位趋势股 → 回踩低吸
-    if position_label in ('低位', '中低位') and role in ('core_trend', 'catch_up'):
+    # 3. 低位趋势股 → 回踩低吸
+    if position_label in ('低位', '中低位'):
         return {
             'type': 'pullback', 'label': '回踩低吸',
             'note': '不追高；挂低单等回踩至买入参考价附近，盘中跌破均价线或涨幅转负放弃'
         }
 
-    # 5. 其余 → 盘中灵活
+    # 4. 其余 → 盘中灵活
     note = '日内均价线附近介入为宜，避免尾盘急拉时追高'
     if market_change <= -0.5:
         note += '；大盘弱，轻仓参与'
@@ -565,20 +435,22 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
 def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
                          trend_details: Optional[Dict] = None,
                          market_change: float = 0.0) -> Dict:
-    """计算买入点、当前价、卖出点（V4.3 6级角色分类版）
+    """计算买入点、当前价、卖出点（V4.6，2026-10-28 删除角色体系）
 
     V4.1: 基于振幅动态调整买卖比例
-    V4.2: 叠加位置高低修正 + 龙头/跟风修正 + 评分置信度修正
-    V4.3: 替换二分法为6级角色分类（总龙头/板块龙头/中军/情绪先锋/补涨龙/跟风/杂毛）
-          止盈倍率 = 位置倍率 × 角色倍率 × 评分倍率，封顶 15%
-          角色判定：按优先级匹配连板高度+涨停次数+市值+换手+位置+涨幅+量比
+    V4.2: 叠加位置高低修正 + 评分置信度修正
+    V4.3: 曾改为 6 级角色分类 × 角色倍率（2026-10-28 整体删除，见下）
+    V4.5 (2026-10-12): 新增 buyTiming 买入时机判定（次日竞价/尾盘/回踩低吸/盘中灵活）
+    V4.6 (2026-10-28): 角色体系下线，止盈倍率 = 位置倍率 × 评分倍率（不再乘角色倍率）；
+          涨停股基准统一 4%（原七档 2%~7% 的中值），**这个数是占位不是验证结果**：
+          真正的封板强度（封单额/流通市值、首次涨停时间、开板次数）目前没有数据源，
+          待补齐后再做分档，届时用影子对照决定是否替换。
           位置判定：优先 trend_details.positionPct，fallback base_scores['position']
-    V4.5 (2026-10-12): 新增 buyTiming 买入时机判定（次日竞价/早盘/尾盘/回踩低吸/盘中灵活）
 
     Args:
         stock: 行情数据 dict
         score_result: calc_stock_score_v2 返回值（含 total/base_scores/factor_values）
-        trend_details: 趋势扫描 details dict（含 positionPct/maxConsecutiveBoards，可选）
+        trend_details: 趋势扫描 details dict（含 positionPct，可选）
         market_change: 大盘涨跌幅%，用于买入时机的大盘环境修正（可选）
     """
     try:
@@ -591,9 +463,8 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
     change_pct = float(stock.get('changePercent', 0) or 0)
     amplitude = float(stock.get('amplitude', 0) or 0)
 
-    # ===== 提取位置/角色/评分上下文 =====
-    position_pct, role, position_label = _classify_stock_role(
-        stock, score_result, trend_details)
+    # ===== 提取位置/评分上下文 =====
+    position_pct, position_label = _position_context(score_result, trend_details)
 
     stock_score = 0.0
     if score_result and isinstance(score_result, dict):
@@ -613,9 +484,6 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
     else:
         pos_mult = 1.0
 
-    # ===== 角色止盈倍率 =====
-    role_mult = BUY_SELL_ROLE_TARGET_MULT.get(role, 1.0)
-
     # ===== 评分置信度止盈倍率 =====
     if stock_score >= 80:
         score_mult = BUY_SELL_TARGET_SCORE_HIGH_MULT
@@ -626,42 +494,22 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
 
     # ===== 涨停板特殊处理 =====
     if change_pct >= TREND_LIMIT_UP_THRESHOLD:
-        weibi = float(stock.get('weibi', 0) or 0)
-        turnover = float(stock.get('turnoverRate', 0) or 0)
-        # 角色分级涨停预期：龙头最高，杂毛最低
-        if role in ('total_leader', 'sector_leader'):
-            if weibi > 80 and 2 <= turnover <= 15:
-                base_sell_pct = 0.06   # 龙头封单坚决，预期稳定
-            else:
-                base_sell_pct = 0.07   # 龙头普通封板
-        elif role == 'core_trend':
-            base_sell_pct = 0.05       # 中军趋势封板
-        elif role == 'sentiment_vanguard':
-            base_sell_pct = 0.05       # 情绪先锋封板（波动大，不贪）
-        elif role == 'catch_up':
-            base_sell_pct = 0.04       # 补涨龙封板
-        elif role == 'follower':
-            base_sell_pct = 0.03       # 跟风封板
-        else:
-            base_sell_pct = 0.02       # 杂毛封板（烂板概率高）
+        # 4% 是原七档角色基准的中值占位；封板质量数据（封单比/涨停时间/开板次数）
+        # 补齐前不做分档，避免再拿一个没验证的映射去乘价格。
+        base_sell_pct = 0.04
+        sell_pct = min(base_sell_pct * pos_mult * score_mult, BUY_SELL_MAX_TARGET_PCT)
 
-        # 位置修正（角色倍率已在 base_sell_pct 中体现，此处只叠位置+评分）
-        sell_pct = base_sell_pct * pos_mult * score_mult
-        sell_pct = min(sell_pct, BUY_SELL_MAX_TARGET_PCT)
-
-        stock_type = _build_stock_type(role, position_label)
         return _apply_exec_honesty(stock, {
             'buy': '竞价关注',
             'current': f'{price:.2f}',
             'sell': f'{price * (1 + sell_pct):.2f}',
             'sellPct': round(sell_pct * 100, 1),
-            'stockType': stock_type,
-            'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
-            'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
+            'expectationNote': _build_expectation_note(position_label, stock_score, sell_pct),
+            'buyTiming': calc_buy_timing(stock, change_pct, amplitude,
                                          position_label, stock_score, market_change),
         })
 
-    # ===== 非涨停板：振幅基础 + 三维修正 =====
+    # ===== 非涨停板：振幅基础 + 两维修正 =====
     if amplitude >= 5:
         base_buy_pct = 0.03
         base_sell_pct = 0.06
@@ -675,8 +523,8 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
         base_buy_pct = 0.015
         base_sell_pct = 0.03
 
-    # 止盈倍率 = 位置 × 角色 × 评分
-    total_mult = pos_mult * role_mult * score_mult
+    # 止盈倍率 = 位置 × 评分
+    total_mult = pos_mult * score_mult
     sell_pct = min(base_sell_pct * total_mult, BUY_SELL_MAX_TARGET_PCT)
 
     # 买入回撤受位置影响：低位可以多等（可能还有低点），高位少等（机会稍纵即逝）
@@ -687,16 +535,14 @@ def calc_buy_sell_points(stock: Dict, score_result: Optional[Dict] = None,
     else:
         buy_pct = base_buy_pct
 
-    stock_type = _build_stock_type(role, position_label)
     return _apply_exec_honesty(stock, {
         'buy': f'{price * (1 - buy_pct):.2f}',
         'current': f'{price:.2f}',
         'sell': f'{price * (1 + sell_pct):.2f}',
         'sellPct': round(sell_pct * 100, 1),
         'buyPct': round(buy_pct * 100, 1),
-        'stockType': stock_type,
-        'expectationNote': _build_expectation_note(role, position_label, stock_score, sell_pct),
-        'buyTiming': calc_buy_timing(stock, change_pct, amplitude, role,
+        'expectationNote': _build_expectation_note(position_label, stock_score, sell_pct),
+        'buyTiming': calc_buy_timing(stock, change_pct, amplitude,
                                      position_label, stock_score, market_change),
     })
 
@@ -809,7 +655,7 @@ def calc_intraday_trajectory(stock: Dict) -> Dict:
     return result
 
 
-SHADOW_EVAL_POOL = 15  # 影子精选只对分数靠前这么多只做角色/买卖点复算，避免整天任务变重
+SHADOW_EVAL_POOL = 15  # 影子精选只对分数靠前这么多只做位置/买卖点复算，避免整天任务变重
 
 
 def _ensure_shadow_table(conn):
@@ -828,7 +674,6 @@ def _shadow_item(s, bsp):
             'score': (s.get('score') or {}).get('total'),
             'changePercent': s.get('changePercent'),
             'volumeRatio': s.get('volumeRatio'),
-            'role': (bsp or {}).get('stockType') or '',
             'timing': ((bsp or {}).get('buyTiming') or {}).get('label') or '',
             'tag': s.get('primary_tag') or '其他'}
 
@@ -902,7 +747,6 @@ def _cycle_info(gate, cycle_name, cycle_max, cash):
         'maxRecommend': int(cycle_max),
         'vetoEnabled': bool(_g.get('vetoEnabled')),
         'minScore': _g.get('minScore') if _g.get('vetoEnabled') else None,
-        'vetoRoles': list(_g.get('vetoRoles') or []),
         'allowChase': bool(_g.get('allowChase', True)),
         'cash': bool(cash),
     }
@@ -910,10 +754,11 @@ def _cycle_info(gate, cycle_name, cycle_max, cash):
 
 async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
                                market_change, live_min_score, zone_dropped=None):
-    """影子精选：同一份候选池，按"情绪周期门槛 + 角色否决 + 不追高"再选一遍，只落库不替换线上。
+    """影子精选：同一份候选池，按"情绪周期门槛 + 不追高"再选一遍，只落库不替换线上。
 
-    口径与线上唯一的不同就是这三条市场级规则，因此两天结果的差集可以直接回答：
-      · 被挡掉的票 T+1 是不是真的更差（证明否决有效）；
+    2026-10-28 起删掉"角色否决"这一条（角色体系整体下线），影子与线上都只剩
+    min_score 与不追高两条市场级规则；两天结果的差集仍可直接回答：
+      · 被挡掉的票 T+1 是不是真的更差（证明门槛有效）；
       · 影子多推的票 T+1 是不是真的更好（证明门槛有效）。
 
     zone_dropped：涨幅段闸门（drop 模式）从候选里整只拦掉的票。并进 excluded 组，
@@ -925,10 +770,8 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
 
     sent = await get_sentiment()
     gate = cycle_gate(sent)
-    rule = sent.get('rule') or {}
     # 影子用 advisory 口径（不受"过 10:00 才拦"的限制）：影子只是记录，不是执行
     min_score = gate.get('advisoryMinScore') or 60
-    veto_roles = tuple(rule.get('veto_roles') or ())
     allow_chase = gate.get('advisoryChase', True)
     cycle = sent.get('cycle')
 
@@ -945,15 +788,11 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
         except Exception:
             bsp = {}
         total = (s.get('score') or {}).get('total') or 0
-        role = bsp.get('stockType') or ''
         chg = float(s.get('changePercent') or 0)
         reasons = []
         if total < min_score:
             reasons.append(f'低于{cycle}门槛{min_score}（现{total:.0f}分）')
-        hit_role = next((r for r in veto_roles if r and r in role), None)
-        if hit_role:
-            reasons.append(f'{cycle}·{hit_role}不接力')
-        if not allow_chase and chg >= 5 and not hit_role:
+        if not allow_chase and chg >= 5:
             reasons.append(f'{cycle}·涨幅{chg:.1f}%不追高')
         bsp_by_sym[(s.get('symbol') or '').lower()] = bsp
         item = _shadow_item(s, bsp)
@@ -1033,7 +872,7 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
     diff = '、'.join(x['name'] for x in payload['excluded']) or '无'
     print(f'[智能推荐] 影子精选（{cycle}·门槛{min_score}）：'
           f'线上{len(live_top3)}只 / 影子{len(shadow_top)}只，被挡 {diff}')
-    # 返回 payload 给决策快照用：role/timing/matrix 标签在这里才算得出来，
+    # 返回 payload 给决策快照用：timing/matrix 标签在这里才算得出来，
     # 快照再自己跑一遍 buy_sell_points 既费时间又可能和影子口径对不上。
     return payload
 
@@ -1277,8 +1116,9 @@ async def auto_generate_recommendations_task():
         # ===== 5. 行业分散 + 过滤取前3（P2） =====
         # P0-2（2026-10-24，默认关）：门槛上移 config；周期调度启用时按 gate 抬门槛。
         MIN_RECOMMEND_SCORE = RECOMMEND_MIN_SCORE_BASE
-        # 周期调度（实施计划 §4）：gate/minScore/vetoRoles/allowChase 用 live 口径
+        # 周期调度（实施计划 §4）：gate/minScore/allowChase 用 live 口径
         # （vetoEnabled 才生效，过 10:00 + ≥2 弱信号，见 sentiment.cycle_gate 四前提）；
+        # 2026-10-28 起角色体系下线，周期只剩"门槛 + 不追高 + 不接力"三条约束。
         # 关闭时 gate=None、行为与改造前逐字节一致。
         gate = None
         cycle_name = None
@@ -1294,7 +1134,7 @@ async def auto_generate_recommendations_task():
                     MIN_RECOMMEND_SCORE = max(RECOMMEND_MIN_SCORE_BASE, int(gate['minScore']))
                 print(f'[周期调度] 启用：{cycle_name}·veto={gate.get("vetoEnabled")} '
                       f'门槛={MIN_RECOMMEND_SCORE} 推荐上限={cycle_max} '
-                      f'vetoRoles={gate.get("vetoRoles") or ()} allowChase={gate.get("allowChase", True)}')
+                      f'allowChase={gate.get("allowChase", True)}')
             except Exception as e:
                 print(f'[周期调度] 情绪/闸门获取失败（按基础门槛与上限 3 走）: {e}')
                 gate = None
@@ -1410,12 +1250,12 @@ async def auto_generate_recommendations_task():
                       f'（弱势区 0~{_zone_c["weak_max"]:g}%、死亡区 '
                       f'{_zone_c["chase_min"]:g}~{_zone_c["chase_max"]:g}%）')
 
-        # ===== 4.9 周期调度·角色否决 / 不追高 / 极热模式禁令 / 大盘否决（P0-2，2026-10-24，默认关） =====
+        # ===== 4.9 周期调度·不追高 / 极热模式禁令 / 大盘否决（P0-2，2026-10-24，默认关） =====
         # 实施计划 §4：RECOMMEND_CYCLE_SCHEDULE_ENABLED=False 时本节整体跳过，
         # 主链路行为与改造前一致；每条挡掉的票都写 blocked 快照，事后可回放。
-        # 口径与影子 _log_shadow_selection 一致：角色 = bsp.stockType 子串命中 vetoRoles、
-        # 不追高 = not allowChase 且当日涨幅 ≥5%（影子里用的是 advisory 口径，这里用
-        # live 口径 = gate.vetoEnabled 才生效，见 sentiment.cycle_gate 的四前提）。
+        # 口径与影子 _log_shadow_selection 一致：不追高 = not allowChase 且当日涨幅 ≥5%
+        # （影子里用的是 advisory 口径，这里用 live 口径 = gate.vetoEnabled 才生效，
+        # 见 sentiment.cycle_gate 的四前提）。2026-10-28 角色体系下线，角色否决整块移除。
         cash_reason: Optional[str] = None   # 非空 → 本批写空仓哨兵、不出买入推荐
         if RECOMMEND_CYCLE_SCHEDULE_ENABLED:
             # --- 大盘否决位：severe crash 日不出新买入推荐 ---
@@ -1430,37 +1270,22 @@ async def auto_generate_recommendations_task():
                     print(f'[周期调度] 大盘预警检查失败（不否决，按周期规则走）: {e}')
 
             if cash_reason is None and gate is not None:
-                # --- 角色否决 + 不追高（与影子同口径） ---
-                _veto_roles = tuple(gate.get('vetoRoles') or ())
+                # --- 不追高（与影子同口径） ---
                 _no_chase = not gate.get('allowChase', True)
-                _veto_n = _chase_n = 0
-                if _veto_roles or _no_chase:
+                _chase_n = 0
+                if _no_chase:
                     _safe4 = []
                     for s in candidates:
                         _sym = (s.get('symbol') or '').lower()
-                        _t = trend_map.get(_sym) or {}
-                        try:
-                            _bsp = calc_buy_sell_points(
-                                s, score_result=s.get('score'),
-                                trend_details=(_t or {}).get('details'),
-                                market_change=market_change)
-                        except Exception:
-                            _bsp = {}
-                        _role = _bsp.get('stockType') or ''
-                        _hit = next((r for r in _veto_roles if r and r in _role), None)
                         _chg = float(s.get('changePercent') or 0)
-                        if _hit:
-                            _blk(_sym, f'{cycle_name}·{_hit}不接力')
-                            _veto_n += 1
-                            continue
-                        if _no_chase and _chg >= 5:
+                        if _chg >= 5:
                             _blk(_sym, f'{cycle_name}·涨幅{_chg:.1f}%不追高')
                             _chase_n += 1
                             continue
                         _safe4.append(s)
                     candidates = _safe4
-                    if _veto_n or _chase_n:
-                        print(f'[周期调度] {cycle_name}：角色否决 {_veto_n} 只 / 不追高 {_chase_n} 只')
+                    if _chase_n:
+                        print(f'[周期调度] {cycle_name}：不追高挡掉 {_chase_n} 只')
 
                 # --- 极热模式级规则（非一刀切）：涨停 >120 且非 stale → 禁低吸/追高形态，
                 #     打板保留（1094 口径：极热档全体买入 42.6%/-0.28% 最差，封板接力仍
@@ -1656,7 +1481,7 @@ async def auto_generate_recommendations_task():
                     for _key in ('live', 'shadow'):
                         for it in (shadow_payload.get(_key) or []):
                             _cur = _lab((it.get('symbol') or '').lower())
-                            for _k in ('role', 'timing'):
+                            for _k in ('timing',):
                                 if it.get(_k):
                                     _cur[_k] = it[_k]
                             _mx = it.get('matrix') or {}

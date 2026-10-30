@@ -583,36 +583,12 @@ def init_db():
                 correct_count INTEGER DEFAULT 0,
                 updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
             )''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS role_thresholds (
-                role TEXT PRIMARY KEY,        -- 'total_leader','sector_leader','core_trend',...
-                min_boards INTEGER DEFAULT 0,
-                min_limitups INTEGER DEFAULT 0,
-                min_mv REAL DEFAULT 0,
-                min_score REAL DEFAULT 0,
-                min_turnover REAL DEFAULT 0,
-                max_position REAL DEFAULT 100,
-                min_change REAL DEFAULT 0,
-                min_vol_ratio REAL DEFAULT 0,
-                updated_at DATETIME DEFAULT (datetime('now', '+8 hours'))
-            )''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS role_performance (
-                role TEXT NOT NULL,
-                record_date TEXT NOT NULL,    -- 统计日期 YYYY-MM-DD
-                total INTEGER DEFAULT 0,
-                win INTEGER DEFAULT 0,
-                win_rate REAL DEFAULT 0,
-                avg_change REAL DEFAULT 0,
-                avg_market REAL DEFAULT 0,
-                excess_return REAL DEFAULT 0,
-                created_at DATETIME DEFAULT (datetime('now', '+8 hours')),
-                PRIMARY KEY (role, record_date)
-            )''')
+        # 2026-10-28 角色体系整体下线：不再建 role_thresholds / role_performance。
+        # 老库里这两张表保留（不 DROP，避免误删历史数据），但已无任何读写方。
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS optimization_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                module TEXT NOT NULL,          -- 'trend_dimension_weights'/'role_thresholds'/'grid_search'
+                module TEXT NOT NULL,          -- 'trend_dimension_weights'/'grid_search'
                 parameter_set TEXT DEFAULT '', -- JSON 参数快照
                 metric_name TEXT DEFAULT '',
                 metric_value REAL DEFAULT 0,
@@ -624,11 +600,7 @@ def init_db():
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_optimization_module ON optimization_history(module)
         ''')
-        # V4.4：趋势回测记录表添加 role 字段（角色门槛优化需要）
-        try:
-            cursor.execute('ALTER TABLE trend_backtest_records ADD COLUMN role TEXT DEFAULT ""')
-        except Exception:
-            pass  # 列已存在
+        # 2026-10-28 角色体系下线：不再补 role 列（老库里已有的同名列保留但无人写读）
         # V4.4：趋势回测记录表添加 s_d1/s_d2/s_d3/s_d4 字段（D1-D4权重优化需要）
         for dim_col in ['s_d1', 's_d2', 's_d3', 's_d4']:
             try:
@@ -1167,8 +1139,8 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
                 INSERT OR REPLACE INTO trend_backtest_records
                     (predict_date, symbol, name, score, predict_direction,
                      sector_factor, chip_factor, pattern, pattern_factor, market_regime, total_factor,
-                     role, s_d1, s_d2, s_d3, s_d4)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     s_d1, s_d2, s_d3, s_d4)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 predict_date,
                 r.get('symbol', ''),
@@ -1181,7 +1153,6 @@ def save_trend_backtest_records(predict_date: str, results: List[Dict]) -> bool:
                 float(details.get('patternFactor', 0) or 0),
                 str(details.get('marketRegime', 'range') or 'range'),
                 float(details.get('totalFactor', 0) or 0),
-                str(r.get('stockRole', '') or ''),
                 details.get('sD1'),
                 details.get('sD2'),
                 details.get('sD3'),
@@ -2688,151 +2659,9 @@ def save_trend_dimension_weights(weights_data: Dict) -> bool:
             pass
 
 
-def load_role_thresholds() -> Dict:
-    """加载角色分类门槛（无数据时返回 config 默认值）"""
-    from app.config import (
-        BUY_SELL_ROLE_TOTAL_LEADER_BOARDS, BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS,
-        BUY_SELL_ROLE_SECTOR_LEADER_BOARDS, BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS,
-        BUY_SELL_ROLE_CORE_TREND_MV, BUY_SELL_ROLE_CORE_TREND_SCORE,
-        BUY_SELL_ROLE_VANGUARD_TURNOVER, BUY_SELL_ROLE_CATCHUP_POSITION_MAX,
-        BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN, BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN,
-        BUY_SELL_ROLE_FOLLOWER_SCORE_MIN,
-    )
-    defaults = {
-        'total_leader': {
-            'min_boards': BUY_SELL_ROLE_TOTAL_LEADER_BOARDS,
-            'min_limitups': BUY_SELL_ROLE_TOTAL_LEADER_LIMITUPS,
-        },
-        'sector_leader': {
-            'min_boards': BUY_SELL_ROLE_SECTOR_LEADER_BOARDS,
-            'min_limitups': BUY_SELL_ROLE_SECTOR_LEADER_LIMITUPS,
-        },
-        'core_trend': {
-            'min_mv': BUY_SELL_ROLE_CORE_TREND_MV,
-            'min_score': BUY_SELL_ROLE_CORE_TREND_SCORE,
-        },
-        'sentiment_vanguard': {
-            'min_turnover': BUY_SELL_ROLE_VANGUARD_TURNOVER,
-        },
-        'catch_up': {
-            'max_position': BUY_SELL_ROLE_CATCHUP_POSITION_MAX,
-        },
-        'follower': {
-            'min_change': BUY_SELL_ROLE_FOLLOWER_CHANGE_MIN,
-            'min_vol_ratio': BUY_SELL_ROLE_FOLLOWER_VOL_RATIO_MIN,
-            'min_score': BUY_SELL_ROLE_FOLLOWER_SCORE_MIN,
-        },
-        'marginal': {},
-    }
-    try:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM role_thresholds')
-        rows = cursor.fetchall()
-        conn.close()
-        if not rows:
-            return defaults
-        result = dict(defaults)
-        for row in rows:
-            role = row['role']
-            if role not in result:
-                result[role] = {}
-            for col in ['min_boards', 'min_limitups', 'min_mv', 'min_score',
-                        'min_turnover', 'max_position', 'min_change', 'min_vol_ratio']:
-                val = dict(row).get(col)
-                if val is not None and val != 0:
-                    result[role][col] = val
-        return result
-    except Exception as error:
-        print(f'加载角色门槛失败: {str(error)}')
-        return defaults
-
-
-def save_role_thresholds(thresholds_data: Dict) -> bool:
-    """保存角色分类门槛"""
-    try:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-        for role, data in thresholds_data.items():
-            cursor.execute('''
-                INSERT OR REPLACE INTO role_thresholds
-                    (role, min_boards, min_limitups, min_mv, min_score,
-                     min_turnover, max_position, min_change, min_vol_ratio, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
-            ''', (
-                role,
-                int(data.get('min_boards', 0)),
-                int(data.get('min_limitups', 0)),
-                float(data.get('min_mv', 0)),
-                float(data.get('min_score', 0)),
-                float(data.get('min_turnover', 0)),
-                float(data.get('max_position', 100)),
-                float(data.get('min_change', 0)),
-                float(data.get('min_vol_ratio', 0)),
-            ))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as error:
-        print(f'保存角色门槛失败: {str(error)}')
-        return False
-
-
-def load_role_performance() -> Dict[str, Dict]:
-    """加载最近的角色表现统计"""
-    try:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-        today_str = date.today().isoformat()
-        cursor.execute('''
-            SELECT role, total, win, win_rate, avg_change, avg_market, excess_return
-            FROM role_performance
-            WHERE record_date = ?
-        ''', (today_str,))
-        rows = cursor.fetchall()
-        conn.close()
-        result = {}
-        for row in rows:
-            result[row['role']] = {
-                'total': int(row['total']),
-                'win': int(row['win']),
-                'win_rate': float(row['win_rate']),
-                'avg_change': float(row['avg_change']),
-                'avg_market': float(row['avg_market']),
-                'excess_return': float(row['excess_return']),
-            }
-        return result
-    except Exception as error:
-        print(f'加载角色表现统计失败: {str(error)}')
-        return {}
-
-
-def save_role_performance(perf_data: Dict[str, Dict]) -> bool:
-    """保存角色表现统计"""
-    try:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-        today_str = date.today().isoformat()
-        for role, stats in perf_data.items():
-            cursor.execute('''
-                INSERT OR REPLACE INTO role_performance
-                    (role, record_date, total, win, win_rate, avg_change, avg_market, excess_return)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                role, today_str,
-                int(stats.get('total', 0)),
-                int(stats.get('win', 0)),
-                float(stats.get('win_rate', 0)),
-                float(stats.get('avg_change', 0)),
-                float(stats.get('avg_market', 0)),
-                float(stats.get('excess_return', 0)),
-            ))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as error:
-        print(f'保存角色表现统计失败: {str(error)}')
-        return False
+# ===== 角色体系已于 2026-10-28 整体删除 =====
+# load_role_thresholds / save_role_thresholds / load_role_performance / save_role_performance
+# 四个函数随之移除；老库里的 role_thresholds / role_performance 两张表保留但不再读写。
 
 
 def save_optimization_history(module: str, parameter_set: str = '',
