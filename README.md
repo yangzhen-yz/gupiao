@@ -299,8 +299,8 @@ bull_threshold += penalty      # 仅影响 predict_direction，不影响标签�
 
 **P2a 风控止损输出（`services/risk_control.py`）**——为每只被推荐/被查看的股票输出一套"可执行的风控结论"，纯函数（零 IO）可在扫描循环内逐股同步调用，不增加网络请求：
 
-- **止损价 `stop_loss`**：基于当日振幅（波动率代理）动态缩放止损幅度 = `clamp(振幅% × 1.5, 4%, 12%)`；停牌/无振幅数据给中性默认 6%。低波动股止损窄、高波动股止损宽。**V4.2 增强**：止损幅度叠加位置倍率（低位放宽 20%、高位收紧 20%）和龙头倍率（龙头放宽 10%、跟风收紧 10%），实现"低位给更多恢复余地、高位破位快跑"的位置感知止损。
-- **买卖点 `buy_sell_points`**（V4.2 位置+龙头感知版）：止盈幅度 = 基础振幅比例 × 位置倍率 × 龙头倍率 × 评分倍率，封顶 15%。位置判定优先 `trend_details.positionPct`（精确年度分位），fallback `base_scores['position']`；龙头判定：连板≥2 / 涨停 / (涨幅≥5%+量比≥2) / (高分+非高位)。输出含 `stockType`（如"低位龙头"）和 `expectationNote`（预期说明文字）。
+- **止损价 `stop_loss`**：基于当日振幅（波动率代理）动态缩放止损幅度 = `clamp(振幅% × 1.5, 4%, 12%)`；停牌/无振幅数据给中性默认 6%。低波动股止损窄、高波动股止损宽。**V4.6（2026-10-28）**：角色体系整体下线，止损只叠加位置倍率（低位放宽 20%、高位收紧 20%），不再有龙头/跟风角色倍率；`risk_note` 只写"高位止损 X%"或"止损 X%"。
+- **买卖点 `buy_sell_points`**（V4.6 位置感知版，2026-10-28 去角色）：止盈幅度 = 基础比例 × 位置倍率 × 评分倍率，封顶 15%。位置判定优先 `trend_details.positionPct`（精确年度分位），fallback `base_scores['position']`。涨停股基础比例固定 4%（原七档 2%~7% 的中值，**占位不是验证结果**，封板强度类数据补齐前不分档）；非涨停股按振幅 6%/5%/4%/3% 止盈、3%/2.5%/2%/1.5% 买入回撤档。输出含 `sellPct` 与 `expectationNote`，不再有 `stockType`。
 - **风险等级 `risk_level`**（low / mid / high）：基础由综合评分决定（`<55→high`，`<65→mid`，否则 `low`）；叠加高危信号（估值极端高估 / 龙虎榜净卖出 / 股东户数环比 ≥10% 散户化）至少升 `mid`，高风险不可被降级。
 - **仓位建议 `position_suggest`**：low→可重仓(≤80%)，mid→半仓(≤50%)，high→轻仓(≤30%)。
 - **一句话 `risk_note`** 直连前端展示。注入点：单股分析端点、full 端点、扫描端点、智能推荐（推荐卡片内嵌"🛡️ 风控建议"区块）。
@@ -544,6 +544,8 @@ const r = getRating(stock.score)   // { label, short, color }
   - 人气榜熔断：`appdata` 是独立 scope，不受 push2 全域闸门连带停止；成功不关全域、失败只冷自己。热搜榜抓空时保留上一份缓存，不覆盖、不删当日快照；行情源被熔断、名称/价格缺失时，先用本地 `stock_basic_info` 补名称（零外部请求）、再用腾讯批量行情补价格（一次 60 只），避免空名让 ST/退市过滤失真、价格缩水或为 0。另注意 `ulist.np` 用 `fltt=2`，返回的 f2/f3/f4 已是真实数值，不能再除 100
   - 热搜榜备源：东财人气榜返回空时自动改用同花顺热股榜（`dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock`，`type=hour`，免登录、前 100 只带名称与名次，`Referer: eq.10jqka.com.cn`，120 秒缓存）；本轮用了谁记在 `hot_search_meta.source`（`eastmoney`/`ths`），`/api/hot_search_ranking` 一并返回
   - 接口用量登记：`api_usage._HOST_EXACT` 里没有的域名不会丢计数，但会挂到"其他"下、没有上限预警（2026-10-23 补齐 `dq.10jqka.com.cn→同花顺·热股榜`、`vip.stock.finance.sina.com.cn→新浪·行情`、`push2ex.eastmoney.com→东财·涨停池`、`smartbox.gtimg.cn→腾讯·搜索联想`，历史 9 行用 `analysis_out/api_usage_reclassify.py` 归位；接新源要同步补登记表与 `DEFAULT_LIMITS`）
+  - 页面加载耗时（2026-10-30）：页头「本次加载」条由 `client-vue/src/utils/perf.js` 记录（纯内存、不落库、不发额外请求）。口径＝切页到首屏这批 `/api/*` 请求全部返回，1.2s 空闲宽限**不计入**总耗时，末帧渲染只补 <300ms；服务端耗时取响应头 `X-Process-Time`（`server/app/main.py` 中间件写入，CORS 已 expose），两者相减即隧道/传输/排队耗时。只记 `/api/*` 与 `/eastmoney/*`，`/api/auth/*` 不计
+  - 页面 2s 内保障（2026-10-30）：universe/流动性 600s 缓存由调度器每 9 分钟后台保活刷新（先算好再原子换入）；批量扫描与大盘预测缓存过期后先返回旧数据、后台刷新（陈旧最长 10 分钟）；配置页口径摘要整份缓存、改配置后台重算；启动预热补批量扫描与行动台。冷算不再出现在请求路径上，重启后首开实测全部 ≤2s
 - 数据库：SQLite（`server/gupiao.db`），使用 `sqlite3` 原生连接 + WAL 模式（定义在 `server/db/database.py`；已从 MySQL 迁移，迁移脚本 `migrate_mysql_to_sqlite.py`）
 - 存储：通过 `trend_scan_results` 表持久化，内存缓存加速访问
 - 热加载：修改 `config.py` 后自动生效，无需重启
