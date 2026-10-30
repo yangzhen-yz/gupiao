@@ -11,7 +11,12 @@ from services.strategy.strategy import backtest_yesterday_predictions, save_pred
 from services.strategy.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
 from services.strategy.trend_backtest import backtest_trend_predictions
 from services.data.trading_calendar import is_trading_day
-from services.pick.recommend import auto_generate_recommendations_task, calc_buy_sell_points
+# 2026-10-29：推荐模块一律按模块属性取用。10-29 那次 500
+# （"_build_expectation_note() takes 3 positional arguments but 4 were given"）的根因是
+# app/main.py 的 _reload_config() 曾 importlib.reload(services.pick.recommend)，
+# 而本模块启动时 from-import 的旧函数对象不会更新，旧函数体却读到新的全局表。
+# 该 reload 已移除；这里仍按属性取用，避免将来有人恢复 reload 时再踩同一个坑。
+from services.pick import recommend as _recommend_svc
 from services.ops.review import generate_daily_review
 from services.strategy.market import predict_market_risk, check_market_crash, load_market_alert
 from services.data.fundflow import get_fund_flow_summary
@@ -37,10 +42,39 @@ _HOT_SCAN_CACHE: Dict[str, Dict] = {}
 # 每轮触发全量重扫（120 只行情+资金流+评分）；45s > 30s 轮询间隔，交替命中，
 # 全量重扫频率减半，缓存数据最旧 45s（30s 一轮的筛选页可接受）。
 _HOT_SCAN_CACHE_TTL = 45  # 秒
+# 2026-10-30 陈旧兜底：45s TTL 一过，下一个请求就要白付全量重扫（实测冷 2.2s、
+# 缓存过期叠并发时 8.7s 甚至 53.9s）。过期但未超 10 分钟的数据先原样返回、由后台
+# 线程刷新；筛选页是 30s 轮询的大盘画面，秒级新鲜度足够，页面耗时从此 ≤ 缓存命中。
+_HOT_SCAN_STALE_MAX = 600  # 秒
+_HOT_SCAN_REFRESHING: Dict[str, float] = {}   # {cache_key: 上次后台刷新时间}，20s 节流
+_HOT_SCAN_CTX = threading.local()             # 后台刷新线程内置 compute=True，避免递归再进缓存分支
 
 def _invalidate_hot_scan_cache():
     """清空批量扫描缓存（添加/移除自选股后调用，避免脏缓存）"""
     _HOT_SCAN_CACHE.clear()
+    _HOT_SCAN_REFRESHING.clear()
+
+
+def _spawn_hot_scan_refresh(cache_key: str, codes_raw: str, pool_only: bool):
+    """后台刷新一份过期的扫描缓存（2026-10-30 陈旧兜底的另一半）。
+
+    20s 节流防止 30s 轮询叠并发时重复全量扫；子线程自带事件循环
+    （asyncio.run）是安全的——扫描的网络调用全部走 requests + to_thread，
+    不依赖主循环资源。失败只打日志，旧缓存留给下一个请求继续兜底。
+    """
+    _now = time.time()
+    if _now - _HOT_SCAN_REFRESHING.get(cache_key, 0) < 20:
+        return
+    _HOT_SCAN_REFRESHING[cache_key] = _now
+
+    def _run():
+        _HOT_SCAN_CTX.compute = True
+        try:
+            asyncio.run(hot_stock_buttons_scan(codes=codes_raw, force=False, pool_only=pool_only))
+            print(f'[批量扫描] 后台刷新完成 {cache_key[:40]}…')
+        except Exception as e:
+            print(f'[批量扫描] 后台刷新失败（旧缓存保留）: {e}')
+    threading.Thread(target=_run, daemon=True, name='hot-scan-refresh').start()
 
 # ========== 扫描宇宙扩展（2026-08-31 选股策略优化） ==========
 # 背景：原「股票筛选」只扫前端传入的用户自选池（通常 20~30 只），覆盖面窄。
@@ -137,7 +171,6 @@ async def get_tab_scan_config():
     from app.config import (
         TAB_SCAN_FILTER_MODES, TAB_SCAN_DEFAULT_MODE,
         TAB_SCAN_BULL_MIN_SCORE, TAB_SCAN_BEAR_MAX_SCORE,
-        TAB_SCAN_LEADERS_MIN_GAIN,
     )
     from services.support import app_settings as A
     return {
@@ -148,9 +181,8 @@ async def get_tab_scan_config():
             "defaultMinScore": A.value('tab_scan_default_min_score'),
             "bullMinScore": TAB_SCAN_BULL_MIN_SCORE,
             "bearMaxScore": TAB_SCAN_BEAR_MAX_SCORE,
-            "leadersMinGain": TAB_SCAN_LEADERS_MIN_GAIN,
+            # 2026-10-28 角色体系下线：不再下发 leadersMinGain / leaders_only（仅优质龙头）模式
             "modeLabels": {
-                "leaders_only": "仅优质龙头",
                 "all": "全部",
                 "bull_only": "仅看涨",
                 "bull_and_hold": "观望以上",
@@ -352,8 +384,8 @@ async def get_stock_analysis(symbol: str):
                 "score": int(score_val) if isinstance(score_val, (int, float)) else 0,
                 "max": int(max_val),
             })
-        # 买卖点（预期涨幅，V4.2 位置+龙头感知版）
-        buy_sell_points = calc_buy_sell_points(stock_data, score_result=result)
+        # 买卖点（预期涨幅，V4.6 位置感知版）
+        buy_sell_points = _recommend_svc.calc_buy_sell_points(stock_data, score_result=result)
         return {
             "success": True,
             "data": {
@@ -448,9 +480,9 @@ async def get_stock_full(symbol: str):
                 "score": int(score_val) if isinstance(score_val, (int, float)) else 0,
                 "max": int(max_val),
             })
-        # 买卖点（V4.2 位置+龙头感知版）：raw 始终可用（缓存命中或新拉取），解析后纯函数计算
+        # 买卖点（V4.6 位置感知版）：raw 始终可用（缓存命中或新拉取），解析后纯函数计算
         _parsed_full = parse_tencent_batch_data(raw) if raw else []
-        buy_sell_points = calc_buy_sell_points(_parsed_full[0], score_result=result) if _parsed_full else {}
+        buy_sell_points = _recommend_svc.calc_buy_sell_points(_parsed_full[0], score_result=result) if _parsed_full else {}
         return {
             "success": True,
             "data": {
@@ -1570,7 +1602,7 @@ async def delete_recommendation(date: str):
 async def generate_recommendations_api():
     """手动触发生成智能推荐并返回结果"""
     try:
-        result = await auto_generate_recommendations_task()
+        result = await _recommend_svc.auto_generate_recommendations_task()
         if result and result.get('recommendations'):
             return {"success": True, "recommendations": result['recommendations']}
         # 如果任务没有返回数据，尝试从数据库读取今天的推荐
@@ -1603,7 +1635,7 @@ async def get_trend_scan_results():
     try:
         trend_data = load_trend_scan_results()
         trend_data = _ensure_today_date(trend_data)
-        # V4.2: 为每只趋势股票注入买卖点（位置+龙头感知，trend_details 精确度最高）
+        # V4.6: 为每只趋势股票注入买卖点（位置感知，trend_details 精确度最高）
         stocks = trend_data.get('stocks', [])
         for s in stocks:
             # 涨跌幅（2026-10-23）：新快照写在 details.changePercent；
@@ -1626,7 +1658,7 @@ async def get_trend_scan_results():
             try:
                 details = s.get('details', {}) or {}
                 score_result = {'total': s.get('score', 0), 'base_scores': {}, 'factor_values': {}}
-                s['buySellPoints'] = calc_buy_sell_points(s, score_result=score_result, trend_details=details)
+                s['buySellPoints'] = _recommend_svc.calc_buy_sell_points(s, score_result=score_result, trend_details=details)
             except Exception as _e:
                 print(f'[趋势] 买卖点计算失败 {s.get("symbol")}: {_e}')
         return {"success": True, "data": trend_data}
@@ -1955,13 +1987,25 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         except Exception as e:
             print(f'[批量扫描] 股票范围过滤失败(不过滤): {e}')
 
+        # 2026-10-30：阶段耗时（用户要求页面 2s 内，先把 8.7s 到底花在哪一段量出来）。
+        # 只 print、不改任何返回结构；冷路径才有意义，热缓存会直接命中返回、看不到这几行。
+        print(f'[批量扫描] 阶段 候选+范围 {time.time() - t0:.2f}s（{len(codes_list)} 只）')
+
         # 2026-08-31 性能优化：内存缓存覆盖前端 30s 轮询的重复请求（2026-10-24 TTL 15s→45s，
         # 15s 时单用户每轮必过期）。命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
+        # 2026-10-30 加陈旧兜底：45s 过期但未超 10 分钟 → 立即返回旧数据并后台刷新，
+        # 用户请求从此最多等"缓存命中"级别的耗时；只有完全无缓存（重启后首次）或 force 才同步算。
         cache_key = ','.join(sorted(set(codes_list)))
         _now_ts = time.time()
         _cached = _HOT_SCAN_CACHE.get(cache_key)
-        if not force and _cached and (_now_ts - _cached['ts']) < _HOT_SCAN_CACHE_TTL:
-            return _cached['data']
+        _compute_now = force or getattr(_HOT_SCAN_CTX, 'compute', False)
+        if not _compute_now and _cached:
+            _age = _now_ts - _cached['ts']
+            if _age < _HOT_SCAN_CACHE_TTL:
+                return _cached['data']
+            if _age < _HOT_SCAN_STALE_MAX:
+                _spawn_hot_scan_refresh(cache_key, codes, pool_only)
+                return _cached['data']
         
         # 2026-07-08 修复：取消 100 只截断，支持全量扫描
         # 原 codes_list[:100] 导致 80% 股票未被扫描
@@ -1988,6 +2032,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             for i in range(0, len(codes_list), batch_size)
         ]
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        _t_quote = time.time()
+        print(f'[批量扫描] 阶段 行情批量 {_t_quote - t0:.2f}s')
         for idx, r in enumerate(batch_results, 1):
             if isinstance(r, Exception):
                 print(f'  [批次 {idx}] 异常: {r}')
@@ -2057,19 +2103,30 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
                 print(f'[批量扫描] 估值分位获取失败: {e}')
                 return {}
 
+        _acc_t: Dict[str, float] = {}
+
+        async def _timed(name: str, coro):
+            _s = time.time()
+            try:
+                return await coro
+            finally:
+                _acc_t[name] = round(time.time() - _s, 2)
+
         market_change, fund_flow_map, holder_map, rps_map, fund_map, sm_map, val_map = await asyncio.gather(
-            _fetch_market_change(),
-            _fetch_fund_flow(),
-            _fetch_holder_num(),
-            _fetch_rps(),
-            _fetch_fundamental(),
-            _fetch_smart_money(),
-            _fetch_valuation(),
+            _timed('market', _fetch_market_change()),
+            _timed('fund_flow', _fetch_fund_flow()),
+            _timed('holder', _fetch_holder_num()),
+            _timed('rps', _fetch_rps()),
+            _timed('fundamental', _fetch_fundamental()),
+            _timed('smart_money', _fetch_smart_money()),
+            _timed('valuation', _fetch_valuation()),
         )
+        print(f'[批量扫描] 阶段 附加数据 {time.time() - _t_quote:.2f}s 明细 {_acc_t}')
 
         # 评分（传入 market_change + fund_flow_data + holder_data + rps + 基本面 + 聪明钱）
         # 趋势分复用今日趋势扫描缓存（isUp 票）；全市场逐票现算 is_up_trend 成本过高，
         # 反弹股抑制已在单票评分/持仓/推荐/趋势扫描路径覆盖，此处作为明确边界。
+        _t_score = time.time()
         try:
             from services.strategy.trend import load_trend_scan_results
             _scan_trend = load_trend_scan_results().get('stocks', [])
@@ -2113,6 +2170,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
                 print(f'[批量扫描] 行业映射持久化失败（不影响评分）: {e}')
 
         all_results.sort(key=lambda x: x['score']['total'], reverse=True)
+        print(f'[批量扫描] 阶段 评分+趋势缓存 {time.time() - _t_score:.2f}s')
+        _t_db = time.time()
 
         # 2026-07-08 修复：移除 60 分硬性过滤，返回全部结果由前端排序展示
         # 原逻辑直接丢弃低于 60 分的股票，导致用户无法看到完整市场全貌
@@ -2161,6 +2220,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             await asyncio.to_thread(save_predictions, predictions)
         if PREDICT_SAVE_QUALITY_GATE and skipped:
             print(f'[扫描] 质量门槛v2过滤 {skipped} 只看涨信号（非涨停且评分<{PREDICT_SAVE_MIN_SCORE}），保留 {len(predictions)} 条')
+        print(f'[批量扫描] 阶段 落库+行业 {time.time() - _t_db:.2f}s')
         
         response = [
             {
@@ -2195,7 +2255,7 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
                                if (sm := sm_map.get(s['symbol'].lower())) else None),
                 'valuation': s.get('valuation'),
                 'riskControl': s.get('riskControl'),
-                'buySellPoints': calc_buy_sell_points(s, score_result=s.get('score')),
+                'buySellPoints': _recommend_svc.calc_buy_sell_points(s, score_result=s.get('score')),
             }
             for s in all_results
         ]
@@ -2735,45 +2795,23 @@ async def kline_history_stats_api():
 async def get_settings_api(user: Dict = Depends(current_user)):
     """列出可改项（当前值/默认值/是否被覆盖/生效方式）+ 口径摘要与改动记录。
 
-    2026-10-17 提速：口径摘要四项（范围/选票/预览一致性/陈旧数）原本在事件循环里
-    串行跑，冷路径合计 6.3s（selectable 流动性聚合一项就 5s）——改为两个 to_thread
-    并行（范围与预览互不依赖），叠加 universe 选票范围 10 分钟结果缓存，
-   热路径全命中时 <50ms。
+    2026-10-17 提速：口径摘要四项（范围/选票/预览一致性/陈旧数）改为 to_thread 并行，
+    热路径全命中时 <50ms。
+    2026-10-30 再提速：摘要整份缓存化（settings_preview.compute_summary），调度器
+    启动预热 + 每 9 分钟保活刷新，改「选股范围」配置后由 app_settings 触发后台重算。
+    请求只读快照，实测冷路径 27.8s / 过期 5.3s 从此不再出现在请求路径上；
+    只有快照缺失（重启后预热未完成的窗口）才由本请求现算兜底。
     """
-    from services.support import app_settings as A
+    from services.support import app_settings as A, settings_preview as P
     items = A.list_items()
 
-    def _scope_summary():
-        try:
-            from services.data import universe
-            return {
-                'dataScope': len(universe.eligible_symbols()),
-                'selectableScope': universe.selectable_count(),
-                'scopeText': universe.describe_selectable(),
-            }
-        except Exception as e:
-            return {'scopeError': str(e)[:120]}
-
-    def _preview_summary():
-        out = {}
-        try:
-            from services.support import settings_preview as P
-            p = P.parity_check()
-            out['previewParity'] = p
-            if not p.get('ok'):
-                print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
-                      f" —— settings_preview 漏了条件，得补")
-            out['staleOutOfSync'] = P.stale_no_sync_count()
-        except Exception as e:
-            out['previewError'] = f'{type(e).__name__}: {str(e)[:120]}'
-        return out
-
-    scope_res, preview_res = await asyncio.gather(
-        asyncio.to_thread(_scope_summary),
-        asyncio.to_thread(_preview_summary),
-    )
-    summary = dict(scope_res)
-    summary.update(preview_res)
+    _snap = P.summary_snapshot()
+    if _snap is None:
+        summary = await asyncio.to_thread(P.compute_summary)
+    else:
+        summary = dict(_snap)
+        if P.summary_age() > P.SUMMARY_REFRESH_SEC:
+            P.refresh_summary_async()
     return {"success": True, "data": {'items': items, 'summary': summary,
                                       'history': A.history(15),
                                       'canWrite': A.can_write(user),
@@ -3085,17 +3123,14 @@ async def get_optimization_history(module: str = '', limit: int = 50):
 
 @router.get("/api/optimization/status", tags=["自动优化"])
 async def get_optimization_status():
-    """查询当前优化状态（D1-D4权重 + 角色门槛 + 角色表现）"""
-    from db.database import load_trend_dimension_weights, load_role_thresholds, load_role_performance
+    """查询当前优化状态（D1-D4权重）
+    2026-10-28 角色体系下线：不再返回 roleThresholds / rolePerformance。"""
+    from db.database import load_trend_dimension_weights
     dim_weights = load_trend_dimension_weights()
-    role_thresholds = load_role_thresholds()
-    role_performance = load_role_performance()
     return {
         "success": True,
         "data": {
             "dimensionWeights": dim_weights,
-            "roleThresholds": role_thresholds,
-            "rolePerformance": role_performance,
         }
     }
 
@@ -3124,16 +3159,7 @@ async def get_optimization_trend():
     ''')
     weight_history = [dict(r) for r in cursor.fetchall()]
 
-    # 2. 角色近期表现（最近7天）
-    cursor.execute('''
-        SELECT role, record_date, total, win_rate, excess_return
-        FROM role_performance
-        WHERE record_date >= date('now', '-7 days')
-        ORDER BY record_date DESC, role
-    ''')
-    role_perf = [dict(r) for r in cursor.fetchall()]
-
-    # 3. 网格搜索结果历史
+    # 2. 网格搜索结果历史（2026-10-28 删掉"角色近期表现"：角色体系已下线）
     cursor.execute('''
         SELECT created_at, metric_value as best_winrate,
                old_value as current_winrate,
@@ -3145,7 +3171,7 @@ async def get_optimization_trend():
     ''')
     grid_history = [dict(r) for r in cursor.fetchall()]
 
-    # 4. 全量优化统计
+    # 3. 全量优化统计
     cursor.execute('SELECT count(*) as cnt FROM optimization_history')
     total_opt = cursor.fetchone()['cnt']
 
@@ -3161,7 +3187,6 @@ async def get_optimization_trend():
         "success": True,
         "data": {
             "weightHistory": weight_history,
-            "rolePerformance": role_perf,
             "gridHistory": grid_history,
             "stats": {
                 "totalOptimizations": total_opt,

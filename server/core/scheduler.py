@@ -166,10 +166,7 @@ async def auto_optimization_task():
                 if adj.get('action') != 'keep':
                     print(f'  D1-D4权重: {adj["dimension"]} {adj["action"]} → {adj.get("new_weight", "N/A")} ({adj.get("reason", "")})')
 
-        if result.get('role_thresholds'):
-            role = result['role_thresholds']
-            for adj in role.get('adjustments', []):
-                print(f'  角色门槛: {adj.get("role", "")}.{adj.get("param", "")} {adj.get("direction", "")} ({adj.get("reason", "")})')
+        # 2026-10-28：角色门槛优化随角色体系删除，不再有 role_thresholds 结果
 
         if result.get('grid_search'):
             gs = result['grid_search']
@@ -186,14 +183,70 @@ async def auto_optimization_task():
 def run_scheduler():
     # 2026-10-17 启动预热：universe 选票范围首算要 ~5s（流动性聚合），
     # 不预热则重启后第一次开配置页白等 5s。放后台线程跑，不阻塞调度器注册。
-    def _prewarm_universe():
+    # 2026-10-30 升级为**常驻保活**：universe 两层缓存与流动性统计的 TTL 都是 600s，
+    # 只在启动预热一次的话，重启 ~10 分钟后缓存过期，下一个撞上的请求（批量扫描/
+    # 配置页/海选）实测要再付 3~8s 冷算（10-30 16:13 筛选页 8.71s 即此因）。
+    # 改为每 540s 后台刷新一次，永远赶在过期前；先算好再原子换入
+    # （universe.refresh_caches），刷新窗口内请求继续用旧值，不撞冷路径。
+    def _keepwarm_universe():
+        import time as _time
+        from services.data import liquidity, universe
+        _t = _time.time()
         try:
-            from services.data import universe
             universe.selectable_count()
-            print(f'[预热 {datetime.now():%H:%M:%S}] universe 选票范围缓存完成')
+            print(f'[预热 {datetime.now():%H:%M:%S}] universe 选票范围缓存完成（{_time.time() - _t:.1f}s）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] universe 预热失败（不致命，首次请求会现算）: {e}')
-    threading.Thread(target=_prewarm_universe, daemon=True, name='prewarm-universe').start()
+        # 2026-10-30：配置页口径摘要预热（/api/settings 只读快照，缺快照才现算；
+        # 这里先算好，重启后第一个打开配置页的人不再撞 27.8s 冷路径）
+        try:
+            from services.support import settings_preview
+            _t2 = _time.time()
+            settings_preview.compute_summary()
+            print(f'[预热 {datetime.now():%H:%M:%S}] 配置页口径摘要缓存完成（{_time.time() - _t2:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 口径摘要预热失败（首次请求会现算兜底）: {e}')
+        while True:
+            _time.sleep(540)  # 9 分钟 < 600s TTL
+            try:
+                _t = _time.time()
+                liquidity.stats_map(force=True)   # 先刷流动性统计（universe 重算要用）
+                universe.refresh_caches()          # 再重算两层范围并原子换入
+                settings_preview.compute_summary() # 配置页摘要随热缓存重算（热路径 <1s）
+                print(f'[预热 {datetime.now():%H:%M:%S}] universe/流动性/口径摘要保活刷新完成（{_time.time() - _t:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] universe 保活刷新失败（不影响请求，下轮再试）: {e}')
+    threading.Thread(target=_keepwarm_universe, daemon=True, name='prewarm-universe').start()
+
+    # 批量扫描预热（2026-10-30）：重启后第一次打开筛选页要付一次全量冷算
+    # （实测 2.2~2.9s，超"页面 2s 内"目标）。用**全部用户池的并集**构建宇宙
+    # （与前端传参同源，load_user_scan_pool() 无参=所有人池子合并），启动后台
+    # 预扫一次，首开即命中缓存；即使之后池子变了 key 不一致，也只是退回
+    # "首开冷算一次"的旧行为，不会更差。失败不致命。
+    def _prewarm_hot_scan():
+        import time as _time
+        try:
+            import asyncio as _aio
+            from app.api import routes as _r
+            from db.database import load_user_scan_pool
+            _codes = ','.join(load_user_scan_pool()) or 'sh600519'
+            _t = _time.time()
+            _aio.run(_r.hot_stock_buttons_scan(codes=_codes, force=False, pool_only=False))
+            print(f'[预热 {datetime.now():%H:%M:%S}] 批量扫描缓存完成（{_time.time() - _t:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 批量扫描预热失败（首开会现算）: {e}')
+        # 行动台预热（2026-10-30）：重启后首开实测 2.2s（行情/情绪/主线冷算）。
+        # build_action_desk 的公共部分与 user_id 无关（持仓段按用户现查，本来就轻），
+        # 用 user_id=1 预热公共缓存即可；失败不致命。
+        try:
+            import asyncio as _aio
+            from services.ops.action_desk import build_action_desk
+            _t = _time.time()
+            _aio.run(build_action_desk(user_id=1))
+            print(f'[预热 {datetime.now():%H:%M:%S}] 行动台缓存完成（{_time.time() - _t:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 行动台预热失败（首开会现算）: {e}')
+    threading.Thread(target=_prewarm_hot_scan, daemon=True, name='prewarm-hot-scan').start()
 
     # 可执行超额预热（2026-10-27）：`/api/recommend-excess` 冷算实测 7.4s，而前端默认 10s
     # 超时——重启后第一个开「回测曲线」页的人正好撞上（当天实拍：超额没算出来：请求超时（10s））。

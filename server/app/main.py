@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
-import os, sys, time, asyncio, threading
+import os, time, asyncio, threading
 from datetime import date, datetime, timedelta
 
 from . import config as _cfg
@@ -72,16 +72,14 @@ def _reload_config():
             if val is not None:
                 g[name] = val
         g['TENCENT_API'] = g['TENCENT_QUOTE_API']
-        # 同步 reload 业务模块，让它们的 from app.config import 常量重新求值
-        for mod_name in ('services.data.stock', 'services.strategy.trend', 'services.pick.recommend'):
-            mod = sys.modules.get(mod_name)
-            if mod is not None:
-                try:
-                    importlib.reload(mod)
-                    print(f'[Config] 已重载 {mod_name}')
-                except Exception as e:
-                    print(f'[Config] 重载 {mod_name} 失败: {e}')
-        print('[Config] 热加载完成 (config.py 已变更)')
+        # 2026-10-29：不再 importlib.reload 业务模块。
+        # reload 只替换模块字典，不会替换别处 already from-import 的旧函数对象：
+        # 旧函数体 + 新全局表混用，就是 10-29 那次
+        # "_build_expectation_note() takes 3 positional arguments but 4 were given"
+        # 的根因（全仓有 33 处顶层 from-import 指向这三个模块）。
+        # 常改的开关请走 app_settings 覆盖表（每次取值现读，不受此影响）；
+        # 直接改 config.py 的常量需要重启后端才生效（写 server/data/backend_restart_requested）。
+        print('[Config] config.py 已变更：app.config 已重载；业务模块常量需重启后端生效')
         return True
     except Exception as e:
         print(f'[Config] 热加载失败: {e}')
@@ -217,7 +215,7 @@ app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票
 # 这类小响应不压，省 CPU。注意：手机走 cloudflared 隧道时 CF 边缘也会压一遍，
 # 本中间件主要收益在本地/局域网直连与回源段，不是重复劳动。
 app.add_middleware(GZipMiddleware, minimum_size=500)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source", "X-Process-Time"])
 
 # 注册路由
 from app.api.routes import router
@@ -290,5 +288,9 @@ async def eastmoney_proxy(path: str, request: Request):
 @app.middleware("http")
 async def _config_reload_middleware(request, call_next):
     _reload_config()
+    # 2026-10-30：把服务端处理耗时写进响应头，前端「本次加载」条用它把
+    # "接口本身慢" 与 "传输/隧道排队慢" 分开。只加头，不改任何响应体。
+    _t0 = time.perf_counter()
     response = await call_next(request)
+    response.headers['X-Process-Time'] = f'{(time.perf_counter() - _t0) * 1000:.0f}'
     return response

@@ -15,6 +15,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import app.config as cfg
+import threading
+import time
 
 
 def _scope_params(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -128,3 +130,58 @@ def preview_for(key: str, new_value: Any) -> Dict[str, Any]:
                            f'要真的收回来得同时把它们纳入同步（config.KLINE_SYNC_UNIVERSE_ONLY 与市值口径），'
                            f'并等一次同步补齐历史。')
     return out
+
+
+# ========== 口径摘要缓存（2026-10-30，页面 2s 内目标） ==========
+# /api/settings 每次打开都现算四项摘要（数据范围/选票范围/预览一致性/停同步数），
+# 实测：重启后首开 27.8s、universe 缓存过期后 5.3s、全热 <50ms。摘要只随
+# "口径参数 / 日K库 / 范围缓存"变，没必要每次请求都算。整份摘要缓存化：
+# 调度器启动预热 + 每 9 分钟随 universe 保活一起刷新；改「选股范围」组配置后
+# 由 app_settings 触发一次后台重算；读取方永远拿缓存值（最多旧几秒~几分钟）。
+_SUMMARY: Dict[str, Any] = {'ts': 0.0, 'data': None}
+SUMMARY_REFRESH_SEC = 540.0   # 与调度器保活同节奏；超龄只触发后台重算，不阻塞请求
+
+
+def compute_summary() -> Dict[str, Any]:
+    """现算四项摘要并写入缓存（供 /api/settings 无快照时兜底、调度器与改配置后台调用）。"""
+    from services.data import universe
+    out: Dict[str, Any] = {}
+    try:
+        out.update({
+            'dataScope': len(universe.eligible_symbols()),
+            'selectableScope': universe.selectable_count(),
+            'scopeText': universe.describe_selectable(),
+        })
+    except Exception as e:
+        out['scopeError'] = str(e)[:120]
+    try:
+        p = parity_check()
+        out['previewParity'] = p
+        if not p.get('ok'):
+            print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
+                  f" —— settings_preview 漏了条件，得补")
+        out['staleOutOfSync'] = stale_no_sync_count()
+    except Exception as e:
+        out['previewError'] = f'{type(e).__name__}: {str(e)[:120]}'
+    _SUMMARY.update(ts=time.time(), data=out)
+    return out
+
+
+def summary_snapshot() -> Optional[Dict[str, Any]]:
+    """当前缓存的一份摘要；没有（重启后还没预热完）返回 None。"""
+    return _SUMMARY['data']
+
+
+def summary_age() -> float:
+    return time.time() - _SUMMARY['ts']
+
+
+def refresh_summary_async() -> None:
+    """后台线程重算摘要（失败只打日志，读方继续用旧值）。"""
+    def _run():
+        try:
+            compute_summary()
+            print('[配置] 口径摘要后台重算完成')
+        except Exception as e:
+            print(f'[配置] 口径摘要后台重算失败: {e}')
+    threading.Thread(target=_run, daemon=True, name='settings-summary').start()

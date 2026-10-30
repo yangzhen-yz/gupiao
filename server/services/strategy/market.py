@@ -165,8 +165,29 @@ def get_crash_suggestion(market_status: str, indexes: List[Dict]) -> Dict:
 
 # ========== 大盘预测系统（主力资金流向预测） ==========
 # 性能优化（2026-07-02）：60 秒内存缓存，避免 TabQuote/TabStrategy 重复触发 500 只股票扫描
+# 2026-10-30 陈旧兜底：60s TTL 一过，下一个请求要白付 ~500 只行情重扫（实测 5.38s）。
+# 过期但未超 10 分钟 → 先返回旧值、后台线程刷新；行情页轮询场景秒级新鲜度足够。
+import threading as _threading
 _market_predict_cache: Dict[str, tuple] = {}  # {date_str: (timestamp, result)}
 _MARKET_PREDICT_CACHE_TTL = 60  # 秒
+_MARKET_PREDICT_STALE_MAX = 600  # 秒
+_MARKET_PREDICT_REFRESH_TS = {'t': 0.0}          # 后台刷新 30s 节流
+_MARKET_PREDICT_CTX = _threading.local()         # 后台刷新线程内置 compute=True
+
+def _spawn_market_predict_refresh():
+    _now = datetime.now().timestamp()
+    if _now - _MARKET_PREDICT_REFRESH_TS['t'] < 30:
+        return
+    _MARKET_PREDICT_REFRESH_TS['t'] = _now
+
+    def _run():
+        _MARKET_PREDICT_CTX.compute = True
+        try:
+            asyncio.run(predict_market_risk())
+            print(f'[大盘预测] 后台刷新完成')
+        except Exception as e:
+            print(f'[大盘预测] 后台刷新失败（旧缓存保留）: {e}')
+    _threading.Thread(target=_run, daemon=True, name='market-predict-refresh').start()
 
 async def predict_market_risk() -> Dict:
     """基于全市场股票数据预测大盘风险（主力资金流向预测）"""
@@ -175,6 +196,11 @@ async def predict_market_risk() -> Dict:
     cached = _market_predict_cache.get(today_str)
     now_ts = datetime.now().timestamp()
     if cached and (now_ts - cached[0]) < _MARKET_PREDICT_CACHE_TTL:
+        return cached[1]
+    # 2026-10-30 陈旧兜底：过期但未超 10 分钟 → 立即返回旧值并后台刷新
+    if cached and (now_ts - cached[0]) < _MARKET_PREDICT_STALE_MAX \
+            and not getattr(_MARKET_PREDICT_CTX, 'compute', False):
+        _spawn_market_predict_refresh()
         return cached[1]
 
     # 收集所有可用的股票池数据

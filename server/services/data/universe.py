@@ -196,6 +196,26 @@ def selectable_count() -> int:
     return len(selectable_symbols())
 
 
+def refresh_caches() -> None:
+    """后台保活用（2026-10-30）：重算两层缓存后**原子换入**。
+
+    与 `invalidate_cache()` 的区别：invalidate 是"先清空、下一个请求撞上再现算"，
+    重算窗口内进来的请求（批量扫描/配置页/海选）要付 3～8s 冷算；本函数是
+    "先算好、再换入"，窗口内请求继续用旧值，只是拿到稍旧一点的范围清单——
+    对"10 分钟才变一次"的口径来说完全可接受。供调度器每 9 分钟保活调用。
+    """
+    import time as _time
+    scope = _compute_eligible(_db_symbols())
+    try:
+        from services.data import liquidity
+        selectable = liquidity.filter_codes(scope)
+    except Exception as e:
+        print(f'[股票范围] 保活刷新：流动性这层没接上(按不含流动性处理): {e}')
+        selectable = scope
+    _SCOPE_CACHE.update(ts=_time.time(), value=scope)
+    _SELECTABLE_CACHE.update(ts=_time.time(), value=list(selectable))
+
+
 def selectable_prefixed(symbols: Iterable[str]) -> list:
     """选票层的入口过滤：主板 + 非ST/退 + 市值下限 + 流动性/价位三条件，一次过。"""
     kept = filter_prefixed(symbols)

@@ -713,6 +713,13 @@ def set_value(key: str, incoming: Any, user: str = '') -> Dict[str, Any]:
                         getattr(m, fn)()
             except Exception as e:
                 print(f'[配置覆盖] {mod} 缓存清理跳过: {type(e).__name__}: {e}')
+        # 2026-10-30：口径摘要缓存随配置变化后台重算（/api/settings 只读快照，
+        # 不在请求路径上付 5~28s 冷算；旧值在重算完成前继续兜底）
+        try:
+            from services.support import settings_preview as _sp
+            _sp.refresh_summary_async()
+        except Exception as _e:
+            print(f'[配置覆盖] 口径摘要重算触发失败（不影响本次写入）: {type(_e).__name__}: {_e}')
     return {'ok': True, 'key': key, 'value': val_or_err, 'live': spec(key)['live']}
 
 
@@ -740,6 +747,12 @@ def reset_value(key: str, user: str = '') -> Dict[str, Any]:
                     m.invalidate_cache()
             except Exception:
                 pass
+        # 2026-10-30：同 set_value，口径摘要后台重算
+        try:
+            from services.support import settings_preview as _sp
+            _sp.refresh_summary_async()
+        except Exception:
+            pass
     return {'ok': True, 'key': key, 'value': default_value(key)}
 
 
