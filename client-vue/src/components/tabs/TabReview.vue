@@ -251,6 +251,7 @@
           <div class="dual-col">
             <div class="section-title-row">
               <div class="section-title-small">🔄 板块轮动</div>
+              <span v-if="isClsSector(review)" class="sector-source-tag">财联社口径</span>
             </div>
             <div v-if="getIndustryTop(review).length" class="mini-section">
               <div class="mini-label up">领涨行业</div>
@@ -282,11 +283,11 @@
                 </div>
               </div>
             </div>
-            <div v-if="(review.conceptSectors || []).length" class="mini-section">
+            <div v-if="getConceptTop(review).length" class="mini-section">
               <div class="mini-label purple">热门概念（涨）</div>
               <div class="mini-pill-list">
                 <div
-                  v-for="(s, i) in review.conceptSectors.slice(0, 5)"
+                  v-for="(s, i) in getConceptTop(review).slice(0, 5)"
                   :key="s.code"
                   class="mini-pill purple"
                   @click="openSectorModal(s)"
@@ -301,7 +302,7 @@
               v-if="
                 !getIndustryTop(review).length &&
                 !getIndustryLag(review).length &&
-                !(review.conceptSectors || []).length
+                !getConceptTop(review).length
               "
               class="empty-tip"
             >
@@ -622,107 +623,6 @@
     return reviews.value[0].date !== todayStr
   })
 
-  const CACHE_KEY = 'review_enrich_cache'
-  const CACHE_TTL = 10 * 60 * 1000
-
-  function getCachedEnrichData() {
-    try {
-      const raw = localStorage.getItem(CACHE_KEY)
-      if (!raw) return null
-      const c = JSON.parse(raw)
-      if (Date.now() - c.ts > CACHE_TTL) {
-        localStorage.removeItem(CACHE_KEY)
-        return null
-      }
-      return c.data
-    } catch {
-      return null
-    }
-  }
-  function setCachedEnrichData(data) {
-    try {
-      localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data }))
-    } catch {}
-  }
-
-  async function fetchEnrichData() {
-    const cached = getCachedEnrichData()
-    if (cached) return cached
-    try {
-      const [indJson, conJson, gainJson, loseJson] = await Promise.all([
-        fetch(
-          '/eastmoney/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:2+f:!50&fields=f2,f3,f12,f14,f62'
-        )
-          .then(r => (r.ok ? r.json() : null))
-          .catch(() => null),
-        fetch(
-          '/eastmoney/api/qt/clist/get?fid=f3&po=1&pz=8&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:90+t:3+f:!50&fields=f2,f3,f12,f14,f62'
-        )
-          .then(r => (r.ok ? r.json() : null))
-          .catch(() => null),
-        fetch(
-          '/eastmoney/api/qt/clist/get?fid=f3&po=1&pz=10&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
-        )
-          .then(r => (r.ok ? r.json() : null))
-          .catch(() => null),
-        fetch(
-          '/eastmoney/api/qt/clist/get?fid=f3&po=0&pz=10&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f8,f12,f14,f62'
-        )
-          .then(r => (r.ok ? r.json() : null))
-          .catch(() => null),
-      ])
-      const result = { industrySectors: [], industrySectorsLag: [], conceptSectors: [], topGainers: [], topLosers: [] }
-      if (indJson?.data?.diff) {
-        for (const it of indJson.data.diff) {
-          const e = { name: it.f14, code: it.f12, changePercent: it.f3, mainNetInflow: it.f62 }
-          ;(it.f3 || 0) >= 0 ? result.industrySectors.push(e) : result.industrySectorsLag.push(e)
-        }
-      }
-      if (conJson?.data?.diff) {
-        for (const it of conJson.data.diff)
-          result.conceptSectors.push({ name: it.f14, code: it.f12, changePercent: it.f3, mainNetInflow: it.f62 })
-      }
-      if (gainJson?.data?.diff) {
-        for (const it of gainJson.data.diff) {
-          if (Math.abs(it.f3 || 0) < 20)
-            result.topGainers.push({
-              name: it.f14,
-              code: it.f12,
-              changePercent: it.f3,
-              turnoverRate: it.f8,
-              mainNetInflow: it.f62,
-            })
-        }
-      }
-      if (loseJson?.data?.diff) {
-        for (const it of loseJson.data.diff) {
-          if (Math.abs(it.f3 || 0) < 20)
-            result.topLosers.push({
-              name: it.f14,
-              code: it.f12,
-              changePercent: it.f3,
-              turnoverRate: it.f8,
-              mainNetInflow: it.f62,
-            })
-        }
-      }
-      if (result.industrySectors.length || result.conceptSectors.length) setCachedEnrichData(result)
-      return result
-    } catch {
-      return null
-    }
-  }
-
-  function applyEnrichData(review, data) {
-    if (!data) return
-    if (!review.industrySectors || !review.industrySectors.length) review.industrySectors = data.industrySectors
-    if (!review.industrySectorsLag || !review.industrySectorsLag.length)
-      review.industrySectorsLag = data.industrySectorsLag
-    if (!review.conceptSectors || !review.conceptSectors.length) review.conceptSectors = data.conceptSectors
-    if (!review.topGainers || !review.topGainers.length) review.topGainers = data.topGainers
-    if (!review.topLosers || !review.topLosers.length) review.topLosers = data.topLosers
-  }
-
   function getTotalLimitUp(review) {
     // 优先读真实总数字段；缺失时降级为数组长度（旧历史数据）
     if (review && typeof review.limitUpCount === 'number') return review.limitUpCount
@@ -740,12 +640,26 @@
     return `${u}:${d}`
   }
   function getIndustryTop(review) {
-    if (review.industrySectors && review.industrySectors.length) return review.industrySectors.slice(0, 5)
-    return []
+    // 只取真涨的，别把绿盘写成「领涨 +-0.6%」
+    const rows = (review.industrySectors || []).filter(s => (s.changePercent || 0) >= 0)
+    return rows.slice(0, 5)
   }
   function getIndustryLag(review) {
-    if (review.industrySectorsLag && review.industrySectorsLag.length) return review.industrySectorsLag.slice(0, 5)
-    return []
+    if (review.industrySectorsLag && review.industrySectorsLag.length)
+      return review.industrySectorsLag.slice(0, 5)
+    // 历史收评没有 lag 字段：从行业列表尾部取跌的（后端已把跌幅放在末尾）
+    return (review.industrySectors || [])
+      .filter(s => (s.changePercent || 0) < 0)
+      .slice(-5)
+      .reverse()
+  }
+  function getConceptTop(review) {
+    return (review.conceptSectors || []).filter(s => (s.changePercent || 0) > 0)
+  }
+  // 2026-10-31：东财 clist 被封时收评板块由财联社兜底，行内带 source='cls'
+  function isClsSector(review) {
+    const rows = [...(review.industrySectors || []), ...(review.conceptSectors || [])]
+    return rows.some(s => s && s.source === 'cls')
   }
   // 个股热度：优先用后端收评里的数据，取前5（涨幅榜/跌幅榜 > 涨停股降级补充）
   function getTop5Gainers(review) {
@@ -1044,18 +958,30 @@
     sectorModal.error = ''
     sectorModal.stocks = []
     try {
-      // 板块代码格式: BK0438 → 拼 fs=b:BK0438
-      const url = `/eastmoney/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=b:${encodeURIComponent(s.code)}&fields=f2,f3,f8,f12,f14,f62`
-      const r = await fetch(url)
-      const j = await r.json()
-      const diff = j?.data?.diff || []
-      sectorModal.stocks = diff.map(it => ({
-        name: it.f14,
-        code: it.f12,
-        changePercent: it.f3,
-        turnoverRate: it.f8,
-        mainNetInflow: it.f62,
-      }))
+      if (String(s.code).toLowerCase().startsWith('cls')) {
+        // 财联社板块（2026-10-31 兜底来源）：代码是 clsXXXXX，不能拼东财的 fs=b:
+        // 财联社不提供换手率，这里不传 turnoverRate（模板按“有则显示”）。
+        const j = await apiFetch(`/api/cls-plate-stocks?code=${encodeURIComponent(s.code)}`)
+        sectorModal.stocks = (j?.data || []).map(it => ({
+          name: it.name,
+          code: it.code,
+          changePercent: it.changePercent,
+          mainNetInflow: it.mainNetInflow,
+        }))
+      } else {
+        // 板块代码格式: BK0438 → 拼 fs=b:BK0438
+        const url = `/eastmoney/api/qt/clist/get?fid=f3&po=1&pz=20&pn=1&np=1&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5&fs=b:${encodeURIComponent(s.code)}&fields=f2,f3,f8,f12,f14,f62`
+        const r = await fetch(url)
+        const j = await r.json()
+        const diff = j?.data?.diff || []
+        sectorModal.stocks = diff.map(it => ({
+          name: it.f14,
+          code: it.f12,
+          changePercent: it.f3,
+          turnoverRate: it.f8,
+          mainNetInflow: it.f62,
+        }))
+      }
     } catch (e) {
       sectorModal.error = '加载成分股失败: ' + (e?.message || e)
     } finally {
@@ -1080,16 +1006,8 @@
       if (result.success && result.data) {
         reviews.value = result.data
         currentPage.value = 1
-        // 尝试用实时数据补全（若后端数据缺失），但不阻塞渲染
-        fetchEnrichData()
-          .then(data => {
-            if (data) {
-              reviews.value.slice(0, 3).forEach(r => applyEnrichData(r, data))
-            }
-          })
-          .catch(() => {
-            /* 实时补充失败时静默忽略 */
-          })
+        // 2026-10-31：删掉原来的 `/eastmoney/...` 前端补全。生产代理对 clist 实测 502，
+        // 这条兜底从来没成功过，只会白打 4 个请求；板块改由后端（财联社）兜底并落库。
         // 若 topGainers 为空，用热搜榜数据做降级
         const latest = reviews.value[0]
         if (latest && !latest.topGainers?.length) {
@@ -1531,6 +1449,16 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+  /* 2026-10-31：板块由财联社兜底时的口径标记（东财 clist 被封时出现） */
+  .sector-source-tag {
+    font-size: 0.65rem;
+    color: var(--accent-warning);
+    border: 1px solid var(--accent-warning);
+    border-radius: 4px;
+    padding: 1px 5px;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .section-sub {
     font-size: 0.7rem;

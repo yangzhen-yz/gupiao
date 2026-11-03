@@ -2523,38 +2523,6 @@ body {
   background: var(--border-subtle);
 }
 
-/* 只数影子标注（2026-10-27）：中性灰 + 虚线边，刻意不像警告——它是待裁决的观察项，
-   不是"别买"的信号（82 日离线复算方向与提出者的预期相反，详见 docs/系统更新日志.md） */
-.shadow-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 7px;
-  border: 1px dashed var(--border-subtle);
-  border-radius: 999px;
-  font-size: 0.68rem;
-  font-weight: 600;
-  color: var(--text-tertiary);
-  background: var(--bg-tertiary);
-  white-space: nowrap;
-}
-
-.shadow-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin: -4px 0 var(--spacing-md);
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-}
-
-.shadow-line em {
-  font-style: normal;
-  font-size: 0.68rem;
-  color: var(--text-tertiary);
-}
-
 .history-stock-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));

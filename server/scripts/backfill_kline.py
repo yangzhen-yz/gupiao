@@ -39,6 +39,15 @@ def _print_stats(eng: HistoryKlineEngine) -> None:
 
 
 def main() -> None:
+    # 手工跑这个脚本的终端默认是 GBK，而盘后自检的告警文案里有非 GBK 字符——2026-11-02 21:45
+    # 实测：coverage_report 打印 "⚠" 时 print 自己抛 UnicodeEncodeError，把"看得见的告警"
+    # 变成"看不见的崩溃"，收尾自检整段没跑完。stdout 统一收到 UTF-8 并 errors='replace'，
+    # 打印本身永远不该是故障点。
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception as e:
+        print(f"[启动] stdout 编码切换失败（不影响本次运行）: {type(e).__name__}: {e}")
+
     parser = argparse.ArgumentParser(description="本地历史日K线库管理（baostock 前复权）")
     parser.add_argument("--mode", choices=["backfill", "sync", "stats"], required=True,
                         help="backfill=全量回填; sync=每日增量; stats=查看统计")
@@ -47,6 +56,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="仅回填前 N 只（调试用，0=全市场）")
     parser.add_argument("--date", default=None,
                         help="sync 模式专用：只补到这一个交易日（用于补昨天漏掉的一天），默认今天")
+    parser.add_argument("--fill-dates", default=None,
+                        help="sync 模式专用：点名回填这些交易日（逗号分隔，如 2026-11-03）。"
+                             "判定是「这一天在不在」，不像 --date 那样只看每只票的最新日期，"
+                             "所以能补中间漏掉的一天；非交易日（周末/节假日）会被交易日历"
+                             "当场跳过，不会对着它发起全市场查询")
     args = parser.parse_args()
 
     eng = HistoryKlineEngine(args.db_path)
@@ -54,8 +68,11 @@ def main() -> None:
         if args.mode == "stats":
             _print_stats(eng)
         elif args.mode == "sync":
-            written = eng.sync_today_bulk(args.date)
-            print(f"增量同步写入 {written} 条" + (f"（补到 {args.date}）" if args.date else ""))
+            fills = [x.strip() for x in (args.fill_dates or "").split(",") if x.strip()]
+            written = eng.sync_today_bulk(args.date, fill_dates=fills or None)
+            print(f"增量同步写入 {written} 条"
+                  + (f"（点名回填 {','.join(fills)}）" if fills else
+                     (f"（补到 {args.date}）" if args.date else "")))
             _print_stats(eng)
         elif args.mode == "backfill":
             symbols = eng.get_all_symbols()

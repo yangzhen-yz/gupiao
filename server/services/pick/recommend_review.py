@@ -9,7 +9,7 @@
     如果按现价追高只有 25.3%/-3.61% —— 挂低吸的价值是躲诱多，不是保证赚；
   - 低吸单没成交的日子如果追高：+3.39%/81.8% —— 刚性低吸漏掉强势延续；
   - 低吸纪律 EV（成交率 68.3%×成交组均值 + 未成交按 0）= -0.72%，
-    同样本无脑追高 EV = -1.39%（`docs/胜率低根因复盘-2026-10-18.md`）；
+    同样本无脑追高 EV = -1.39%（`server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）；
   - 现价追高口径 46.8%/-0.55%（全量 218 条；139 子集 43.2%/-1.39%）。
 
 本模块提供：
@@ -24,18 +24,37 @@
   exec_t1_filled 成交部分如果按现价追入的 T+1 统计（低吸纪律的反事实基准）
   fill_rate      低吸价可成交比例；dixi_ev = 成交率×成交组均值（低吸纪律期望）
 
-数据源：本地历史日K线库（data/history_kline.db，baostock 前复权，无网络依赖），
+数据源：本地历史日K线库（data/history_kline.db，前复权，无网络依赖），
         T+N 按 rec_date 之后第 N 个交易日收盘价计算。
+
+复权口径校验（2026-11-01 新增）
+------------------------------
+推荐表里 `price` / `buy_price` 是**推荐当时的不复权实时价**，而日K库是**前复权序列**
+（因子锚定最新交易日）。两者直接相除，只要推荐日之后发生过除权除息，收益就会被算成
+一个不存在的暴跌——2026-11-01 诊断里的三条都被这个口径污染：
+  603629 利通电子 05-29 记 236.72、库内前复权 171.82 → 记账 T+1 −34.67%，
+  实际是不复权 240.73 → 216.66（一根跌停）≈ −8.5%。
+所以每一条先做比值校验 `db_close(rec_date) / rec_price`：
+  · 偏离 > 20% → `data_invalid=1`（主板单日涨跌停 ±10%，盘中漂移不可能到 20%，
+    只能是复权基准不一致或脏价）；
+  · 12%~20% → 该票在 rec_date 之后有除权记录才判无效，否则只标 `data_suspect`；
+  · 判无效的记录**不进入任何胜率/均值统计**，也不参与亏损黑名单（否则会误封票）。
+原值不删，仍原样返回，供追溯。
 """
 import json
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from app.config import KLINE_HISTORY_ENABLED, KLINE_HISTORY_DB_PATH
 from db.database import get_db_conn
 # 区间口径必须与卡片同源：复盘算的"扩展上沿"就是 buy_range 那一份算法，不能在这儿重写一遍
 from services.strategy.buy_range import buy_range, recent_volatility
+
+# 复权口径校验阈值（2026-11-01 定）。改动必须同时改模块 docstring 的三条实测样本，
+# 否则半年后没人知道 20% 这个数是怎么来的。
+ADJ_RATIO_HARD = 0.20   # 硬判：偏离超过 20% 一律 data_invalid
+ADJ_RATIO_SOFT = 0.12   # 软判：12%~20% 只有"期间有除权"才判无效，否则只标疑似
 
 
 def _local_history_conn():
@@ -56,6 +75,87 @@ def _fill_price(limit_price: float, next_open: Optional[float]) -> float:
     if next_open and next_open > 0 and next_open <= limit_price:
         return float(next_open)
     return float(limit_price)
+
+
+def _exdiv_index() -> Dict[str, List[str]]:
+    """除权事件索引 {裸码: [need_date...]}，来自 `kline_restate_queue`。
+
+    这张表只覆盖 2026-10-16 之后（每日收盘快照上线时才有写入口），
+    更早的除权事件查不到——所以它只用于**软判**的佐证，绝不作为判无效的必要条件。
+    """
+    out: Dict[str, List[str]] = {}
+    try:
+        hconn = _local_history_conn()
+    except Exception:
+        return out
+    try:
+        for code, need_date in hconn.execute(
+                'SELECT symbol, need_date FROM kline_restate_queue').fetchall():
+            out.setdefault((code or '').lower(), []).append(need_date or '')
+    except Exception:
+        return {}
+    finally:
+        hconn.close()
+    return out
+
+
+def _close_on_or_before(series: List[Tuple[str, float]], date_str: str) -> Tuple[Optional[str], Optional[float]]:
+    """在按日期升序的收盘序列里取 rec_date 当日或之前最近一根（二分，不逐条扫）。
+
+    推荐日当天有 K 线是常态；取不到当天就退到最近一根，由调用方按 gap 判库存缺失。
+    """
+    if not series:
+        return None, None
+    lo, hi = 0, len(series) - 1
+    best = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if series[mid][0] <= date_str:
+            best = series[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return (best[0], best[1]) if best else (None, None)
+
+
+def _mark_data_quality(rec: Dict, bar_date: Optional[str], bar_close: Optional[float],
+                       exdiv: Dict[str, List[str]], code: str) -> Dict:
+    """给一条复盘结果打复权口径标记（原地改 r 并返回）。
+
+    判据见模块 docstring：硬阈值 20%、软阈值 12%+除权佐证。所有偏离值都保留在
+    `price_ratio` 里，不因为判了无效就把比值藏起来——下次复核要能一眼看到偏离多少。
+    """
+    price = rec.get('rec_price')
+    anchor = price if isinstance(price, (int, float)) and price > 0 else rec.get('buy')
+    if not isinstance(anchor, (int, float)) or anchor <= 0 or not bar_close:
+        return rec
+    rec['adj_bar_date'] = bar_date
+    rec['price_ratio'] = round(float(bar_close) / float(anchor), 4)
+    dev = abs(rec['price_ratio'] - 1)
+    if dev > ADJ_RATIO_HARD:
+        rec['data_invalid'] = 1
+        rec['invalid_reason'] = 'adjust_mismatch'
+        return rec
+    if dev > ADJ_RATIO_SOFT:
+        # 只有 rec_date **之后**的除权才会让库内历史比推荐价低；当天的除权两边同口径
+        later = [d for d in (exdiv.get(code) or []) if d > (rec.get('date') or '')]
+        if later:
+            rec['data_invalid'] = 1
+            rec['invalid_reason'] = 'adjust_mismatch_exdiv'
+        else:
+            rec['data_suspect'] = 1
+        return rec
+    # 当天没有 K 线（停牌/补数缺口）时比值不可信，只标疑似，不剔除
+    if bar_date and bar_date != rec.get('date'):
+        try:
+            _gap = (datetime.strptime(rec['date'], '%Y-%m-%d')
+                    - datetime.strptime(bar_date, '%Y-%m-%d')).days
+        except (ValueError, TypeError):
+            _gap = 0
+        if _gap > 3:
+            rec['data_suspect'] = 1
+            rec['invalid_reason'] = ''
+    return rec
 
 
 def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
@@ -94,6 +194,8 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
                     f"WHERE symbol IN ({_ph}) ORDER BY symbol, date", tuple(codes)).fetchall():
                 if _close is not None:
                     series.setdefault(_code, []).append((_d, float(_close)))
+        # 复权口径校验用的除权索引：一次读 126 行，别放进逐条循环里查库
+        exdiv = _exdiv_index()
         for rec in recs:
             sym = (rec.get('symbol') or '').lower()
             code = sym.replace('sh', '').replace('sz', '').replace('bj', '')
@@ -113,6 +215,10 @@ def compute_recommendation_performance(recs: List[Dict]) -> List[Dict]:
             if not bars:
                 continue
             r = dict(rec)
+            # 复权口径校验必须**在算收益之前**打完标记：后面聚合与黑名单都按这个标记过滤，
+            # 不能让一条 −34% 的伪亏损先混进统计再被剔除（中间任何一次聚合都可能漏掉）。
+            _bd, _bc = _close_on_or_before(series.get(code) or [], rec['date'])
+            _mark_data_quality(r, _bd, _bc, exdiv, code)
             if has_buy:
                 r['r1'] = round((bars[0][2] / buy - 1) * 100, 2)
                 r['r3'] = round((bars[2][2] / buy - 1) * 100, 2) if len(bars) >= 3 else None
@@ -215,7 +321,17 @@ def _aggregate(perf: List[Dict]) -> Dict:
                      低吸纪律的反事实基准：两个数字的差就是"挂低吸"躲掉的诱多；
       fill_rate      低吸价可成交比例；dixi_ev=成交率×成交组均值，
                      即"挂低吸单"这条纪律的期望收益（未成交按 0，不幻想）。
+
+    2026-11-01 起先按复权口径过滤：`data_invalid=1` 的记录不进任何分项统计
+    （它们不是"差交易"，是"价钱都不是同一口径"，混进来只会污染胜负）。
+    被剔除的条数与疑似条数并列返回（n_all/n_invalid/n_suspect），不藏起来。
     """
+    n_all = len(perf)
+    # 疑似（12%~20% 且无除权佐证）保留在统计里，只是标出来；只有 data_invalid 剔除
+    perf = [r for r in perf if not r.get('data_invalid')]
+    n_invalid = n_all - len(perf)
+    n_suspect = sum(1 for r in perf if r.get('data_suspect'))
+
     def _stats_vals(vals):
         if not vals:
             return None
@@ -257,6 +373,14 @@ def _aggregate(perf: List[Dict]) -> Dict:
             and r.get('r1_dyn_fill') is not None]
     dds = [r['dd5'] for r in perf if r.get('dd5') is not None]
     return {
+        # 2026-10-30：补 n（记录条数）。此前 by_mode 聚合里没有这个键，
+        # 回测页"条数"列一直是空的（模板读 m.n 读到 undefined）。
+        # 2026-11-01：n 改为**有效条数**（已剔除 data_invalid），另给 n_all 供对账，
+        # 否则"剔了 3 条"这件事在页面上看不出来。
+        'n': len(perf),
+        'n_all': n_all,
+        'n_invalid': n_invalid,
+        'n_suspect': n_suspect,
         't1': _stats('r1'), 't3': _stats('r3'), 't5': _stats('r5'),
         'exec_t1': _stats('exec_r1'),
         't1_filled': t1_filled,
@@ -328,6 +452,9 @@ def run_recommendation_review() -> Dict:
     t1 = summary.get('t1') or {}
     tf = summary.get('t1_filled') or {}
     ex = summary.get('exec_t1') or {}
+    if summary.get('n_invalid'):
+        print(f"[推荐复盘] 复权口径校验剔除 {summary.get('n_invalid')} 条"
+              f"（另有疑似 {summary.get('n_suspect')} 条保留待核）")
     print(f"[推荐复盘] 全量{len(perf)}条: 纸面T+1 {t1.get('win_rate')}%/{t1.get('avg')}%"
           f" | 低吸单成交 {tf.get('win_rate')}%/{tf.get('avg')}%"
           f"(n={tf.get('n')}, 成交率{summary.get('fill_rate')}%, 纪律EV {summary.get('dixi_ev')}%)"
@@ -380,6 +507,10 @@ def get_loser_map(days: int = None, loss_threshold: float = None) -> Dict[str, D
     perf = compute_recommendation_performance(recs)
     today = datetime.now().date()
     for r in perf:
+        # 复权口径不一致的记录不进黑名单：利通电子 05-29 那条记账 −34.67% 会让它被误封 30 天，
+        # 而真实交易只是 −8.5%（一根跌停）。用脏价去封票，比不封更伤。
+        if r.get('data_invalid'):
+            continue
         r1 = r.get('r1')
         r3 = r.get('r3')
         worst, basis = None, ''
@@ -440,7 +571,10 @@ def get_review_summary(days: int = 30) -> Dict:
         return {'available': False, 'total': {}, 'recent': {}, 'recent_days': days,
                 'by_date': {}, 'by_mode': {}, 'worst': [], 'best': []}
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    recent = [r for r in perf if r['date'] >= cutoff]
+    # 复权口径无效的记录从"最近/最好/最差/模式榜"全部剔除；_aggregate 内部也会再滤一次，
+    # 这里先滤是为了 worst/best 与名次排序不吃脏价。
+    valid = [r for r in perf if not r.get('data_invalid')]
+    recent = [r for r in valid if r['date'] >= cutoff]
     by_date: Dict[str, List[Dict]] = {}
     for r in recent:
         by_date.setdefault(r['date'], []).append(r)
@@ -452,15 +586,43 @@ def get_review_summary(days: int = 30) -> Dict:
         from services.strategy.buy_rules import mode_label as _ml
     except Exception:
         _ml = lambda c: c or '其他'
-    for r in perf:
+    for r in valid:
         by_mode.setdefault(_ml(r.get('mode') or ''), []).append(r)
+
+    # 2026-10-30 借鉴"老王量化"组合榜：模式榜补运行天数与名次变化。
+    #   days      = 该模式出现过的日期数（不是记录条数——同一天有多个批次就多条）；
+    #   rank      = 按 T+1 胜率排名，只统计 T+1 样本 ≥5 的模式（样本太少的名次纯属噪声）；
+    #   rankDelta = 截至前一交易日算出的名次 - 当前名次，正数=名次上升（前端红▲绿▼）。
+    # 数据只有一天时 rankDelta 为 None，前端显示成"#N"不带箭头。
+    def _mode_rank(recs_by_mode: Dict[str, List[Dict]]) -> Dict[str, int]:
+        stats = {}
+        for m, v in recs_by_mode.items():
+            vals = [r['r1'] for r in v if r.get('r1') is not None]
+            if len(vals) >= 5:
+                stats[m] = sum(1 for x in vals if x > 0) / len(vals)
+        order = sorted(stats, key=lambda m: -stats[m])
+        return {m: i + 1 for i, m in enumerate(order)}
+
+    rank_now = _mode_rank(by_mode)
+    _latest = max((r['date'] for r in perf), default=None)
+    rank_prev = _mode_rank({m: [r for r in v if r['date'] < _latest]
+                            for m, v in by_mode.items()} if _latest else {})
+
+    def _mode_cell(v: List[Dict], mode: str) -> Dict:
+        agg = _aggregate(v)
+        agg['days'] = len({r['date'] for r in v})
+        agg['rank'] = rank_now.get(mode)
+        _prev = rank_prev.get(mode)
+        agg['rankDelta'] = (_prev - agg['rank']) if (_prev is not None and agg['rank'] is not None) else None
+        return agg
+
     return {
         'available': True,
         'total': _aggregate(perf),
         'recent': _aggregate(recent),
         'recent_days': days,
         'by_date': {d: _aggregate(v) for d, v in sorted(by_date.items(), reverse=True)},
-        'by_mode': {m: _aggregate(v) for m, v in sorted(
+        'by_mode': {m: _mode_cell(v, m) for m, v in sorted(
             by_mode.items(), key=lambda kv: -len(kv[1]))},
         'worst': sorted(recent, key=lambda x: x.get('r1') or 0)[:5],
         'best': sorted(recent, key=lambda x: -(x.get('r1') or 0))[:5],

@@ -3,7 +3,8 @@ import asyncio, schedule, time, threading
 from datetime import datetime, timedelta
 
 from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, REC_SIM_DAILY_TIME, SHADOW_EVAL_TIME, SHADOW_EVAL_MIN_DAYS, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
-                        KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS)
+                        KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS,
+                        KLINE_RESTATE_TIME, KLINE_RESTATE_LIMIT)
 
 from services.data.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
@@ -42,6 +43,11 @@ from app.config import WESTOCK_CROSSCHECK_TIME
 from app.config import EVAL_LAB_ENABLED, EVAL_LAB_TIME, EVAL_LAB_WEEKDAY
 from app.config import AUCTION_SNAPSHOT_ENABLED, AUCTION_SNAPSHOT_TIME, AUCTION_SNAPSHOT_BATCH
 from app.config import MINUTE5_FORWARD_ENABLED, MINUTE5_FORWARD_TIME
+# 盘中龙头通道（2026-11-01）：默认关，影子期只落库不推送
+from app.config import (INTRADAY_DRAGON_ENABLED, INTRADAY_DRAGON_START,
+                        INTRADAY_DRAGON_END, INTRADAY_DRAGON_INTERVAL_SEC,
+                        INTRADAY_DRAGON_RATE_GOVERNOR_ON,
+                        INTRADAY_DRAGON_SHADOW)
 
 
 # 盘后数据自检的告警去重：同一天+同一"库内最新日期"只轰一次，否则每轮重跑都发一条
@@ -348,7 +354,7 @@ def run_scheduler():
     def job_generate_recommendations():
         if not _today_is_trading():
             return
-        asyncio.run(auto_generate_recommendations_task())
+        asyncio.run(auto_generate_recommendations_task(source='schedule'))
 
     def job_recommend_review():
         """智能推荐复盘（本地K线库计算，无网络依赖，非交易日也可跑）"""
@@ -408,6 +414,65 @@ def run_scheduler():
             print(f'[板块持续性] 计算完成：{n} 个行业板块入库')
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 板块持续性预热失败: {e}')
+
+    def job_theme_sync():
+        """主题篮子收盘落库（2026-10-31，10-31 晚改为动态链）。
+
+        链不再是固定的机器人/商业航天/算力，而是 `hot_chains` 按财联社板块榜每天选出的
+        涨停数/涨幅前 3 热门板块（见 services/ops/hot_chains.py）。两条顺序不能反：
+        ① 先按当日板块榜重建链（15:10 `cls_plate` 已落库，这里非盘中优先读库，零外部请求）；
+        ② 再逐链把成分当日 OHLC 落 theme_member_daily——链里创业板/科创板本地日K
+        停更在 10-15/10-16，只能靠腾讯批量行情的交易所昨收逐日续写。
+
+        排 15:12（板块榜落库后 2 分钟，行情已定格）与 15:47（失败重试一次）；两个点都只在
+        交易日跑，sync_today 内部还有 15:02 时段闸门。动态链重建失败时保留上一次的链，
+        并用它继续落库，不会出现"今天没有主题卡"。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            from services.ops import hot_chains
+            n = hot_chains.refresh(force=True)
+            print(f'[动态链] 收盘重建 {n} 条链')
+        except Exception as e:
+            print(f'[动态链] 收盘重建失败（沿用上一次的链）: {e}')
+        try:
+            import asyncio as _aio
+            from services.ops.theme_index import sync_today, active_ids
+            ids = active_ids()
+            total = 0
+            for tid in ids:
+                try:
+                    total += _aio.run(sync_today(tid))
+                except Exception as error:
+                    print(f'[主题温度] {tid} 落库失败: {error}')
+            print(f'[主题温度] 收盘落库 {total} 行（{len(ids)} 条链）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 主题温度落库失败: {e}')
+
+    def job_cls_ladder_sync():
+        """财联社四池 + 板块榜落库（2026-10-31，影子/展示兜底）。
+
+        15:10 收盘定版抓一次，15:45 再抓一次当重试（接口偶发 503）。只交易日跑。
+        四池与东财涨停池口径不同（10-30：财联社 49 / 本地 51，47 只重合），只落
+        财联社自己的原始字段；板块榜（行业 54 / 概念 398）同时落 `cls_plate_daily`，
+        供资金流页概念板块与收评板块轮动兜底。两者都只展示，不进选股。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            import asyncio as _aio
+            from services.ops.cls_pool import sync_today as _cls_sync
+            saved = _aio.run(_cls_sync())
+            print(f'[财联社梯队] 收盘落库 {saved} 行')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 财联社梯队落库失败: {e}')
+        try:
+            from services.ops.cls_plate import sync_today as _plate_sync
+            plates = _plate_sync()
+            print(f'[财联社板块] 收盘落库 {plates} 行')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 财联社板块落库失败: {e}')
 
     def job_shadow_eval_daily():
         """影子对照日常监控（2026-10-18，实施计划"工具：影子对照脚本"）：
@@ -556,7 +621,7 @@ def run_scheduler():
             return
         print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前推荐快照：开始最终生成...')
         try:
-            asyncio.run(auto_generate_recommendations_task())
+            asyncio.run(auto_generate_recommendations_task(source='pre_close'))
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘前快照生成异常: {e}')
         # 落库校验
@@ -578,7 +643,8 @@ def run_scheduler():
 
     def job_update_holder_num():
         # 股东人数是月度数据；2026-10-19 降频：接口取的是"最新一期"，一期披露后内容不再变，
-        # 每天重拉全市场 ~50 页只是把同样的行搬一遍，而东财 datacenter 正是 IP 风控的来源。
+        # 每天重拉全市场 ~12 页（pageSize=500；旧表 100 条/页要 50+ 页）只是把同样的行搬一遍，
+        # 而东财 datacenter 正是 IP 风控的来源。
         # 非刷新日直接退出（一行日志，零请求）；财报季自动恢复每日。原注释"非交易日也可拉取"
         # 的意图保留：刷新日不看是否交易日，周末披露的公告照样能在下一个刷新日入库。
         if not _slow_data_due(SLOW_DATA_HOLDER_NUM_WEEKDAYS):
@@ -793,15 +859,54 @@ def run_scheduler():
         # 完全依赖这张表，而 ST 帽子是随时戴随时摘的 —— 名录过期就等于范围失效。
         # 单独一段 try，且放在新鲜度自检之前：它失败只让范围变旧，不该拖住日K同步的结论。
         try:
-            from sync_stock_basic import sync as sync_stock_names
-            n = sync_stock_names()
-            if n < 0:
-                print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步失败（ST 判定可能过期）')
+            # 2026-10-31 修：`from sync_stock_basic import sync` 从来就没成功过（模块在
+            # server/scripts/ 下，不在 sys.path 里），每天只往日志里写一条 ImportError，
+            # stock_basic_full 的 fetched_at 停在 2026-10-16 —— 而范围里"剔除 ST/*ST"
+            # 全靠这张表。改为按文件路径加载（与 shadow_eval / westock_crosscheck 同法）。
+            import os as _os
+            import importlib.util as _ilu
+            from services.data.kline_history import ban_cooldown_remaining
+            left = ban_cooldown_remaining()
+            if left > 0:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 股票名录同步跳过：'
+                      f'baostock 仍在冷却（剩 {int(left)} 分钟），不为名录续封')
+            else:
+                _dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+                _spec = _ilu.spec_from_file_location(
+                    'sync_stock_basic', _os.path.join(_dir, 'scripts', 'sync_stock_basic.py'))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                n = _mod.sync()
+                if n == -2:
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] 股票名录同步跳过（baostock 冷却）')
+                elif n < 0:
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步失败（ST 判定可能过期）')
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步异常: {e}')
         # 只有最后一个重试时刻还没等到数据才算真失败（16:05 那种"baostock 还没出当天EOD"
         # 不是故障，半夜叫警报只会让人以为系统坏了）
         _alert_kline_stale(sync_err, final=datetime.now().strftime('%H:%M') >= KLINE_HISTORY_SYNC_LAST)
+
+    def job_restate_queue():
+        """消费除权重算队列（2026-11-01）。
+
+        这张表以前只有入口没有出口：收盘快照发现"腾讯昨收 ≠ 库内最后一根"就写一行，
+        注释说"交给 baostock 逐只重灌"，可 baostock 10-16 就被拉黑了 —— 11-01 翻出来时
+        126 只票的 done 全是 NULL，等于 126 只除权票的历史前复权序列一直停在旧因子上，
+        跨除权日的 T+N 收益全是假数（诊断文档里 −34% 的"极端亏损"就是这么来的）。
+
+        放在 21:30：晚于 18:15~20:15 五轮日K同步，夜里腾讯限流压力也最小。
+        每晚最多 KLINE_RESTATE_LIMIT 只，处理不完的留在队里等下一晚；
+        `restate_one` 自己会回验（连续两根与腾讯不一致就不写库、保持 done=NULL）。
+        """
+        try:
+            from services.data import restate_queue
+            st = restate_queue.run(limit=KLINE_RESTATE_LIMIT)
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 除权重算：成功 {st["ok"]}（无需调整 {st["noop"]}）、'
+                  f'跳过 {st["skip"]}、失败 {st["fail"]}，改 {st["rows"]} 根K线'
+                  + (f'｜⚠️ {st["aborted"]}' if st.get('aborted') else ''))
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 除权重算异常: {type(e).__name__}: {e}')
 
     def job_matrix_rerun():
         """一次性把买法四张表重跑成"选股范围 2462 只"口径（用户 2026-10-16 选定：冷却结束后自动跑）。
@@ -945,6 +1050,10 @@ def run_scheduler():
         for _t in KLINE_HISTORY_SYNC_TIMES:
             schedule.every().day.at(_t).do(_warp_trading_only(job_sync_history))
 
+    # 除权重算队列消费（2026-11-01）：排在五轮日K同步之后，每晚最多 KLINE_RESTATE_LIMIT 只。
+    # 不挂交易日门控：周末/节假日跑也是在还旧账（队列里只有收盘快照发现的除权票）。
+    schedule.every().day.at(KLINE_RESTATE_TIME).do(job_restate_queue)
+
     # 总市值表每周刷新（2026-10-16）：选票/K线/分时线据此剔除 <35亿 小微盘，防量化操控；非交易日也跑
     getattr(schedule.every(), MARKET_CAP_REFRESH_WEEKDAY).at(MARKET_CAP_REFRESH_TIME).do(job_refresh_market_cap)
 
@@ -953,6 +1062,14 @@ def run_scheduler():
 
     # 买法矩阵按"选股范围 2462"重跑（一次性，跑成功写标记后自动不再触发）；非交易日也要跑
     schedule.every().day.at(MATRIX_RERUN_TIME).do(job_matrix_rerun)
+
+    # 主题篮子收盘落库（2026-10-31）：15:12 在板块榜(15:10)之后重建动态链并落成分日K，
+    # 15:47 失败重试一次（仅交易日）。盘中跟随见主循环的 hot_chains.tick()。
+    schedule.every().day.at("15:12").do(job_theme_sync)
+    schedule.every().day.at("15:47").do(job_theme_sync)
+    # 财联社题材梯队（2026-10-31，影子）：15:10 收盘定版落库，15:45 跟着主题链一起重试
+    schedule.every().day.at("15:10").do(job_cls_ladder_sync)
+    schedule.every().day.at("15:45").do(job_cls_ladder_sync)
 
     # 企业微信选股推送：开盘前 9:25 推送今日关注池预览（仅交易日）
     schedule.every().day.at(WECOM_PUSH_PREVIEW_TIME).do(job_push_daily_preview)
@@ -1016,7 +1133,15 @@ def run_scheduler():
           f'达标候选股实时推送企业微信（仅交易日；范围=用户池∪推荐池，日限 '
           f'{WECOM_PUSH_DAILY_LIMIT} 只）')
     print(f'[定时任务]   - 盘中 09:15~15:05 每180秒: 短线情绪温度计刷新（涨停池/炸板池/跌停池/宽度→周期+主线板块，仅交易日）')
-    print(f'[定时任务]   - 盘中 {POSITION_WATCH_START}~{POSITION_WATCH_END} 每{POSITION_WATCH_INTERVAL_SEC}秒: 持仓止损/止盈/炸板快反推送（仅交易日，避开竞价与午休）\n')
+    print(f'[定时任务]   - 盘中 09:40~15:05 每300秒: 动态热门板块链跟随（财联社板块榜→行动台前3链，仅交易日）')
+    print(f'[定时任务]   - 15:12 / 15:47: 重建动态链 + 主题链成分当日OHLC落库（板块榜15:10之后，仅交易日）')
+    print(f'[定时任务]   - 盘中 {POSITION_WATCH_START}~{POSITION_WATCH_END} 每{POSITION_WATCH_INTERVAL_SEC}秒: 持仓止损/止盈/炸板快反推送（仅交易日，避开竞价与午休）')
+    print(f'[定时任务]   - 盘中 {INTRADAY_DRAGON_START}~{INTRADAY_DRAGON_END} 每{INTRADAY_DRAGON_INTERVAL_SEC}秒: '
+          f'龙头通道分钟级形态打分（仅交易日；'
+          f'{"已启用" if INTRADAY_DRAGON_ENABLED else "默认关"}，'
+          f'{"影子落库不推送" if INTRADAY_DRAGON_SHADOW else "推送已开"}；'
+          f'频率熔断{"已接（20s 基准 / 失败率>5%退60s / 连败3次熔断300s）" if INTRADAY_DRAGON_RATE_GOVERNOR_ON else "默认关（保持现行 15s）"}；'
+          f'主循环 10s 一轮，实际节奏约 20s）\n')
 
     # 自愈机制：schedule 库的 .day.at() 可能在 60s 间隔下漏触发（run_pending 恰好跳过目标分钟），
     # 主循环每 30s 额外检查：交易日 15:10 后若今日收评仍缺失则自动补生成，最多重试 3 次
@@ -1033,6 +1158,11 @@ def run_scheduler():
     _last_watch_ts = 0.0
     # 盘中情绪刷新：主循环预热，避免用户第一次打开页面时现打接口
     _last_sentiment_ts = 0.0
+    # 盘中动态链跟随（2026-10-31）：财联社板块榜变了就重建"今日热门板块前 3"，
+    # 行情窗口内每 5 分钟看一次（TTL 判定在 hot_chains 内部，未到点直接返回）
+    _last_chain_ts = 0.0
+    # 盘中龙头通道（2026-11-01）：独立于 60s 主推送，开盘后 09:31~10:15 用更密的节奏看形态
+    _last_dragon_ts = 0.0
 
     while True:
         try:
@@ -1055,6 +1185,31 @@ def run_scheduler():
                         asyncio.run(push_candidates_task())
                     except Exception as push_err:
                         print(f'[定时任务 {_now:%H:%M:%S}] 选股推送异常: {push_err}')
+
+            # ---- 盘中龙头通道（2026-11-01，默认关；T2.7 接频率状态机）----
+            # 与上面的 60s 主推送完全分开：只做分钟级形态打分，影子期写 intraday_dragon_shadow。
+            # 关掉时整块不进入、一个请求都不发；单独 try 隔离，任何异常不拖累主推送与自愈。
+            # T2.7：间隔与熔断由 dragon_risk.due() 决定——开关关＝现行 15s；开关开＝20s 基准，
+            # 失败率 >5% 退 60s，连续 3 次失败熔断 300s；熔断期不进、也不刷新 _last_dragon_ts。
+            if INTRADAY_DRAGON_ENABLED:
+                _dragon_due = False
+                try:
+                    from services.pick import dragon_risk as _dr
+                    _dragon_due = _dr.due(_hm, _today_is_trading(), _last_dragon_ts,
+                                          time.time())['due']
+                except Exception as _dr_err:
+                    # 节奏判定自己坏了就退回改造前 15s，别让风控层拖住整条通道
+                    print(f'[定时任务 {_now:%H:%M:%S}] 龙头节奏判定异常（退回 15s）: {_dr_err}')
+                    _dragon_due = (_today_is_trading()
+                                   and INTRADAY_DRAGON_START <= _hm <= INTRADAY_DRAGON_END
+                                   and time.time() - _last_dragon_ts >= INTRADAY_DRAGON_INTERVAL_SEC)
+                if _dragon_due:
+                    _last_dragon_ts = time.time()
+                    try:
+                        from services.pick.intraday_dragon import run_scan as run_dragon_scan
+                        run_dragon_scan()
+                    except Exception as dragon_err:
+                        print(f'[定时任务 {_now:%H:%M:%S}] 龙头通道异常: {dragon_err}')
 
             # ---- 盘中情绪刷新（2026-10-14，仅交易日 9:15~15:05）----
             # 主循环主动预热：情绪分是选股门槛/环境档位/快反文案的共同上游，
@@ -1088,6 +1243,18 @@ def run_scheduler():
                                  if _mm else f"无主线：{(_m.get('none') or {}).get('reason','')}"))
                 except Exception as _ml_err:
                     print(f'[主线 {_now:%H:%M:%S}] 预热失败: {_ml_err}')
+
+            # ---- 盘中动态链跟随（2026-10-31，仅交易日 9:40~15:05）----
+            # 行动台的"今日热门板块"按财联社板块榜动态选，盘中榜变了链也要跟着变；
+            # hot_chains 自己按 TTL(盘中300s) 判重，主循环只负责按时戳叫醒它，不阻塞。
+            if (_hm >= '09:40' and _hm <= '15:05' and _today_is_trading()
+                    and time.time() - _last_chain_ts >= 300):
+                _last_chain_ts = time.time()
+                try:
+                    from services.ops import hot_chains
+                    hot_chains.tick()
+                except Exception as _chain_err:
+                    print(f'[动态链 {_now:%H:%M:%S}] 盘中跟随失败: {_chain_err}')
 
             # ---- 持仓快反推送（2026-10-14，止损/止盈不等用户打开页面）----
             # 时窗/交易日/午休判定在 watch_all_users 内部再做一次，这里只控频率。

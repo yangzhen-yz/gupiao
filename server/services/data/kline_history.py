@@ -337,7 +337,7 @@ class HistoryKlineEngine:
                         print(f"[历史K线] 重连第{attempt + 1}次失败，10s×{attempt + 2} 后重试")
                     if not ok:
                         aborted = '重连多次失败，终止回填'
-                        print(f"[历史K线] ⚠️ {aborted}")
+                        print(f"[历史K线] 告警 {aborted}")
                         break
                     since_reconnect = 0
                 # 进度日志（每 200 只）
@@ -355,7 +355,8 @@ class HistoryKlineEngine:
         return {"success": success, "skipped": skipped, "failed": failed, "written": written,
                 "aborted": aborted}
 
-    def sync_today_bulk(self, end_date: Optional[str] = None) -> int:
+    def sync_today_bulk(self, end_date: Optional[str] = None,
+                        fill_dates: Optional[List[str]] = None) -> int:
         """每日增量：对本地已有股票，从各自 last_date+1 补到 end_date（默认今天，前复权）。
 
         2026-10-15 深夜重写过，原因有两条实测教训：
@@ -367,6 +368,16 @@ class HistoryKlineEngine:
            现在两条路同一套口径，且同步清单先过选股范围（主板 + 非ST/退 + 市值≥下限）。
 
         end_date：指定要补到哪个交易日（用于补昨天漏掉的一天），None=今天。
+        fill_dates：2026-11-02 新增。**按日期点名回填**，判定改成"这一天在不在"，
+            而不是"这只票的最新日期到没到"。原来的判定有个静默缺陷：某天的同步整批漏掉
+            （机器关机/被限流）之后，第二天起每只票的 max(date) 都已经越过那个洞，
+            于是它永远不会被回填——这个缺陷是真的，保留。
+            但触发它的那次排查结论是错的：11-02 白天以为"2026-10-31 全市场 0~5 只"
+            是个洞，晚上 21:38 单进程点名回填跑满 2464 只、写入 0 条、失败 0 只，
+            第二天核对发现 **10-31 是周六**，交易日历判非交易日，全库从来没有过周末的行
+            （`select distinct date … weekday()>=5` 返回 0 条）。所以现在 fill_dates
+            会先过一遍 trading_calendar，非交易日直接跳过并说明，绝不为了一个不存在的洞
+            去做 2464 次查询 + 3~4 次登录（baostock 的登录频率本身就是风控信号）。
         """
         import socket
         import baostock as bs
@@ -389,16 +400,45 @@ class HistoryKlineEngine:
         local = [(s, d) for (s, d) in local if s in _scope]
         # 计算每只的待补区间
         tasks = []
-        for symbol, last_date in local:
-            if last_date and last_date >= end_str:
-                continue
-            start = end_str
-            if last_date:
-                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-            tasks.append((symbol, start, end_str))
+        dropped: List[str] = []
+        if fill_dates:
+            from services.data.trading_calendar import is_calendar_covered, is_trading_day
+            # 非交易日先剔掉：baostock 对周末/节假日返回"成功但 0 行"，而这里的判定是
+            # "这一天在不在"，于是会对全市场 2464 只各发一次查询、登录 3~4 次，438 秒
+            # 全部空转（2026-11-02 21:38 实测，点名回填 2026-10-31=周六）。
+            # 登录频率本身就是 baostock 的风控信号，这种空转不只是浪费。
+            real = []
+            for d in sorted(set(fill_dates)):
+                if is_calendar_covered(d) and not is_trading_day(d):
+                    print(f"[历史K线] 点名回填跳过 {d}：交易日历判定为非交易日，库里本来就不该有")
+                    dropped.append(d)
+                    continue
+                real.append(d)
+            for d in real:
+                have = self._symbols_on(d)
+                todo = [s for s, _ in local if s not in have]
+                print(f"[历史K线] 点名回填 {d}：已有 {len(have)} 只，待补 {len(todo)} 只")
+                tasks += [(s, d, d) for s in todo]
+            fill_dates = real
+        else:
+            for symbol, last_date in local:
+                if last_date and last_date >= end_str:
+                    continue
+                start = end_str
+                if last_date:
+                    start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+                tasks.append((symbol, start, end_str))
 
         if not tasks:
-            print(f"[历史K线] 所有股票已是最新（补到 {end_str}），无需增量更新")
+            if dropped:
+                # 点名回填的日期全被判成非交易日，这里必须说清楚，别让"都已齐"冒充成功
+                why = f'点名回填的 {",".join(dropped)} 都被判为非交易日，未发起任何 baostock 查询'
+            elif fill_dates:
+                why = '点名回填的日期都已齐'
+            else:
+                why = '所有股票已是最新（补到 %s）' % end_str
+            print(f"[历史K线] {why}，无需增量更新")
+            self.coverage_report()
             return 0
 
         lg = bs.login()
@@ -459,9 +499,10 @@ class HistoryKlineEngine:
             except Exception:
                 pass
         if aborted:
-            print(f"[历史K线] ⚠️ 增量同步中断 → {aborted}")
+            print(f"[历史K线] 告警 增量同步中断 → {aborted}")
         print(f"[历史K线] 增量同步{ '中断' if aborted else '完成' } → 补到 {end_str}：{total} 只待补，"
               f"写入 {written} 条，失败 {failed} 只，耗时 {int(time.time() - t0)}s")
+        self.coverage_report()
         return written
 
     def _fetch_one_bs(self, symbol: str, start: str, end: str, max_retries: int = 3) -> Optional[List[Tuple]]:
@@ -655,6 +696,73 @@ class HistoryKlineEngine:
         return self._get_conn().execute(
             "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
         ).fetchall()
+
+    def _symbols_on(self, day: str) -> set:
+        """某天在本地库里有日线的股票集合（点名回填用它判"缺不缺这一天"）。"""
+        rows = self._get_conn().execute(
+            "SELECT symbol FROM stock_daily WHERE date=?", (day,)).fetchall()
+        return {r[0] for r in rows}
+
+    def coverage_report(self, recent_days: int = 20) -> List[Tuple[str, int]]:
+        """最近 N 个交易日的覆盖只数 + "整日缺失"检查。
+
+        同步完顺手打一遍，查两件事：
+
+        1. **矮柱子**：库里出现了这一天但只数明显低于峰值（<90%）——当天同步部分失败；
+        2. **整日缺失**（2026-11-02 补）：交易日历说是交易日，库里却一整天没有行。
+           只看"库里出现过的日期"永远看不见这种洞，10-31 那次就是这么误判的（见下）。
+
+        2026-11-02 实测更正：**2026-10-31 是周六、非交易日**，`stock_daily` 里
+        从来没有过周末的行（全库 0 条），所谓"10-31 全市场 0 只"不是漏同步而是本来就不交易。
+        但"整批漏掉一天、第二天起每只票的 max(date) 都已越过那个洞"的判定缺陷是真的，
+        所以 `fill_dates` 与本报告都保留，只是都要先过一遍交易日历。
+        """
+        from services.data.trading_calendar import is_calendar_covered, is_trading_day
+
+        conn = self._get_conn()
+        days = [r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT ?",
+            (recent_days,)).fetchall()]
+        out = []
+        for d in sorted(days):
+            n = conn.execute("SELECT count(DISTINCT symbol) FROM stock_daily WHERE date=?",
+                             (d,)).fetchone()[0]
+            out.append((d, n))
+        if len(out) >= 3:
+            # 基线用**中位**而不是最大值：窗口里混着 10-16 之前的宽口径日子（5222 只），
+            # 拿它当峰值会把 10-19 之后每一天真叫"覆盖不足"——2026-11-02 自测实锤。
+            # 中位正好落在"现行选股范围"那一档，矮柱子才是真的矮。
+            ns = sorted(n for _, n in out)
+            base = ns[len(ns) // 2]
+            holes = [d for d, n in out if n < base * 0.9]
+            if holes:
+                print(f"[历史K线] 告警 近 {recent_days} 个交易日里有 {len(holes)} 天覆盖不足 "
+                      f"（窗口中位 {base} 只，缺口日 {holes[:5]}{'…' if len(holes) > 5 else ''}）"
+                      f"，用 `--mode sync --fill-dates 日期` 点名回填")
+        # 整日缺失：以最新一天为右端，往回取 recent_days 个"日历上的交易日"，看库里在不在。
+        # 只在库已覆盖到的区间里查（min(days) 之前不算缺失），否则新库回填到一半
+        # 会把"还没回填的历史"报成"漏同步的洞"。
+        if days:
+            newest = max(days)
+            oldest = min(days)
+            cur = date.fromisoformat(newest)
+            expect, guard = [], 0
+            while len(expect) < recent_days and guard < recent_days * 4:
+                guard += 1
+                if cur.strftime('%Y-%m-%d') < oldest:
+                    break
+                if is_calendar_covered(cur) and is_trading_day(cur):
+                    expect.append(cur.strftime('%Y-%m-%d'))
+                cur -= timedelta(days=1)
+            missing = [d for d in expect if d not in set(days)]
+            if missing:
+                print(f"[历史K线] 告警 近 {len(expect)} 个交易日里 {len(missing)} 天一天都没有："
+                      f"{sorted(missing)[:5]}（库里整日缺，用 "
+                      f"`--mode sync --fill-dates {','.join(sorted(missing))}` 补）")
+            elif expect:
+                print(f"[历史K线] 覆盖自检：近 {len(expect)} 个交易日一天不缺，"
+                      f"最少一天 {min(out, key=lambda x: x[1])[0]} 有 {min(n for _, n in out)} 只")
+        return out
 
 
 _VOL_MAP_CACHE: Dict[str, object] = {'ts': 0.0, 'bars': 0, 'map': {}}

@@ -12,7 +12,7 @@
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, time as _dtime, timedelta
 from typing import (Dict, List, Optional)
 
 import requests
@@ -27,6 +27,7 @@ from app.config import (
 )
 from db.database import load_hot_search_ranking, save_fund_flow_snapshot, load_fund_flow_snapshot
 from services.data.stock import has_delisting_risk  # 复用 ST/退市 基础过滤
+from services.data.trading_calendar import is_trading_day  # 休市快照"定版"判据
 
 import re as _re     # 行业名去国标码用（见 _clean_industry）
 
@@ -679,6 +680,22 @@ async def _sina_sector_rankings(top_n: int) -> Optional[Dict]:
     return {'industry': {'inflow': inflow, 'outflow': outflow}, 'concept': {'inflow': [], 'outflow': []}}
 
 
+async def _cls_sector_rankings(top_n: int) -> Optional[Dict]:
+    """财联社板块榜兜底（2026-10-31）：补东财被风控时缺的概念板块。
+
+    新浪只能给行业（本地分类聚合），概念板块一直没有源；财联社板块榜一次请求
+    就有行业 54 / 概念 398 的涨幅、主力净流入、涨跌家数与涨停数（`services/ops/cls_plate`）。
+    调用方只在新浪之后用它补概念；新浪也不可用时行业再用它兜底。
+    财联社分类与东财/申万不是一套，数值不可混算（行里带 source='cls'）。
+    """
+    try:
+        from services.ops import cls_plate
+        return await asyncio.to_thread(cls_plate.sector_rankings, top_n)
+    except Exception as error:
+        print(f'[资金流向] 财联社板块兜底失败: {error}')
+        return None
+
+
 def _in_trading_window() -> bool:
     """粗判盘中（周一~周五 9:15-15:05）。收盘后已有快照的区块不再请求东财。"""
     now = datetime.now()
@@ -686,6 +703,31 @@ def _in_trading_window() -> bool:
         return False
     hm = now.hour * 60 + now.minute
     return (9 * 60 + 15) <= hm <= (15 * 60 + 5)
+
+
+def _snapshot_final(ts: float) -> bool:
+    """快照是否已是「最近一个交易日的收盘定版」——是就不必按 2 小时龄期重算。
+
+    2026-10-31：休市分支原先只按 2 小时龄期判新鲜度，周末/夜间每过 2 小时就
+    把新浪全市场排行重算一遍（实测首开约 15s，资金流页停在"加载"）。但休市期间
+    数据不会再变，重算出来的还是同一份收盘数据。
+
+    判据：ts 不早于「最近一个交易日 15:05」。最近交易日 = 今天（交易日且已过
+    15:05），否则往前找最近的交易日。周五中午的临时快照不算定版 —— 周末第一次
+    打开仍会补算一次，把缺掉的午后两小时补齐；补算后的快照自然满足定版条件。
+    """
+    if not ts:
+        return False
+    now = datetime.now()
+    day = now.date()
+    if not (is_trading_day(day) and (now.hour * 60 + now.minute) >= 15 * 60 + 5):
+        day -= timedelta(days=1)
+        for _ in range(30):          # 防御：日历异常时不至于死循环
+            if is_trading_day(day):
+                break
+            day -= timedelta(days=1)
+    close_ts = datetime.combine(day, _dtime(15, 5)).timestamp()
+    return ts >= close_ts
 
 
 def _cache_key(stock_top_n, sector_top_n, change_threshold, hot_top_n, hidden_top_n) -> str:
@@ -858,7 +900,7 @@ async def get_fund_flow_summary(
         # "收盘后就用快照"的前提是**这份快照是今天的**。10-19 东财 clist 被封一整天，
         # 页面从 08:51 起就一直停在旧数据上（用户截图看到的正是这个），而新浪排行
         # 只要 4 个请求就能拿到今天已经定型的数 —— 收盘后数据不再变，这次补算成本几乎为零。
-        fresh_snap = has_snap and (now - ts) <= _STALE_AFTER_SEC
+        fresh_snap = has_snap and ((now - ts) <= _STALE_AFTER_SEC or _snapshot_final(ts))
         # 注意这里**不看 cooling**：熔断关的是东财那条路，新浪排行不是东财。
         # 10-19 实测：加了 `and not cooling` 之后，"东财被封"反而变成"页面彻底不动"——
         # 冷却期越长（现在起步 30 分钟、指数退避到 4 小时）页面就越旧，正好把兜底废掉。
@@ -902,24 +944,65 @@ async def get_fund_flow_summary(
                     _mark('stocks', src_stocks, ts)
     await asyncio.sleep(0.25)
 
-    # ---- 板块排名三级回退：东财（2 次）→ 新浪+本地行业聚合 → 历史快照 ----
+    # ---- 板块排名回退：东财（2 次）→ 新浪×本地行业聚合 + 财联社概念 → 历史快照 ----
+    async def _merge_cls(base: Optional[Dict]) -> Optional[Dict]:
+        """在已有行业基础上用财联社补概念；base 为空时行业也取财联社。
+
+        新浪只覆盖行业（概念无本地分类）。有行业时绝不拿财联社行业替换，
+        保持主线的行业口径稳定（mainline 只读 industry）。
+        """
+        cl = await _cls_sector_rankings(sector_top_n)
+        if not cl:
+            return None
+        con = cl.get('concept') or {}
+        have_con = bool(con.get('inflow') or con.get('outflow'))
+        base_ind = ((base or {}).get('industry') or {})
+        ind = base_ind if (base_ind.get('inflow') or base_ind.get('outflow')) else (cl.get('industry') or {})
+        have_ind = bool(ind.get('inflow') or ind.get('outflow'))
+        if not have_con and not (base_ind.get('inflow') or base_ind.get('outflow')) and not have_ind:
+            return None
+        # 已有行业、财联社又没概念可补：不合并（避免无意义地改写来源标记）
+        if not have_con and (base_ind.get('inflow') or base_ind.get('outflow')):
+            return None
+        return {'industry': ind or {'inflow': [], 'outflow': []},
+                'concept': con or {'inflow': [], 'outflow': []}}
+
     src_sectors = 'none'
     if closed:
         d, ts = _lg_data(lg_sectors, {})
-        has_snap = bool(d and ((d.get('industry') or {}).get('inflow')
-                               or (d.get('concept') or {}).get('inflow')))
-        ok_snap = has_snap and (now - ts) <= _STALE_AFTER_SEC
-        if not ok_snap:
+        has_ind = bool(d and (d.get('industry') or {}).get('inflow'))
+        has_con = bool(d and (d.get('concept') or {}).get('inflow'))
+        fresh = has_ind and ((now - ts) <= _STALE_AFTER_SEC or _snapshot_final(ts))
+        if fresh:
+            sectors, src_sectors = d, 'snapshot'
+            _mark('sectors', src_sectors, ts)
+            if not has_con:
+                # 旧快照只有行业（新浪时代概念恒空）：只补财联社概念，行业与时间戳都不动，
+                # 不把旧行业数据标成新的。
+                _m = await _merge_cls(d)
+                if _m and ((_m.get('concept') or {}).get('inflow')
+                           or (_m.get('concept') or {}).get('outflow')):
+                    sectors, src_sectors = _m, 'snapshot+cls'
+                    _LAST_GOOD['sectors'] = {'data': _m, 'ts': ts}
+                    save_fund_flow_snapshot('sectors', {'data': _m, 'ts': ts})
+                    print('[资金流向] 板块快照只有行业 → 财联社补概念（行业沿用快照）')
+        else:
             _sb = await _sina_sector_rankings(sector_top_n)
             if _sb and (_sb.get('industry') or {}).get('inflow'):
                 sectors, src_sectors = _sb, 'sina'
-                _LAST_GOOD['sectors'] = {'data': _sb, 'ts': now}
-                save_fund_flow_snapshot('sectors', {'data': _sb, 'ts': now})
-                print('[资金流向] 收盘后板块快照缺失/过期 → 新浪×本地行业聚合补算'
-                      '（概念板块无本地分类，仍缺）')
-        if src_sectors == 'none' and has_snap:
-            sectors, src_sectors = d, 'snapshot'
-            _mark('sectors', src_sectors, ts)
+                print('[资金流向] 收盘后板块快照缺失/过期 → 新浪×本地行业聚合补算')
+            _m = await _merge_cls(sectors if src_sectors != 'none' else None)
+            if _m:
+                sectors = _m
+                src_sectors = 'cls' if src_sectors == 'none' else 'sina+cls'
+                print('[资金流向] 板块概念部分来自财联社')
+            if src_sectors != 'none':
+                _LAST_GOOD['sectors'] = {'data': sectors, 'ts': now}
+                save_fund_flow_snapshot('sectors', {'data': sectors, 'ts': now})
+            elif bool(d and ((d.get('industry') or {}).get('inflow')
+                             or (d.get('concept') or {}).get('inflow'))):
+                sectors, src_sectors = d, 'snapshot'
+                _mark('sectors', src_sectors, ts)
     else:
         if not cooling:
             try:
@@ -936,9 +1019,15 @@ async def get_fund_flow_summary(
             _sb = await _sina_sector_rankings(sector_top_n)
             if _sb and (_sb.get('industry') or {}).get('inflow'):
                 sectors, src_sectors = _sb, 'sina'
-                print('[资金流向] 板块排名使用新浪+本地行业聚合兜底（东财不可用，概念板块暂缺）')
-                _LAST_GOOD['sectors'] = {'data': _sb, 'ts': now}
-                save_fund_flow_snapshot('sectors', {'data': _sb, 'ts': now})
+                print('[资金流向] 板块行业使用新浪+本地行业聚合兜底（东财不可用）')
+            _m = await _merge_cls(sectors if src_sectors != 'none' else None)
+            if _m:
+                sectors = _m
+                src_sectors = 'cls' if src_sectors == 'none' else 'sina+cls'
+                print('[资金流向] 板块概念部分来自财联社')
+            if src_sectors != 'none':
+                _LAST_GOOD['sectors'] = {'data': sectors, 'ts': now}
+                save_fund_flow_snapshot('sectors', {'data': sectors, 'ts': now})
             else:
                 d, ts = _lg_data(lg_sectors, {})
                 if d:
@@ -951,7 +1040,7 @@ async def get_fund_flow_summary(
     src_hidden = 'none'
     if closed:
         d, ts = _lg_data(lg_hidden, [])
-        fresh = bool(d) and (now - ts) <= _STALE_AFTER_SEC
+        fresh = bool(d) and ((now - ts) <= _STALE_AFTER_SEC or _snapshot_final(ts))
         if not fresh:
             _hg = await _sina_hidden_gems(change_threshold, hot_top_n, hidden_top_n)
             if _hg:
@@ -990,9 +1079,14 @@ async def get_fund_flow_summary(
 
     # 龄期判定：本轮现取的（sina/eastmoney）时间就是 now；只有快照可能是旧的。
     for _b, _src in (('stocks', src_stocks), ('sectors', src_sectors), ('hidden', src_hidden)):
-        if _src in ('sina', 'eastmoney'):
+        # cls / sina+cls 也是本轮现取；snapshot+cls 的行业仍来自快照，时间由 _mark 记过，不覆盖
+        if _src not in ('none', 'snapshot'):
             block_ts.setdefault(_b, now)
-    stale_blocks = [b for b, t in block_ts.items() if t and (now - t) > _STALE_AFTER_SEC]
+    # 定版快照（最近交易日收盘后取的）只在**休市时**不算"旧"——周末/夜间打开页面
+    # 不该标黄；盘中仍要标：盘中用的是上一个交易日的收盘数据，就是旧数据。
+    stale_blocks = [b for b, t in block_ts.items()
+                    if t and (now - t) > _STALE_AFTER_SEC
+                    and not (closed and _snapshot_final(t))]
     # `stale` 只跟着**个股那一块**走 —— 它是这页的主口径；其余旧块由 staleBlocks 点名。
     # dataTs 取最旧那一块（"这页里最旧的东西是什么时候的"）。
     if block_ts:

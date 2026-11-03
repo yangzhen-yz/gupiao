@@ -37,7 +37,8 @@ from app.config import (SENTIMENT_ENABLED, SENTIMENT_REFRESH_TTL_SEC,
                         SENTIMENT_VETO_MIN_WEAK_SIGNALS, SENTIMENT_VETO_AFTER_MIN,
                         SENTIMENT_LADDER_COLLAPSE_RATE, SENTIMENT_LEADER_FAIL_CHANGE,
                         SENTIMENT_LADDER_MIN_BASE, CYCLE_RULES,
-                        SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC)
+                        SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC,
+                        SENTIMENT_ALT_FALLBACK)
 from db.database import get_db_conn
 from services.ops.review import (_em_zt_pool_get, _em_zb_pool_get, _em_batch_change_percent,
                              _fetch_market_breadth, _calc_lianban_ladder,
@@ -214,6 +215,64 @@ def _relay_stats(today_zt_pool: List[Dict], yest_pool: List[Dict],
     return stats
 
 
+def _alt_collect(now: datetime) -> Optional[Dict]:
+    """东财冷却/涨停池失败时的新浪备源口径（sentiment_alt，2026-11-03 接线）。
+
+    备源能给的：涨停/跌停家数（剔 ST）、涨跌家数（市场宽度，带 5 分钟 TTL）。
+    备源给不了的：连板梯队（lbc）、封板质量（fund/ltsz/zbc）、炸板池、昨日涨停溢价——
+    这些维度置缺，快照如实标 gap 并 stale（只提示不否决，与硬约束 2 一致）。
+    只在交易时段被调（_sync_collect 内部），同步阻塞成本可接受（冷路径 15~50s 在线程里）。
+    """
+    if not SENTIMENT_ALT_FALLBACK:
+        return None
+    try:
+        from services.data import sentiment_alt
+        lc = sentiment_alt.limit_counts()
+        bd = sentiment_alt.market_breadth()
+    except Exception as e:
+        print(f'[情绪] 新浪备源取数失败: {e}')
+        return None
+    if not lc or lc.get('limitUp') is None:
+        return None
+    zt_n = int(lc.get('limitUp') or 0)
+    dt_n = int(lc.get('limitDown') or 0)
+    breadth = {'riseCount': bd.get('riseCount'), 'fallCount': bd.get('fallCount'),
+               'riseFallRatio': None}
+    if breadth['riseCount'] is not None and breadth['fallCount'] is not None:
+        f = int(breadth['fallCount'] or 0)
+        breadth['riseFallRatio'] = round(breadth['riseCount'] / f, 2) if f > 0 else 99.0
+    ladder = {'maxLianban': None, 'lianbanGe3': None, 'lianbanEq2': None, 'firstBoard': None}
+    gaps = ['东财冷却/失败，启用新浪备源：连板梯队/炸板/昨日涨停溢价三维缺数据',
+            f'备源口径：已剔除 ST/*ST（剔 ST {int(lc.get("stExcluded", {}).get("zt") or 0)} 涨停 / '
+            f'{int(lc.get("stExcluded", {}).get("dt") or 0)} 跌停）']
+    sent = _calc_sentiment_cycle(limit_up_count=zt_n,
+                                 limit_down_count=dt_n,
+                                 breadth=breadth, ladder=ladder,
+                                 zhaban_count=None, yesterday_premium=None)
+    return {
+        'asOf': now.isoformat(timespec='seconds'),
+        'date': now.strftime('%Y-%m-%d'),
+        # 备源缺了三 维，不给否决权：接口降级不该被当成“确认退潮”而清空买入区
+        'stale': True,
+        'source': 'alt_source',
+        'final': False,
+        'dataGaps': gaps,
+        'cycle': sent['cycle'],
+        'cycleScore': sent['cycleScore'],
+        'advice': sent['advice'],
+        'detail': sent['detail'],
+        'weakSignals': list(sent.get('weakSignals') or []),
+        'indicators': dict(sent.get('indicators') or {},
+                          **{'limitUpCount': zt_n,
+                             'limitDownCount': dt_n,
+                             'zhabanCount': None}),
+        'leadSectors': [],
+        'failedLeaders': [],
+        'rule': CYCLE_RULES.get(sent['cycle'], {}),
+        'minScore': SENTIMENT_MIN_SCORE.get(sent['cycle'], 60),
+    }
+
+
 def _sync_collect() -> Dict:
     """同步取数（调用方用 asyncio.to_thread 包）：4 类东财请求 + 昨日溢价批量行情
 
@@ -240,9 +299,12 @@ def _sync_collect() -> Dict:
             return fb
         return _empty_snapshot(f'非交易时段({phase or "未知"})')
 
-    # 2) 东财熔断中：不硬打。优先沿用当日最近盘中快照，其次才退收评——
+    # 2) 东财熔断中：不硬打。先试新浪备源（sentiment_alt），再退快照/收评——
     #    直接退收评会把昨天的连板高度/炸板率当成今天的（2026-10-23 6板显示5板即此因）。
     if _em_guard().skip('clist'):
+        alt = _alt_collect(now)
+        if alt:
+            return alt
         fb = _fallback_snapshot(now)
         if fb:
             return fb
@@ -273,8 +335,11 @@ def _sync_collect() -> Dict:
         _em_guard().ok('clist')
     else:
         _em_guard().fail('clist')
-        # 涨停池重试后仍为空：不要拿 0 涨停算出一个假的"冰点"周期。
-        # 先退当日最近盘中快照，再退收评；两者都带 stale，只提示不拦。
+        # 涨停池重试后仍为空：不要拿 0 涨停算出一个假的“冰点”周期。
+        # 先试新浪备源，再退当日最近盘中快照，最后退收评；两者都带 stale，只提示不拦。
+        alt = _alt_collect(now)
+        if alt:
+            return alt
         fb = _fallback_snapshot(now)
         if fb:
             return fb

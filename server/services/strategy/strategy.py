@@ -2,7 +2,7 @@
 import asyncio
 from typing import List, Dict, Optional
 from datetime import date, timedelta
-from app.config import (STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_TREND_STALE_DRIFT, RECOMMEND_TREND_STALE_FACTOR, TREND_GATE_ENABLED, TREND_GATE_LOW_SCORE, TREND_GATE_MIN_CHANGE, DEAD_CAT_BOUNCE_PENALTY)
+from app.config import (STRATEGY_BULL_THRESHOLD, STRATEGY_BEAR_THRESHOLD, STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_SCORE_THRESHOLDS, STRATEGY_SCORE_VALUES, STRATEGY_WEBI_VERIFY, STRATEGY_MAIN_FORCE_SWEEP, STRATEGY_MAIN_FORCE_CONTROL, STRATEGY_PE_FILTER, STRATEGY_LABEL_THRESHOLDS, DEFAULT_WEIGHTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, STRATEGY_INDUSTRY_NEUTRAL_MIN_SAMPLE, STRATEGY_INDUSTRY_P80_BONUS, STRATEGY_INDUSTRY_P20_PENALTY, TREND_LIMIT_UP_THRESHOLD, RECOMMEND_TREND_STALE_DRIFT, RECOMMEND_TREND_STALE_FACTOR, TREND_GATE_ENABLED, TREND_GATE_LOW_SCORE, TREND_GATE_MIN_CHANGE, DEAD_CAT_BOUNCE_PENALTY, STRATEGY_ZERO_SAMPLE_EXCLUDE)
 from db.database import (get_db_conn, load_strategy_factor_weights, save_strategy_factor_weights, save_predictions)
 # 2026-10-14：IC 权重学习开关（bug 修复后默认先影子，见 config 注释）
 from app.config import FACTOR_WEIGHT_LEARNING_ENABLED
@@ -464,26 +464,44 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     else:
         base_scores['position'] = 10
 
-    # 应用动态权重
-    total = 0
-    for factor, base_score in base_scores.items():
-        w = weights.get(factor, {}).get('weight', 1.0)
-        total += base_score * w
-
-    # 归一化到100分（动态计算各因子满分总和，支持因子扩展）
-    # ：从 8 因子扩展到 9 因子（新增 main_capital_inflow），硬编码改为动态计算
+    # 应用动态权重 + 归一化到 100 分（动态计算各因子满分总和，支持因子扩展）
     # 2026-07-08 修复：归一化公式从 sum(max)*avg(w) 改为正确的 sum(max[f]*w[f])
-    # 原公式当高权重因子满分值低时会高估 max_possible，导致所有评分被系统性压低
     def _factor_max(f: str) -> float:
         """从 STRATEGY_SCORE_VALUES 提取该因子的最大档位分值"""
         vals = STRATEGY_SCORE_VALUES.get(f, {})
         # 过滤掉非数值的 key（如 'no_data'）后取最大
         numeric_vals = [v for v in vals.values() if isinstance(v, (int, float))]
         return max(numeric_vals) if numeric_vals else 0
-    max_possible = sum(_factor_max(f) * weights.get(f, {}).get('weight', 1.0) for f in base_scores)
-    if max_possible > 0:
-        total = round(total / max_possible * 100)
-    total = min(100, max(0, total))
+
+    # ====== 修②（2026-11-03，影子）：零样本三因子从归一化分母摘掉 ======
+    # rps/fundamental/smart_money 三因子的数据源从未产出过样本（strategy_factor_weights
+    # 里 sample_count=0），每只票都吃 no_data 中档分，却占归一化分母 ~29%：
+    # 分子 +21×w、分母 +40×w，等效于把所有票的总分系统性压低三成。
+    # 摘掉 = 该票这三因子无真实数据时，不进分子（no_data 分也不加）也不进分母；
+    # 有真实数据照旧参与。独立开关 STRATEGY_ZERO_SAMPLE_EXCLUDE 默认关（逐字节等于现状）；
+    # 影子臂 alt_total 恒算（纯算术零 IO），随 score dict 进 recommendation_batches.stocks_json
+    # 留痕，供 20 个交易日后按可成交净期望 + 最深回撤裁决。
+    # 注意：alt_total 不含行业中性化后处理（industryAdjust 只改主链 total），对照时已知此口径差。
+    _ZERO_SAMPLE_FACTORS = ('rps', 'fundamental', 'smart_money')
+    _zs_has_data = {
+        'rps': rps_value is not None,
+        'fundamental': fund_roe is not None and fund_yoy is not None,
+        'smart_money': sm_info is not None,
+    }
+
+    def _aggregate(exclude_zero_sample: bool) -> int:
+        items = list(base_scores.items())
+        if exclude_zero_sample:
+            items = [(f, v) for f, v in items
+                     if not (f in _ZERO_SAMPLE_FACTORS and not _zs_has_data[f])]
+        num = sum(v * weights.get(f, {}).get('weight', 1.0) for f, v in items)
+        den = sum(_factor_max(f) * weights.get(f, {}).get('weight', 1.0) for f, _ in items)
+        if den > 0:
+            num = round(num / den * 100)
+        return min(100, max(0, num))
+
+    total = _aggregate(STRATEGY_ZERO_SAMPLE_EXCLUDE)
+    alt_intraday = _aggregate(not STRATEGY_ZERO_SAMPLE_EXCLUDE)
 
     label = ''
     
@@ -526,39 +544,49 @@ def calc_stock_score_v2(data: Dict, weights: Dict = None, market_change: float =
     # 属"下跌中继反弹"，日内动量分(change_percent/outer_ratio等)不可信，融合前打折，
     # 避免反弹股凭单日暴涨在纯日内口径下反超趋势良好股。
     dead_cat_bounce = False
-    if trend_score is not None:
-        if TREND_GATE_ENABLED and 0 < trend_score < TREND_GATE_LOW_SCORE and change_percent >= TREND_GATE_MIN_CHANGE:
-            dead_cat_bounce = True
-            intraday_score = round(intraday_score * (1 - DEAD_CAT_BOUNCE_PENALTY))
-        if trend_score == 0:
-            # 趋势评分=0 意味着股票被强制排除（ST/利空/RSI超买等），
-            # 轻度折价而非直接拉到 0
-            total = round(intraday_score * 0.7)
-        else:
-            # 自适应权重：根据大盘涨跌幅动态调整
-            if market_change > 0.5:
-                trend_weight = 0.6   # 牛市：趋势分更可信
-            elif market_change < -0.5:
-                trend_weight = 0.4   # 熊市：日内分更敏感
+
+    def _fuse(v_intraday: float) -> int:
+        """融合趋势分（主链与影子臂 alt_total 共用同一套口径，2026-11-03 抽出）"""
+        nonlocal dead_cat_bounce
+        v = v_intraday
+        if trend_score is not None:
+            if TREND_GATE_ENABLED and 0 < trend_score < TREND_GATE_LOW_SCORE and change_percent >= TREND_GATE_MIN_CHANGE:
+                dead_cat_bounce = True
+                v = round(v * (1 - DEAD_CAT_BOUNCE_PENALTY))
+            if trend_score == 0:
+                # 趋势评分=0 意味着股票被强制排除（ST/利空/RSI超买等），
+                # 轻度折价而非直接拉到 0
+                v = round(v * 0.7)
             else:
-                trend_weight = 0.5   # 震荡：均衡
-            total = round(intraday_score * (1 - trend_weight) + trend_score * trend_weight)
-        total = min(100, max(0, total))
-        # 融合后重新判定标签和方向
-        if total >= strong_bull_threshold:
-            label = '强烈看涨'
-        elif total >= label_bull_threshold:
-            label = '偏多看涨'
-        elif total >= 45:
-            label = '震荡观望'
-        elif total >= 30:
-            label = '偏空看跌'
-        else:
-            label = '强烈看跌'
-        predict_direction = 'bull' if total >= bull_threshold else 'bear' if total < STRATEGY_BEAR_THRESHOLD else 'neutral'
+                # 自适应权重：根据大盘涨跌幅动态调整
+                if market_change > 0.5:
+                    trend_weight = 0.6   # 牛市：趋势分更可信
+                elif market_change < -0.5:
+                    trend_weight = 0.4   # 熊市：日内分更敏感
+                else:
+                    trend_weight = 0.5   # 震荡：均衡
+                v = round(v * (1 - trend_weight) + trend_score * trend_weight)
+        return min(100, max(0, v))
+
+    total = _fuse(intraday_score)
+    # 影子臂（修②）：摘掉零样本分母后的同一套融合，随 score dict 进批次留痕供对照
+    alt_total = _fuse(alt_intraday)
+    # 融合后重新判定标签和方向
+    if total >= strong_bull_threshold:
+        label = '强烈看涨'
+    elif total >= label_bull_threshold:
+        label = '偏多看涨'
+    elif total >= 45:
+        label = '震荡观望'
+    elif total >= 30:
+        label = '偏空看跌'
+    else:
+        label = '强烈看跌'
+    predict_direction = 'bull' if total >= bull_threshold else 'bear' if total < STRATEGY_BEAR_THRESHOLD else 'neutral'
 
     return {
         'total': total,
+        'alt_total': alt_total,           # 修②影子臂：零样本三因子摘分母后的同口径总分
         'label': label,
         'predict_direction': predict_direction,
         'base_scores': base_scores,
@@ -708,6 +736,31 @@ async def _get_next_day_change_from_kline(symbol: str, pred_date: str) -> Option
         return None
 
 
+def _rec_verify_use_kline() -> bool:
+    """预测验证走哪个口径取"次日涨跌"（2026-11-03 修①，覆盖表 `rec_verify_use_kline` 热改）。
+
+    True（默认）＝与补验路径同一口径：从 K 线取"严格晚于预测日的第一根"算次日涨跌。
+    False＝回到改造前的实时行情口径（`actual_change_map`），逐字节等于旧行为。
+
+    为什么要换：旧口径取的是**调用那一刻**的实时涨跌。15:20 定时跑没问题；但这个函数还有
+    一个 `POST /api/strategy/backtest`（"手动触发回测验证"）的直接入口，**没有交易日守卫**，
+    周末/节假日或非次日时段再调一次时，腾讯的 changePercent 仍是上一个交易日的，于是把
+    "预测日自己"的涨跌写成了"次日"涨跌。实测 2410 条已验证记录里 **167 条（6.9%）对不上
+    "次日收盘"**：93 条等于预测日自己当天的涨跌（集中在周五的 predict_date：06-05/06-26/
+    07-03/07-17），35 条与前后任何一根都对不上（盘中快照值），39 条跨多根歧义（平盘/窄幅）。
+    这些行同时喂给准确率统计与因子权重学习，是"分数与收益脱节"里最不该有的那部分噪声。
+    判据自测 `analysis_out/verify_kline_selftest.py`。
+    """
+    try:
+        from services.support import app_settings
+        if 'rec_verify_use_kline' in [s['key'] for s in app_settings.SPEC]:
+            return bool(app_settings.value('rec_verify_use_kline'))
+    except Exception:
+        pass
+    import app.config as _cfg
+    return bool(getattr(_cfg, 'REC_VERIFY_USE_KLINE', True))
+
+
 async def backtest_yesterday_predictions() -> Dict:
     """回溯验证未验证的预测，计算准确率，调整权重
     
@@ -770,6 +823,14 @@ async def backtest_yesterday_predictions() -> Dict:
                            WHERE predict_date=? AND symbol=?''',
                         (actual_change, actual_dir, 1 if is_correct else 0, ud, pred['symbol'])
                     )
+                    # 锁外等待（2026-11-03）：写完这条立刻提交，把 WAL 写锁交还出去。
+                    # 原来整个补验循环共用一个事务：第一条 UPDATE 起就一直持锁，而循环里
+                    # 每只票还要 await 一次 _get_next_day_change_from_kline（外部源拿不到时
+                    # 一等都是几十秒）。实测 2026-11-03 16:51:08 的"定时任务自愈"补跑把
+                    # server/gupiao.db 的写锁连续占了 1 小时以上——gupiao.db-wal 停在
+                    # 16:22:25 之后没再前进，全库写排队 busy_timeout=30000 超时，
+                    # 页面请求出现 8~30 秒抖动甚至直接超时。
+                    conn.commit()
                     backfilled_count += 1
                 except Exception:
                     continue
@@ -836,6 +897,8 @@ async def backtest_yesterday_predictions() -> Dict:
                          json.dumps(misjudge_analysis, ensure_ascii=False),
                          json.dumps([], ensure_ascii=False))
                     )
+                    # 报告也即写即提交，把锁交还出去；理由见上面补验 UPDATE 处的注释
+                    conn.commit()
         
         if backfilled_count > 0:
             print(f'[回测] 补验了 {backfilled_count} 条历史未验证预测（日期：{", ".join(unverified_dates)}）')
@@ -879,10 +942,13 @@ async def backtest_yesterday_predictions() -> Dict:
             pass
 
         # 性能优化（2026-07-02）：收集所有未验证的 symbols，一次性批量拉取行情（消除 N+1）
+        # 修①（2026-11-03）：默认口径改成"K 线次日"，此时**不再拉这批实时行情**（省一次全量请求）；
+        # 开关关掉时下面的批量拉取与改造前完全一致。
+        _verify_kline = _rec_verify_use_kline()
         unverified_preds = [p for p in predictions if not (p['verified'] and p['actual_change'] is not None)]
         unverified_symbols = list({p['symbol'] for p in unverified_preds})
         actual_change_map: Dict[str, float] = {}
-        if unverified_symbols:
+        if unverified_symbols and not _verify_kline:
             # 分批拉取（每批最多100只）
             _b_size = 100
             async def _fetch_batch(syms):
@@ -942,11 +1008,20 @@ async def backtest_yesterday_predictions() -> Dict:
                 actual_dir = pred['actual_direction'] if pred['actual_direction'] else ('bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral')
                 is_correct = bool(pred['is_correct'])
             else:
-                # 性能优化（2026-07-02）：从 actual_change_map 取值，不再 N+1 await
-                actual_change = actual_change_map.get(symbol.lower(), 0)
-                # 2026-07-08 修复：停牌/零涨跌的股票也跳过（changePercent=0 几乎一定是数据异常）
-                if symbol.lower() not in actual_change_map or actual_change == 0:
-                    continue  # 拉取失败或停牌的跳过
+                if _verify_kline:
+                    # 修①：与补验路径同一口径（K 线里严格晚于预测日的第一根）。
+                    # 取不到就**不写**，留给下一轮或补验——绝不拿"当天/盘中快照"冒充次日收盘。
+                    # 代价：这里恢复成逐只 await（每只命中当天 kline_cache，日预测 ≤29 条），
+                    # 换掉的是 2026-07-02 那次为省请求做的批量实时行情。
+                    actual_change = await _get_next_day_change_from_kline(symbol, yesterday)
+                    if actual_change is None or actual_change == 0:
+                        continue
+                else:
+                    # 性能优化（2026-07-02）：从 actual_change_map 取值，不再 N+1 await
+                    actual_change = actual_change_map.get(symbol.lower(), 0)
+                    # 2026-07-08 修复：停牌/零涨跌的股票也跳过（changePercent=0 几乎一定是数据异常）
+                    if symbol.lower() not in actual_change_map or actual_change == 0:
+                        continue  # 拉取失败或停牌的跳过
 
                 actual_dir = 'bull' if actual_change > 0 else 'bear' if actual_change < 0 else 'neutral'
                 is_correct = predict_dir == actual_dir
@@ -957,6 +1032,9 @@ async def backtest_yesterday_predictions() -> Dict:
                        WHERE predict_date=? AND symbol=?''',
                     (actual_change, actual_dir, 1 if is_correct else 0, yesterday, symbol)
                 )
+                # 同上：修①（2026-11-03）之后这里也变成逐只 await K 线，写完即提交，
+                # 别让日预测这 ≤29 条全部压在同一个持锁事务里
+                conn.commit()
 
             verified_count += 1
             if is_correct:

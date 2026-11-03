@@ -76,6 +76,20 @@ def _spawn_hot_scan_refresh(cache_key: str, codes_raw: str, pool_only: bool):
             print(f'[批量扫描] 后台刷新失败（旧缓存保留）: {e}')
     threading.Thread(target=_run, daemon=True, name='hot-scan-refresh').start()
 
+
+def _scan_as_of_json(payload, as_of_ts: float):
+    """扫描结果统一出口：附 X-Scan-As-Of = 这份数据是什么时候算出来的。
+
+    2026-10-30 陈旧兜底上线后，"读取于 14:00:00"（前端客户端时钟）和
+    "数据是 13:52 算的"（陈旧缓存）可能是两回事——老王量化那行"延迟 309 秒"
+    治的就是这种误导。响应体结构不变（仍是裸数组），只多一个响应头。
+    """
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=payload,
+        headers={'X-Scan-As-Of': datetime.fromtimestamp(as_of_ts).strftime('%H:%M')})
+
+
 # ========== 扫描宇宙扩展（2026-08-31 选股策略优化） ==========
 # 背景：原「股票筛选」只扫前端传入的用户自选池（通常 20~30 只），覆盖面窄。
 #       而趋势扫描已覆盖 ~477 只，热搜榜有全市场最活跃的 ~600 只。
@@ -524,41 +538,6 @@ async def get_stocks(symbols: str):
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"批量获取失败: {str(error)}")
 
-def attach_rec_count_shadow(records) -> int:
-    """给"当日推荐只数 ≠ 满编"的那些天挂一个**影子标注**字段，返回标注条数。
-
-    来历（2026-10-27）：用户提出「回测曲线里所有模式，当推荐数量不等于 3 时说明当天行情不好，
-    当天推荐一律不采纳（盘中低吸、次日交易都算），直接空仓」。按这个判据把 2026-06-01 起
-    82 个交易日离线复算，**方向与预期相反**：不足 3 只的 17 天（26 条样本）次日开盘买持 3/5 日
-    +1.22%/+0.71%、胜率 60%，满 3 只的 65 天反而 1/3/5 日全负（−0.60%/−2.24%/−4.04%）。
-    所以这一层**只标注、不拦截**——把现场留在页面上，等样本攒够 ≥60 对再裁决要不要真上线。
-
-    关掉 `rec_below_full_shadow_label` 时一个字段都不下发，前端也就不会多出任何 DOM：
-    关掉的代价严格等于改造前。复算脚本 `server/analysis_out/rec_count_vs_winrate.py`
-    （该目录被 .gitignore 排除，不在版本控制里）。
-    """
-    from services.support import app_settings as A
-    if not bool(A.value('rec_below_full_shadow_label')):
-        return 0
-    full = int(A.value('recommend_full_pick_count') or 3)
-    hit = 0
-    for record in records or []:
-        stocks = record.get('daily_recommendations') or record.get('stocks') or []
-        n = len(stocks)
-        if n == full:
-            continue
-        record['shadow'] = {
-            'count': n, 'full': full,
-            'label': f'本日 {n} 只（满编 {full}）· 影子观察',
-            'note': (f'你定的规则：只数≠{full} 的当天不采纳、直接空仓。当前只做标注，不拦截任何动作。'
-                     '82 个交易日离线复算方向相反：不足 3 只那 17 天次日开盘买持 3/5 日 +1.22%/+0.71%'
-                     '（胜率 60%），满 3 只的 65 天 1/3/5 日全负（−0.60%/−2.24%/−4.04%）。'
-                     '样本仅 26 条，±5pp 内是噪声，攒够 ≥60 对样本外再裁决。'),
-        }
-        hit += 1
-    return hit
-
-
 async def _build_daily_recs_payload() -> Dict:
     """实际构建"历史推荐记录 + 实时盈亏"响应体（原 get_daily_recommendations 函数体抽出）
 
@@ -656,12 +635,6 @@ async def _build_daily_recs_payload() -> Dict:
                         pass
                 if buy_price > 0:
                     s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
-
-    try:
-        attach_rec_count_shadow(daily_recommendations)
-    except Exception as _e:
-        # 标注这层挂了不能连累推荐数据本身（历史上"影子层拖垮主链路"是踩过的坑）
-        print(f'[历史推荐] 只数影子标注没接上（不影响推荐数据）: {_e}')
 
     return {"success": True, "data": daily_recommendations}
 
@@ -1504,9 +1477,15 @@ async def sim_generate_api(payload: Dict, user: Dict = Depends(current_user)):
     """从信号源生成建议订单。body: {sources:[...], symbols:[...]}"""
     try:
         from services.portfolio.trade_sim import generate_proposals
+        from asyncio import wait_for as _wait_for
         sources = payload.get('sources') or ['tomorrow_plan', 'diagnosis', 'screener']
         symbols = payload.get('symbols') or None
-        return await generate_proposals(user['id'], sources, symbols)
+        # 2026-11-03 修复：整体加 25s 硬超时兜底，超时返回 504 而非让前端干等/无限挂起。
+        # 前端已放宽到 30s，这里更紧，保证后端先响应。
+        return await _wait_for(
+            generate_proposals(user['id'], sources, symbols), timeout=25)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="生成耗时过长（已触发超时保护），请稍后重试")
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"生成建议失败: {str(error)}")
 
@@ -1563,7 +1542,7 @@ async def post_daily_recommendations(record: Dict):
         else:
             daily_recommendations.insert(0, record)
         
-        saved = save_daily_recommendations(daily_recommendations)
+        saved = save_daily_recommendations(daily_recommendations, source='api')
         
         if saved:
             _invalidate_daily_recs_cache()      # 写后清档，避免旧档多显示一轮
@@ -2002,10 +1981,10 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         if not _compute_now and _cached:
             _age = _now_ts - _cached['ts']
             if _age < _HOT_SCAN_CACHE_TTL:
-                return _cached['data']
+                return _scan_as_of_json(_cached['data'], _cached['ts'])
             if _age < _HOT_SCAN_STALE_MAX:
                 _spawn_hot_scan_refresh(cache_key, codes, pool_only)
-                return _cached['data']
+                return _scan_as_of_json(_cached['data'], _cached['ts'])
         
         # 2026-07-08 修复：取消 100 只截断，支持全量扫描
         # 原 codes_list[:100] 导致 80% 股票未被扫描
@@ -2263,8 +2242,9 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         print(f'[批量扫描] 完成: {len(response)} 只, 耗时 {(time.time() - t0):.1f}s')
 
         # 2026-08-31 性能优化：写入内存缓存（TTL 15s），下次轮询直接命中
-        _HOT_SCAN_CACHE[cache_key] = {'ts': time.time(), 'data': response}
-        return response
+        _ts_now = time.time()
+        _HOT_SCAN_CACHE[cache_key] = {'ts': _ts_now, 'data': response}
+        return _scan_as_of_json(response, _ts_now)
     except Exception as error:
         print(f'批量扫描失败: {str(error)}')
         raise HTTPException(status_code=502, detail=f"扫描失败: {str(error)}")
@@ -2472,6 +2452,66 @@ async def get_action_desk_api(phase: str = '', user: Dict = Depends(current_user
     except Exception as error:
         print(f'[行动台API] 错误: {str(error)}')
         raise HTTPException(status_code=500, detail=f"生成行动台数据失败: {str(error)}")
+
+@router.get("/api/theme-index", tags=["今日行动台"])
+async def get_theme_index_api(theme: str = 'auto', days: int = 0, user: Dict = Depends(current_user)):
+    """主题篮子温度（2026-10-31）。只做"现在有多热 + 是否已走坏"，不做顶底预测。
+
+    theme=auto（默认）：先算齐所有链，返回近 5 日最强的那条，并在 chains 里带各链摘要；
+    theme=<id>：指定链。2026-10-31 起链由 `hot_chains` 按财联社板块榜每天动态选出，
+    所以 id 是板块代码（如 cls80014），固定链 robot/space/compute 只在动态链不可用时兜底。
+    days>0 时把返回的序列裁到最近 N 个交易日；默认 120。行情只在盘中相位拉，
+    其它时段直接读本地日K与 theme_member_daily（有内存缓存，60s/600s）。
+    """
+    from services.ops import theme_index
+    theme = (theme or 'auto').strip().lower()
+    if theme != 'auto' and not theme_index.known(theme):
+        raise HTTPException(status_code=400, detail=f"未知主题: {theme}")
+    try:
+        data = await theme_index.snapshot(theme, live=True)
+        if days and data.get('series'):
+            data = {**data, 'series': data['series'][-max(1, min(days, 250)):]}
+        return {"success": True, "data": data}
+    except Exception as error:
+        print(f'[主题温度API] 错误: {str(error)}')
+        raise HTTPException(status_code=500, detail=f"生成主题温度失败: {str(error)}")
+
+
+@router.get("/api/cls-ladder", tags=["今日行动台"])
+async def get_cls_ladder_api(user: Dict = Depends(current_user)):
+    """财联社题材梯队（2026-10-31，影子）：四池 + 看盘头部 + 板块榜。
+
+    只展示，不进选股评分/买入门槛/推送。外部接口 0.6~0.9s，盘中 60s / 休市 600s 缓存；
+    失败时回退上一次成功快照，并带 stale 标记。网页接口不支持历史日期，只能逐日留档。
+    """
+    from services.ops import cls_pool
+    try:
+        return {"success": True, "data": await cls_pool.snapshot(live=True)}
+    except Exception as error:
+        backup = cls_pool.peek(86400) or cls_pool.peek_from_db()
+        if backup:
+            return {"success": True, "data": {**backup, 'stale': True, 'error': str(error)[:120]}}
+        print(f'[财联社梯队API] 错误: {str(error)}')
+        raise HTTPException(status_code=503, detail=f"财联社梯队暂不可用: {str(error)}")
+
+
+@router.get("/api/cls-plate-stocks", tags=["收评"])
+async def get_cls_plate_stocks_api(code: str, user: Dict = Depends(current_user)):
+    """财联社板块成分股（2026-10-31，收评「板块轮动」弹窗用）。
+
+    只接受 clsXXXXX（东财 BK 代码走原有 `/eastmoney/...` 代理）；按涨跌幅降序，最多 60 只。
+    财联社不提供换手率，这里不造该字段，前端按“有则显示”处理。
+    """
+    from services.ops import cls_plate
+    try:
+        rows = await asyncio.to_thread(cls_plate.members, code, 60)
+        return {"success": True, "data": rows}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        print(f'[财联社板块成分API] 错误: {str(error)}')
+        raise HTTPException(status_code=503, detail=f"财联社板块成分暂不可用: {str(error)}")
+
 
 @router.get("/api/kline/{symbol}", tags=["K线数据"])
 async def get_kline(symbol: str):

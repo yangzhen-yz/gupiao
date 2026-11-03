@@ -1,4 +1,71 @@
 """app - FastAPI 应用实例、中间件、生命周期"""
+
+# ── 运行期日志编码兜底（2026-11-02）────────────────────────────────────────
+# 本机看护把进程 stdout 重定向进 server/server_supervised.log，而那条管道是按 **GBK**
+# 建的（日志里 GBK 与 UTF-8 混排就是证据）。后果不是"难看"而是"任务被日志打死"：
+# 全仓 32 处运行期 print 里有 ⚠️/⚠ 这类 GBK 编不出的字符，实锤一例——`[推荐模式]`
+# 的接力票告警自 10-26 起抛 UnicodeEncodeError 16 次（'gbk' can't encode '\u26a0'），
+# 连带把后面的标签汇总日志一起吞了。盘后/盘中任务最怕失败得看不见，所以在应用入口
+# 一次性把 stdout/stderr 收到 UTF-8 + errors='replace'：**任何一条日志都不该再把它的
+# 调用方打死**。只在探测到 GBK 家族编码时动手，别人显式配了 UTF-8 就不越权。
+# 回滚：删掉本块即可（各 print 恢复原行为）。
+try:
+    import sys as _sys
+
+    def _make_log_utf8_safe() -> None:
+        for _name in ('stdout', 'stderr'):
+            _s = getattr(_sys, _name, None)
+            if _s is None or not hasattr(_s, 'reconfigure'):
+                continue
+            _enc = (getattr(_s, 'encoding', '') or '').lower().replace('-', '').replace('_', '')
+            if _enc in ('gbk', 'cp936', 'gb2312', 'gb18030'):
+                _s.reconfigure(encoding='utf-8', errors='replace')
+
+    _make_log_utf8_safe()
+except Exception as _e:      # 兜底本身绝不影响启动
+    try:
+        print(f'[启动] 日志编码兜底未生效（不影响启动）: {type(_e).__name__}: {_e}')
+    except Exception:
+        pass
+
+# ── Windows proactor 事件循环的"客户端硬断开"噪声过滤（2026-11-02）────────
+# `server/server_supervised.log` 里 `Exception in callback` 一共 160 条，**100% 是同一个签名**：
+# `_ProactorBasePipeTransport._call_connection_lost` → `OSError: [WinError 10022] 提供了一个无效
+# 的参数`。这是 Windows asyncio proactor 循环在隧道/浏览器直接断开连接时的固有行为（socket 已
+# 被对端关掉，再 shutdown 就报 10022），**不是本项目的故障**，但它把真正的错误埋了——排查时
+# grep 'Traceback' 命中 160 次全是它。所以只掐这一个组合（两个标记都在才丢），其余 asyncio
+# 记录一律放行。回滚：删掉本块。
+PROACTOR_NOISE_MARKERS = ('_call_connection_lost', 'WinError 10022')
+
+
+class _ProactorNoiseFilter:
+    """logging.Filter：命中 proactor "连接已断"固定噪声才丢弃（两个标记必须同时出现）。"""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:          # 取不到文本就放行，绝不因为过滤器本身出错而丢日志
+            return True
+        return not all(m in msg for m in PROACTOR_NOISE_MARKERS)
+
+    # 兼容 addFilter(callable) 与 addFilter(Filter) 两种用法
+    __call__ = filter
+
+
+try:
+    import logging as _logging
+
+    _asyncio_logger = _logging.getLogger('asyncio')
+    if not any(getattr(f, 'drops_proactor_noise', False) for f in _asyncio_logger.filters):
+        _pf = _ProactorNoiseFilter()
+        _pf.drops_proactor_noise = True
+        _asyncio_logger.addFilter(_pf)
+except Exception as _e:
+    try:
+        print(f'[启动] proactor 噪声过滤未生效（不影响启动）: {type(_e).__name__}: {_e}')
+    except Exception:
+        pass
+
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware

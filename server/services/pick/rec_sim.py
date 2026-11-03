@@ -48,6 +48,9 @@ ENTRIES = {
     'tailclose': '尾盘买入（封板买不到就剔除）',
     'auction': '按推荐执行（封板票次日竞价买·高开>5%不追）',
     'filled': '排板全成交（上界，现实做不到）',
+    # 2026-11-02 加：只由离线对照脚本调用，不进 simulate() 的六口径、页面不下发——
+    # 排板挂涨停价，开板那一刻就成交，收盘没封回去的当天就浮亏（旧三条都没算这笔）
+    'paiban': '排板真实成交（开板即成交在涨停价·一字排不进）',
 }
 MODES = {'open': '次日开盘卖', 'close': '次日尾盘卖'}
 DEFAULT_CURVES = ('auction_open', 'auction_close')
@@ -179,6 +182,27 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
             if v2 and lu_buy > 0 and sealed_at_close and not sealed_hard:
                 sealed_note = '盘中炸过板·收盘回封涨停（按收盘价买仍要排队）'
             sealed = sealed_at_close
+            if entry == 'paiban':
+                # 排板挂的是**涨停价**，不是收盘价：只有当天真的开过板（价格跌破涨停）才轮得到
+                # 你成交，成交那一刻就是涨停价。收盘还封着的票两者数值相同（收盘=涨停价），
+                # 但**盘中触板、收盘没封回去**的那部分，你是买在涨停价、当天就浮亏——
+                # 现有三条口径都没算这笔：tailclose 按收盘价买，等于假设你能在炸板后的低价买到，
+                # 是偏乐观的；filled 干脆假设一字也排得到，是上界。这条是"排队排到"的真实版。
+                if lu_buy <= 0:
+                    skipped.append((r, '缺前收→算不出涨停价，排板无法判定'))
+                    continue
+                if sealed_hard:
+                    skipped.append((r, '一字涨停（全天无低于涨停价的成交）→排板排不进'))
+                    continue
+                if h < lu_buy - REC_SIM_BOARD_EPS:
+                    skipped.append((r, '全天未触板→没有板可排'))
+                    continue
+                price = lu_buy
+                entry_note = ('排板成交在涨停价（收盘未回封，当天 %+.1f%%）'
+                              % ((c / lu_buy - 1) * 100)
+                              if c < lu_buy - REC_SIM_BOARD_EPS else '排板成交在涨停价（收盘回封）')
+                sealed = False
+                sealed_hard = False
             if sealed and entry == 'auction':
                 if idx + 2 >= len(series):
                     skipped.append((r, '次日竞价买入但次次日无K线'))

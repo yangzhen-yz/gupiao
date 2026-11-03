@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 from app.config import KLINE_HISTORY_DB_PATH
 
@@ -45,10 +45,7 @@ def invalidate_cache() -> None:
     """配置改动后打掉本进程缓存（范围清单 + ST 名录 + 选票范围）。"""
     _SCOPE_CACHE['value'] = []
     _SELECTABLE_CACHE['value'] = []
-    try:
-        excluded_symbols.cache_clear()
-    except Exception:
-        pass
+    _EXCLUDED_CACHE.update(ts=0.0, value=set())
 
 MAIN_BOARD_PREFIXES = ('600', '601', '603', '605',        # 沪市主板
                        '000', '001', '002', '003')        # 深市主板（含并入的中小板）
@@ -70,11 +67,22 @@ def is_st_name(name: str) -> bool:
     return ('ST' in n) or ('退' in n)
 
 
-@lru_cache(maxsize=1)
+_EXCLUDED_CACHE: Dict[str, object] = {'ts': 0.0, 'value': set()}
+_EXCLUDED_TTL = 6 * 3600.0   # 名称每天 18:15 由收盘快照刷新，6 小时足够新且不至于每次重扫 8890 行
+
+
 def excluded_symbols() -> Set[str]:
-    """当前该排除的裸 6 位码（ST/*ST/退市整理）。名录缺失时返回空集并提示去同步。"""
+    """当前该排除的裸 6 位码（ST/*ST/退市整理）。名录缺失时返回空集并提示去同步。
+
+    2026-11-01 从 `lru_cache(maxsize=1)` 改为**带 TTL 的缓存**：名录现在每天 18:15 由
+    收盘快照刷新（`eod_snapshot.sync_snapshot`），而 lru_cache 在常驻进程里永远不失效——
+    不换缓存的话，新戴帽的票要等到下次重启才会被挡。
+    """
+    import time as _time
     if not _flag('universe_exclude_st'):
         return set()
+    if _EXCLUDED_CACHE['value'] and _time.time() - float(_EXCLUDED_CACHE['ts']) < _EXCLUDED_TTL:
+        return set(_EXCLUDED_CACHE['value'])
     try:
         conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=30)
         try:
@@ -86,7 +94,9 @@ def excluded_symbols() -> Set[str]:
     if not rows:
         print('[股票范围] 读不到 stock_basic_full，ST 判定失效 —— 先跑 python scripts/sync_stock_basic.py')
         return set()
-    return {_pure(r[0]) for r in rows if is_st_name(r[1])}
+    value = {_pure(r[0]) for r in rows if is_st_name(r[1])}
+    _EXCLUDED_CACHE.update(ts=_time.time(), value=value)
+    return set(value)
 
 
 def in_universe(symbol: str, name: str = '') -> bool:

@@ -93,13 +93,6 @@
         <div class="section-subtitle-small">今日推荐股票</div>
         <span class="section-stats">{{ todayDate }}</span>
       </div>
-      <!-- 只数影子标注（2026-10-27）：用户规则"只数≠满编当天不采纳、直接空仓"。
-           82 日离线复算方向相反，所以这一层只挂标签、不拦截任何动作；
-           字段由后端在开关打开时才下发，关掉就一行 DOM 都不存在。 -->
-      <div v-if="todayShadow" class="shadow-line" :title="todayShadow.note">
-        <span class="shadow-tag">影子</span>{{ todayShadow.label }}
-        <em>只标注、不拦截（悬停看离线复算结论）</em>
-      </div>
       <!-- 当日批次折叠区（2026-10-21）：推荐表先删后插只留末批，各批次名单从 strategy_snapshot 回看 -->
       <div v-if="dayBatches.length" class="batch-fold">
         <div class="batch-fold-h" @click="batchOpen = !batchOpen">
@@ -283,9 +276,6 @@
       <div v-for="record in pagedHistoryRecommend" :key="record.date" class="history-item">
         <div class="history-date-header">
           📅 {{ record.date }}
-          <span v-if="record.shadow" class="shadow-tag" :title="record.shadow.note">
-            {{ record.shadow.label }}
-          </span>
         </div>
         <div class="history-stock-grid">
           <div
@@ -433,8 +423,6 @@
   // P0-2 周期调度（2026-10-24）：后端 RECOMMEND_CYCLE_SCHEDULE_ENABLED 开启时推荐记录带
   // cycleInfo（今日模式横幅）；空仓哨兵 isCash 单独渲染，不进普通卡片流。关闭时横幅不渲染。
   const cycleInfo = ref(null)
-  // 只数影子标注（2026-10-27）：后端开关关掉时不下发该字段，这里永远是 null
-  const todayShadow = ref(null)
   const cashItem = computed(() => todayRecommend.value.find(r => r && r.isCash) || null)
   const visibleRecommend = computed(() => todayRecommend.value.filter(r => r && !r.isCash))
 
@@ -549,7 +537,6 @@
           todayRecommend.value = today.stocks || today.daily_recommendations || []
           todayDate.value = today.date
           cycleInfo.value = today.cycleInfo || null
-          todayShadow.value = today.shadow || null
         }
         historyRecommend.value = result.data.filter(d => !d.isToday)
       }

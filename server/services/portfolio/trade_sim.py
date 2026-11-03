@@ -297,7 +297,10 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
             pass
         for p in positions:
             q = qmap.get(p['symbol'].lower())
-            d = diagnose_position(p, q, market_change, losers)
+            # 2026-11-03 修复：diagnose_position 是同步函数且冷缓存单只 ~1.8s，
+            # 直接在 async 里调用会阻塞事件循环（与 get_sim_state 的 _position_advice 不一致）。
+            # 丢线程池跑，避免持仓较多+勾选诊断时把整个服务请求一起卡死。
+            d = await asyncio.to_thread(diagnose_position, p, q, market_change, losers)
             action = d.get('action')
             if action in ('stop_loss', 'take_profit'):
                 _add('sell', p['symbol'], p['name'], round(d.get('price') or 0, 2), p['shares'],

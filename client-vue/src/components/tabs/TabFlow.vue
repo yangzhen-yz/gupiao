@@ -150,7 +150,10 @@
 
       <!-- 区块3：概念板块资金流（净流入左 / 净流出右，同一行） -->
       <h3 class="section-title">概念板块净流入 / 净流出排名</h3>
-      <p class="section-subtitle">概念板块，按主力净流入（元）排序 · 红=流入 / 绿=流出 · 每页 {{ PAGE_SIZE }} 条</p>
+      <p class="section-subtitle">
+        概念板块，按主力净流入（元）排序 · 红=流入 / 绿=流出 · 每页 {{ PAGE_SIZE }} 条
+        <span v-if="conceptNote" class="cooling-badge">{{ conceptNote }}</span>
+      </p>
       <div class="flow-grid">
         <div class="flow-col">
           <div class="flow-col-title inflow">🔴 概念板块净流入排名</div>
@@ -275,6 +278,7 @@
   const stale = ref(false) // 2026-10-19：数据龄期超阈值（今天从未成功刷新，页面显示的是旧快照）
   const sourceLabel = ref('') // 2026-10-17：数据来源提示（新浪兜底 / 冷却缓存）
   const sectorNote = ref('') // 2026-10-19：板块数据来源提示（兜底/快照/概念暂缺）
+  const conceptNote = ref('') // 2026-10-31：概念板块来源提示（财联社兜底）
 
   const hiddenChangeThreshold = ref(3.0)
   const hiddenHotTopN = ref(30)
@@ -351,13 +355,34 @@
               : d.cooling
                 ? `东财冷却中·约 ${coolMin} 分钟后才再试`
                 : ''
+        // 2026-10-31：东财 clist 被封时，概念板块由财联社板块榜补；行业仍优先新浪×本地聚合。
+        // 财联社分类与东财不是一套，数值不可混算，所以来源必须写在页面上。
+        // 行级 source='cls' 比块级来源更准：合并后的快照（行业来自新浪/快照、概念来自财联社）
+        // 落库后的 dataSource 只写 snapshot，但仍要如实告诉用户概念是财联社的。
+        const _conRows = ((d.sectors || {}).concept || {})
+        const _conCls = [...(_conRows.inflow || []), ...(_conRows.outflow || [])]
+          .some(r => r && r.source === 'cls')
         sectorNote.value =
-          ds.sectors === 'sina'
-            ? '板块为「新浪个股资金流 × 本地行业分类」聚合（行业来自 baostock 周更表，' +
-              '与东财板块名不是同一套分类；概念板块无本地分类，暂缺）'
-            : ds.sectors === 'snapshot'
-              ? '板块为历史快照'
-              : ''
+          ds.sectors === 'cls'
+            ? '行业与概念板块均来自财联社（东财 clist 被封；财联社板块分类与东财不同，不可混算）'
+            : ds.sectors === 'sina+cls'
+              ? '行业为「新浪个股资金流 × 本地行业分类」聚合，概念板块来自财联社（两套分类不可混算）'
+              : ds.sectors === 'snapshot+cls' || (ds.sectors === 'snapshot' && _conCls)
+                ? '行业为历史快照，概念板块来自财联社'
+                : ds.sectors === 'sina'
+                  ? '板块为「新浪个股资金流 × 本地行业分类」聚合（行业来自 baostock 周更表，' +
+                    '与东财板块名不是同一套分类；概念板块无本地分类，暂缺）'
+                  : ds.sectors === 'snapshot'
+                    ? '板块为历史快照'
+                    : ''
+        conceptNote.value =
+          ds.sectors === 'cls' || ds.sectors === 'sina+cls' || ds.sectors === 'snapshot+cls' || _conCls
+            ? '概念板块来自财联社（自有分类，与东财不可混算）'
+            : ds.sectors === 'sina'
+              ? '新浪无概念分类，概念板块暂缺'
+              : ds.sectors === 'snapshot'
+                ? '概念板块为历史快照'
+                : ''
         // 容错：任一部分失败返回空对象时补默认值，避免模板报错
         d.stocks = d.stocks || { inflow: [], outflow: [] }
         d.stocks.inflow = d.stocks.inflow || []

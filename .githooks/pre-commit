@@ -14,6 +14,7 @@
 #   git config --local hooks.artifacts.enabled false  # B3 前端产物删增不成对
 #   git config --local hooks.secret.enabled   false   # B4 凭据/本机绝对路径写进代码
 #   git config --local hooks.docsync.enabled  false   # B5 文档未同步（只提醒，本来就不拦）
+#   git config --local hooks.txlock.enabled   false   # B6 事务内等外部 IO（只提醒，2026-11-03 新增）
 # 整体停用：git config --local --unset core.hooksPath
 #
 # 失败信息一律给出"怎么改对"，不给出"怎么绕过"（不提供 --no-verify 建议）。
@@ -94,13 +95,21 @@ if enabled artifacts; then
 fi
 
 # --------------------------------------------------- B4 凭据 / 本机绝对路径入库
+# 判据 v2（2026-11-03 收紧）：v1 用 grep -F 匹配 'wecom_webhook' / 'webhook_url' 这类
+# **词面**，结果把 `from services.support.push import push_wecom_webhook` 这种函数名引用
+# 当成凭据拦下（实测阻断了一次正常提交）。凭据从来不在函数名里，在**值**里，所以 v2 只认
+# 三种真形态：本机绝对路径、带 key 的 webhook URL、corpsecret 紧跟长字面量。
+# 收紧后仍拦得住真凭据（当场验过），但不再拦 `wecom_webhook.json` 的路径引用与函数名——
+# 那是正当做法（凭据本体在 .gitignore 排除的 server/wecom_webhook.json 里）。
 if enabled secret; then
     bad=$(git diff --cached -U0 --diff-filter=ACM -- '*.py' '*.js' '*.jsx' '*.ts' '*.vue' '*.json' '*.yaml' '*.yml' ':(exclude)server/static' 2>/dev/null \
           | grep '^+' | grep -v '^+++' \
-          | grep -F -e 'D:\' -e 'd:\' -e 'C:\Users' -e 'c:\users' -e 'corpsecret' -e 'webhook_url' -e 'wecom_webhook' \
+          | grep -E -e 'D:[\\]' -e 'd:[\\]' -e 'C:[\\]Users' -e 'c:[\\]users' \
+                      -e 'webhook/send.key=[0-9a-zA-Z_-]{8,}' \
+                      -e 'corpsecret.{1,6}[0-9a-zA-Z_-]{12,}' \
           | head -8)
     if [ -n "$bad" ]; then
-        echo "⛔ 代码/配置里出现本机绝对路径或推送凭据字段（只检本次新增行）："
+        echo "⛔ 代码/配置里出现本机绝对路径或推送凭据字面量（只检本次新增行）："
         printf '%s\n' "$bad" | sed 's/^/      /'
         echo "   为什么拦：绝对路径让代码只能在这台机器跑；凭据一旦进提交就永久留在历史里。"
         echo "   正确做法：路径走配置项或环境变量（守护脚本里的硬编码路径留在仓库外），"
@@ -121,6 +130,32 @@ if enabled docsync; then
         echo "      docs/优化实施计划-2026-10-18.md / docs/选股策略取长补短-2026-10-22.md"
         echo "   这条不阻断：真拦会诱导'为了过关写一句空话'，反而污染文档。"
         echo "   自检办法是改完 grep 自己写入的独有关键串，命中 0 就是没落进去（或被另一路会话覆盖了）。"
+    fi
+fi
+
+# ------------------------------------ B6 事务内等外部 IO（只提醒，2026-11-03 新增）
+# 判据与边界见 server/scripts/tx_holding_scan.py 文件头。白名单式检查，宁可漏报不误拦，
+# 所以只提醒不阻断——拦错一次的代价是逼人绕 hook，那比不拦更糟。
+if enabled txlock; then
+    py_bin=''
+    for cand in python python3 py; do
+        if command -v "$cand" >/dev/null 2>&1; then py_bin="$cand"; break; fi
+    done
+    if [ -n "$py_bin" ]; then
+        tx_hits=$("$py_bin" server/scripts/tx_holding_scan.py --staged 2>/dev/null)
+        if [ -n "$tx_hits" ]; then
+            echo "⚠ 本次新增行里有「已经拿到写锁、还没提交就等外部 IO」的写法："
+            printf '%s\n' "$tx_hits" | sed 's/^/      /'
+            echo "   为什么提醒：db/database.py 的 get_db_conn 用 isolation_level IMMEDIATE + busy_timeout 30000，"
+            echo "             而 WAL 同时只允许一个写者——第一条 DML 就占住写锁，循环里再 await 一次外部源，"
+            echo "             全库的写就一起排队到 30 秒。2026-11-03 页面 8~30 秒抖动、前端弹「网络错误，"
+            echo "             请确认后端服务已启动」就是这么来的。判据特征：X-Process-Time 只有 1~2ms 而"
+            echo "             请求几十秒，说明耗时发生在进入 HTTP 中间件之前，按「接口慢」去查一定查偏。"
+            echo "   改法：外部拉数挪到事务之外，或逐条写完就 conn.commit 把锁交还。"
+            echo "   这条不阻断。停用：git config --local hooks.txlock.enabled false"
+        fi
+    else
+        echo "⚠ 没找到 python 解释器，事务持锁检查已跳过（本次放行）"
     fi
 fi
 

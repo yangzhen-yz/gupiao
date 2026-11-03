@@ -1,7 +1,7 @@
 """database.py - split from main.py"""
 import sqlite3, json, time
 from typing import List, Dict, Optional
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from app.config import SQLITE_DB_PATH, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, HOT_SEARCH_TOP_N, HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS, DEFAULT_WEIGHTS
 
 # ========== SQLite 配置 ==========
@@ -356,6 +356,27 @@ def init_db():
         if 'mode' not in _rec_cols:
             cursor.execute("ALTER TABLE daily_recommendations ADD COLUMN mode TEXT DEFAULT ''")
             print('[数据库] daily_recommendations 已补 mode 列（低吸/打板/抄底/接力/其他）')
+        # 批次留痕（2026-11-01）：daily_recommendations 是"当日最后一次推荐"的快照，
+        # 每批保存都 DELETE+INSERT 覆盖当天——09:45/10:00/13:30/14:05 的四批内容与
+        # 14:45 收盘前那一批全被抹掉（实测 10-31 的 241 行 created_at 全是 14:45:10）。
+        # 于是"上午推的是A、下午换成B"这件事事后无从考证，复盘只能拿最后一批判"系统
+        # 选得准不准"，把"盘中换股换对了还是换错了"整个维度丢了。
+        # 现在每批另存一行到 recommendation_batches（只追加不覆盖），行里带 batch_ref。
+        if 'batch_ref' not in _rec_cols:
+            cursor.execute("ALTER TABLE daily_recommendations ADD COLUMN batch_ref INTEGER DEFAULT NULL")
+            print('[数据库] daily_recommendations 已补 batch_ref 列（指向 recommendation_batches）')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS recommendation_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rec_date TEXT NOT NULL,
+                batch_time TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                stock_count INTEGER DEFAULT 0,
+                payload_hash TEXT DEFAULT '',
+                stocks_json TEXT DEFAULT '',
+                created_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rec_batches_date '
+                       'ON recommendation_batches(rec_date, id)')
 
         # 股票映射表
         cursor.execute('''
@@ -513,6 +534,98 @@ def init_db():
                 snap_key TEXT PRIMARY KEY,       -- 'stocks:<n>' / 'sectors:<n>' / 'hidden:<key>'
                 snap_json TEXT NOT NULL,         -- 该区块最后成功数据的整包 JSON
                 updated_at TEXT)''')
+        # 主题篮子成分日线（2026-10-31）：人形机器人链 39 只等权指数用。
+        # 本地 stock_daily 只同步主板选股范围，创业板/科创板 22 只停更；
+        # 这张表由盘后 15:05/18:30 用腾讯批量行情（qt.gtimg.cn，含昨收/最高/最低/成交额）
+        # 追加当日 OHLC，不依赖已被 WAF 拦掉的 ifzq 日K接口。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS theme_member_daily (
+                theme TEXT NOT NULL,             -- robot / ...
+                symbol TEXT NOT NULL,            -- 小写带前缀 sz300580
+                date TEXT NOT NULL,              -- YYYY-MM-DD
+                name TEXT,
+                open REAL, high REAL, low REAL, close REAL,
+                prev_close REAL,                 -- 交易所口径昨收（除权日自动调整）
+                amount REAL,                     -- 成交额（元）
+                volume REAL,                     -- 成交量（股）
+                source TEXT,                     -- tencent_quote / backfill
+                created_at TEXT,
+                PRIMARY KEY (theme, symbol, date))''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_theme_member_daily
+            ON theme_member_daily (theme, date)''')
+        # 财联社四池逐票日表（2026-10-31，影子）：涨停/连板/炸板/跌停各存一份。
+        # 用途是"题材梯队"落档与后续一周对照；财联社网页接口不支持历史日期，
+        # 所以只能从上线当天起逐日留档，不做回填。pool 值沿用接口名：
+        # up_pool / continuous_up_pool / up_open_pool / down_pool。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cls_pool_daily (
+                trade_date TEXT NOT NULL,
+                pool       TEXT NOT NULL,        -- up / continuous / up_open / down
+                symbol     TEXT NOT NULL,        -- 六位代码（与本地库一致）
+                code       TEXT,                 -- 财联社原始代码 sh605338
+                name       TEXT,
+                change_pct REAL,
+                last_px    REAL,
+                seal_time  TEXT,                 -- 首封/最后触及时间，原始 YYYY-MM-DD HH:MM:SS
+                days       INTEGER,              -- 连板数（跌停池为空）
+                is_st      INTEGER,
+                reason     TEXT,                 -- up_reason 原文
+                themes     TEXT,                 -- JSON 数组（up_reason 前缀切分）
+                plates     TEXT,                 -- JSON 数组（财联社板块标签）
+                num_stocks INTEGER,              -- 该池当日总只数
+                source     TEXT DEFAULT 'cls',
+                created_at TEXT,
+                PRIMARY KEY (trade_date, pool, symbol))''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_cls_pool_daily
+            ON cls_pool_daily (trade_date, pool)''')
+        # 财联社板块榜日快照（2026-10-31，展示兜底）：行业 54 / 概念 398。
+        # 用途是资金流页概念板块与收评板块轮动的兜底，以及逐日留档；
+        # 财联社网页接口不支持历史日期（date 参数无效），所以只能从上线起逐日写。
+        # 口径与东财/申万不同，不参与选股与门槛。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cls_plate_daily (
+                trade_date    TEXT NOT NULL,
+                plate_type    TEXT NOT NULL,     -- industry / concept
+                code          TEXT NOT NULL,     -- cls80014
+                name          TEXT,
+                change_pct    REAL,
+                main_fund_diff REAL,             -- 元
+                up_count      INTEGER,
+                down_count    INTEGER,
+                limit_up_num  INTEGER,
+                limit_down_num INTEGER,
+                first_stock   TEXT,              -- JSON {name, code, changePct}
+                source        TEXT DEFAULT 'cls',
+                created_at    TEXT,
+                PRIMARY KEY (trade_date, plate_type, code))''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_cls_plate_daily
+            ON cls_plate_daily (trade_date, plate_type)''')
+        # 动态热门板块链（2026-10-31，行动台主题卡）：当天从财联社概念榜选出的前 3 个板块
+        # 及核心成分。只做展示，不进选股；成分明细同时写 theme_member_daily（chain_id 作 theme）。
+        # 落库目的有二：重启后先显示最近一次的链（不必等接口），以及回溯"当天为什么是它"。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS theme_chain_daily (
+                trade_date      TEXT NOT NULL,
+                chain_id        TEXT NOT NULL,     -- cls80014
+                rank            INTEGER,
+                name            TEXT,              -- 白酒链
+                plate_code      TEXT,              -- cls80014
+                plate_name      TEXT,
+                change_pct      REAL,
+                limit_up_num    INTEGER,
+                breadth         INTEGER,           -- 上涨+下跌家数
+                member_count    INTEGER,
+                members_json    TEXT,              -- [[symbol, name], ...]
+                note            TEXT,
+                source          TEXT DEFAULT 'cls',
+                created_at      TEXT,
+                PRIMARY KEY (trade_date, chain_id))''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_theme_chain_daily
+            ON theme_chain_daily (trade_date)''')
         # 双源交叉校验（2026-10-19）：westock（腾讯自选股）每日快照 + 与本地口径比对，
         # 权威源=westock（用户决策"不一致的以 westock 为准"）。
         # 宇宙=当日资金流 top + 热搜 top + 当日推荐（约 150-200 只），非全市场。
@@ -928,15 +1041,58 @@ def load_recommendation_group(rec_date: str = None) -> Dict:
         return {'date': '', 'stocks': []}
 
 
-def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
+def _payload_hash(recs: List[Dict]) -> str:
+    """批次内容指纹：只看影响复盘结论的字段（代码/分数/现价/买卖点/理由）。"""
+    import hashlib
+    slim = []
+    for r in recs or []:
+        bsp = r.get('buySellPoints') or {}
+        slim.append([r.get('symbol', ''), r.get('score', 0), str(r.get('price', '')),
+                     str(bsp.get('buy', '')), str(bsp.get('current', '')),
+                     str(bsp.get('sell', '')), r.get('mode', ''), r.get('reason', '')])
+    return hashlib.md5(json.dumps(slim, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def save_daily_recommendations(daily_recommendations: List[Dict],
+                               batch_time: str = '', source: str = '') -> bool:
+    """保存推荐（当日行覆盖）**并把这一批另存进 recommendation_batches**。
+
+    2026-11-01：原来每批都是 DELETE+INSERT 覆盖当天，09:45/10:00/13:30/14:05 四批
+    在库里留不下任何痕迹（10-31 实测 241 行的 created_at 全是 14:45:10）。批次表只追加，
+    内容指纹与"该日最后一批"相同的就不再重复记（历史日期每次都会被重新 save 一遍，
+    不比对的话每天会凭空多出 30 份重复批次）。
+    """
     try:
         if len(daily_recommendations) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
             daily_recommendations = daily_recommendations[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
+        import datetime as _dt
+        stamp = batch_time or _dt.datetime.now().strftime('%H:%M:%S')
         conn = get_db_conn()
         cursor = conn.cursor()
         for idx, rec_group in enumerate(daily_recommendations):
             rec_date = rec_group.get('date', '')
             recs = rec_group.get('daily_recommendations', [])
+            # ── 批次留痕：与当日最后一批内容相同则不重复记 ──
+            _h = _payload_hash(recs)
+            batch_ref = None
+            try:
+                last = cursor.execute(
+                    'SELECT id, payload_hash FROM recommendation_batches '
+                    'WHERE rec_date=? ORDER BY id DESC LIMIT 1', (rec_date,)).fetchone()
+                if not last or (last[1] or '') != _h:
+                    cursor.execute(
+                        'INSERT INTO recommendation_batches '
+                        '(rec_date, batch_time, source, stock_count, payload_hash, stocks_json) '
+                        'VALUES (?,?,?,?,?,?)',
+                        (rec_date, stamp, source or '', len(recs), _h,
+                         json.dumps(recs, ensure_ascii=False)))
+                    batch_ref = cursor.lastrowid
+                else:
+                    batch_ref = last[0]
+            except Exception as _e:
+                # 批次表写失败不能挡住当日推荐本身（它是复盘用的旁证，不是主数据）
+                print(f'[推荐批次] 留痕失败（不影响保存）: {type(_e).__name__}: {_e}')
+                batch_ref = None
             # 删除该日期旧数据
             cursor.execute('DELETE FROM daily_recommendations WHERE rec_date = ?', (rec_date,))
             for sort_order, rec in enumerate(recs):
@@ -945,8 +1101,8 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
                 buy_timing = bsp.get('buyTiming')
                 buy_timing_json = json.dumps(buy_timing, ensure_ascii=False) if buy_timing else ''
                 cursor.execute('''
-                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, buy_timing, sort_order, mode)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO daily_recommendations (rec_date, symbol, name, price, change_val, change_percent, score, buy_price, current_price, sell_price, reason, buy_timing, sort_order, mode, batch_ref)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     rec_date,
                     rec.get('symbol', ''),
@@ -963,7 +1119,8 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
                     sort_order,
                     # 模式标签（2026-10-18）：由 buy_rules.classify 的 verdict 机械映射而来，
                     # 不人工判断 —— 标签打错，按模式的复盘结论就是歪的。
-                    rec.get('mode', '') or ''
+                    rec.get('mode', '') or '',
+                    batch_ref
                 ))
         conn.commit()
         conn.close()
@@ -971,6 +1128,34 @@ def save_daily_recommendations(daily_recommendations: List[Dict]) -> bool:
     except Exception as error:
         print(f'保存推荐记录失败: {str(error)}')
         return False
+
+
+def load_recommendation_batches(rec_date: str = '') -> List[Dict]:
+    """按日读批次留痕（复盘用）：[{id, rec_date, batch_time, source, stock_count, stocks}]"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if rec_date:
+            rows = cursor.execute(
+                'SELECT id, rec_date, batch_time, source, stock_count, stocks_json '
+                'FROM recommendation_batches WHERE rec_date=? ORDER BY id', (rec_date,)).fetchall()
+        else:
+            rows = cursor.execute(
+                'SELECT id, rec_date, batch_time, source, stock_count, stocks_json '
+                'FROM recommendation_batches ORDER BY id').fetchall()
+        conn.close()
+        out = []
+        for r in rows:
+            try:
+                stocks = json.loads(r[5] or '[]')
+            except Exception:
+                stocks = []
+            out.append({'id': r[0], 'date': r[1], 'batch_time': r[2], 'source': r[3],
+                        'stock_count': r[4], 'stocks': stocks})
+        return out
+    except Exception as error:
+        print(f'读取推荐批次失败: {str(error)}')
+        return []
 
 def delete_daily_recommendations_by_date(rec_date: str) -> bool:
     """按日期物理删除推荐记录（2026-10-12 新增）
@@ -2600,29 +2785,67 @@ def save_hot_search_ranking(data: Dict) -> bool:
 
 # ========== 自动优化引擎 CRUD（V4.4）==========
 
+_OPTIMIZER_V2_SCHEMA_READY = False
+
+
+def _ensure_optimizer_v2_columns(cursor) -> None:
+    """惰性补列（2026-11-01 T1.3）：只加列、不删不改旧列。
+
+    - optimization_history：新 metric 与旧 discrimination_avg 并存，旧列继续写，
+      新列只做审计与回填；objective_version 标明这一行由哪套口径产生。
+    - trend_dimension_weights：valid_neg_streak 记录连续负向次数，用于 0.8 回落。
+    """
+    global _OPTIMIZER_V2_SCHEMA_READY
+    if _OPTIMIZER_V2_SCHEMA_READY:
+        return
+    try:
+        hist_cols = {row[1] for row in cursor.execute('PRAGMA table_info(optimization_history)')}
+        for name, ddl in (
+            ('metric_v2_name', "TEXT DEFAULT ''"),
+            ('metric_v2_value', 'REAL DEFAULT NULL'),
+            ('objective_version', "TEXT DEFAULT 'v1'"),
+            ('walk_forward', 'INTEGER DEFAULT 0'),
+            ('backfill_note', "TEXT DEFAULT ''"),
+        ):
+            if name not in hist_cols:
+                cursor.execute(f'ALTER TABLE optimization_history ADD COLUMN {name} {ddl}')
+
+        w_cols = {row[1] for row in cursor.execute('PRAGMA table_info(trend_dimension_weights)')}
+        if 'valid_neg_streak' not in w_cols:
+            cursor.execute('ALTER TABLE trend_dimension_weights ADD COLUMN valid_neg_streak INTEGER DEFAULT 0')
+        _OPTIMIZER_V2_SCHEMA_READY = True
+    except Exception as error:
+        # 补列失败不阻断主流程：旧列仍可写，调用方会打印告警
+        print(f'[优化器] 补列失败: {error}')
+
+
 def load_trend_dimension_weights() -> Dict:
     """加载 D1-D4 趋势维度权重（无数据时返回 1.0 默认值）"""
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
+        _ensure_optimizer_v2_columns(cursor)
+        conn.commit()
         cursor.execute('SELECT * FROM trend_dimension_weights')
         rows = cursor.fetchall()
         conn.close()
         result = {
-            'd1': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
-            'd2': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
-            'd3': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
-            'd4': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0},
+            'd1': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0, 'valid_neg_streak': 0},
+            'd2': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0, 'valid_neg_streak': 0},
+            'd3': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0, 'valid_neg_streak': 0},
+            'd4': {'weight': 1.0, 'accuracy': 50.0, 'discrimination': 0, 'sample_count': 0, 'correct_count': 0, 'valid_neg_streak': 0},
         }
         for row in rows:
             d = row['dimension'].lower()
             if d in result:
+                raw = dict(row)
                 result[d] = {
                     'weight': float(row['weight']),
                     'accuracy': float(row['accuracy']),
-                    'discrimination': float(dict(row).get('discrimination') or 0),
+                    'discrimination': float(raw.get('discrimination') or 0),
                     'sample_count': int(row['sample_count']),
                     'correct_count': int(row['correct_count']),
+                    'valid_neg_streak': int(raw.get('valid_neg_streak') or 0),
                 }
         return result
     except Exception as error:
@@ -2635,17 +2858,20 @@ def save_trend_dimension_weights(weights_data: Dict) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
+        _ensure_optimizer_v2_columns(cursor)
         for dim_key, data in weights_data.items():
             weight = data.get('weight', 1.0)
             accuracy = data.get('accuracy', 0)
             discrimination = data.get('discrimination', 0)
             sample_count = data.get('sample_count', 0)
             correct_count = data.get('correct_count', 0)
+            valid_neg_streak = int(data.get('valid_neg_streak', 0) or 0)
             cursor.execute('''
                 INSERT OR REPLACE INTO trend_dimension_weights
-                    (dimension, weight, accuracy, discrimination, sample_count, correct_count, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
-            ''', (dim_key, weight, accuracy, discrimination, sample_count, correct_count))
+                    (dimension, weight, accuracy, discrimination, sample_count, correct_count,
+                     valid_neg_streak, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
+            ''', (dim_key, weight, accuracy, discrimination, sample_count, correct_count, valid_neg_streak))
         conn.commit()
         conn.close()
         return True
@@ -2667,17 +2893,31 @@ def save_trend_dimension_weights(weights_data: Dict) -> bool:
 def save_optimization_history(module: str, parameter_set: str = '',
                               metric_name: str = '', metric_value: float = 0,
                               old_value: float = None, new_value: float = None,
-                              details: str = '') -> bool:
-    """保存优化历史"""
+                              details: str = '',
+                              metric_v2_name: str = '', metric_v2_value: float = None,
+                              objective_version: str = 'v1',
+                              walk_forward: int = 0,
+                              backfill_note: str = '') -> bool:
+    """保存优化历史
+
+    2026-11-01（T1.3）：旧 metric 列继续写（审计用），新口径写
+    metric_v2_name/metric_v2_value；objective_version 标明口径版本，
+    方便回滚后区分同一张表里的两类记录。
+    """
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
+        _ensure_optimizer_v2_columns(cursor)
         cursor.execute('''
             INSERT INTO optimization_history (module, parameter_set, metric_name, metric_value,
-                                              old_value, new_value, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                              old_value, new_value, details,
+                                              metric_v2_name, metric_v2_value, objective_version,
+                                              walk_forward, backfill_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (module, parameter_set, metric_name, metric_value,
-              old_value, new_value, details))
+              old_value, new_value, details,
+              metric_v2_name, metric_v2_value, objective_version,
+              int(walk_forward or 0), backfill_note))
         conn.commit()
         conn.close()
         return True
@@ -2802,3 +3042,262 @@ def load_api_usage_limits() -> List[Dict]:
     except Exception as error:
         print(f'读取接口上限失败: {str(error)}')
         return []
+
+
+def save_theme_member_daily(rows: List[Dict], theme: str = 'robot') -> int:
+    """主题篮子成分日线 UPSERT（2026-10-31）。
+
+    rows 每项：{symbol, date, name, open, high, low, close, prev_close, amount, volume, source}
+    只写盘后快照，不做全量回补；返回成功写入条数。
+    """
+    if not rows:
+        return 0
+    try:
+        from datetime import datetime
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        cursor.executemany('''
+            INSERT INTO theme_member_daily
+                (theme, symbol, date, name, open, high, low, close, prev_close,
+                 amount, volume, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(theme, symbol, date) DO UPDATE SET
+                name=excluded.name, open=excluded.open, high=excluded.high,
+                low=excluded.low, close=excluded.close, prev_close=excluded.prev_close,
+                amount=excluded.amount, volume=excluded.volume,
+                source=excluded.source, created_at=excluded.created_at''',
+            [(theme, r.get('symbol'), r.get('date'), r.get('name'),
+              r.get('open'), r.get('high'), r.get('low'), r.get('close'), r.get('prev_close'),
+              r.get('amount'), r.get('volume'), r.get('source') or 'tencent_quote', now)
+             for r in rows if r.get('symbol') and r.get('date')])
+        conn.commit()
+        conn.close()
+        return len(rows)
+    except Exception as error:
+        print(f'[数据库] 保存主题篮子日线失败: {str(error)}')
+        return 0
+
+
+def load_theme_member_daily(theme: str = 'robot', since: str = '') -> List[Dict]:
+    """读取主题篮子成分日线（按日期升序）。since 为空 = 全部。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if since:
+            rows = cursor.execute(
+                'SELECT * FROM theme_member_daily WHERE theme = ? AND date >= ? '
+                'ORDER BY symbol, date', (theme, since)).fetchall()
+        else:
+            rows = cursor.execute(
+                'SELECT * FROM theme_member_daily WHERE theme = ? ORDER BY symbol, date',
+                (theme,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as error:
+        print(f'[数据库] 读取主题篮子日线失败: {str(error)}')
+        return []
+
+
+def save_cls_pool_daily(day: str, rows: List[Dict]) -> int:
+    """财联社四池逐票落库（2026-10-31，影子）。按 (trade_date, pool, symbol) 覆盖写。
+
+    rows 每项字段与 services/ops/cls_pool._normalize_pool 一致：
+    pool/symbol/code/name/changePct/lastPx/sealTime/days/isSt/reason/themes/plates/numStocks。
+    失败只打印、不抛：这是影子数据，接口抖动不应该影响收盘任务的其他环节。
+    """
+    if not rows:
+        return 0
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data = []
+        for r in rows:
+            if not (r.get('pool') and r.get('symbol')):
+                continue
+            data.append((
+                day, r.get('pool'), r.get('symbol'), r.get('code'), r.get('name'),
+                r.get('changePct'), r.get('lastPx'), r.get('sealTime'), r.get('days'),
+                int(r.get('isSt') or 0), r.get('reason'),
+                json.dumps(r.get('themes') or [], ensure_ascii=False),
+                json.dumps(r.get('plates') or [], ensure_ascii=False),
+                r.get('numStocks'), now,
+            ))
+        if not data:
+            return 0
+        conn = get_db_conn()
+        try:
+            conn.executemany('''
+                INSERT INTO cls_pool_daily
+                    (trade_date, pool, symbol, code, name, change_pct, last_px, seal_time,
+                     days, is_st, reason, themes, plates, num_stocks, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cls', ?)
+                ON CONFLICT(trade_date, pool, symbol) DO UPDATE SET
+                    code=excluded.code, name=excluded.name, change_pct=excluded.change_pct,
+                    last_px=excluded.last_px, seal_time=excluded.seal_time, days=excluded.days,
+                    is_st=excluded.is_st, reason=excluded.reason, themes=excluded.themes,
+                    plates=excluded.plates, num_stocks=excluded.num_stocks,
+                    created_at=excluded.created_at''', data)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(data)
+    except Exception as error:
+        print(f'[数据库] 保存财联社四池失败 day={day}: {str(error)}')
+        return 0
+
+
+def save_cls_plate_daily(day: str, rows: List[Dict]) -> int:
+    """财联社板块榜日快照（2026-10-31，展示兜底）。按 (trade_date, plate_type, code) 覆盖写。
+
+    rows 每项由 services/ops/cls_plate.sync_today 组装：plateType/code/name/changePct/
+    mainFundDiff/upCount/downCount/limitUpNum/limitDownNum + firstStockJson。
+    失败只打印、不抛：这是兜底展示数据，接口抖动不应该影响收盘任务。
+    """
+    if not rows:
+        return 0
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data = []
+        for r in rows:
+            if not (r.get('plateType') and r.get('code')):
+                continue
+            first = r.get('firstStockJson')
+            if first is None and r.get('firstStock'):
+                first = json.dumps(r.get('firstStock'), ensure_ascii=False)
+            data.append((
+                day, r.get('plateType'), r.get('code'), r.get('name'),
+                r.get('changePct'), r.get('mainFundDiff'), r.get('upCount'),
+                r.get('downCount'), r.get('limitUpNum'), r.get('limitDownNum'),
+                first, now,
+            ))
+        if not data:
+            return 0
+        conn = get_db_conn()
+        try:
+            conn.executemany('''
+                INSERT INTO cls_plate_daily
+                    (trade_date, plate_type, code, name, change_pct, main_fund_diff,
+                     up_count, down_count, limit_up_num, limit_down_num, first_stock,
+                     source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cls', ?)
+                ON CONFLICT(trade_date, plate_type, code) DO UPDATE SET
+                    name=excluded.name, change_pct=excluded.change_pct,
+                    main_fund_diff=excluded.main_fund_diff, up_count=excluded.up_count,
+                    down_count=excluded.down_count, limit_up_num=excluded.limit_up_num,
+                    limit_down_num=excluded.limit_down_num, first_stock=excluded.first_stock,
+                    created_at=excluded.created_at''', data)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(data)
+    except Exception as error:
+        print(f'[数据库] 保存财联社板块失败 day={day}: {str(error)}')
+        return 0
+
+
+def save_theme_chain_daily(day: str, chains: List[Dict]) -> int:
+    """动态热门板块链落库（2026-10-31）。**整日替换**，不是增量覆盖。
+
+    chains 每项由 services/ops/hot_chains 组装：chain_id/rank/name/plateCode/
+    plateName/changePct/limitUpNum/breadth/members/note。失败只打印不抛。
+
+    为什么整日删再插：同一天可能重建多次（盘中跟随、重叠板块被踢掉、收盘重算），
+    UPSERT 会把已淘汰的板块留在表里，重启后 `load_theme_chain_daily` 又把它读回来，
+    等于"页面上多出一条今天已经不该展示的链"（10-31 实测发生过：酿酒被重叠过滤后
+    仍以 rank=2 留在库中）。当日表就是"当前生效的链"，所以按天全量覆盖。
+    """
+    if not chains:
+        return 0
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data = []
+        for c in chains:
+            members = c.get('members') or []
+            data.append((
+                day, c.get('chain_id') or c.get('id'), c.get('rank'),
+                c.get('name'), c.get('plateCode'), c.get('plateName'),
+                c.get('changePct'), c.get('limitUpNum'), c.get('breadth'),
+                len(members), json.dumps(members, ensure_ascii=False),
+                c.get('note'), now,
+            ))
+        conn = get_db_conn()
+        try:
+            conn.execute('DELETE FROM theme_chain_daily WHERE trade_date = ?', (day,))
+            conn.executemany('''
+                INSERT INTO theme_chain_daily
+                    (trade_date, chain_id, rank, name, plate_code, plate_name,
+                     change_pct, limit_up_num, breadth, member_count, members_json,
+                     note, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cls', ?)''', data)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(data)
+    except Exception as error:
+        print(f'[数据库] 保存动态板块链失败 day={day}: {str(error)}')
+        return 0
+
+
+def load_theme_chain_daily(day: str = '') -> List[Dict]:
+    """读动态板块链。day 为空时取最近一个有数据的一天（重启后先显示上次的链）。"""
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        if not day:
+            row = cursor.execute(
+                'SELECT MAX(trade_date) FROM theme_chain_daily').fetchone()
+            day = (row[0] if row else '') or ''
+            if not day:
+                conn.close()
+                return []
+        rows = cursor.execute(
+            'SELECT * FROM theme_chain_daily WHERE trade_date = ? ORDER BY rank',
+            (day,)).fetchall()
+        conn.close()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d['members'] = json.loads(d.get('members_json') or '[]')
+            except Exception:
+                d['members'] = []
+            out.append(d)
+        return out
+    except Exception as error:
+        print(f'[数据库] 读取动态板块链失败: {str(error)}')
+        return []
+
+
+def load_cls_pool_daily(day: str) -> Dict[str, List[Dict]]:
+    """读某天财联社四池，按池名分组；字段名与 _normalize_pool 对齐。"""
+    out: Dict[str, List[Dict]] = {}
+    try:
+        conn = get_db_conn()
+        try:
+            rows = conn.execute(
+                'SELECT * FROM cls_pool_daily WHERE trade_date=? ORDER BY pool, days DESC, seal_time',
+                (day,)).fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            d = dict(r)
+            try:
+                themes = json.loads(d.get('themes') or '[]')
+            except Exception:
+                themes = []
+            try:
+                plates = json.loads(d.get('plates') or '[]')
+            except Exception:
+                plates = []
+            out.setdefault(d['pool'], []).append({
+                'pool': d['pool'], 'symbol': d['symbol'], 'code': d.get('code'),
+                'name': d.get('name'), 'changePct': d.get('change_pct'),
+                'lastPx': d.get('last_px'), 'sealTime': d.get('seal_time'),
+                'days': d.get('days'), 'isSt': d.get('is_st'),
+                'reason': d.get('reason'), 'themes': themes, 'plates': plates,
+                'numStocks': d.get('num_stocks'),
+            })
+        return out
+    except Exception as error:
+        print(f'[数据库] 读取财联社四池失败 day={day}: {str(error)}')
+        return {}

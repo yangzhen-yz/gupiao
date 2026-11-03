@@ -432,6 +432,15 @@ def _pass_filter(stock) -> bool:
     评分≥阈值 + 未涨停 + 预期涨幅≥阈值 + 量比≥阈值。
     （2026-10-28 起删掉"角色非跟风/杂毛"一条：角色体系整体下线）
     """
+    # 名称层 ST 复核（2026-11-01）：与智能推荐同一条判据，堵"推荐不推、推送推"的漏口。
+    # 扫描接口虽然也走范围过滤，但它读的是本地名录；行情名称是当下的，多挡一次不花成本。
+    try:
+        from services.data.universe import is_st_name as _is_st
+        if _is_st(stock.get('name')):
+            print(f"[推送] ST 名称否决 {stock.get('name')}（{stock.get('symbol')}）")
+            return False
+    except Exception:
+        pass
     try:
         score = float(stock.get('score') or 0)
     except (TypeError, ValueError):
@@ -596,6 +605,13 @@ def _ensure_table():
             pushed_at TEXT NOT NULL,
             PRIMARY KEY (push_date, symbol)
         )''')
+        # 2026-11-03 补两列：score=推送时的评分，channel=哪条推送链（达标即推/龙头/主推送…）。
+        # 老行为 NULL；CREATE TABLE IF NOT EXISTS 不会加列，只能逐个 ALTER 兼容已存在的库。
+        for col, ddl in (('score', 'REAL'), ('channel', 'TEXT')):
+            try:
+                conn.execute(f'ALTER TABLE push_sent_log ADD COLUMN {col} {ddl}')
+            except Exception:
+                pass  # 列已存在
         conn.commit()
         conn.close()
     except Exception as e:
@@ -614,12 +630,13 @@ def _already_pushed(date_str: str, symbol: str) -> bool:
         return False
 
 
-def _mark_pushed(date_str: str, symbol: str):
+def _mark_pushed(date_str: str, symbol: str, score=None, channel: str = 'screener'):
     try:
         conn = get_db_conn()
         conn.execute(
-            'INSERT OR IGNORE INTO push_sent_log (push_date, symbol, pushed_at) VALUES (?,?,?)',
-            (date_str, symbol, datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            'INSERT OR IGNORE INTO push_sent_log (push_date, symbol, pushed_at, score, channel) '
+            'VALUES (?,?,?,?,?)',
+            (date_str, symbol, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), score, channel),
         )
         conn.commit()
         conn.close()
@@ -690,7 +707,8 @@ async def push_candidates_task():
         content = _fmt_markdown(hits, '⚡ 选股推送（达标即推）')
         if push_wecom_markdown(content):
             for s in hits:
-                _mark_pushed(today, s.get('symbol', ''))
+                _mark_pushed(today, s.get('symbol', ''),
+                             score=s.get('score'), channel='screener')
             print(f'[推送 {datetime.now():%H:%M:%S}] 已推送 {len(hits)} 只: '
                   f'{", ".join(s.get("name", "") for s in hits)}')
     except Exception as e:

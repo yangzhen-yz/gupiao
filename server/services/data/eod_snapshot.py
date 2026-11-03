@@ -205,6 +205,24 @@ def sync_snapshot(target_date: Optional[str] = None, dry_run: bool = False,
             conn.executemany('INSERT OR REPLACE INTO stock_daily '
                              '(symbol,date,open,high,low,close,volume,turnover) VALUES (?,?,?,?,?,?,?,?)',
                              payload)
+        if not dry_run:
+            # 名称同步（2026-11-01）：ST 过滤唯一的数据源是名称，而 baostock 名录已不可用
+            # （10-16 拉黑），`stock_basic_full.fetched_at` 一度停在 10-16 —— 此后新戴帽的票
+            # 能一路混进推荐（10-15 的 *ST威领 就是这么漏的）。腾讯快照本身就带名称，
+            # 顺手按天刷新，不增加任何请求；IPO 日期/状态等字段保持不动，只覆盖 name。
+            # 与 payload 解耦：停牌/休市时 stamp 不是今天、K线不写，但名称仍是当天的，
+            # 照样要刷——否则周末跑一次就整天不更新名录。
+            _names = [(s, d['name'], datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                      for s, d in snap.items() if d.get('name')]
+            if _names:
+                conn.execute('CREATE TABLE IF NOT EXISTS stock_basic_full ('
+                             'symbol TEXT PRIMARY KEY, name TEXT, ipo_date TEXT, out_date TEXT,'
+                             ' type TEXT, status TEXT, fetched_at TEXT)')
+                conn.executemany(
+                    'INSERT INTO stock_basic_full (symbol,name,fetched_at) VALUES (?,?,?) '
+                    'ON CONFLICT(symbol) DO UPDATE SET name=excluded.name, fetched_at=excluded.fetched_at',
+                    _names)
+                stats['names'] = len(_names)
             conn.commit()
         stats['written'] = 0 if dry_run else len(payload)
         stats['restated'] = len(restate)

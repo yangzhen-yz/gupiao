@@ -13,12 +13,19 @@
       <h2 class="hero-text">{{ hero.text }}</h2>
       <p v-if="hero.sub" class="hero-sub">{{ hero.sub }}</p>
 
-      <div v-if="data.market && (data.market.riskScore || data.market.indexes.length)" class="hero-market">
+      <div v-if="(data.market && (data.market.riskScore || data.market.indexes.length)) || theme" class="hero-market">
         <span class="risk-chip" :class="riskChipClass(data.market.riskScore)">
           大盘风险 {{ data.market.riskScore }}
         </span>
         <span v-for="ix in data.market.indexes" :key="ix.name" class="idx-chip">
           {{ ix.name }} <b :class="numClass(ix.changePercent)">{{ fmtPct(ix.changePercent) }}</b>
+        </span>
+        <!-- 页面标记（2026-10-31）：机器人链就贴在顶部，不用滚到卡片也知道今天热不热 -->
+        <span v-if="theme" class="idx-chip theme-chip">
+          {{ theme.name }} <b :class="numClass(theme.retPct)">{{ fmtPct(theme.retPct) }}</b>
+          <template v-if="theme.temp != null">
+            · 温度 <b>{{ theme.tempText }}</b></template
+          >
         </span>
       </div>
 
@@ -179,7 +186,180 @@
         </p>
       </section>
 
-      <!-- 持仓待办 -->
+      <!-- 主题篮子温度（2026-10-31）：用户问"能不能在页面看，好在高潮次日减仓"。
+           这里明确不做顶底预测 —— 温度只回答"现在多热"，横幅只回答"下一步减多少"。
+           口径、横幅文案、历史样本全部来自 services/ops/theme_index.py，前端只排版。 -->
+      <section
+        v-else-if="sec === 'theme'"
+        :class="['block', 'block-sent', 'block-theme', theme ? 'temp-' + theme.tempCls : '']"
+      >
+        <!-- 服务端 2 秒预算超时且没有旧快照时保留卡片位置，不留一条空空的分隔线 -->
+        <div v-if="!theme" class="ml-none">主题温度暂不可用，稍后刷新（服务端计算超时）</div>
+        <header v-else class="block-head">
+          <h3>🌡️ {{ theme.name }}</h3>
+          <span class="block-meta">{{ theme.memberCount }} 只等权 · 截至 {{ theme.asOf }}</span>
+        </header>
+
+        <!-- 为什么今天展示这条链（2026-10-31）：链是财联社板块榜每天动态选的前 3 热门板块，
+             这里只标明来源与当日板块涨跌/涨停数，不参与任何评分。 -->
+        <div v-if="theme && theme.source === 'cls' && theme.plate" class="theme-source">
+          今日热门 · 财联社「{{ theme.plate }}」
+          <b v-if="theme.plateChangePct != null" :class="numClass(theme.plateChangePct)">{{
+            fmtPct(theme.plateChangePct)
+          }}</b>
+          <template v-if="theme.plateLimitUp != null"> · 涨停 {{ theme.plateLimitUp }} 家</template>
+          <template v-if="theme.rank"> · 板块榜第 {{ theme.rank }} 名</template>
+        </div>
+
+        <!-- 链切换（2026-10-31）：三条链的数据后端一次下发，这里纯本地切换。
+             默认跟随"近 3 日最强"；点过别的链就停在手选的那条，点回"最热"恢复自动。 -->
+        <div v-if="theme && themeChains.length > 1" class="chain-chips">
+          <button
+            v-for="c in themeChains"
+            :key="c.id"
+            :class="['chain-chip', c.id === theme.id ? 'on' : '']"
+            @click="pickChain(c.id)"
+          >
+            <span class="cc-name">{{ (c.name || '').replace('链', '') }}</span>
+            <b :class="numClass(chainRet3(c) * 100)">{{ fmtPct(chainRet3(c) * 100) }}</b>
+            <i v-if="c.id === autoId" class="cc-hot">最热</i>
+          </button>
+        </div>
+
+        <div v-if="theme" class="sent-nums">
+          <span class="sent-num"
+            ><em>指数</em><b>{{ theme.idx }}</b></span
+          >
+          <span class="sent-num"
+            ><em>当日</em><b :class="numClass(theme.retPct)">{{ fmtPct(theme.retPct) }}</b></span
+          >
+          <span class="sent-num">
+            <em>温度</em><b>{{ theme.tempText }}</b
+            ><span class="temp-bar"><i :class="theme.tempCls" :style="{ width: theme.tempPct + '%' }"></i></span>
+          </span>
+          <span class="sent-num"
+            ><em>距20日高点</em><b :class="numClass(theme.ddPct)">{{ fmtPct(theme.ddPct) }}</b></span
+          >
+          <span class="sent-num"
+            ><em>状态</em><b class="state">{{ theme.stateLabel || '—' }}</b></span
+          >
+        </div>
+
+        <template v-if="theme">
+          <div class="theme-spark">
+            <svg viewBox="0 0 300 36" preserveAspectRatio="none" aria-hidden="true">
+              <polyline
+                :points="theme.points"
+                fill="none"
+                :class="['spark-line', numClass(theme.retPct)]"
+                vector-effect="non-scaling-stroke"
+              />
+            </svg>
+            <span class="spark-axis">近 {{ theme.seriesLen }} 个交易日 · {{ theme.tempHint }}</span>
+          </div>
+
+          <div v-if="theme.banner" :class="['theme-banner', 'lvl-' + theme.banner.level]">
+            <b>{{ theme.banner.title }}</b>
+            <span class="tb-text">· {{ theme.banner.text }}</span>
+            <button class="expand-btn" @click="toggleList('themeBanner')">
+              {{ expanded.themeBanner ? '收起 ↑' : '依据 ↓' }}
+            </button>
+            <div v-if="expanded.themeBanner" class="sent-extra">
+              <div class="sent-extra-item">{{ theme.banner.detail }}</div>
+            </div>
+          </div>
+
+          <div v-if="theme.events.length" class="sent-sectors">
+            <span class="sent-mini">近期过热</span>
+            <span v-for="e in theme.events" :key="e.date" class="hot-chip"
+              >{{ e.md }} <b>{{ e.tempText }}</b></span
+            >
+            <span class="sent-mini">过热≠顶，只减 1/3</span>
+          </div>
+
+          <button class="expand-btn" @click="toggleList('theme')">
+            {{ expanded.theme ? '收起 ↑' : '口径与分项 ↓' }}
+          </button>
+          <div v-if="expanded.theme" class="sent-extra">
+            <div class="sent-extra-item">口径：{{ theme.note }}</div>
+            <div class="sent-extra-item">温度：{{ theme.tempBasis }}</div>
+            <div class="sent-extra-item">
+              当日：涨停 {{ theme.last.zt || 0 }} 家 · 炸板 {{ theme.last.zb || 0 }} 家 · 上涨占比
+              {{ Math.round((theme.last.upRatio || 0) * 100) }}% · 成交 {{ theme.last.amount || 0 }} 亿
+            </div>
+            <div class="sent-extra-item">位置：{{ theme.posText }}</div>
+            <div class="sent-extra-item">
+              确认线：指数约 {{ theme.confirmLine }}（回撤 8%）或收盘跌破 20 日线 {{ theme.ma20Text }}
+            </div>
+            <div class="sent-extra-item">{{ theme.disclaimer }}</div>
+          </div>
+        </template>
+      </section>
+
+      <!-- 财联社题材梯队（2026-10-31，影子）：四池 → up_reason 归因 → 龙头/先锋/中军/跟风。
+           默认每个题材只占一行（题材 + 家数 + 最高板 + 龙头），点开才铺明细，
+           保证 900px 办公窗与 420px 手机都在 1.5 屏内。口径与来源全部来自
+           services/ops/cls_pool.py，前端不判断谁强谁弱。 -->
+      <section v-else-if="sec === 'ladder'" class="block block-sent block-ladder">
+        <div v-if="!ladder" class="ml-none">财联社梯队暂不可用，稍后刷新（接口超时）</div>
+        <template v-else>
+          <header class="block-head">
+            <h3>🏆 板块梯队</h3>
+            <span class="block-meta">
+              财联社 · 截至 {{ ladder.date }}<template v-if="ladder.stale"> · 缓存</template> · 影子
+            </span>
+          </header>
+
+          <div class="ld-nums">
+            <span>涨停 <b>{{ ladder.counts.up }}</b></span>
+            <span>连板 <b>{{ ladder.counts.continuous }}</b></span>
+            <span>炸板 <b>{{ ladder.counts.open }}</b></span>
+            <span>封板率 <b>{{ ladder.sealRate }}</b></span>
+            <span>昨涨停今 <b :class="numClass(ladder.prevZtVal)">{{ ladder.prevZt }}</b></span>
+          </div>
+
+          <div v-for="g in ladder.groups" :key="g.theme" class="ld-group">
+            <div class="ld-head" @click="toggleList('ld-' + g.theme)">
+              <b class="ld-theme">{{ g.theme }}</b>
+              <span class="ld-meta">{{ g.count }} 只 · 最高 {{ g.maxDays }} 板 · 首封 {{ g.firstSeal }}</span>
+              <span class="ld-lead">{{ g.leader ? g.leader.name : '—' }}</span>
+              <i class="ld-fold">{{ expanded['ld-' + g.theme] ? '收起' : '明细' }}</i>
+            </div>
+            <div v-if="expanded['ld-' + g.theme]" class="ld-members">
+              <div v-for="m in g.members" :key="m.symbol" class="ld-row">
+                <span :class="['ld-role', 'role-' + m.roleCls]">{{ m.role }}</span>
+                <span class="ld-name">{{ m.name }}</span>
+                <span class="ld-days">{{ m.days || 1 }}板</span>
+                <span class="ld-seal">{{ m.sealTime }}</span>
+                <b class="ld-chg" :class="numClass(m.changePct)">{{ fmtPct(m.changePct) }}</b>
+                <span class="ld-cap">{{ m.ltsz == null ? '市值—' : m.ltsz + '亿' }}</span>
+              </div>
+            </div>
+          </div>
+          <div v-if="!ladder.groups.length" class="block-empty">
+            今天没有成组题材 —— 同一题材至少 2 只涨停才成梯队。
+          </div>
+
+          <div v-if="ladder.plates.length" class="ld-plates">
+            <span class="sent-mini">板块榜</span>
+            <span v-for="p in ladder.plates" :key="p.name" class="ld-plate">
+              {{ p.name }} <b>{{ p.limitUpNum }}家</b>
+              <b :class="numClass(p.changePct)">{{ fmtPct(p.changePct) }}</b>
+            </span>
+          </div>
+
+          <button class="expand-btn" @click="toggleList('ladder')">
+            {{ expanded.ladder ? '收起 ↑' : '口径与来源 ↓' }}
+          </button>
+          <div v-if="expanded.ladder" class="sent-extra">
+            <div class="sent-extra-item">来源：{{ ladder.meta.source }}</div>
+            <div class="sent-extra-item">角色：{{ ladder.meta.caliber }}</div>
+            <div class="sent-extra-item">口径差：{{ ladder.meta.dayDiff }}</div>
+            <div class="sent-extra-item">{{ ladder.meta.disclaimer }}</div>
+          </div>
+        </template>
+      </section>
+
       <section v-else-if="sec === 'positionActions'" class="block">
         <header class="block-head">
           <h3>📌 持仓待办</h3>
@@ -463,7 +643,7 @@
 </template>
 
 <script setup>
-  import { ref, computed, onMounted } from 'vue'
+  import { ref, computed, onMounted, watch } from 'vue'
   import { apiFetch, apiFetchText } from '../../utils/helpers'
   import { usePolling } from '../../composables/usePolling'
   import { navigate } from '../../composables/useHashRoute'
@@ -576,6 +756,143 @@
       persistAsOf: cal.persistAsOfDate || '',
       fundCaliber: cal.fund === 'sina_r0' ? '仅超大单(r0)' : cal.fund === 'eastmoney_f62' ? '超大+大单(f62)' : '—',
       disclaimer: s.disclaimer || '',
+    }
+  })
+
+  // 主题篮子温度（2026-10-31）：服务端已把温度、位置、横幅建议算好，这里只做
+  // 百分比换算与折线点位。温度高不等于顶——文案由后端给，前端不加形容词。
+  // 也不在这里做任何阈值判断：_TEMP_HOT/_DD_CONFIRM 只有一处（theme_index.py）。
+  //
+  // 财联社题材梯队（2026-10-31，影子）：只做展示，不做"该不该买"的判断。
+  // 角色名与排序都由 services/ops/cls_pool.py 给出，这里只把数字转成显示格式。
+  const LADDER_ROLE_CLS = { 龙头: 'lead', 先锋: 'pioneer', 中军: 'core', 跟风: 'follow' }
+  const ladder = computed(() => {
+    const l = data.value && data.value.ladder
+    if (!l || !Array.isArray(l.ladders)) return null
+    const sum = l.summary || {}
+    const dp = sum.dingpan || {}
+    const prevZtVal = parseFloat(String(dp.prevZtPerf || '').replace('%', ''))
+    return {
+      date: String(l.date || '').slice(5),
+      stale: !!l.stale,
+      counts: sum.counts || {},
+      sealRate: dp.sealRate || '--',
+      prevZt: dp.prevZtPerf || '--',
+      prevZtVal: Number.isFinite(prevZtVal) ? prevZtVal : null,
+      groups: (l.ladders || []).slice(0, 3).map(g => ({
+        theme: g.theme,
+        count: g.count,
+        maxDays: g.maxDays,
+        firstSeal: g.firstSeal,
+        leader: (g.members || []).find(m => m.role === '龙头') || null,
+        members: (g.members || []).map(m => ({ ...m, roleCls: LADDER_ROLE_CLS[m.role] || 'follow' })),
+      })),
+      plates: (sum.plates || []).slice(0, 4),
+      meta: l.meta || {},
+    }
+  })
+
+  // 多链（10-31 晚）：后端一次下发三条链（data.themes），这里纯本地切换，
+  // 不发请求，也不会出现"页面刷新后还挂着旧链"。pickedChain 为空 = 跟随最热。
+  const pickedChain = ref('')
+  const themeChains = computed(() => {
+    const d = data.value || {}
+    const list = Array.isArray(d.themes) ? d.themes.filter(t => t && !t.error) : []
+    if (list.length) return list
+    return d.theme && !d.theme.error ? [d.theme] : []
+  })
+  const autoId = computed(() => ((data.value && data.value.theme) || {}).id || '')
+  const themeRaw = computed(() => {
+    const list = themeChains.value
+    if (pickedChain.value) {
+      const hit = list.find(c => c.id === pickedChain.value)
+      if (hit) return hit
+    }
+    return (data.value && data.value.theme) || list[0] || null
+  })
+  function chainRet3(c) {
+    const v = c && c.last && c.last.ret3
+    return v == null || !Number.isFinite(Number(v)) ? 0 : Number(v)
+  }
+  function pickChain(id) {
+    pickedChain.value = id && id !== autoId.value ? id : ''
+  }
+  watch(themeChains, list => {
+    if (pickedChain.value && !list.some(c => c.id === pickedChain.value)) pickedChain.value = ''
+  })
+
+  const theme = computed(() => {
+    const t = themeRaw.value
+    if (!t || t.error || !Array.isArray(t.series) || t.series.length < 2) return null
+    const levels = t.series.map(s => Number(s.idx)).filter(v => Number.isFinite(v))
+    if (levels.length < 2) return null
+    const min = Math.min(...levels)
+    const max = Math.max(...levels)
+    const span = max - min || 1
+    const H = 36
+    const points = levels
+      .map((v, i) => {
+        const x = ((i / (levels.length - 1)) * 300).toFixed(1)
+        const y = (H - 2 - ((v - min) / span) * (H - 4)).toFixed(1)
+        return `${x},${y}`
+      })
+      .join(' ')
+    const last = t.last || {}
+    const temp = t.temp == null ? null : Number(t.temp)
+    const dd = last.dd == null ? null : Number(last.dd) * 100
+    const rp = t.recentPeak || {}
+    const pctText = v => (v == null || !Number.isFinite(Number(v)) ? '—' : `${Number(v).toFixed(1)}%`)
+    return {
+      id: t.id || '',
+      name: t.name || '主题篮子',
+      // 动态链（2026-10-31）：source='cls' 表示这条链是财联社当日热门板块，
+      // plate/plateChangePct/plateLimitUp 用来说明"为什么今天展示它"。
+      source: t.source || 'fixed',
+      plate: t.plate || '',
+      plateChangePct: t.plateChangePct == null ? null : Number(t.plateChangePct),
+      plateLimitUp: t.plateLimitUp == null ? null : Number(t.plateLimitUp),
+      // rank 是板块榜名次（不是链强度排名），只有动态链才有
+      rank: t.rank || null,
+      memberCount: t.memberCount || 0,
+      asOf: String(t.asOf || '').slice(5),
+      idx: last.idx == null ? '--' : Number(last.idx).toFixed(1),
+      retPct: last.ret == null ? null : Number(last.ret) * 100,
+      temp,
+      tempText: temp == null ? '—' : temp.toFixed(0),
+      // 配色只区分"温度档"，与红涨绿跌无关：热=橙、偏热=黄、冷=蓝、中性=灰
+      tempCls: temp == null ? 'na' : temp >= 80 ? 'hot' : temp >= 60 ? 'warm' : temp <= 20 ? 'cold' : 'mid',
+      tempPct: temp == null ? 0 : Math.max(0, Math.min(100, temp)),
+      tempHint:
+        temp == null
+          ? '温度数据不足'
+          : temp >= 80
+            ? '过热区（历史前 20%）'
+            : temp >= 60
+              ? '偏热'
+              : temp <= 20
+                ? '冰点区'
+                : '中性',
+      ddPct: dd,
+      stateLabel: t.stateLabel || '',
+      points,
+      seriesLen: levels.length,
+      banner: t.banner || null,
+      events: (t.events || []).map(e => ({
+        ...e,
+        md: String(e.date || '').slice(5),
+        tempText: e.temp == null ? '—' : Number(e.temp).toFixed(0),
+      })),
+      note: t.note || '',
+      tempBasis: (t.meta && t.meta.tempBasis) || '',
+      disclaimer: (t.meta && t.meta.disclaimer) || '',
+      last,
+      posText:
+        dd == null
+          ? '—'
+          : `距 ${String(rp.date || '').slice(5) || '近期'} 高点 ${rp.idx == null ? '--' : Number(rp.idx).toFixed(1)}（${pctText(dd)}）` +
+            (t.dd60 == null ? '' : `；相对近 60 日高点 ${pctText(Number(t.dd60) * 100)}`),
+      confirmLine: rp.idx == null ? '--' : (Number(rp.idx) * 0.92).toFixed(1),
+      ma20Text: last.ma20 == null ? '--' : Number(last.ma20).toFixed(1),
     }
   })
 
@@ -1590,6 +1907,276 @@
     font-size: 0.75rem;
     line-height: 1.45;
     color: var(--text-tertiary);
+  }
+
+  /* ===== 主题篮子温度（2026-10-31）=====
+     温度条只表示"在历史分位里的位置"，与红涨绿跌无关：高温=橙、偏热=黄、冷=蓝。
+     折线才用红绿（>0 红、<0 绿）。整卡默认约 160px 高，明细全部折叠。 */
+  .block-theme {
+    border-left-color: var(--border-subtle);
+  }
+  .block-theme.temp-hot {
+    border-left-color: var(--accent-danger);
+  }
+  .block-theme.temp-warm {
+    border-left-color: var(--accent-warning);
+  }
+  .block-theme.temp-cold {
+    border-left-color: var(--accent-info);
+  }
+  .temp-bar {
+    display: inline-block;
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+    vertical-align: middle;
+  }
+  .temp-bar i {
+    display: block;
+    height: 100%;
+    background: var(--accent-tertiary);
+  }
+  .temp-bar i.hot {
+    background: var(--accent-danger);
+  }
+  .temp-bar i.warm {
+    background: var(--accent-warning);
+  }
+  .temp-bar i.cold {
+    background: var(--accent-info);
+  }
+  .sent-num b.state {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+  .theme-spark {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.375rem;
+  }
+  .theme-spark svg {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 36px;
+    display: block;
+  }
+  .spark-line {
+    stroke: var(--text-tertiary);
+    stroke-width: 1.5;
+  }
+  .spark-line.up {
+    stroke: var(--accent-danger);
+  }
+  .spark-line.down {
+    stroke: var(--accent-success);
+  }
+  .spark-axis {
+    flex: 0 0 auto;
+    font-size: 0.6875rem;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+  }
+  .theme-banner {
+    margin-top: 0.375rem;
+    padding: 5px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+  .theme-banner b {
+    color: var(--text-primary);
+    margin-right: 0.375rem;
+  }
+  .theme-banner.lvl-warn {
+    background: var(--accent-warning-bg);
+    border-color: var(--accent-warning-border);
+  }
+  .theme-banner.lvl-danger {
+    background: var(--accent-danger-bg);
+    border-color: var(--accent-danger-border);
+  }
+  .theme-banner.lvl-info {
+    background: var(--accent-info-bg);
+    border-color: var(--accent-info-border);
+  }
+  .theme-banner .expand-btn {
+    margin-top: 0;
+  }
+  .tb-text {
+    color: var(--text-secondary);
+  }
+  .hot-chip {
+    font-size: 0.6875rem;
+    padding: 1px 7px;
+    border-radius: var(--radius-pill);
+    color: var(--accent-warning);
+    background: var(--accent-warning-bg);
+    border: 1px solid var(--accent-warning-border);
+  }
+  .theme-chip {
+    border-color: var(--border-medium);
+  }
+  /* 链切换 chips（2026-10-31）：420px 下三颗放不满时换行，不靠横向滑动藏内容；
+     数值红涨绿跌 */
+  .chain-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px 0 2px;
+  }
+  .chain-chip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 9px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    cursor: pointer;
+  }
+  .chain-chip.on {
+    border-color: var(--accent-warning-border);
+    background: var(--accent-warning-bg);
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .chain-chip .cc-name {
+    white-space: nowrap;
+  }
+  .chain-chip .cc-hot {
+    font-style: normal;
+    font-size: 0.625rem;
+    color: var(--accent-warning);
+  }
+
+  /* 链来源说明（2026-10-31）：一行小字，写清"今天为什么是这条链"。
+     420px 下自动换行，紧贴区块头部，不单独占一行高度。 */
+  .theme-source {
+    padding: 2px 0 0;
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+
+  /* ===== 财联社题材梯队（2026-10-31，影子）=====
+     默认每个题材一行（题材/家数/最高板/龙头），点开才铺角色明细。
+     420px 下所有行都 flex-wrap，不裁内容、不横向滚动。 */
+  .block-ladder .ld-nums {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+    padding: 5px 0 2px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+  .block-ladder .ld-nums b {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .ld-group {
+    border-top: 1px dashed var(--border-subtle);
+  }
+  .ld-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+    padding: 6px 0;
+    cursor: pointer;
+  }
+  .ld-theme {
+    font-size: 0.8125rem;
+    color: var(--text-primary);
+  }
+  .ld-meta {
+    font-size: 0.6875rem;
+    color: var(--text-tertiary);
+  }
+  .ld-lead {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .ld-fold {
+    margin-left: auto;
+    font-style: normal;
+    font-size: 0.6875rem;
+    color: var(--accent-warning);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .ld-members {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 0 6px;
+  }
+  .ld-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 8px;
+    font-size: 0.75rem;
+    line-height: 1.6;
+  }
+  .ld-role {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
+    font-size: 0.6875rem;
+    line-height: 1.5;
+  }
+  /* 龙头用红、先锋用橙：与"上涨=红"同向，只表示梯队位置，不表示推荐 */
+  .ld-role.role-lead {
+    color: var(--accent-danger);
+    border-color: var(--accent-danger);
+    font-weight: 600;
+  }
+  .ld-role.role-pioneer {
+    color: var(--accent-warning);
+    border-color: var(--accent-warning);
+  }
+  .ld-role.role-core,
+  .ld-role.role-follow {
+    color: var(--text-secondary);
+  }
+  .ld-name {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .ld-days,
+  .ld-seal,
+  .ld-cap {
+    color: var(--text-tertiary);
+    font-size: 0.6875rem;
+  }
+  .ld-chg {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+  }
+  .ld-plates {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    padding: 4px 0 2px;
+    font-size: 0.6875rem;
+    color: var(--text-tertiary);
+  }
+  .ld-plate b {
+    margin-left: 2px;
+    color: var(--text-secondary);
   }
 
   .env-card.env-warning {

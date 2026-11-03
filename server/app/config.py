@@ -456,6 +456,14 @@ STRATEGY_SCORE_VALUES = {
     'smart_money': {'high': 10, 'mid': 6, 'low': 4, 'none': 0},
 }
 
+# ========== 修②（2026-11-03，影子）：零样本三因子从归一化分母摘掉 ==========
+# rps/fundamental/smart_money 三因子数据源零样本（strategy_factor_weights 里 sample_count=0），
+# 每票都吃 no_data 分却占归一化分母 ~29%，系统性压低总分。
+# True=主链也摘掉（上线动作）；False=主链现状不变（逐字节等于现状），
+# 影子臂 alt_total 恒算（纯算术零 IO）随 stock['score'] 进 recommendation_batches.stocks_json 留痕，
+# 20 个交易日后按可成交净期望 + 最深回撤裁决再定是否翻 True。
+STRATEGY_ZERO_SAMPLE_EXCLUDE = False
+
 # ========== 策略委比验证配置 ==========
 # 用于验证委比指标是否真实反映买盘强度，防止虚假信号
 STRATEGY_WEBI_VERIFY = {
@@ -636,6 +644,12 @@ RECOMMEND_MAX_DRAWDOWN_FROM_HIGH = 8.0     # 自日内高点回落≥此值(%)�
 RECOMMEND_TREND_STALE_DRIFT = 0.03         # 3%
 RECOMMEND_TREND_STALE_FACTOR = 0.4         # 打折系数（97.6分→39分，无法再靠趋势分越过60分推荐线）
 
+# ========== 新③（2026-11-03，影子）：rev20+缩量 候选池影子臂 ==========
+# 因子体检（85 截面）里唯一稳健为正的组合：rev20 分位≥0.7 且 vol_shrink 分位≥0.6
+# （5 日超额 +0.12pp）。只落 strategy_snapshot 影子列、不改候选/分数/门槛；
+# 攒 20 个交易日后按可成交净期望 + 最深回撤与修②同批裁决。
+RECOMMEND_REV20_SHADOW_ENABLED = True
+
 # ========== 死猫反弹趋势门控（2026-10-13，修"下跌趋势短暂反弹股评分高于趋势良好股"） ==========
 # 根因：① calc_stock_score_v2 多数调用点(单票评分/持仓/趋势扫描/扫描)未传 trend_result，
 #       趋势因子完全缺席，退化为纯日内分；② 日内动量因子只看当日，下跌趋势股单日大涨
@@ -648,7 +662,7 @@ TREND_GATE_MIN_CHANGE = 3.0      # 当日涨幅≥此值(%)才可能是"反弹"�
 DEAD_CAT_BOUNCE_PENALTY = 0.30   # 日内分打折比例：×0.70（反弹股日内分80→56，再融合低趋势分后总分显著下移）
 
 # ========== 智能推荐：涨幅段闸门（2026-10-18，根因复盘 §3；替换原"半山腰追高惩罚"） ==========
-# 复盘数据（218 条，`docs/胜率低根因复盘-2026-10-18.md`）：推荐时当日涨幅
+# 复盘数据（218 条，`server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）：推荐时当日涨幅
 # 0~2%（弱势区）T+1 36.4%/-2.59%、4.5~9.8%（半山腰死亡区）40.0%/-2.27%，
 # 两段共 91 条、均值与超额双负；砍掉后剩 52.8%/+0.82%。甜点区 2~4.5%
 # 与涨停区 ≥9.8% 历史最强，不拦；负涨幅样本不足（n=2）同样不拦。
@@ -678,7 +692,7 @@ RECOMMEND_LOSER_CACHE_SEC = 600       # 这张表要算全量推荐的 T+1/3/5�
 # 2026-10-18 起这条常量退居"兜底文案"：卡片上的警告改成按票算的（现价比买入上限高多少），
 # 胜率数字也换成当天复盘的实测值（`recommend.exec_rates`）。原来那句写着"复盘132次…45%/63%"，
 # 样本每天在长、口径刚换成 1094 选票范围，写死的数字迟早变成没人核对的旧结论。
-# 同日口径再纠偏（`docs/胜率低根因复盘-2026-10-18.md`）：纸面"低吸参考价 60.4%"里
+# 同日口径再纠偏（`server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）：纸面"低吸参考价 60.4%"里
 # 31.7% 是次日没跌到买入价的幻觉胜利（未成交组按构造 100% 胜率），卡片只放
 # "低吸单真正成交 42.1%（n=95）+ 成交日追高 25.3% + 现价追入 46.8%（n=218）"。
 RECOMMEND_EXEC_HINT_ENABLED = True
@@ -791,6 +805,155 @@ WECOM_PUSH_MATRIX_LABEL = True          # 推送文案里带上"这个位置历�
 # 盘中 60 秒扫描是否也查亏损黑名单（2026-10-17 补的漏口：以前只有智能推荐查它，
 # 被拉黑的票仍会从推送里回来）。关掉=恢复旧行为，仅用于对照。
 WECOM_PUSH_APPLY_LOSER_BLACKLIST = True
+
+# ========== 盘中龙头通道（2026-11-01，影子先行，默认关）==========
+# 用户描述的形态：开盘快速拉升 → 短暂停顿换手 → 不破分时均线（破了快速收回）→
+# 均线上方震荡 2~5 分钟 → 开盘 10 分钟内拉板。痛点：现有链路 09:45 才出推荐，
+# 龙头那时已封板买不到。本通道独立于 13 因子日线评分，只做分钟级形态打分，
+# 影子期只落库不推送；开关关掉时代码路径完全不进入（一个请求都不多发）。
+INTRADAY_DRAGON_ENABLED = True           # 总开关。开=盘中每 15s 额外打腾讯快照+分时（2026-11-02 21:1x 开 P1 影子：窗口 09:31~10:15 之外不产生任何请求，推送仍双关）
+INTRADAY_DRAGON_SHADOW = True            # True=只落 intraday_dragon_shadow，不推送
+INTRADAY_DRAGON_PUSH_ENABLED = False     # 影子满 20 交易日后才允许打开
+INTRADAY_DRAGON_START = '09:31'          # 专用扫描窗口（避开集合竞价）
+INTRADAY_DRAGON_END = '10:15'
+INTRADAY_DRAGON_INTERVAL_SEC = 15        # 专用轮询间隔（比主推送的 60s 更密）；
+                                         # 主循环 10s 一拍，名义 15s 实际落到 20s
+INTRADAY_DRAGON_PUSH_SCORE = 0            # 推送的分数下限。0=不设：2026-11-01 五日回放里
+                                          # 分数≥70 的子集反而更差（B −1.94%），分数只用于排序与观察档
+INTRADAY_DRAGON_WARN_SCORE = 65           # ≥此值预警（形态未成立但强度高）
+INTRADAY_DRAGON_WATCH_SCORE = 52          # ≥此值观察
+INTRADAY_DRAGON_MIN_ROOM_PCT = 0.8        # 距涨停价至少留 0.8% 才推（封板前必须还有空间）
+INTRADAY_DRAGON_MAX_ROOM_PCT = 2.0        # 距涨停价超过 2% 不推：五日回放里 ≤2% 的 6 只触板 5 只
+INTRADAY_DRAGON_COOLDOWN_SEC = 600        # 同一只票两次推送的最小间隔（10 分钟）
+INTRADAY_DRAGON_MAX_PER_STOCK = 2        # 同一只票一天最多推几次（含分数升级）
+INTRADAY_DRAGON_DAILY_LIMIT = 4          # 龙头通道一天最多推几只（与主推送额度分账）
+INTRADAY_DRAGON_SCAN_MAX = 30            # 单轮最多对多少只票做分钟级评分（控请求量）。P1 首日降量：30 只≈3,990 次分时/44 分钟（≈91 次/分），120 只≈15,960 次；腾讯单 IP 频次未实测，先小口径，失败率 0 且单轮 <5s 才升 60/120
+INTRADAY_DRAGON_MIN_VOL_RATIO = 1.2      # 快照预筛：量比下限
+# 全市场预筛（默认关）：打开后 09:31~09:50 每 SWEEP_INTERVAL 秒对主板 3052 只做一次批量快照
+# （41 批 qt，6 线程实测 3.1s），把"昨日没涨停、今天平开急拉"的票补进候选 ——
+# 五日回放里早封龙只有 29.2% 落在盘前池内，不补这一层，通道再准也只能看见三成。
+# 命中约 186 只（相对今开 2%~8.5% 且量比≥1.2），单轮分钟抓取会因此涨到 ~10s；
+# 腾讯批量频次未验证，所以默认关，等用户确认请求预算后再开。
+INTRADAY_DRAGON_SWEEP_ALL = False
+INTRADAY_DRAGON_SWEEP_INTERVAL_SEC = 60
+INTRADAY_DRAGON_MIN_OPEN_GAIN = 1.2      # 快照预筛：相对今开涨幅下限（%）
+
+# B 臂：涨幅前 20 入口（清单 T2.1，2026-11-01，影子 / 默认关）
+# 解决"候选池只有昨涨停/海选/推荐，早封龙头只有 29.2% 在池内"。
+# 每 ROUND_SEC 秒对主板做一次批量快照，按相对今开涨幅取前 TOP_N，与 A 臂（结构优先）
+# 并行交给同一套分钟评分；只多出候选行，不改 A 臂任何判定。
+# 关掉时 scan_once 连这个模块都不导入 —— 零额外请求、零额外行。
+INTRADAY_DRAGON_B_ARM = False            # B 臂总开关
+INTRADAY_DRAGON_B_TOP_N = 20             # 涨幅榜取前 N
+INTRADAY_DRAGON_B_ROUND_SEC = 300        # 候选重排间隔（5 分钟）；20s 轮询只做触发检查
+INTRADAY_DRAGON_B_FIRST = '09:35'        # 第一轮粗筛（开盘 5 分钟走完）
+INTRADAY_DRAGON_B_LAST = '10:15'         # 最后一轮
+INTRADAY_DRAGON_B_GAIN_LO = 2.0          # 相对今开涨幅下限（%）
+INTRADAY_DRAGON_B_GAIN_HI = 8.5          # 上限：再高是追高，不是"起步阶段"
+INTRADAY_DRAGON_B_VOL_RATIO = 1.5        # 同刻量比下限（快照量比为准，缺则标 vol_src）
+INTRADAY_DRAGON_B_AMOUNT_5M = 3000.0     # 最近 5 分钟成交额下限（万元）
+INTRADAY_DRAGON_B_SPREAD_MAX = 0.3       # 买卖价差上限（%）
+INTRADAY_DRAGON_B_NEW_DAYS = 60          # 上市不足 N 个交易日剔除（用本地日K首根近似）
+
+# 特征层（清单 T2.2，2026-11-01）：每轮把候选的 11 个特征落 dragon_features。
+# 零外部请求（复用已抓的分时与同一轮快照），只多本地写入；关掉只停写，不打分、不影响 A 臂。
+# 缺失一律 NULL，不填中档；coverage<0.60 时 score_ready=0（T2.3 不给它打分）。
+INTRADAY_DRAGON_FEATURE_LOG = True
+INTRADAY_DRAGON_FEATURE_MIN_COVERAGE = 0.60
+
+# 评分 v2 / 结构 / 流动性（清单 T2.3，2026-11-01，影子）
+# 判定顺序固定 G3.1：硬排除 → 涨幅/room → 流动性 → 结构 → 评分 → 推送前复核 → 额度。
+# 默认 legacy：一行都不算，A 臂逐票 diff=0；v2_shadow 只算分、只记录，不改变谁被推。
+# v2_live 要等 20 交易日影子对照（≥70 与 ≥0 两套触发）后再谈，现在打开会直接报错。
+INTRADAY_DRAGON_SCORE_MODE = 'v2_shadow' # legacy / v2_shadow（P1 影子：落影子表与 v2 分，不进推送判据）
+INTRADAY_DRAGON_MIN_SCORE = 0            # v2 分数下限；0=不设。70 只做影子对照，不当线上线
+INTRADAY_DRAGON_VWAP_SHARE_MIN = 0.70    # 结构：VWAP 上方分钟占比下限（开盘至今）
+INTRADAY_DRAGON_VWAP_SHARE_FROM = '09:45'  # 结构：占比起点。09:45 前只记 pending，不推
+INTRADAY_DRAGON_PAUSE_MIN = 2            # 结构：停顿换手分钟数下限（含）
+INTRADAY_DRAGON_PAUSE_MAX = 5            # 结构：停顿换手分钟数上限（含）
+INTRADAY_DRAGON_GAP_MAX = 7.0            # 高开上限（%）：>7 不硬拒，只扣 15 分并记录
+INTRADAY_DRAGON_GAP_PENALTY = 15.0       # 同上扣分（清单 T2.5 第 1 条）
+INTRADAY_DRAGON_LIQ_SHADOW_DAYS = 20     # 流动性影子分位数的窗口（交易日）
+INTRADAY_DRAGON_LIQ_SAMPLE_EVERY_MIN = 5  # 取样本的分钟步长（5 分钟一次，避免全量几百万行）
+INTRADAY_DRAGON_LIQ_MIN_SAMPLES = 200    # 影子样本少于此数，回退配置阈值并标 fallback
+INTRADAY_DRAGON_LIQ_SPREAD_Q = 0.80      # 价差影子分位：只收紧不放松（min(0.30, q80)）
+INTRADAY_DRAGON_LIQ_ASK_BID_Q = 0.80     # 卖一量/买一量影子分位上限
+INTRADAY_DRAGON_LIQ_AMOUNT_Q = 0.20      # 5 分钟额影子分位：只收紧不放松（max(3000, q20)）
+INTRADAY_DRAGON_ASK_BID_MAX = 2.0        # 影子样本不足时的回退上限（来源标 fallback_config）
+
+# 推送机制（清单 T2.4，2026-11-01，默认 legacy / 零消息）
+# 三条独立约束：窗口 / 复核 / 额度。逐条可关；legacy 时整个模块不导入、不落一行。
+# v2_dry：算完整推送字段并落 dragon_push_log，但不发消息（测试群验证靠 DRY_SEND）；
+# v2_live：真正发企业微信，并同时写 dragon_alert_log（与 legacy 同一张表，5 列）。
+INTRADAY_DRAGON_PUSH_MODE = 'legacy'      # legacy / v2_dry / v2_live
+INTRADAY_DRAGON_PUSH_WINDOW_START = '09:31'
+INTRADAY_DRAGON_PUSH_WINDOW_END = '10:15'
+INTRADAY_DRAGON_PUSH_QUOTE_MAX_AGE = 60   # 秒：报价时间超过它 → 改观察，不推
+INTRADAY_DRAGON_PUSH_DEVIATION_MAX = 1.0  # %：现价偏离触发价超过它 → 改观察，不推
+INTRADAY_DRAGON_PUSH_DRY_SEND = False     # dry 也真发（只用于测试群演练）
+INTRADAY_DRAGON_ENTRY_ARMS = 'both'       # both / pullback / breakout：影子两臂对照，不混算
+INTRADAY_DRAGON_ENTRY_LIVE_ARM = 'pullback'  # live 发哪一臂；两臂未对照完，默认回踩
+INTRADAY_DRAGON_ENTRY_BAND_PCT = 0.3      # 回踩臂：VWAP ± 0.3%
+INTRADAY_DRAGON_BREAKOUT_ADD_PCT = 0.2    # 突破臂：触发分钟价 ~ +0.2%
+INTRADAY_DRAGON_STOP_MODE = 'fixed_2pct'  # fixed_2pct / vwap / day_low
+INTRADAY_DRAGON_STOP_PCT = 2.0            # 止损：成交价 ×(1−2%)；无成交价用区间下限估计
+INTRADAY_DRAGON_STOP_DAY_LOW_BUF = 0.2    # day_low 模式：当日分钟最低价再留 0.2%
+INTRADAY_DRAGON_SELL_TIME = '10:30'       # 未封板的卖出时点
+INTRADAY_DRAGON_POSITION_PCT = 5.0        # 提示用仓位上限（组合层另算；不改线上满仓等分）
+INTRADAY_DRAGON_CAP_DAILY_ON = True       # 额度三条各自独立开关
+INTRADAY_DRAGON_CAP_PER_STOCK_ON = True
+INTRADAY_DRAGON_CAP_COOLDOWN_ON = True
+
+# 风控与止损/仓位（清单 T2.5，2026-11-01，影子）
+# 四条闸各自独立：关掉只退回 T2.3 结构门（同一阈值已经挡过一次），不是放行追高票。
+# 仓位与频率默认关：前者等 P3 接组合层，后者等 T2.7 接调度器；现行满仓等分与 15s 轮询都不动。
+INTRADAY_DRAGON_RISK_CHASE_ON = True      # 相对今开 > 8.5% 不推
+INTRADAY_DRAGON_RISK_GAP_ON = True        # 高开 > 7% 扣 15 分（分数在 T2.3 里扣，这里只管开关与留痕）
+INTRADAY_DRAGON_RISK_ROOM_ON = True       # room <0.8% 或 >2.0% 不推
+INTRADAY_DRAGON_RISK_LIQ_ON = True        # 流动性 fail 不推；unknown 不挡但记录
+INTRADAY_DRAGON_RISK_POSITION_ON = False  # 单笔 ≤5%、通道 ≤20%；P3 才接
+INTRADAY_DRAGON_CHANNEL_CAP_PCT = 20.0    # 龙头通道占总资金上限（仅 position_on 时生效）
+INTRADAY_DRAGON_RISK_STOP_ON = True       # −2% 止损只在回放/影子里建模，不假设止损价一定成交
+INTRADAY_DRAGON_RATE_GOVERNOR_ON = True   # 频率状态机：T2.7 已接调度（dragon_risk.due）；P1 首日打开——失败率>5% 退 60s、连败 3 次熔断 300s，只会变疏不会变密
+                                          # 默认关＝保持现行节奏，打开后 20s 基准（实际不变密）
+INTRADAY_DRAGON_RATE_BASE_SEC = 20        # 基准轮询（10s 主循环上 15s 与 20s 都落到 20s，节奏不变密）
+INTRADAY_DRAGON_RATE_SLOW_SEC = 60        # 失败率 >5% 退到 60s
+INTRADAY_DRAGON_RATE_FAIL_PCT = 5.0       # 失败率阈值（%）
+INTRADAY_DRAGON_RATE_FAIL_STREAK = 3      # 连续失败次数 → 熔断
+INTRADAY_DRAGON_RATE_BREAK_SEC = 300      # 熔断时长（5 分钟）
+INTRADAY_DRAGON_RATE_WINDOW = 20          # 算失败率的滑动窗口（轮）
+
+# 影子表与开关矩阵（清单 T2.6 / T4.2，2026-11-01，影子）
+# 七个条件各自独立：on=是否计算，mode=shadow 只记录 / live 才据它改判定。
+# 默认必须等于今天的行为：量比/涨幅/VWAP 已在 T2.3 里生效（live），
+# 回踩买/止损只建模（shadow），5% 仓位与板块前 3 未接（off / unavailable）。
+INTRADAY_DRAGON_SHADOW_TABLE_ON = True    # 写 dragon_shadow；关掉=零写入（不影响主链路）
+INTRADAY_DRAGON_SHADOW_KEEP_DAYS = 40     # 至少保留 40 个交易日；手工 prune 时才删更早的
+INTRADAY_DRAGON_COND_SECTOR_ON = True     # 板块前 3：sector_rank 恒 NULL，暂时不可用
+INTRADAY_DRAGON_COND_SECTOR_MODE = 'shadow'
+INTRADAY_DRAGON_COND_VOL_ON = True        # 同刻量比 ≥ 1.5（B 臂入口；live）
+INTRADAY_DRAGON_COND_VOL_MODE = 'live'
+INTRADAY_DRAGON_COND_GAIN_5M_ON = True    # 相对今开 2.0%~8.5%（结构下界；live）
+INTRADAY_DRAGON_COND_GAIN_5M_MODE = 'live'
+INTRADAY_DRAGON_COND_VWAP70_ON = True     # VWAP 上方占比 ≥ 0.70（结构；live）
+INTRADAY_DRAGON_COND_VWAP70_MODE = 'live'
+INTRADAY_DRAGON_COND_PULLBACK_ON = True   # 回踩 VWAP 买（两臂之一；live_arm=pullback）
+INTRADAY_DRAGON_COND_PULLBACK_MODE = 'live'
+
+# WP4 的 12 个配置项（清单 T4.1，2026-11-01）：默认值全部等于改造前行为。
+# 本次只新增 3 项（ML_ENABLED / PULLBACK_WAIT_SEC / PUSH_MIN_INTERVAL_SEC），
+# 其余 9 项在 T2.x 落地时已经存在；清单名与代码名不同的以本文件为准：
+#   TOP_GAIN_N        -> INTRADAY_DRAGON_B_TOP_N
+#   MAX_OPEN_GAIN     -> INTRADAY_DRAGON_B_GAIN_HI
+#   MIN_AMOUNT_5M     -> INTRADAY_DRAGON_B_AMOUNT_5M
+#   MAX_SPREAD        -> INTRADAY_DRAGON_B_SPREAD_MAX
+#   MAX_PUSH_PER_DAY  -> INTRADAY_DRAGON_DAILY_LIMIT
+# 热读边界：这 12 项在导入时绑定进各模块命名空间，改这里**必须重启**才生效；
+# 没有一项走 app_settings 实时覆盖（对照表见 services/pick/dragon_settings.py）。
+INTRADAY_DRAGON_ML_ENABLED = False        # 无 sklearn/lightgbm、T1.5 未做；改为 True 会被校验拒绝
+INTRADAY_DRAGON_PULLBACK_WAIT_SEC = 180   # 回踩限价最多等 3 分钟；与 dragon_backtest.PULLBACK_WAIT_SEC 同值
+INTRADAY_DRAGON_PUSH_MIN_INTERVAL_SEC = 20  # 两条推送之间的最小间隔（秒）；P2 纸面时才接，当前未被读取
+
 TREND_BACKTEST_KLINE_CONCURRENCY = 5                # 批量拉 K 线并发度
 TREND_BACKTEST_MARKET_SYMBOL = 'sh000001'           # 大盘基准（上证指数）
 TREND_BACKTEST_SCORE_SEGMENTS = [(60, 70), (70, 80), (80, 101)]  # 分数段（左闭右开，80+ 用 101 兜顶）
@@ -826,6 +989,17 @@ REC_SIM_DAILY_MONTHS = 3            # 每天固定回看 3 个月（与用户最
 REC_SIM_BOARD_PRICE_V2 = True       # 封死与否改看"有无突破价成交"（炸板回封算可买）
 REC_SIM_DEFER_LIMIT_DOWN = True     # 一字跌停卖不掉就顺延（open 与 close 都判）
 REC_SIM_BOARD_EPS = 0.005           # 涨跌停价比较容差（半分；价格四舍五入到分后仍需留 eps）
+
+# ========== 预测验证口径（2026-11-03 修①）==========
+# `backtest_yesterday_predictions` 主流程原来用**调用那一刻的实时涨跌**当"次日涨跌"。
+# 15:20 定时跑是对的，但这个函数也被接口直接调；周末/节假日再调时，腾讯的 changePercent
+# 还是上一个交易日的，于是把"预测日自己"的涨跌写成了"次日"。实测 2410 条已验证记录里
+# 167 条（6.9%）对不上"次日收盘"：93 条等于预测日自己当天的涨跌（集中在周五那批：
+# 06-05/06-26/07-03/07-17）、35 条与前后任何一根都对不上（盘中快照值）、39 条跨多根歧义。
+# 判据自测 `analysis_out/verify_kline_selftest.py`。这些行同时喂给准确率统计与因子权重学习。
+# True＝与补验路径同一口径（K 线里严格晚于预测日的第一根，取不到就不写）；
+# False＝逐字节回到改造前（批量实时行情 + changePercent=0 跳过）。覆盖表可热改。
+REC_VERIFY_USE_KLINE = True
 
 # ========== 回测仓位规则（2026-10-20：风险预算 + 单票上限 + 总敞口，三个独立开关）==========
 # 现状（也是关掉时的行为）：`budget = cash / 当天要买的只数` —— 满仓轮动、不留缓冲。
@@ -875,6 +1049,19 @@ EXIT_RULES_LIVE_ENABLED = False
 EXIT_RULES_TIME_STOP_DAYS = 5        # 持有满 N 个自然日仍没有 +3% 浮盈 → 时间止损提示
 EXIT_RULES_TIME_STOP_MIN_PNL = 3.0   # 时间止损的"及格线"（%）
 EXIT_RULES_LOGIC_MA_DAYS = 20        # 逻辑止损参考均线（收盘跌破 MA20）
+
+# ========== 自动优化目标 C（2026-11-01 T1.3）：可回滚 ==========
+# v2 = 验证窗 D5−D1 分位差改善 pp + 强制 walk-forward + 连续负向回落；
+# v1 = 改造前的 discrimination_avg 口径（只在回滚时用，行为与 2026-11-01 之前一致）。
+OPTIMIZER_OBJECTIVE_VERSION = 'v2'
+OPTIMIZER_FORCE_WALK_FORWARD = True  # True=没有可用验证窗时不采纳任何权重调整
+OPTIMIZER_DECAY_FACTOR = 0.8         # 回落：w ← 1 + (w-1)*0.8（向中性收缩）
+OPTIMIZER_DECAY_STREAK = 2           # 连续 N 次验证窗改善为负才触发回落
+OPTIMIZER_DECAY_MIN_ABS_PP = 0.0     # 改善小于该值（pp）即记负向；0=只认严格负数
+# 2026-11-03 新增「只评估不采纳」闸门：False=优化器照算指标、优化历史照记（供观察期审计），
+# 但一律不写权重（D1-D4 与网格搜索两个写入点都拦）。跑 5~10 个交易日后再放开为 True。
+OPTIMIZER_APPLY = False
+
 
 # 双源数据交叉校验（2026-10-19，westock 权威源）：每日收盘后把本地资金流/行情与
 # westock（腾讯自选股）比对，权威值=westock（用户决策"不一致的以 westock 为准"）。
@@ -1050,6 +1237,11 @@ SENTIMENT_SNAPSHOT_SAVE_SEC = 300     # 情绪快照落库间隔（秒），供�
 # “盘中不要显示昨天”。改成 6 小时覆盖整个交易时段（09:15→15:05）；宁可显示
 # 今早的快照并标注 HH:MM，也不把昨天的连板高度当成今天的。查询仍限当日。
 SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC = 21600
+# 2026-11-03 接线 sentiment_alt（新浪备源）：东财冷却/涨停池失败时，先用备源算
+# 涨停/跌停家数与涨跌家数（剔 ST 口径），备源也挂才退盘中快照/收评。
+# 备源给不了连板梯队/炸板/昨日溢价，快照会如实标 gap 并 stale（只提示不否决）。
+# 关掉即回到"东财挂→直接退快照/收评"的旧行为。
+SENTIMENT_ALT_FALLBACK = True
 SENTIMENT_ZT_POOL_PAGESIZE = 600      # 涨停池单页拉取上限（全市场涨停极少超过此数）
 SENTIMENT_PREMIUM_MAX_CODES = 200     # 昨日涨停溢价最多查多少只（与 review 口径一致）
 # 情绪周期 → 精选推荐最低分：改门槛而非改扣分，纪律不该被其他因子平均掉
@@ -1193,6 +1385,13 @@ KLINE_HISTORY_SYNC_TIMES = ['18:15', '18:45', '19:15', '19:45', '20:15']
 #   最后一个时刻(20:15)仍拿不到数据，才由盘后自检真的告警（避免 16:05 就叫假警报）。
 KLINE_HISTORY_SYNC_TIME = KLINE_HISTORY_SYNC_TIMES[0]   # 兼容旧引用
 KLINE_HISTORY_SYNC_LAST = KLINE_HISTORY_SYNC_TIMES[-1]  # 过了这个点还没数据，才算真失败
+
+# 除权重算队列的消费时刻（2026-11-01）：`kline_restate_queue` 原来只有写入方（收盘快照
+# 检测到除权就写一行），没有任何消费方 —— baostock 被封之后那 126 只票就一直挂在队里。
+# 排在 21:30：晚于 18:15~20:15 的五轮日K同步，且夜间腾讯 fqkline 限流压力最小。
+# 每晚只处理这么多只，剩下的留给下一晚（单线程节流，不追一次性清空）。
+KLINE_RESTATE_TIME = '21:30'
+KLINE_RESTATE_LIMIT = 60
 
 # 日K同步的范围是否只跟"选股范围"（主板 + 非ST/退 + 总市值≥下限）。
 # 2026-10-16 用户原话："目前我不是增加了限制默认所有的选股条件：沪深主板、非ST和*ST、市值大于35亿"。

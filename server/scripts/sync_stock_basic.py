@@ -53,11 +53,22 @@ def is_main_board(symbol: str) -> bool:
 
 def sync() -> int:
     import baostock as bs
-    bs.login()
+    from services.data.kline_history import ban_cooldown_remaining, note_ban
+    left = ban_cooldown_remaining()
+    if left > 0:
+        print(f'[名录] baostock 冷却中（剩 {int(left)} 分钟），本轮不敲门')
+        return -2       # -2 = 冷却跳过（非失败），CLI 不当错误退出
+    lg = bs.login()
     try:
+        if getattr(lg, 'error_code', '0') != '0':
+            print(f'[名录] baostock 登录失败: {getattr(lg, "error_msg", "")}')
+            note_ban(f'名录登录失败: {getattr(lg, "error_msg", "")}')
+            return -1
         rs = bs.query_stock_basic()
         if rs.error_code != '0':
             print(f'[名录] baostock 返回错误: {rs.error_msg}')
+            # 被拉黑时 query 会直接报错；记一次冷却，别第二天再来续封
+            note_ban(f'名录查询失败: {rs.error_msg}')
             return -1
         rows = []
         while rs.next():
@@ -110,7 +121,7 @@ if __name__ == '__main__':
     ap.add_argument('--stats', action='store_true', help='只打印当前库里的统计，不拉数据')
     a = ap.parse_args()
     if not a.stats:
-        if sync() < 0:
+        if sync() == -1:            # -2 是冷却跳过，不算失败
             sys.exit(1)
     else:
         report()

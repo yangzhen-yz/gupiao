@@ -500,7 +500,12 @@ def _em_batch_change_percent(codes: List[str], batch_size: int = 40,
 
 
 def _fetch_market_breadth() -> Dict:
-    """市场宽度：汇总全部行业板块的上涨/下跌家数（东财行业板块覆盖全市场个股）"""
+    """市场宽度：汇总全部行业板块的上涨/下跌家数（东财行业板块覆盖全市场个股）
+
+    2026-11-03 接线 sentiment_alt：东财 clist 被封/失败时降级新浪备源。
+    备源口径为"剔 ST 的沪深京 A 股"（2026-10-28 用户口径），与东财"全市场含 ST"
+    天然有几百只分母差，故带 source 标记，收评文案不混算。
+    """
     breadth = {'riseCount': None, 'fallCount': None, 'riseFallRatio': None}
     try:
         diff = _em_clist_get(fid='f3', po=1, pz=100, fs='m:90+t:2+f:!50',
@@ -514,6 +519,22 @@ def _fetch_market_breadth() -> Dict:
                 breadth['riseFallRatio'] = round(rise / fall, 2) if fall > 0 else 99.0
     except Exception as e:
         print(f'[收评] 市场宽度统计失败: {e}')
+    if breadth['riseCount'] is None:
+        try:
+            from app.config import SENTIMENT_ALT_FALLBACK
+            if SENTIMENT_ALT_FALLBACK:
+                from services.data import sentiment_alt
+                bd = sentiment_alt.market_breadth()
+                if bd and bd.get('riseCount') is not None:
+                    fall = int(bd.get('fallCount') or 0)
+                    breadth['riseCount'] = int(bd['riseCount'])
+                    breadth['fallCount'] = fall
+                    breadth['riseFallRatio'] = round(breadth['riseCount'] / fall, 2) if fall > 0 else 99.0
+                    breadth['source'] = 'sina_rank_alt'
+                    print(f'[收评] 东财宽度不可用，已降级新浪备源: '
+                          f'涨{breadth["riseCount"]}/跌{breadth["fallCount"]}')
+        except Exception as e:
+            print(f'[收评] 市场宽度备源也失败: {e}')
     return breadth
 
 
@@ -763,11 +784,32 @@ async def generate_daily_review() -> Dict:
             except Exception as e:
                 print(f'[收评] 概念板块请求失败: {e}')
             return ind_list, con_list
+        sector_source = 'eastmoney'
+        _ind_from_em = _con_from_em = True
         try:
             industry_sectors, concept_sectors = await asyncio.to_thread(_sync_fetch_sectors)
             print(f'[收评] 行业板块:{len(industry_sectors)} 概念板块:{len(concept_sectors)}')
         except Exception as e:
             print(f'获取板块数据失败: {e}')
+        # 东财 clist 被风控时 `_em_clist_get` 冷却直接 return []（不抛异常），这里就是 0/0。
+        # 2026-10-31：缺哪类就用财联社板块榜补哪类，行内带 source='cls' 供前端标注。
+        if not industry_sectors or not concept_sectors:
+            try:
+                from services.ops import cls_plate
+                _fb = await asyncio.to_thread(cls_plate.review_sectors)
+                if not industry_sectors and _fb.get('industry'):
+                    industry_sectors = _fb['industry']
+                    _ind_from_em = False
+                if not concept_sectors and _fb.get('concept'):
+                    concept_sectors = _fb['concept']
+                    _con_from_em = False
+                if not (_ind_from_em and _con_from_em):
+                    sector_source = ('cls' if not _ind_from_em and not _con_from_em
+                                     else 'eastmoney+cls')
+                    print(f'[收评] 板块兜底：财联社 行业{len(industry_sectors)} / '
+                          f'概念{len(concept_sectors)}（来源 {sector_source}）')
+            except Exception as e:
+                print(f'[收评] 财联社板块兜底失败: {e}')
         
         # 3. 获取涨跌停个股 — 优先使用东方财富涨停池/跌停池专用API（准确），降级用clist+分板阈值
         limit_up_stocks = []
@@ -1099,12 +1141,23 @@ async def generate_daily_review() -> Dict:
             print(f'[收评] 明日关注：{len(pending_tail)} 只尾盘票降级为"待盘中确认"并排到最后')
 
         # 5. 生成收评
+        # 涨跌分开：领涨前 20 里可能混入绿盘，「热门概念（涨）」也只展示真涨的；
+        # 跌的单独放 industrySectorsLag（前端据此显示「领跌行业」）。
+        _ind_sorted = sorted(industry_sectors,
+                             key=lambda s: s.get('changePercent') or 0, reverse=True)
+        _ind_up = [s for s in _ind_sorted if (s.get('changePercent') or 0) >= 0][:20]
+        _ind_down = [s for s in _ind_sorted if (s.get('changePercent') or 0) < 0][:10]
+        _con_up = [s for s in sorted(concept_sectors,
+                                     key=lambda s: s.get('changePercent') or 0, reverse=True)
+                   if (s.get('changePercent') or 0) > 0][:20]
         review = {
             'date': today_str,
             'timestamp': datetime.now().isoformat(),
             'market': market_data,
-            'industrySectors': industry_sectors[:20],
-            'conceptSectors': concept_sectors[:20],
+            'industrySectors': _ind_up + _ind_down,
+            'industrySectorsLag': _ind_down,
+            'conceptSectors': _con_up,
+            'sectorSource': sector_source,
             # 真实总数：涨停/跌停家数（前端 KPI 卡直接展示，不再依赖截取后的数组长度
             'limitUpCount': len(limit_up_stocks),
             'limitDownCount': len(limit_down_stocks),
@@ -1135,14 +1188,16 @@ async def generate_daily_review() -> Dict:
             summary_lines.append(f'大盘今日{change_str}，上证指数收报{sz["price"]}，涨跌幅{sz["changePercent"]}%。')
         
         if industry_sectors:
-            top_ind = industry_sectors[0] if industry_sectors else None
-            if top_ind:
+            top_ind = industry_sectors[0]
+            # 全市场下跌时最高涨幅也是绿的，别写成「领涨（+-0.6%）」
+            if (top_ind.get('changePercent') or 0) > 0:
                 summary_lines.append(f'行业板块方面，{top_ind["name"]}领涨（+{top_ind["changePercent"]}%），', )
             if len(industry_sectors) > 1:
                 worst_ind = industry_sectors[-1]
-                summary_lines.append(f'{worst_ind["name"]}领跌（{worst_ind["changePercent"]}%）。')
+                if (worst_ind.get('changePercent') or 0) < 0:
+                    summary_lines.append(f'{worst_ind["name"]}领跌（{worst_ind["changePercent"]}%）。')
         
-        if concept_sectors:
+        if concept_sectors and (concept_sectors[0].get('changePercent') or 0) > 0:
             top_con = concept_sectors[0]
             summary_lines.append(f'概念板块中，{top_con["name"]}表现最强（+{top_con["changePercent"]}%）。')
         
