@@ -49,22 +49,6 @@ SPEC: List[Dict[str, Any]] = [
         'note': '股票筛选 Tab 打开时，过滤条里的最低分取这个值；在筛选页直接改数字也会写回这里'
                 '（只有管理员能改），刷新和手机端都按它显示。0~100，常用 40~70。',
     },
-    # 2026-10-27：用户提出"当日推荐只数≠3 说明行情不好，当天不采纳、直接空仓"。
-    # 82 个交易日离线复算方向相反（不足 3 只那 17 天次日开盘买持 3/5 日 +1.22%/+0.71%，
-    # 满 3 只的 65 天 1/3/5 日全负），所以先只做**影子标注**，不拦截任何动作。
-    {
-        'key': 'rec_below_full_shadow_label', 'default': True, 'kind': 'bool',
-        'label': '推荐只数不足满编时做影子标注', 'group': '推荐只数影子', 'live': True,
-        'note': '开：历史推荐记录与今日推荐头部挂一个灰标签，写明"本日 N 只（满编 M）· 影子观察"，'
-                '不参与任何拦截。关：接口不再下发该字段，页面与改造前完全一致。',
-    },
-    {
-        'key': 'recommend_full_pick_count', 'default': 3, 'kind': 'int',
-        'label': '每日精选满编只数', 'group': '推荐只数影子', 'live': True,
-        'min': 1, 'max': 10, 'step': 1, 'unit': '只',
-        'note': '影子标注的比较基准（用户口径里的"3"）。做成配置而不是写死，是因为周期调度'
-                '（CYCLE_MAX_RECOMMEND）上线后各档名额本来就不同，届时按档取上限。',
-    },
     {
         'key': 'universe_main_board_only', 'cfg': 'UNIVERSE_MAIN_BOARD_ONLY', 'kind': 'bool',
         'label': '只做沪深主板', 'group': '选股范围', 'live': True,
@@ -321,6 +305,16 @@ SPEC: List[Dict[str, Any]] = [
         'min': 0.0, 'max': 0.05, 'step': 0.005, 'unit': '元',
         'note': '价格按四舍五入到分算，比较时留半分容差；调大只会让更多票被判成"能成交"',
         'impact': 'backtest',
+    },
+    {
+        # 2026-11-03 修①：预测验证的"次日涨跌"原来取调用那一刻的实时涨跌，周末/接口重跑时
+        # 会把预测日自己的涨跌写成次日（实测 2410 条里 93 条中招、集中在周五那批）。
+        'key': 'rec_verify_use_kline', 'cfg': 'REC_VERIFY_USE_KLINE', 'kind': 'bool',
+        'label': '预测验证改从日K取"次日"涨跌', 'group': '回测成交口径', 'live': True,
+        'note': '开（默认）＝与补验路径同一口径：取日K里严格晚于预测日的第一根，取不到就不写、'
+                '留给下一轮，绝不拿当天或盘中快照冒充次日；这批数同时喂给准确率统计与因子权重学习。'
+                '关＝回到改造前的批量实时行情口径（含 changePercent=0 跳过），逐字节等于旧行为。',
+        'impact': None,
     },
     {
         'key': 'rec_sim_sizing_v2', 'cfg': 'REC_SIM_SIZING_V2', 'kind': 'bool',

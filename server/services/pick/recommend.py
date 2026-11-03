@@ -299,7 +299,7 @@ def exec_rates(max_age: float = 600.0) -> Dict:
     警告文案里挂一个会过期的数字，等于让用户信一个没人再核对的结论。
     单股分析、行动台、命令行都不传 rates，靠这里拿到同一份数。
 
-    2026-10-18 口径纠偏（根因下钻 `docs/胜率低根因复盘-2026-10-18.md`）：
+    2026-10-18 口径纠偏（根因下钻 `server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）：
     纸面"低吸参考价 60.4%"里 44/139 条次日没跌到买入价（挂单不会成交，
     未成交组按构造 100% 胜率）——那个数字不能往卡片上放。现在给三组：
       filledWin/filledAvg/filledN   低吸单真正成交部分的 T+1（42.1%/-1.06%，n=95）
@@ -366,7 +366,7 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
     以前这里是一句全局常量 `RECOMMEND_EXEC_HINT`："建议低吸或尾盘介入，不追盘中高价"。
     问题是它对所有票都说同一句话，而"现在这只票的现价到底比买入上限高了多少"没人算 ——
     实测现价追入口径 T+1 胜率 46.8%，低吸单真正成交的口径 42.1%（纸面 60.4% 里
-    三成是未成交的幻觉胜利，见 `docs/胜率低根因复盘-2026-10-18.md`），
+    三成是未成交的幻觉胜利，见 `server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`），
     光靠一句劝不住。现在按票给出具体数字，超价 ≥3% 直接写"不建议买入"。
 
     算不出来（行情缺字段、价格非法）就退回全局常量文案，推荐链路绝不因为文案崩掉。
@@ -403,7 +403,7 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
                 # 没超价也要说清"为什么默认挂低吸"：用当天复盘的实测数，不抄旧常量。
                 # 2026-10-18 口径纠偏：纸面"低吸 60.4%"里三成是未成交的幻觉胜利，
                 # 卡片只放真正成交口径，并列"成交日追高只有 filledChaseWin%"——
-                # 挂低吸的意义是躲诱多，不是保证赚（`docs/胜率低根因复盘-2026-10-18.md`）。
+                # 挂低吸的意义是躲诱多，不是保证赚（`server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）。
                 # 两个附属数字可能缺（复盘表没算出来），缺就不写，不许出现"None%"。
                 _fill = rates.get('fillRate')
                 _fill_txt = f'，成交率 {_fill}%' if _fill is not None else ''
@@ -877,8 +877,304 @@ async def _log_shadow_selection(now, date_key, candidates, live_top3, trend_map,
     return payload
 
 
-async def auto_generate_recommendations_task():
+# ===== 影子闸门四维调整（2026-10-31，只记录、不生效）=====
+# 在现有闸门链之外另算一遍"市场情绪 + 个股历史 + 行业特征 + 主线题材"的加减分，
+# 把 base→shadow 与 keep/drop 落库，攒够样本后拿 T+1 实测裁决方向对不对。
+# 硬约束：不改 MIN_RECOMMEND_SCORE、candidates、top3、推送、快照的任何字段；
+#        本模块内任何异常只打日志，绝不冒泡影响推荐。
+#
+# 幅度是**先验设定，未做参数寻优**，不是实测最优值。影子期的任务就是检验方向：
+# 若"影子留"的 T+1 显著好于"影子挡"，再谈给每维分配正式权重。
+SHADOW_GATE_LOG_ENABLED = True
+SHADOW_GATE_MAX_DELTA = 15.0   # 四维合计上限，防止影子分把线上分改得面目全非
+_SG_SENT_DELTA = {'冰点': -6.0, '退潮': -5.0, '分歧': -2.0,
+                  '回暖': 0.0, '发酵': 3.0, '高潮': 2.0}
+_SG_DIM_LABEL = {'sentiment': '情绪', 'history': '历史',
+                 'industry': '行业', 'mainline': '主线'}
+
+
+def _sg_industry_stats(results, industry_map):
+    """行业当日平均涨幅（只用本批扫描结果，n 一并记下当样本量）。
+
+    口径限制：这是"推荐批次扫描到的票"的行业均值，不是全市场行业指数涨幅；
+    n<3 的行业在下游按样本不足处理，调整量记 0。
+    """
+    agg = {}
+    for s in results or []:
+        ind = (industry_map or {}).get((s.get('symbol') or '').lower()) or ''
+        if not ind:
+            continue
+        try:
+            chg = float(s.get('changePercent') or 0)
+        except (TypeError, ValueError):
+            continue
+        b = agg.setdefault(ind, {'n': 0, 'sum': 0.0})
+        b['n'] += 1
+        b['sum'] += chg
+    return {k: {'n': v['n'], 'avg': round(v['sum'] / v['n'], 2)} for k, v in agg.items()}
+
+
+def _sg_name_hit(ticker_names, sector_names):
+    """题材/行业名与主线板块名的粗匹配：互相包含或共享 ≥2 个汉字。
+
+    行业分类（申万/国标）与东财板块名不是同一套口径，这里只能粗匹配；
+    命中与否都要把板块名写进 why —— 匹配失败不等于"不在主线"，
+    这个误判率本身也是影子期要观察的指标。
+    """
+    for a in ticker_names:
+        a = (a or '').strip()
+        if len(a) < 2:
+            continue
+        for b in sector_names:
+            b = (b or '').strip()
+            if len(b) < 2:
+                continue
+            if a in b or b in a:
+                return b
+            if len(set(a) & set(b)) >= 2:
+                return b
+    return ''
+
+
+def shadow_gate_adjustment(stock: Dict, ctx: Dict) -> Dict:
+    """四维影子闸门调整（纯函数，不改动传入的任何对象）。
+
+    参数 ctx：
+      sentiment       get_sentiment() 返回体（只用 cycle / cycleScore / stale）
+      mainline        get_mainline() 或 peek_mainline_cached() 返回体（只用 main 名单）
+      industry_map    {symbol(小写): 行业名}
+      industry_stats  _sg_industry_stats() 的结果
+      loser_map       recommend_review.get_loser_map() 的结果
+      hist_count      {symbol: 近 30 天被推荐次数}
+      min_score       本批线上门槛（只用于和影子分对比，不参与调整）
+
+    返回：base / delta / shadow / dims / verdict，verdict 仅供对照，不驱动任何下单。
+    """
+    sym = (stock.get('symbol') or '').lower()
+    base = float((stock.get('score') or {}).get('total') or 0)
+    try:
+        chg = float(stock.get('changePercent') or 0)
+    except (TypeError, ValueError):
+        chg = 0.0
+    dims = {}
+
+    # 1) 市场情绪：周期档直接给方向；盘中 stale / 未知档不调（宁可不错，不可乱调）。
+    #    收盘定版（final=True）的 stale 只是"不做盘中否决"的纪律标记，不是数据坏了，
+    #    与 mainline._sync_score 的 senti_stale 同口径 —— 否则周末/盘后样本永远记 0。
+    sent = ctx.get('sentiment') or {}
+    cyc = sent.get('cycle') or '未知'
+    if (sent.get('stale') and not sent.get('final')) or cyc not in _SG_SENT_DELTA:
+        dims['sentiment'] = {'delta': 0.0,
+                             'why': f'情绪不可用或未知档({cyc}'
+                                    f'{"/stale" if sent.get("stale") else ""})'}
+    else:
+        dims['sentiment'] = {'delta': _SG_SENT_DELTA[cyc],
+                             'why': f'{cyc}·{sent.get("cycleScore")}'
+                                    f'{"·定版" if sent.get("final") else ""}'}
+
+    # 2) 个股历史：禁推期内最重；近 30 天重复推荐次之（重复推是设计，但连推 3 次要扣）
+    lm = (ctx.get('loser_map') or {}).get(sym)
+    hist = int((ctx.get('hist_count') or {}).get(sym) or 0)
+    if lm:
+        d = -8.0
+        why = (f'近30天被推荐后{lm.get("basis")}{lm.get("worst")}%，'
+               f'禁推至{lm.get("until")}')
+    elif hist >= 3:
+        d, why = -3.0, f'近30天已被推荐{hist}次'
+    elif hist == 2:
+        d, why = -1.5, '近30天已被推荐2次'
+    elif hist == 0:
+        d, why = 0.0, '近30天未被推荐'
+    else:
+        d, why = 0.0, '近30天已被推荐1次'
+    dims['history'] = {'delta': d, 'why': why}
+
+    # 3) 行业特征：先看行业当日均值强弱，再看个股相对行业的超额（同涨但自身弱=跟风）
+    ind = (ctx.get('industry_map') or {}).get(sym) or ''
+    ist = (ctx.get('industry_stats') or {}).get(ind)
+    if not ind:
+        dims['industry'] = {'delta': 0.0, 'why': '行业未知'}
+    elif not ist or ist.get('n', 0) < 3:
+        dims['industry'] = {'delta': 0.0,
+                            'why': f'{(ist or {}).get("n", 0)}只样本不足'}
+    else:
+        avg = float(ist.get('avg') or 0)
+        if avg >= 2:
+            d = 3.0
+        elif avg >= 0.5:
+            d = 1.5
+        elif avg >= -0.5:
+            d = 0.0
+        elif avg >= -2:
+            d = -2.0
+        else:
+            d = -3.5
+        ex = chg - avg
+        if ex >= 2:
+            d += 1.0
+        elif ex <= -2:
+            d -= 1.5
+        dims['industry'] = {'delta': round(d, 1),
+                            'why': f'均值{avg:+.2f}%(n={ist["n"]})，本票超额{ex:+.2f}%'}
+
+    # 4) 主线题材：只认 main 名单（sub/候选不算主线）；今日无主线时本维记 0
+    ml = ctx.get('mainline') or {}
+    mains = [m.get('sector') for m in (ml.get('main') or []) if m.get('sector')]
+    if ml.get('disabled') or not mains:
+        dims['mainline'] = {'delta': 0.0, 'why': '今日无主线（空档）'}
+    else:
+        hit = _sg_name_hit([ind, stock.get('primary_tag') or ''], mains)
+        if hit:
+            dims['mainline'] = {'delta': 5.0, 'why': f'属主线「{hit}」'}
+        else:
+            dims['mainline'] = {'delta': -2.0, 'why': f'不在主线（{"、".join(mains[:2])}）'}
+
+    delta = round(sum(v['delta'] for v in dims.values()), 1)
+    delta = max(-SHADOW_GATE_MAX_DELTA, min(SHADOW_GATE_MAX_DELTA, delta))
+    shadow = round(base + delta, 1)
+    min_score = float(ctx.get('min_score') or 60)
+    return {
+        'symbol': sym,
+        'name': stock.get('name'),
+        'base': round(base, 1),
+        'delta': delta,
+        'shadow': shadow,
+        'dims': dims,
+        'baseKeep': base >= min_score,
+        'shadowKeep': shadow >= min_score,
+        'verdict': 'keep' if shadow >= min_score else 'drop',
+    }
+
+
+def _ensure_shadow_gate_table(conn):
+    conn.execute('''CREATE TABLE IF NOT EXISTS shadow_gate_adjust_log (
+        rec_date     TEXT NOT NULL,
+        slot         TEXT NOT NULL,
+        symbol       TEXT NOT NULL,
+        name         TEXT,
+        base_score   REAL,
+        delta        REAL,
+        shadow_score REAL,
+        online_kept  INTEGER,
+        online_top3  INTEGER,
+        verdict      TEXT,
+        dims         TEXT,
+        PRIMARY KEY (rec_date, slot, symbol)
+    )''')
+
+
+async def _log_shadow_gate_adjustment(now, date_key, pool, zone_dropped, top3,
+                                      min_score, results, industry_map):
+    """取上下文 → 逐只算四维调整 → 落 shadow_gate_adjust_log + 打日志。
+
+    评估对象 = 过基础门槛的票 ∪ 被涨幅段闸门整只拦掉的票：
+    前者能回答"该不该留"，后者能回答"闸门拦得对不对"，两组都要有 T+1 才能对比。
+    """
+    if not SHADOW_GATE_LOG_ENABLED:
+        return
+    try:
+        from datetime import timedelta
+        from db.database import get_db_conn
+        from services.strategy.sentiment import get_sentiment
+        from services.strategy.mainline import peek_mainline_cached, get_mainline
+        from services.pick.recommend_review import get_loser_map
+
+        sent = await get_sentiment()
+        ml = peek_mainline_cached(max_age_sec=7200)
+        if ml is None:
+            try:
+                ml = await get_mainline()
+            except Exception as e:
+                ml = {}
+                print(f'[影子闸门] 主线读取失败（本维记 0）: {type(e).__name__}: {e}')
+        try:
+            loser_map = get_loser_map()
+        except Exception as e:
+            loser_map = {}
+            print(f'[影子闸门] 亏损黑名单读取失败（本维按 0 次）: {type(e).__name__}: {e}')
+
+        # 近 30 天推荐次数：用与亏损黑名单同一份推荐记录，口径好对账
+        hist = {}
+        try:
+            cutoff = (now - timedelta(days=30)).date().isoformat()
+            for rec in (load_daily_recommendations() or []):
+                if str(rec.get('date') or '') < cutoff:
+                    continue
+                for it in (rec.get('daily_recommendations') or []):
+                    _s = (it.get('symbol') or '').lower()
+                    if _s:
+                        hist[_s] = hist.get(_s, 0) + 1
+        except Exception as e:
+            print(f'[影子闸门] 历史推荐统计失败（本维按 0 次）: {type(e).__name__}: {e}')
+
+        ctx = {
+            'sentiment': sent,
+            'mainline': ml or {},
+            'industry_map': industry_map or {},
+            'industry_stats': _sg_industry_stats(results, industry_map),
+            'loser_map': loser_map,
+            'hist_count': hist,
+            'min_score': min_score,
+        }
+
+        seen, targets = set(), []
+        for s in list(pool or []) + list(zone_dropped or []):
+            _sym = (s.get('symbol') or '').lower()
+            if not _sym or _sym in seen:
+                continue
+            seen.add(_sym)
+            targets.append(s)
+        if not targets:
+            print('[影子闸门] 本批无可评估标的（候选为空）')
+            return
+
+        kept_syms = {(s.get('symbol') or '').lower() for s in (pool or [])}
+        top3_syms = {(s.get('symbol') or '').lower() for s in (top3 or [])}
+        rows = []
+        for s in targets:
+            r = shadow_gate_adjustment(s, ctx)
+            r['onlineKept'] = r['symbol'] in kept_syms
+            r['onlineTop3'] = r['symbol'] in top3_syms
+            rows.append(r)
+
+        conn = get_db_conn()
+        try:
+            _ensure_shadow_gate_table(conn)
+            for r in rows:
+                conn.execute(
+                    'INSERT OR REPLACE INTO shadow_gate_adjust_log '
+                    '(rec_date, slot, symbol, name, base_score, delta, shadow_score, '
+                    ' online_kept, online_top3, verdict, dims) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                    (date_key, now.strftime('%H:%M'), r['symbol'], r['name'],
+                     r['base'], r['delta'], r['shadow'],
+                     1 if r['onlineKept'] else 0, 1 if r['onlineTop3'] else 0,
+                     r['verdict'], json.dumps(r['dims'], ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+
+        flip = [r for r in rows if r['shadowKeep'] != r['onlineKept']]
+        for r in flip:
+            print(f'[影子闸门] {r["name"]}({r["symbol"]}) {r["base"]:.0f}→{r["shadow"]:.0f}'
+                  f'({r["delta"]:+.1f}) 线上{"留" if r["onlineKept"] else "挡"}'
+                  f' / 影子{"留" if r["shadowKeep"] else "挡"} | '
+                  + '；'.join(f'{_SG_DIM_LABEL.get(k, k)}{v["delta"]:+.1f}'
+                             for k, v in r['dims'].items()))
+        print(f'[影子闸门] {now.strftime("%H:%M")} {sent.get("cycle")}·门槛{min_score:.0f}：'
+              f'评估{len(rows)}只，线上候选留{sum(1 for r in rows if r["onlineKept"])}只，'
+              f'影子留{sum(1 for r in rows if r["shadowKeep"])}只，判定翻转{len(flip)}只 '
+              f'（已落 shadow_gate_adjust_log）')
+    except Exception as e:
+        print(f'[影子闸门] 计算/落库失败（不影响线上推荐）: {type(e).__name__}: {e}')
+
+
+async def auto_generate_recommendations_task(source: str = 'manual'):
     """定时任务：自动生成智能推荐股票并保存到数据库（V4.1）
+
+    `source`（2026-11-01）：只用于批次留痕 —— 'schedule'（09:45/10:00/13:30/14:05）、
+    'pre_close'（14:45 收盘前最终版）、'manual'（接口手动触发）。以前这几批全被当天
+    最后一批覆盖，事后只能看到"最终推荐"，看不到盘中换过谁。
     
     优化：
     - P0: 50%日内因子 + 50%趋势因子混合评分
@@ -992,6 +1288,18 @@ async def auto_generate_recommendations_task():
             if isinstance(r, Exception):
                 continue
             all_results.extend(r)
+
+        # 名称层 ST 复核（2026-11-01）：范围过滤读的是本地名录，名录落后一天就会放过新戴帽的票
+        # （10-15 的 *ST威领 就是这么进来的：名录 fetched_at 还停在 10-16）。行情里的名称是
+        # **当下**的，用它再挡一次，成本只是一次字符串匹配。
+        try:
+            from services.data.universe import is_st_name as _is_st
+            _n_before = len(all_results)
+            all_results = [s for s in all_results if not _is_st(s.get('name'))]
+            if len(all_results) != _n_before:
+                print(f'[智能推荐] 名称层 ST 复核剔除 {_n_before - len(all_results)} 只')
+        except Exception as e:
+            print(f'[智能推荐] ST 名称复核跳过: {type(e).__name__}: {e}')
 
         if not all_results:
             print('[智能推荐] 未获取到任何股票行情数据')
@@ -1469,6 +1777,17 @@ async def auto_generate_recommendations_task():
                         ('strong+shrink', _strong and _shrink)) if ok])
                     _labs.setdefault(_sym, {})['rps'] = _tag['rps']
                     _labs[_sym]['rps_shadow'] = _tag
+                # 新③（2026-11-03，影子）：rev20+缩量 候选池影子臂——只落快照、不改候选。
+                # 依据：因子体检 85 个截面里唯一稳健为正的组合（rev20 分位≥0.7 且
+                # vol_shrink 分位≥0.6，5 日超额 +0.12pp）。分位分母=当日打分集
+                # （体检是全市场截面，口径差在裁决时注明）；日K取本地库最近 21 根
+                # 已收盘 bar（盘中即昨收基准）。
+                try:
+                    from services.pick.rev20_shadow import rev20_shrink_labs
+                    for _sym, _t in (await rev20_shrink_labs(all_results)).items():
+                        _labs.setdefault(_sym, {}).update(_t)
+                except Exception as _e:
+                    print(f'[策略快照] rev20 影子失败（列留空）: {type(_e).__name__}: {_e}')
                 if shadow_payload:
                     def _lab(_sym):
                         return _labs.setdefault(_sym, {}) if _sym else {}
@@ -1542,10 +1861,20 @@ async def auto_generate_recommendations_task():
                                      'cycleInfo': _cycle_info(gate, cycle_name, cycle_max, True)})
                 if len(_existing) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
                     _existing = _existing[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
-                save_daily_recommendations(_existing)
+                save_daily_recommendations(_existing, batch_time=now.strftime('%H:%M:%S'),
+                                           source=source or 'manual')
                 print(f'[周期调度] 空仓哨兵已写入：{_reason}')
             else:
                 print(f'[智能推荐] 无评分>={MIN_RECOMMEND_SCORE}的股票，跳过')
+            # 空仓批次也要影子评估：'该不该空仓'同样需要 T+1 对照，不能只在有票的日子记样本
+            try:
+                _ind_map_sg = {sym: (ff or {}).get('industry', '')
+                               for sym, ff in (fund_flow_map or {}).items()}
+                await _log_shadow_gate_adjustment(
+                    now, now.date().isoformat(), above_threshold, zone_dropped, [],
+                    MIN_RECOMMEND_SCORE, all_results, _ind_map_sg)
+            except Exception as e:
+                print(f'[影子闸门] 入口异常（不影响线上推荐）: {type(e).__name__}: {e}')
             await _capture_snapshot()
             return
 
@@ -1622,7 +1951,8 @@ async def auto_generate_recommendations_task():
         existing.insert(0, record)
         if len(existing) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
             existing = existing[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
-        saved = save_daily_recommendations(existing)
+        saved = save_daily_recommendations(existing, batch_time=now.strftime('%H:%M:%S'),
+                                           source=source or 'manual')
 
         # ===== 7.5 影子精选（2026-10-14，只记录不替换）=====
         # 为什么必须影子而不是直接换：15:20 的回测与 15:35 的自动优化都在学现有口径，
@@ -1636,6 +1966,18 @@ async def auto_generate_recommendations_task():
         except Exception as e:
             print(f'[智能推荐] 影子精选落库失败（不影响线上推荐）: {e}')
             _shadow_payload = None
+
+        # ===== 7.55 影子闸门四维调整（2026-10-31，只记录不生效）=====
+        # 与 7.5 影子精选的区别：那边调的是"门槛 / 不追高"两条市场级规则，
+        # 这里调的是个股层面的四维加减分；落独立表，两边互不影响。
+        try:
+            _ind_map_sg = {sym: (ff or {}).get('industry', '')
+                           for sym, ff in (fund_flow_map or {}).items()}
+            await _log_shadow_gate_adjustment(now, date_key, above_threshold, zone_dropped,
+                                              top3, MIN_RECOMMEND_SCORE, all_results,
+                                              _ind_map_sg)
+        except Exception as e:
+            print(f'[影子闸门] 入口异常（不影响线上推荐）: {type(e).__name__}: {e}')
 
         # ===== 7.6 策略决策快照（2026-10-17）=====
         # 影子给的是"某天选了谁"，快照给的是"那天每一只为什么被选/被挡"。

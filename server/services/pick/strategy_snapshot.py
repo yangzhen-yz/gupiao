@@ -86,6 +86,9 @@ _DDL_ROWS = '''CREATE TABLE IF NOT EXISTS strategy_snapshot (
     rank_pct       REAL,
     rps            REAL,
     rps_shadow     TEXT,
+    rev20          REAL,
+    vol_shrink     REAL,
+    rev20_shadow   TEXT,
     created_at     TEXT
 )'''
 
@@ -122,7 +125,8 @@ def ensure_tables(conn):
     # 本仓库常有另一路会话同时在改，加列必须自查而不是指望"大家都是从 DDL 建的"。
     have = {r[1] for r in conn.execute('PRAGMA table_info(strategy_snapshot)').fetchall()}
     for _col, _typ in (('shadow_note', 'TEXT'), ('mode', 'TEXT'),
-                       ('rps', 'REAL'), ('rps_shadow', 'TEXT')):
+                       ('rps', 'REAL'), ('rps_shadow', 'TEXT'),
+                       ('rev20', 'REAL'), ('vol_shrink', 'REAL'), ('rev20_shadow', 'TEXT')):
         if _col not in have:
             conn.execute(f'ALTER TABLE strategy_snapshot ADD COLUMN {_col} {_typ}')
     # IF NOT EXISTS 覆盖不到"表已存在但要补索引"的情况，这里都得走一遍
@@ -159,7 +163,8 @@ _COLS = ('snap_date', 'batch', 'symbol', 'name', 'rank', 'stage', 'blocked_by',
          'change_percent', 'price', 'volume_ratio', 'turnover_rate',
          'weibi', 'outer_ratio', 'amplitude', 'factors', 'inputs', 'source',
          'mode', 'timing', 'matrix', 'matrix_why', 'shadow_note', 'concept',
-         'r20', 'rank_pct', 'rps', 'rps_shadow', 'created_at')
+         'r20', 'rank_pct', 'rps', 'rps_shadow',
+         'rev20', 'vol_shrink', 'rev20_shadow', 'created_at')
 
 _BC = ('snap_date', 'batch', 'generated_at', 'cycle', 'cycle_score',
        'limit_up', 'limit_down', 'zhaban', 'promotion_rate', 'market_change',
@@ -185,7 +190,8 @@ def _row(s: Dict, date_key: str, batch: str, rank: int, stage: str,
         lab.get('mode'), lab.get('timing'), lab.get('matrix'), lab.get('matrix_why'),
         lab.get('shadow'),
         s.get('primary_tag'), _f(pool.get('r20')), _f(pool.get('rank_pct')),
-        _f(lab.get('rps')), _j(lab.get('rps_shadow')), now_txt,
+        _f(lab.get('rps')), _j(lab.get('rps_shadow')),
+        _f(lab.get('rev20')), _f(lab.get('vol_shrink')), _j(lab.get('rev20_shadow')), now_txt,
     )
 
 

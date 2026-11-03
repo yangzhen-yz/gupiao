@@ -69,6 +69,11 @@
     <div class="sim-section">
       <h3 class="sec-title">
         模拟持仓 <span class="sec-sub">{{ state.positions.length }} 只</span>
+        <!-- 2026-10-30 盈亏概况：老王量化组合榜同款汇总，只数与占比直接给结论 -->
+        <span v-if="posStats.n" class="pos-pnl-summary">
+          盈利 <b class="up">{{ posStats.win }} 只（{{ posStats.winPct }}%）</b> ·
+          亏损 <b class="down">{{ posStats.loss }} 只（{{ posStats.lossPct }}%）</b>
+        </span>
       </h3>
       <table class="sim-table" v-if="state.positions.length">
         <thead>
@@ -210,7 +215,7 @@
 </template>
 
 <script setup>
-  import { ref, onMounted } from 'vue'
+  import { ref, computed, onMounted } from 'vue'
   import { apiFetch, useNotification } from '../../utils/helpers'
   import { fmtNum } from '../../utils/format'
   import DataFreshness from '../DataFreshness.vue'
@@ -222,6 +227,17 @@
   const busy = ref(false)
   // 新鲜度（2026-10-13）：此前本页既无轮询也没有"更新于"，看不出看到的是不是今天的账户状态
   const fetchedAt = ref('')
+
+  // 盈亏概况（2026-10-30 借鉴"老王量化"组合榜的"盈亏概况"汇总条）：
+  // 按盈亏比例（pnlPct）分盈利/亏损/持平，只数与占比一眼可见，红涨绿跌。
+  const posStats = computed(() => {
+    const ps = state.value.positions || []
+    const win = ps.filter(p => Number(p.pnlPct) > 0).length
+    const loss = ps.filter(p => Number(p.pnlPct) < 0).length
+    const n = ps.length
+    const pct = c => (n ? Math.round((c / n) * 100) : 0)
+    return { n, win, loss, winPct: pct(win), lossPct: pct(loss) }
+  })
 
   function srcLabel(s) {
     return (
@@ -263,6 +279,7 @@
       const d = await apiFetch('/api/sim/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
         body: JSON.stringify({ sources: sources.value, symbols }),
       })
       if (d.success) {
@@ -494,6 +511,16 @@
     font-size: 15px;
     font-weight: 700;
     margin: 0 0 8px;
+  }
+  /* 盈亏概况汇总条（2026-10-30）：跟在标题后的小字，手机上换行不挤 */
+  .pos-pnl-summary {
+    margin-left: 8px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-secondary, #64748b);
+  }
+  .pos-pnl-summary b {
+    font-weight: 600;
   }
   .sec-sub {
     font-size: 12px;

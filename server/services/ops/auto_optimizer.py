@@ -15,6 +15,15 @@ import json
 from datetime import datetime
 from typing import Dict
 from db.database import (get_db_conn, load_trend_dimension_weights, save_trend_dimension_weights, save_optimization_history)
+from app.config import (OPTIMIZER_OBJECTIVE_VERSION, OPTIMIZER_FORCE_WALK_FORWARD,
+                        OPTIMIZER_DECAY_FACTOR, OPTIMIZER_DECAY_STREAK, OPTIMIZER_APPLY)
+from services.ops.objective_v2 import (OBJECTIVE_V2_NAME, blended_spread_pp,
+                                        has_usable_window, apply_decay_streak)
+
+# 2026-11-01（T1.3 优化目标 C）：
+#   v2 = 验证窗 D5−D1 分位差（0.6×1日 + 0.4×3日）+ 强制 walk-forward + 连续负向回落
+#   v1 = 改造前的 discrimination_avg + top20 胜率口径（回滚用，行为与改造前一致）
+USE_OBJECTIVE_V2 = (OPTIMIZER_OBJECTIVE_VERSION == 'v2')
 
 # ========== 常量 ==========
 
@@ -103,6 +112,15 @@ def _blended_objective(rows, w1: float, w2: float, w3: float, w4: float,
     return wr_1d * (1 - GRID_SEARCH_3D_WEIGHT) + wr_3d * GRID_SEARCH_3D_WEIGHT
 
 
+def _blended_spread_value(rows, w1: float, w2: float, w3: float, w4: float):
+    """目标 C：D1~D5 五等分的 D5−D1 准确率差（pp，0.6×1日 + 0.4×3日）。
+
+    分桶样本不足时返回 None（调用方必须按"验证不通过"处理，不能当 0 分）。
+    """
+    result = blended_spread_pp(rows, (w1, w2, w3, w4))
+    return result.get('value') if result.get('ok') else None
+
+
 # ========== Feature 1: D1-D4 维度权重反馈闭环 ==========
 
 async def optimize_trend_dimension_weights() -> Dict:
@@ -116,9 +134,12 @@ async def optimize_trend_dimension_weights() -> Dict:
        b. 计算高组 vs 低组的1日胜率差异（区分度）
        c. 区分度 > 8% → 权重 ×1.05（上限1.3）；< -8% → ×0.95（下限0.7）
     4. 样本外验证（V2 新增，防过拟合）：
-       - 用"调整后权重"在验证窗上模拟 top20 胜率，对比"当前权重"
-       - 改善 < WF_MIN_VALID_IMPROVEMENT(1%) → 回滚该项调整，不采纳
-    5. 保存通过验证的权重到 DB
+       - v2（2026-11-01 目标 C）：用验证窗的 D5−D1 分位差改善（pp）判定，
+         改善 < 1pp 或验证窗不足以分 5 桶 → 回滚；**没有验证窗一律不采纳**
+       - v1（回滚口径）：验证窗 top20 胜率改善 < 1% → 回滚
+    5. 回落（目标 C 新增）：候选连续 2 次在验证窗为负，权重向中性 1.0
+       收缩 0.8（w ← 1 + (w-1)*0.8），不再只有单向下限
+    6. 保存通过验证的权重到 DB，并把新旧两套 metric 同时写进 optimization_history
 
     Returns:
         {'adjustments': [...], 'summary': str}
@@ -148,6 +169,9 @@ async def optimize_trend_dimension_weights() -> Dict:
         # Walk-forward 切分：训练窗产生候选，验证窗检验泛化
         train_rows, valid_rows = _split_train_valid(rows)
         has_validation = len(valid_rows) >= WF_MIN_VALID_SAMPLES and len(train_rows) >= WF_MIN_TRAIN_SAMPLES
+        if USE_OBJECTIVE_V2:
+            # 目标 C：5 桶每桶至少 10 条才够算 D5−D1；不够就视为没有验证窗
+            has_validation = has_validation and has_usable_window(valid_rows, WF_MIN_VALID_SAMPLES)
 
         # 加载当前权重
         weights = load_trend_dimension_weights()
@@ -216,19 +240,61 @@ async def optimize_trend_dimension_weights() -> Dict:
                 action = 'keep'
                 reason = f'训练窗区分度{discrimination:.1f}%在±{WEIGHT_ADJUST_DISCRIMINATION_THRESHOLD}%内，权重保持{old_weight:.3f}'
 
-            # ---- 样本外验证门控（V2）：验证窗模拟无改善则回滚 ----
-            if action != 'keep' and has_validation:
+            # ---- 样本外验证门控 ----
+            # v2：验证窗 D5−D1 改善 pp；v1：旧的验证窗 top20 胜率改善（回滚用）
+            valid_base_pp = None
+            valid_new_pp = None
+            valid_imp_pp = None
+            if action != 'keep':
                 cw = [current_w.get('d1', 1.0), current_w.get('d2', 1.0),
                       current_w.get('d3', 1.0), current_w.get('d4', 1.0)]
                 nw = list(cw)
                 nw[int(dim[1]) - 1] = new_weight
-                base_obj = _blended_objective(valid_rows, *cw)
-                new_obj = _blended_objective(valid_rows, *nw)
-                if new_obj < base_obj + WF_MIN_VALID_IMPROVEMENT:
-                    reason = (f'{reason}；样本外验证未通过(验证窗当前{base_obj:.1f}%→调整后{new_obj:.1f}%)，'
-                              f'不采纳，回滚为{old_weight:.3f}')
+
+                if OPTIMIZER_FORCE_WALK_FORWARD and not has_validation:
+                    # 目标 C：没有可用验证窗 → 一律不采纳，不做"训练窗直接上"
+                    reason = (f'{reason}；无可用验证窗（强制 walk-forward），不采纳，回滚为{old_weight:.3f}')
                     new_weight = old_weight
                     action = 'keep'
+                elif has_validation and USE_OBJECTIVE_V2:
+                    base_obj = _blended_spread_value(valid_rows, *cw)
+                    new_obj = _blended_spread_value(valid_rows, *nw)
+                    valid_base_pp, valid_new_pp = base_obj, new_obj
+                    if base_obj is None or new_obj is None:
+                        reason = (f'{reason}；验证窗不足以分 5 桶，无法算 D5−D1，'
+                                  f'不采纳，回滚为{old_weight:.3f}')
+                        new_weight = old_weight
+                        action = 'keep'
+                    else:
+                        valid_imp_pp = round(new_obj - base_obj, 2)
+                        if valid_imp_pp < WF_MIN_VALID_IMPROVEMENT:
+                            reason = (f'{reason}；验证窗 D5−D1 改善{valid_imp_pp:+.1f}pp'
+                                      f'（{base_obj:.1f}→{new_obj:.1f}）未达{WF_MIN_VALID_IMPROVEMENT}pp，'
+                                      f'不采纳，回滚为{old_weight:.3f}')
+                            new_weight = old_weight
+                            action = 'keep'
+                        else:
+                            reason = (f'{reason}；验证窗 D5−D1 改善{valid_imp_pp:+.1f}pp'
+                                      f'（{base_obj:.1f}→{new_obj:.1f}）通过')
+                elif has_validation:
+                    base_obj = _blended_objective(valid_rows, *cw)
+                    new_obj = _blended_objective(valid_rows, *nw)
+                    if new_obj < base_obj + WF_MIN_VALID_IMPROVEMENT:
+                        reason = (f'{reason}；样本外验证未通过(验证窗当前{base_obj:.1f}%→调整后{new_obj:.1f}%)，'
+                                  f'不采纳，回滚为{old_weight:.3f}')
+                        new_weight = old_weight
+                        action = 'keep'
+
+            # ---- 目标 C 回落：连续 N 次验证窗为负 → 向中性 1.0 收缩 ----
+            prev_streak = int(weights[dim_key].get('valid_neg_streak', 0) or 0)
+            decay = apply_decay_streak(prev_streak, valid_imp_pp, new_weight,
+                                       trigger=OPTIMIZER_DECAY_STREAK, factor=OPTIMIZER_DECAY_FACTOR)
+            weights[dim_key]['valid_neg_streak'] = decay['streak']
+            if decay['decayed']:
+                new_weight = decay['new_weight']
+                action = 'decay'
+                reason = (f'{reason}；连续{OPTIMIZER_DECAY_STREAK}次验证窗为负，'
+                          f'权重向1.0收缩至{new_weight:.4f}')
 
             weights[dim_key]['weight'] = round(new_weight, 4)
 
@@ -241,14 +307,29 @@ async def optimize_trend_dimension_weights() -> Dict:
                 'low_accuracy': round(low_rate, 2),
                 'sample_count': sample_count,
                 'walk_forward_validated': has_validation,
+                'valid_base_pp': valid_base_pp,
+                'valid_new_pp': valid_new_pp,
+                'valid_improvement_pp': valid_imp_pp,
+                'valid_neg_streak': weights[dim_key]['valid_neg_streak'],
+                'objective': 'v2_d5_minus_d1' if USE_OBJECTIVE_V2 else 'v1_discrimination',
                 'reason': reason,
             })
 
-        # 保存权重
-        save_trend_dimension_weights(weights)
+        # 保存权重（OPTIMIZER_APPLY=False：照算指标、优化历史照记，但一律不写权重；
+        # 跑 5~10 个交易日观察期后再放开 —— 2026-11-03 新增闸门）
+        if OPTIMIZER_APPLY:
+            save_trend_dimension_weights(weights)
+        else:
+            for a in adjustments:
+                a['applied'] = False
+                a['reason'] += '；OPTIMIZER_APPLY=False 只评估不采纳，权重未写入'
+            print('[自动优化] OPTIMIZER_APPLY=False：本轮只评估，权重未写入（历史照记供审计）')
 
-        # 记录优化历史
+        # 记录优化历史（旧 metric 照旧写，供审计；新口径写 metric_v2_*）
         changed = [a for a in adjustments if a['action'] != 'keep']
+        v2_vals = [a['valid_improvement_pp'] for a in adjustments
+                   if a.get('valid_improvement_pp') is not None]
+        metric_v2 = round(sum(v2_vals) / len(v2_vals), 2) if v2_vals else None
         save_optimization_history(
             module='trend_dimension_weights',
             parameter_set=json.dumps({k: v['weight'] for k, v in weights.items()}, ensure_ascii=False),
@@ -257,9 +338,15 @@ async def optimize_trend_dimension_weights() -> Dict:
             old_value=None,
             new_value=len(changed),
             details=json.dumps(adjustments, ensure_ascii=False),
+            metric_v2_name=OBJECTIVE_V2_NAME if USE_OBJECTIVE_V2 else '',
+            metric_v2_value=metric_v2,
+            objective_version=OPTIMIZER_OBJECTIVE_VERSION,
+            walk_forward=int(has_validation),
         )
 
-        summary = f'D1-D4权重优化完成(V2 walk-forward): {len(changed)}/{len(adjustments)} 个维度调整'
+        summary = (f'D1-D4权重优化完成({OPTIMIZER_OBJECTIVE_VERSION}): '
+                   f'{len(changed)}/{len(adjustments)} 个维度调整'
+                   + ('' if OPTIMIZER_APPLY else '（只评估，权重未写入）'))
         print(f'[自动优化] {summary}')
         return {'adjustments': adjustments, 'summary': summary}
 
@@ -278,9 +365,12 @@ async def run_grid_search() -> Dict:
     算法：
     1. 定义权重搜索空间：D1/D2 各5档 [0.8~1.2]，D3/D4 各3档 [0.9~1.1]（225种组合）
     2. Walk-forward 切分：训练窗（较旧20天）/ 验证窗（最近10个交易日）
-    3. 训练窗目标函数（V2 多周期）：0.6×1日胜率 + 0.4×3日胜率（避免纯短线噪声主导）
-    4. 样本外验证门控（V2）：最优组合必须在验证窗上也超过当前权重 + 2% 才采纳
-       （训练窗选优、验证窗确认，双门槛防过拟合）
+    3. 训练窗目标函数：
+       - v2（2026-11-01 目标 C）：D5−D1 分位差，0.6×1日 + 0.4×3日
+       - v1（回滚口径）：0.6×1日胜率 + 0.4×3日胜率
+    4. 样本外验证门控（V2）：最优组合必须在验证窗上也超过当前权重 + 2 才采纳
+       （训练窗选优、验证窗确认，双门槛防过拟合）；强制 walk-forward 打开时，
+       没有可用验证窗一律不采纳
 
     Returns:
         {'best_params': {...}, 'current_winrate': float, 'best_winrate': float, 'adopted': bool, 'summary': str}
@@ -317,14 +407,24 @@ async def run_grid_search() -> Dict:
         # Walk-forward 切分
         train_rows, valid_rows = _split_train_valid(rows)
         has_validation = len(valid_rows) >= WF_MIN_VALID_SAMPLES and len(train_rows) >= WF_MIN_TRAIN_SAMPLES
+        if USE_OBJECTIVE_V2:
+            has_validation = has_validation and has_usable_window(valid_rows, WF_MIN_VALID_SAMPLES)
         fit_rows = train_rows if has_validation else rows
 
         # 搜索空间：D1/D2 各5档，D3/D4 各3档 → 225种组合（V2：扩展 D3/D4）
         space_12 = [0.8, 0.9, 1.0, 1.1, 1.2]
         space_34 = [0.9, 1.0, 1.1]
 
+        # 目标函数：v2 = D5−D1 分位差；v1 = 0.6×1日胜率 + 0.4×3日胜率（回滚用）
+        objective_fn = _blended_spread_value if USE_OBJECTIVE_V2 else _blended_objective
+
         # 当前权重的训练窗目标值
-        current_obj = _blended_objective(fit_rows, *cw)
+        current_obj = objective_fn(fit_rows, *cw)
+        if current_obj is None:
+            return {
+                'best_params': None,
+                'summary': '训练窗样本不足以分 5 桶（D5−D1 无法计算），跳过网格搜索',
+            }
 
         # 网格搜索（训练窗）
         best_obj = current_obj
@@ -335,7 +435,9 @@ async def run_grid_search() -> Dict:
             for w2 in space_12:
                 for w3 in space_34:
                     for w4 in space_34:
-                        obj = _blended_objective(fit_rows, w1, w2, w3, w4)
+                        obj = objective_fn(fit_rows, w1, w2, w3, w4)
+                        if obj is None:
+                            continue
                         all_results.append({'d1': w1, 'd2': w2, 'd3': w3, 'd4': w4,
                                             'objective': round(obj, 2)})
                         if obj > best_obj:
@@ -346,47 +448,75 @@ async def run_grid_search() -> Dict:
         improvement = best_obj - current_obj
         adopted = improvement >= GRID_SEARCH_MIN_IMPROVEMENT
         validation_note = '无有效验证窗，仅训练窗判定'
+        valid_base_obj = None
+        valid_best_obj = None
 
         if adopted and has_validation:
             bw = [best_params['d1'], best_params['d2'], best_params['d3'], best_params['d4']]
-            valid_base = _blended_objective(valid_rows, *cw)
-            valid_best = _blended_objective(valid_rows, *bw)
-            if valid_best < valid_base + GRID_SEARCH_MIN_IMPROVEMENT:
+            valid_base_obj = objective_fn(valid_rows, *cw)
+            valid_best_obj = objective_fn(valid_rows, *bw)
+            if valid_base_obj is None or valid_best_obj is None:
                 adopted = False
-                validation_note = (f'样本外验证未通过：验证窗当前{valid_base:.1f}% → 最优{valid_best:.1f}%，'
-                                   f'改善不足{GRID_SEARCH_MIN_IMPROVEMENT}%，判定为过拟合，不采纳')
+                validation_note = '验证窗样本不足以分 5 桶，无法确认泛化，不采纳'
+            elif valid_best_obj < valid_base_obj + GRID_SEARCH_MIN_IMPROVEMENT:
+                adopted = False
+                validation_note = (f'样本外验证未通过：验证窗当前{valid_base_obj:.1f} → 最优{valid_best_obj:.1f}，'
+                                   f'改善不足{GRID_SEARCH_MIN_IMPROVEMENT}，判定为过拟合，不采纳')
             else:
-                validation_note = f'样本外验证通过：验证窗当前{valid_base:.1f}% → 最优{valid_best:.1f}%'
+                validation_note = f'样本外验证通过：验证窗当前{valid_base_obj:.1f} → 最优{valid_best_obj:.1f}'
+
+        if adopted and OPTIMIZER_FORCE_WALK_FORWARD and not has_validation:
+            adopted = False
+            validation_note = '无可用验证窗（强制 walk-forward），不采纳'
 
         if adopted:
-            # 应用新权重
-            for dim_key, new_w in best_params.items():
-                current_weights[dim_key]['weight'] = round(new_w, 4)
-            save_trend_dimension_weights(current_weights)
+            # 应用新权重（OPTIMIZER_APPLY=False：只评估，验证结论照记历史但不写入）
+            if OPTIMIZER_APPLY:
+                for dim_key, new_w in best_params.items():
+                    current_weights[dim_key]['weight'] = round(new_w, 4)
+                save_trend_dimension_weights(current_weights)
+            else:
+                validation_note += '；OPTIMIZER_APPLY=False 只评估不采纳，权重未写入'
 
         # 记录优化历史
+        valid_imp = None
+        if valid_base_obj is not None and valid_best_obj is not None:
+            valid_imp = round(valid_best_obj - valid_base_obj, 2)
         save_optimization_history(
             module='grid_search',
             parameter_set=json.dumps(best_params, ensure_ascii=False),
-            metric_name='blended_winrate_top20',
+            metric_name='quintile_spread_pp' if USE_OBJECTIVE_V2 else 'blended_winrate_top20',
             metric_value=round(best_obj, 2),
             old_value=round(current_obj, 2),
             new_value=round(best_obj, 2),
             details=json.dumps({
                 'adopted': adopted,
+                'applied': bool(adopted and OPTIMIZER_APPLY),
                 'improvement': round(improvement, 2),
-                'objective': '0.6*winrate_1d + 0.4*winrate_3d',
+                'objective': ('0.6*spread_1d + 0.4*spread_3d (D5-D1)' if USE_OBJECTIVE_V2
+                              else '0.6*winrate_1d + 0.4*winrate_3d'),
                 'walk_forward': has_validation,
                 'validation_note': validation_note,
                 'current_objective': round(current_obj, 2),
                 'best_objective': round(best_obj, 2),
+                'valid_base_pp': valid_base_obj,
+                'valid_best_pp': valid_best_obj,
+                'valid_improvement_pp': valid_imp,
                 'sample_size': len(rows),
                 'top_results': sorted(all_results, key=lambda x: x['objective'], reverse=True)[:5],
             }, ensure_ascii=False),
+            metric_v2_name=OBJECTIVE_V2_NAME if USE_OBJECTIVE_V2 else '',
+            metric_v2_value=valid_imp,
+            objective_version=OPTIMIZER_OBJECTIVE_VERSION,
+            walk_forward=int(has_validation),
         )
 
-        summary = (f'网格搜索完成(V2 walk-forward): 训练窗目标{current_obj:.1f}% → 最优{best_obj:.1f}% '
-                   f'(+{improvement:.1f}%), {"已采纳" if adopted else "未达阈值/验证未通过，未采纳"}')
+        unit = 'pp' if USE_OBJECTIVE_V2 else '%'
+        adopt_txt = ('已采纳' if (adopted and OPTIMIZER_APPLY)
+                     else ('已验证·未写入（APPLY关）' if adopted
+                           else '未达阈值/验证未通过，未采纳'))
+        summary = (f'网格搜索完成({OPTIMIZER_OBJECTIVE_VERSION}): 训练窗目标{current_obj:.1f}{unit} → 最优{best_obj:.1f}{unit} '
+                   f'(+{improvement:.1f}), {adopt_txt}')
         print(f'[自动优化] {summary}')
         return {
             'best_params': best_params,

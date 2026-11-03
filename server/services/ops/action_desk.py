@@ -29,6 +29,14 @@ from services.strategy.risk_control import calc_risk_control
 from services.strategy.sentiment import get_sentiment, cycle_gate, _empty_snapshot, peek_cached
 from services.strategy.mainline import (
     get_mainline, peek_mainline_cached, _setting as _ml_setting, DISCLAIMER as _ML_DISCLAIMER)
+# 主题篮子温度（2026-10-31）：独立于主线开关，永远下发；只做"有多热/是否走坏"。
+# 10-31 晚扩到三条链：默认给"近 5 日最强"的那条，peek_auto 从缓存里同步兜底。
+from services.ops.theme_index import (
+    snapshot as theme_snapshot, peek_auto as peek_theme_auto,
+    peek_cached as peek_theme_cached, active_ids as theme_active_ids)
+# 财联社题材梯队（2026-10-31，影子）：只展示，不进选股/门槛/推送。
+# 外部接口约 0.6~0.9s，所以常态走内存/落库快照，盘中 60s 缓存、休市 600s。
+from services.ops import cls_pool as cls_ladder_pool
 from app.config import MAINLINE_ENABLED, DESK_SECTOR_CHIPS_IN_SENTIMENT
 
 # 需要实时行情的时段（休市/盘后不取指数，省 RTT）
@@ -81,18 +89,56 @@ _PHASE_POLL_MS = {
 # 之前用注释里这句话的语义补上了实现。MAINLINE_ENABLED=False 时 build 阶段整个剔除
 # （见 data['sections'] 的过滤），返回体逐字节回到改造前。
 _PHASE_SECTIONS = {
-    'pre':     ['tradeWindow', 'sectors', 'tomorrowPlan', 'positionActions', 'watchlist'],
-    'auction': ['sentiment', 'sectors', 'tomorrowPlan', 'tradeWindow', 'buyNow', 'watchlist'],
-    'morning': ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'lunch':   ['sentiment', 'sectors', 'positionActions', 'reviewDigest', 'buyNow', 'watchlist'],
-    'mid':     ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'tail':    ['sentiment', 'sectors', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
-    'post':    ['sentiment', 'sectors', 'reviewDigest', 'tomorrowPlan', 'positionActions', 'watchlist'],
+    'pre':     ['tradeWindow', 'sectors', 'theme', 'ladder', 'tomorrowPlan', 'positionActions', 'watchlist'],
+    'auction': ['sentiment', 'sectors', 'theme', 'ladder', 'tomorrowPlan', 'tradeWindow', 'buyNow', 'watchlist'],
+    'morning': ['sentiment', 'sectors', 'theme', 'ladder', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'lunch':   ['sentiment', 'sectors', 'theme', 'ladder', 'positionActions', 'reviewDigest', 'buyNow', 'watchlist'],
+    'mid':     ['sentiment', 'sectors', 'theme', 'ladder', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'tail':    ['sentiment', 'sectors', 'theme', 'ladder', 'positionActions', 'buyNow', 'tradeWindow', 'watchlist'],
+    'post':    ['sentiment', 'sectors', 'theme', 'ladder', 'reviewDigest', 'tomorrowPlan', 'positionActions', 'watchlist'],
     # 2026-10-23：休市不等于"没有情绪"。收盘后此处给的是**今天/最近交易日的收盘定版**，
     # 之前把它藏起来，用户只看到"市场主线"（且被 stale 闸门拦成候选），才以为页面停在昨天。
-    'closed':  ['tomorrowPlan', 'sentiment', 'sectors', 'reviewDigest', 'watchlist'],
-    'unknown': ['reviewDigest', 'sentiment', 'watchlist'],
+    'closed':  ['tomorrowPlan', 'sentiment', 'sectors', 'theme', 'ladder', 'reviewDigest', 'watchlist'],
+    'unknown': ['reviewDigest', 'sentiment', 'theme', 'ladder', 'watchlist'],
 }
+
+def _theme_card(theme: Dict) -> Dict:
+    """主题卡下发结构（2026-10-31）：单链一套，多条链同构——前端切换零请求。
+
+    2026-10-31 起链不再固定为机器人/商业航天/算力，而是 `hot_chains` 从财联社板块榜
+    每日选出的涨幅/涨停前 3（见 services/ops/hot_chains.py）；这里只透传
+    source(来源) / plate(财联社板块名) / rank(当日板块排名)，前端据此标明"今日热门"。
+
+    series 只带 (date, idx)：120 点约 3KB，三条链合计约 9KB，手机走隧道也可忽略。
+    """
+    return {
+        'id': theme.get('theme'),
+        'name': theme.get('name'),
+        'note': theme.get('note'),
+        'source': theme.get('source'),
+        'plate': theme.get('plate'),
+        'plateChangePct': theme.get('plateChangePct'),
+        'plateLimitUp': theme.get('plateLimitUp'),
+        'rank': theme.get('rank'),
+        'memberCount': theme.get('memberCount'),
+        'asOf': theme.get('asOf'),
+        'error': theme.get('error'),
+        'auto': bool(theme.get('auto')),
+        'last': theme.get('last') or {},
+        'live': theme.get('live'),
+        'recentPeak': theme.get('recentPeak'),
+        'dd': theme.get('dd'),
+        'dd60': theme.get('dd60'),
+        'state': theme.get('state'),
+        'stateLabel': theme.get('stateLabel'),
+        'temp': theme.get('temp'),
+        'banner': theme.get('banner'),
+        'events': theme.get('events') or [],
+        'series': [{'date': s.get('date'), 'idx': s.get('idx')}
+                   for s in (theme.get('series') or [])],
+        'meta': theme.get('meta') or {},
+    }
+
 
 _URGENCY = {'stop_loss': 0, 'reduce': 1, 'take_profit': 2, 'giveback': 3, 'trailing': 4}
 # 需立刻执行的（卡片染红）vs 该出现在待办里的（多一条"冲高回落"，但不抢紧急的视觉权重）
@@ -461,6 +507,14 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
     # 预算 1.5s < sentiment 的 2s，超时先拿 peek 兜底——它挂了只降级这一张卡。
     mainline_on = bool(_ml_setting('mainline_enabled', MAINLINE_ENABLED))
     mainline_task = asyncio.ensure_future(get_mainline()) if mainline_on else None
+    # 第六路（2026-10-31）：主题篮子温度。调度器盘中每分钟预热，常态命中 60s 缓存；
+    # 三链冷算合计约 0.4~0.6s，给 2 秒预算，超时先拿上一次缓存里最热的链兜底，
+    # 挂掉只影响这一张卡。'auto' 由 theme_index 按近 3 日强度选链（链本身来自 hot_chains
+    # 每日从财联社板块榜选出的前 3 热门板块）。
+    theme_task = asyncio.ensure_future(theme_snapshot('auto', live=live))
+    # 第七路（2026-10-31）：财联社题材梯队（影子）。外部六路并行约 0.6~0.9s，
+    # 盘中 60s / 休市 600s 缓存；超时先拿内存快照，再退到落库数据，都没有就不下发这张卡。
+    ladder_task = asyncio.ensure_future(cls_ladder_pool.snapshot(live=live))
 
     diag = await _guarded(diag_task, 3.0, 'positions',
                           {'positions': [], 'envAdvice': None, 'has_positions': False})
@@ -483,6 +537,17 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         quote_map = {}
     if not isinstance(sentiment, dict):
         sentiment = _empty_snapshot('异常')
+    theme = await _guarded(theme_task, 2.0, 'theme', peek_theme_auto() or None)
+    if theme is not None and not isinstance(theme, dict):
+        theme = None
+    # 多条链同构下发（只取已缓存的）；前端点 chip 直接换数据，不再发请求。
+    # active_ids()：有动态链就是财联社前 3 热门板块，否则退回固定三链。
+    theme_cards = [_theme_card(d) for d in
+                   (peek_theme_cached(t) for t in theme_active_ids()) if d]
+    ladder = await _guarded(ladder_task, 2.0, 'ladder',
+                            cls_ladder_pool.peek(3600) or cls_ladder_pool.peek_from_db())
+    if ladder is not None and not isinstance(ladder, dict):
+        ladder = None
 
     actions = _build_position_actions(diag)
     allowed = _allowed_timings(phase)
@@ -566,6 +631,13 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
             'meta': (sectors or {}).get('meta') or {},
             'disclaimer': _ML_DISCLAIMER,
         }} if mainline_on else {}),
+        # 主题篮子温度（2026-10-31）：三条人工链里"近 3 日最强"的那条的"温度 + 位置"。
+        # 明确不做顶底预测：温度高位只提示减 1/3，结构走坏（回撤 8%/破 20 日线）再减一档。
+        # themes 是三条链的同构数据，前端 chips 本地切换（零请求、不会显示过期链）。
+        **({'theme': _theme_card(theme), 'themes': theme_cards} if theme else {}),
+        # 财联社题材梯队（2026-10-31，影子）：四池 → 按 up_reason 归因 → 龙头/先锋/中军/跟风。
+        # 只展示：不进选股评分、不进买入门槛、不进推送。口径差异（与本地东财 49 vs 51）在 meta 里写明。
+        **({'ladder': ladder} if ladder else {}),
         'market': {
             'riskScore': _to_float((alert or {}).get('riskScore')),
             'savedAt': (alert or {}).get('savedAt') or '',

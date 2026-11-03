@@ -2,7 +2,9 @@
   <div>
     <div class="refresh-controls">
       <div class="toggle-section"><span class="toggle-label">📊 自动刷新中</span></div>
-      <div class="last-update">{{ lastUpdateTime }}</div>
+      <div class="last-update">
+        {{ lastUpdateTime }}<template v-if="scanAsOf"> · 数据口径 {{ scanAsOf }}</template>
+      </div>
     </div>
     <div class="filter-bar">
       <label class="filter-label">过滤模式：</label>
@@ -48,6 +50,14 @@
               :class="'ml-' + mainlineMap[r.symbol].kind"
               :title="mainlineMap[r.symbol].sector + ' · 当前市场主线'"
               >{{ mainlineMap[r.symbol].sector }}</span
+            >
+            <span
+              v-for="s in signalsOf(r)"
+              :key="s.k"
+              class="sig-tag"
+              :class="s.cls"
+              :title="s.tip"
+              >{{ s.k }}</span
             >
             <br />
             <small style="color: #94a3b8; font-weight: 400">{{ r.symbol.toUpperCase() }}</small>
@@ -152,6 +162,7 @@
   const scanResults = ref([])
   const scanning = ref(false)
   const lastUpdateTime = ref('--:--:--')
+  const scanAsOf = ref('') // 服务端 X-Scan-As-Of：这批数据实际算出的时刻（陈旧兜底期间早于现在）
   const scanSummary = ref(null)
   const scanPool = ref([])
 
@@ -336,11 +347,16 @@
     scanning.value = true
     try {
       const codes = scanPool.value.length > 0 ? scanPool.value : scanStockPool.value
-      const result = await apiFetch(`/api/hot-stocks-scan?codes=${codes.join(',')}`)
+      const { data: result, meta } = await apiFetch(`/api/hot-stocks-scan?codes=${codes.join(',')}`, {
+        withMeta: true,
+      })
       if (result.error) {
         if (!silent) showNotification(result.error)
         return
       }
+      // 2026-10-30 数据口径：陈旧兜底期间"读取于"（客户端时钟）会早于数据实际算出的
+      // 时刻——服务端 X-Scan-As-Of 给的是后者，两行并排才是诚实的时间。
+      if (meta && meta.scanAsOf) scanAsOf.value = meta.scanAsOf
       if (Array.isArray(result) && result.length > 0) {
         scanResults.value = result
         currentPage.value = 1
@@ -354,6 +370,29 @@
     } finally {
       scanning.value = false
     }
+  }
+
+  // 信号标签（2026-10-30 借鉴老王量化关注清单的"信号"列）：把已有字段压成 1~2 个
+  // 小徽标直接放在名称下方，结论不用点进详情才看到。阈值用系统自己的口径：
+  // 主力净流入占比 ≥3% 吸筹 / ≤-3% 出逃（strategy.py、trend.py 同一套阈值）；
+  // 龙虎榜上榜（smartMoney.on_board）带主买净额。最多 2 个，不放没有数据依据的信号。
+  function signalsOf(r) {
+    const out = []
+    const mir = Number(r.mainInflowRatio)
+    if (Number.isFinite(mir) && mir >= 3) {
+      out.push({ k: '吸筹', cls: 'sig-in', tip: `主力净流入占比 ${mir.toFixed(1)}%（≥3% 系统口径为吸筹）` })
+    } else if (Number.isFinite(mir) && mir <= -3) {
+      out.push({ k: '出逃', cls: 'sig-out', tip: `主力净流入占比 ${mir.toFixed(1)}%（≤-3% 系统口径为出逃）` })
+    }
+    if (r.smartMoney && r.smartMoney.on_board) {
+      const net = Number(r.smartMoney.net_amt) || 0
+      out.push({
+        k: '榜',
+        cls: net >= 0 ? 'sig-in' : 'sig-out',
+        tip: `龙虎榜上榜，主买净额 ${(net / 1e8).toFixed(2)} 亿（近 5 个交易日）`,
+      })
+    }
+    return out.slice(0, 2)
   }
 
   // 自动扫描：交易时段 30s，休市时睡到下一个开盘点；仅本 Tab 可见时执行
@@ -479,6 +518,40 @@
     color: #1d4ed8;
     background: #eff6ff;
     border: 0.5px solid #bfdbfe;
+  }
+
+  /* 信号徽标（2026-10-30）：红=好信号（吸筹/净买入），绿=坏信号（出逃/净卖出），
+     与全站 A 股红涨绿跌一致；样式贴着 mainline-tag，手机上不占新列 */
+  .sig-tag {
+    display: inline-block;
+    vertical-align: middle;
+    margin-left: 4px;
+    font-size: 0.625rem;
+    font-weight: 700;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .sig-tag.sig-in {
+    color: #b91c1c;
+    background: #fef2f2;
+    border: 0.5px solid #fecaca;
+  }
+  .sig-tag.sig-out {
+    color: #15803d;
+    background: #f0fdf4;
+    border: 0.5px solid #bbf7d0;
+  }
+  :root[data-theme='dark'] .sig-tag.sig-in {
+    color: #f87171;
+    background: rgba(220, 38, 38, 0.12);
+    border-color: rgba(220, 38, 38, 0.35);
+  }
+  :root[data-theme='dark'] .sig-tag.sig-out {
+    color: #4ade80;
+    background: rgba(22, 163, 74, 0.12);
+    border-color: rgba(22, 163, 74, 0.35);
   }
   :root[data-theme='dark'] .mainline-tag.ml-attack {
     color: #fca5a5;

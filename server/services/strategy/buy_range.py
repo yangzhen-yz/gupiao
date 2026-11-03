@@ -184,7 +184,7 @@ def chase_warning(price: float, buy_high: Optional[float], rates: Optional[Dict]
 
     rates 传推荐复盘的实测数 `{'dixiWin':…, 'chaseWin':…, 'dixiN':…, 'chaseN':…,
     'filledChaseWin':…}`（`recommend.exec_rates()` 的返回值），拿不到就退回文档口径
-    （42.1% / 46.8%，`docs/胜率低根因复盘-2026-10-18.md`）——
+    （42.1% / 46.8%，`server/analysis_out/docs_backup_20261102/胜率低根因复盘-2026-10-18.md`）——
     数字必须带出处，但出处可以是文档；有实测量时把样本条数一起写出来，
     几十笔的胜率本来就飘，让用户看得见"这只是 95 条成交给出的 42.1%"。
 

@@ -195,7 +195,7 @@ export const API_TIMEOUT_MS = 10000
 
 // API 请求封装：自动附带登录 token；私有接口返回 401 时清理登录态并通知上层
 export async function apiFetch(url, options = {}) {
-  const { timeout = API_TIMEOUT_MS, expectText = false, ...rest } = options
+  const { timeout = API_TIMEOUT_MS, expectText = false, withMeta = false, ...rest } = options
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
   // 2026-10-30：把每个请求的耗时记进 utils/perf.js（内存态，页面耗时条用它）。
@@ -204,6 +204,7 @@ export async function apiFetch(url, options = {}) {
   const _tok = beginRequest(url)
   let _status = 0
   let _serverMs = null
+  let _asOf = null
   try {
     const opts = { ...rest, signal: ctrl.signal }
     const token = getToken()
@@ -214,6 +215,9 @@ export async function apiFetch(url, options = {}) {
     _status = resp.status
     const _proc = resp.headers.get('X-Process-Time')
     if (_proc !== null) _serverMs = Number(_proc)
+    // 2026-10-30：X-Scan-As-Of = 扫描数据实际算出来的时刻（陈旧兜底期间会早于现在）
+    const _asOfRaw = resp.headers.get('X-Scan-As-Of')
+    if (_asOfRaw !== null) _asOf = _asOfRaw
     if (resp.status === 401 && !url.startsWith('/api/auth/')) {
       clearAuth()
       if (_unauthorizedHandler) _unauthorizedHandler()
@@ -221,8 +225,10 @@ export async function apiFetch(url, options = {}) {
       err.status = 401
       throw err
     }
-    // 腾讯行情那类接口返回的是文本不是 JSON，用 expectText 走同一条超时逻辑
-    return expectText ? await resp.text() : await resp.json()
+    // 腾讯行情那类接口返回的是文本不是 JSON，用 expectText 走同一条超时逻辑。
+    // withMeta=true 时包一层 { data, meta }——只有显式传参的调用方才拿到的形状，别的调用方不受影响。
+    const _payload = expectText ? await resp.text() : await resp.json()
+    return withMeta ? { data: _payload, meta: { scanAsOf: _asOf, serverMs: _serverMs } } : _payload
   } catch (e) {
     if (e.name === 'AbortError') {
       const err = new Error(`请求超时（${Math.round(timeout / 1000)}s）: ${url}`)

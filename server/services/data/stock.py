@@ -314,7 +314,7 @@ async def fetch_with_retry(symbols: str) -> str:
 
     def _sync_fetch() -> str:
         # 2026-07-08 优化：用 _REALTIME_SESSION 复用 keep-alive（无 keep-alive 时自动新建，不影响正确性）
-        resp = _REALTIME_SESSION.get(url, timeout=(2, 3))  # (connect, read)
+        resp = _REALTIME_SESSION.get(url, timeout=(1.5, 3))  # (connect, read)；2026-11-03 收紧 connect 防挂起拖垮调用方
         resp.raise_for_status()
         raw = resp.content
         if len(raw) < 10:
