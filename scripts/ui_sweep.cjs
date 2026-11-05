@@ -10,7 +10,25 @@
  * 安全约束：只点白名单里的「切换/筛选/分页/排序」类按钮；任何会写库、触发全市场
  * 重扫、发推送、改配置的按钮一律跳过（黑名单见 DANGEROUS）。巡检不修改任何业务数据。
  */
-const { chromium } = require('D:/360Downloads/cc/node_modules/playwright')
+// playwright 装在哪是本机事实，不写进提交（AGENTS.md：本机绝对路径不得进代码）。
+// 解析顺序：GP_PLAYWRIGHT → 仓库 node_modules 里的 playwright → GP_PLAYWRIGHT_PATHS（用 ; 分隔的候选目录）。
+function _requirePlaywright() {
+  const cands = [process.env.GP_PLAYWRIGHT, 'playwright',
+                 ...(process.env.GP_PLAYWRIGHT_PATHS || '').split(';').map(s => s.trim())]
+                  .filter(Boolean)
+  const errs = []
+  for (const c of cands) {
+    try { return require(c) } catch (e) { errs.push(`${c}: ${e.code || e.message}`) }
+  }
+  console.error([
+    '找不到 playwright 模块。本机跑这类 UI 实拍脚本，请先设环境变量再重跑：',
+    '  set GP_PLAYWRIGHT=<playwright 模块目录>',
+    '或在仓库里 npm i -D playwright。候选与错误：',
+    ...errs.map(e => '  ' + e),
+  ].join(String.fromCharCode(10)))
+  process.exit(2)
+}
+const { chromium } = _requirePlaywright()
 const fs = require('fs')
 const path = require('path')
 
