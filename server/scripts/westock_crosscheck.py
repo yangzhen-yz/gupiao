@@ -9,8 +9,13 @@
      宇宙覆盖的是系统真正在用的股票（发现工具是全市场排名，权威校验是选股宇宙）。
   2. westock 拉取：fund flow（10 只/批并行）+ quote（60 只/批）。
   3. 双源比对：
-     - 行情层（涨跌幅）：两源应一致（本地行情走腾讯 qt.gtimg.cn，westock 也是腾讯系，
-       同源预期 100% 一致；不一致=某一侧接口异常，告警）；
+     - 行情层（涨跌幅）：本地侧取自**东财资金流快照**的 `changePercent`（不是腾讯行情），
+       westock 取腾讯自选股 —— 是**两个独立源**，不是同源，故存在小数级差异属正常；
+       真正该判"不一致"的是差到价格涨跌停级别的偏离。
+       **2026-11-05 修**：此前本地侧只读"最新一份快照"、不认日期，补跑历史日期时等于
+       拿今天的行情比前天的行情，`quote_agreed` 一致率因此在 1.1%%～97.2%% 之间乱跳、
+       `direction_conflict` 被虚增（westock 侧经本地日K反查逐只吻合，错的始终是本地侧）。
+       现在日期对不上就判**不可校验**：只落 westock 权威快照、不写比对行（宁缺不假）；
      - 资金流层（主力净流入）：本地（东财 f62 / 新浪 r0+r1）vs westock（腾讯口径），
        三口径定义不同，只记录偏差与符号冲突，**westock 值为权威值**（authoritative='westock'）。
   4. 落库：westock_snapshot（每日权威快照）+ data_cross_check（比对结果）。
@@ -45,7 +50,10 @@ _QT_BATCH_SLEEP = 1.0        # quote 批间隔（秒）
 _RATE_LIMIT_RETRY = 3        # 空返回/限频批重试次数
 _RATE_LIMIT_BACKOFF = 10.0   # 退避基数（秒）：10/20/30
 _CLI_TIMEOUT = 45            # 单批 CLI 超时（大批次响应慢，30s 偏紧）
-_QUOTE_TOL = 0.011           # 涨跌幅一致容差（百分点，防浮点/舍入）
+# 涨跌幅一致容差（百分点）。2026-11-05：0.011 → 0.05。原来的 0.011 实际要求
+# "两位小数完全相等"，两源只要一侧四舍五入口径不同（−0.58 vs −0.50）就判不一致，
+# 指标被噪声淹没；0.05 仍远小于涨跌停量级，足以识别真错。
+_QUOTE_TOL = 0.05
 
 
 # ========== CLI 调用与 Markdown 表格解析 ==========
@@ -199,11 +207,35 @@ def collect_universe() -> List[str]:
     return sorted(syms)[:_UNIVERSE_CAP]
 
 
-def collect_our_values() -> Dict[str, Dict]:
-    """本地侧当日值（fund-flow 快照的 stocks 区块）：{symbol: {'change_pct','main_inflow'}}"""
+def _snapshot_date(snap) -> Optional[str]:
+    """资金流快照的抓取日期（本地时区 YYYY-MM-DD）；无 ts / 解析失败返回 None。
+
+    快照顶层只有 `ts`（fetch 时间，不是数据时间）——用它做"是不是同一天"的粗判足够：
+    16:30 跑校验时当日快照的 ts 必然落在同一天。
+    """
+    try:
+        ts = float((snap or {}).get('ts') or 0)
+        return datetime.fromtimestamp(ts).strftime('%Y-%m-%d') if ts > 0 else None
+    except Exception:
+        return None
+
+
+def collect_our_values(date_key: Optional[str] = None) -> Dict[str, Dict]:
+    """本地侧当日值（fund-flow 快照的 stocks 区块）：{symbol: {'change_pct','main_inflow'}}。
+
+    Args:
+        date_key: 要校验的交易日。给了就必须与快照抓取日一致，否则返回空表表示
+            **不可校验**（上游据此跳过比对写入，不记假冲突）。不给则不做日期校验
+            （保留给显式的"只看当前快照"场景）。
+
+    2026-11-05 修：原实现无条件读最新快照，`--date 2026-11-02` 之类补跑等于拿今天
+    的行情比前天，一致率与符号冲突统计全部失真。westock 侧经本地日K逐只反查是准的。
+    """
     from db.database import load_fund_flow_snapshot
     out: Dict[str, Dict] = {}
     snap = load_fund_flow_snapshot('stocks')
+    if date_key and _snapshot_date(snap) != date_key:
+        return {}
     if snap and isinstance(snap, dict) and 'data' in snap:
         for side in ('inflow', 'outflow'):
             for x in (snap['data'].get(side) or []):
@@ -240,7 +272,14 @@ def run(date_key: Optional[str] = None, dry_run: bool = False) -> Dict:
         print(f'[双源校验] westock 拉取失败: {type(e).__name__}: {e}')
         return {'date': date_key, 'total': 0, 'error': str(e)}
 
-    our = collect_our_values()
+    our = collect_our_values(date_key)
+    # 本地侧是否可校验：空表 = 快照非当日/无快照，本轮只做 westock 侧落库
+    our_usable = bool(our)
+    if not our_usable:
+        from db.database import load_fund_flow_snapshot
+        snap_date = _snapshot_date(load_fund_flow_snapshot('stocks'))
+        print(f'[双源校验] ⚠ 本地资金流快照日期={snap_date or "无"} ≠ 校验日 {date_key}，'
+              f'本轮**只落 westock 权威快照、不做双源比对**（避免写入假冲突）')
     print(f'[双源校验] westock 资金流 {len(ff)}/{len(syms)} 只、行情 {len(qt)}/{len(syms)} 只')
 
     snap_rows: List[Dict] = []
@@ -304,6 +343,7 @@ def run(date_key: Optional[str] = None, dry_run: bool = False) -> Dict:
     summary = {
         'date': date_key, 'total': len(syms),
         'westock_ff': len(ff), 'westock_qt': len(qt),
+        'our_side_usable': our_usable,
         'quote_checked': n_quote_checked, 'quote_agreed': n_quote_ok,
         'quote_agreed_rate': round(n_quote_ok / n_quote_checked * 100, 1) if n_quote_checked else None,
         'direction_conflicts': conflicts,
@@ -313,10 +353,17 @@ def run(date_key: Optional[str] = None, dry_run: bool = False) -> Dict:
     if not dry_run:
         from db.database import save_westock_snapshot, save_cross_check
         n1 = save_westock_snapshot(date_key, snap_rows)
-        n2 = save_cross_check(date_key, check_rows)
         summary['saved_snapshot'] = n1
-        summary['saved_check'] = n2
-        print(f'[双源校验] 落库 westock_snapshot {n1} 条、data_cross_check {n2} 条')
+        # 本地侧不可校验就不写比对表：全 NULL 行会把 `quote_agreed_rate` 的分母撑大、
+        # 让一致率看起来永远偏低（历史上 1.1% 那几天正是这么来的）。westock 快照照存。
+        if our_usable:
+            n2 = save_cross_check(date_key, check_rows)
+            summary['saved_check'] = n2
+            print(f'[双源校验] 落库 westock_snapshot {n1} 条、data_cross_check {n2} 条')
+        else:
+            summary['saved_check'] = 0
+            summary['skipped_compare'] = 'local_snapshot_not_same_day'
+            print(f'[双源校验] 落库 westock_snapshot {n1} 条；data_cross_check 本轮跳过（本地快照非当日）')
 
     rate = summary['quote_agreed_rate']
     print(f"[双源校验] 完成：行情一致 {n_quote_ok}/{n_quote_checked}"
