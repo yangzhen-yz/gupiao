@@ -24,6 +24,8 @@ from app.config import (
     FUND_FLOW_HIDDEN_HOT_TOP_N,
     FUND_FLOW_HIDDEN_TOP_N,
     FUND_FLOW_CACHE_TTL,
+    FUND_FLOW_CLOSED_CACHE_TTL,
+    FUND_FLOW_CACHE_TTL_FIX,
 )
 from db.database import load_hot_search_ranking, save_fund_flow_snapshot, load_fund_flow_snapshot
 from services.data.stock import has_delisting_risk  # 复用 ST/退市 基础过滤
@@ -696,6 +698,25 @@ async def _cls_sector_rankings(top_n: int) -> Optional[Dict]:
         return None
 
 
+def _cache_hit(cached: Optional[Dict], closed: bool, now: float,
+               ttl_intraday: float, ttl_closed: float, fix_enabled: bool = True) -> bool:
+    """资金流内存缓存的命中判据。抽成纯函数是为了能被自测直接跑——线上真正走的就是这里，
+    而不是测试里另抄一遍表达式（那种自测只会证明抄的东西对）。
+
+    `fix_enabled=False` 保留 d5b2589(2026-10-16) 到 2026-11-03 的旧判据原样，用于对照与回滚：
+    旧式是 `not closed or age < ttl`，而调用侧 `closed = not _in_trading_window()`，
+    于是 `not closed` 就是"盘中"——**盘中恒真**（TTL 根本不生效、资金流从当天第一次请求起
+    就不刷新），**收盘后反而每 ttl 秒过期一次**（每过 20 秒重走一遍取数）。与它上面那行
+    注释写的意图正好相反。
+    """
+    if not cached:
+        return False
+    if not fix_enabled:
+        return (not closed) or ((now - cached['ts']) < ttl_intraday)
+    ttl = ttl_closed if closed else ttl_intraday
+    return (now - cached['ts']) < ttl
+
+
 def _in_trading_window() -> bool:
     """粗判盘中（周一~周五 9:15-15:05）。收盘后已有快照的区块不再请求东财。"""
     now = datetime.now()
@@ -829,8 +850,15 @@ async def get_fund_flow_summary(
     closed = not _in_trading_window()
     cached = _CACHE.get(key)
     now = time.time()
-    # 盘中：短 TTL 缓存命中直接返回；收盘后：数据已定型，有缓存即返回
-    if cached and (not closed or (now - cached['ts']) < FUND_FLOW_CACHE_TTL):
+    # 命中判据（2026-11-03 修，原注释与代码相反）：原式是 `not closed or age < TTL`，
+    # 而上一行 `closed = not _in_trading_window()`，所以 `not closed` 就是"盘中"——
+    #   盘中：条件恒真 → FUND_FLOW_CACHE_TTL(20s) **根本不生效**，资金流从当天第一次请求起就不刷新；
+    #   收盘后：反而要求 20 秒内才算命中 → 每过 20 秒就重走一遍取数（实测每次 0.52 秒，
+    #          快照缺失时首次 8.99 秒）。由 d5b2589(2026-10-16) 带入，存在一个多月。
+    # 现在按注释原本意图实现：盘中看 20 秒 TTL，收盘后看 2 小时（不取"无限"的理由见 config.py）。
+    # FUND_FLOW_CACHE_TTL_FIX=False 时逐字节回到上面那版（连两个症状一起回来），用于对照与回滚。
+    if _cache_hit(cached, closed, now, FUND_FLOW_CACHE_TTL,
+                  FUND_FLOW_CLOSED_CACHE_TTL, FUND_FLOW_CACHE_TTL_FIX):
         return cached['data']
 
     # 兜底先就位（内存 → DB 快照恢复）；key 去参数化后只此三个 key

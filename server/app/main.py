@@ -227,6 +227,14 @@ async def lifespan(app: FastAPI):
                     try:
                         _review = await generate_daily_review()
                         save_daily_market_reviews([_review])
+                        # 2026-11-04 复查补：收评共 3 个写入点（API / 定时任务 / 这里），
+                        # 前两个都已失效缓存，启动时补生成漏了 —— 若预热先建了缓存，
+                        # 新收评要等 5 分钟 TTL + 一轮后台刷新才可见。
+                        try:
+                            from app.api.routes import _invalidate_daily_reviews_cache
+                            _invalidate_daily_reviews_cache()
+                        except Exception as _ie:
+                            print(f'[初始化] 收评缓存失效失败（不影响补生成）: {_ie}')
                         print(f'[初始化] 收评补生成完成，情绪分={_review.get("aiAnalysis",{}).get("sentimentScore","N/A")}')
                     except Exception as _e:
                         print(f'[初始化] 收评补生成失败: {_e}')

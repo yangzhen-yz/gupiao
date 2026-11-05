@@ -274,6 +274,31 @@ async def watch_positions(user_id: int = 1) -> Dict:
             _mark(date_str, _MARKET_USER_ID, _MARKET_SYMBOL_KEY, f'up:{cycle}', 0.0,
                   f'修复自转弱（{sentiment.get("cycleScore")}分）')
 
+    # 情绪减仓影子（2026-11-04，#11）：情绪进入坏周期时，给该账号每个持仓算一条
+    # "该减多少"落 exit_signal_log。**不执行、不改推送、不参与任何现有判定**，只攒对照数据
+    # （减仓比例是先验值、未做寻优，≥20 个交易日后再裁决要不要接进动作链）。
+    # 与上面的市场级推送是两件事：那条回答"要不要提醒你"（每周期只推一次、记在账号 0），
+    # 这条回答"具体减多少股"（按账号按持仓，一天一票一条，UNIQUE 幂等）。
+    # T+1 当天卖不掉的持仓不记——记了也执行不了，只会虚增信号量。
+    # 关掉 EXIT_SENTIMENT_SHADOW_ENABLED 时一个信号都不落，逐字节等于改造前。
+    shadow_written = 0
+    if sentiment.get('cycle') in _BAD_CYCLES and not sentiment.get('stale'):
+        try:
+            from services.strategy.exit_shadow import record_sentiment_reduce
+            for p in positions:
+                if not p.get('sellable', True):
+                    continue
+                if record_sentiment_reduce(user_id=user_id, pos=p, sentiment=sentiment,
+                                           date_str=date_str):
+                    shadow_written += 1
+            if shadow_written:
+                # 只打汇总、不改返回值结构（前端读的是 pushed/symbols，加 key 是风险）；
+                # 每轮一行便于事后数"这个周期一共给了多少条建议"
+                print(f'[减仓影子] 账号{user_id} 本轮新落 {shadow_written} 条减仓建议'
+                      f'（{sentiment.get("cycle")}，影子·不执行）')
+        except Exception as e:
+            print(f'[减仓影子] 本轮异常（不影响推送）: {e}')
+
     pushed = 0
     if capped:
         print(f'[持仓快反 {datetime.now():%H:%M:%S}] 账号{user_id} 今日已发 '

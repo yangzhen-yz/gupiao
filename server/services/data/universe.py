@@ -154,18 +154,45 @@ def eligible_symbols(symbols: Optional[Iterable[str]] = None) -> list:
     if symbols is None:
         if _SCOPE_CACHE['value'] and _time.time() - _SCOPE_CACHE['ts'] < _SCOPE_TTL:
             return list(_SCOPE_CACHE['value'])
-        result = _compute_eligible(_db_symbols())
+        _t = _time.time()
+        _syms = _db_symbols()
+        _mark_step('日K清单', _time.time() - _t)
+        result = _compute_eligible(_syms)
         _SCOPE_CACHE.update(ts=_time.time(), value=result)
         return list(result)
     return _compute_eligible(symbols)
 
 
+# 11-04 观测用：四层各自本次实际耗时（秒）。纯记录，不参与任何判定；
+# 加在这里是因为启动那行"universe 选票范围缓存完成"线上要 190~751 秒，而进程外单测只有 ~15 秒，
+# 必须在线上现场把"到底是哪一层、是计算还是排队"钉下来才好谈修法。
+_STEP_TIMES: Dict[str, float] = {}
+
+
+def _mark_step(name: str, sec: float) -> None:
+    _STEP_TIMES[name] = round(float(sec), 2)
+
+
+def step_times() -> Dict[str, float]:
+    """给日志/自测读本次四层耗时快照（返回副本，外面改不动它）。"""
+    return dict(_STEP_TIMES)
+
+
 def _compute_eligible(symbols: Iterable[str]) -> list:
+    import time as _time
+    _t = _time.time()
     codes = sorted(filter_symbols(symbols))
+    _mark_step('主板+非ST退', _time.time() - _t)
     try:
         from services.data import market_cap
         if market_cap.enabled_flag():
+            _t = _time.time()
             codes = sorted(market_cap.filter_symbols(codes))
+            _mark_step('市值下限', _time.time() - _t)
+            _mark_step('市值表首次装载', getattr(market_cap, 'LAST_LOAD_SEC', 0.0))
+            # 行数才是"到底装了多少只"的凭据。11-04 首测漏了这一行，日志就打成"…0.01s / 0 行"，
+            # 一个看上去像"市值表是空的"的假数——观测代码自己制造误导，比没有观测更糟。
+            _STEP_TIMES['市值表行数'] = int(getattr(market_cap, 'LAST_LOAD_ROWS', 0))
     except Exception as e:                                  # 市值表读不到时按主板+非ST放行
         print(f'[股票范围] 市值下限这层没接上(按不含市值处理): {e}')
     return codes
@@ -192,14 +219,39 @@ def selectable_symbols() -> list:
     import time as _time
     if _SELECTABLE_CACHE['value'] and _time.time() - _SELECTABLE_CACHE['ts'] < _SELECTABLE_TTL:
         return list(_SELECTABLE_CACHE['value'])
+    _t_all = _time.time()
+    _t = _time.time()
+    _scope = eligible_symbols()
+    _mark_step('数据范围', _time.time() - _t)
     try:
         from services.data import liquidity
-        result = liquidity.filter_codes(eligible_symbols())
+        _t = _time.time()
+        result = liquidity.filter_codes(_scope)
+        _mark_step('流动性', _time.time() - _t)
     except Exception as e:
         print(f'[股票范围] 流动性这层没接上(按不含流动性处理): {e}')
         result = eligible_symbols()
+    _total = _time.time() - _t_all
+    _mark_step('本次合计', _total)
+    _log_step_times(_total)
     _SELECTABLE_CACHE.update(ts=_time.time(), value=list(result))
     return list(result)
+
+
+def _log_step_times(total: float) -> None:
+    """只有本次总耗时超过 `UNIVERSE_STEP_LOG_SEC` 才打这一行——正常 2 秒的轮次不刷屏。"""
+    try:
+        from app.config import UNIVERSE_STEP_LOG_SEC
+    except Exception:
+        UNIVERSE_STEP_LOG_SEC = 5.0
+    if total < float(UNIVERSE_STEP_LOG_SEC):
+        return
+    st = _STEP_TIMES
+    print(f"[股票范围] 分段耗时（总 {total:.1f}s ≥ {UNIVERSE_STEP_LOG_SEC}s 才打）："
+          f"日K清单={st.get('日K清单', 0)}s 主板+非ST退={st.get('主板+非ST退', 0)}s "
+          f"市值下限={st.get('市值下限', 0)}s（其中市值表首次装载 {st.get('市值表首次装载', 0)}s / "
+          f"{int(st.get('市值表行数', 0))} 行）"
+          f"流动性={st.get('流动性', 0)}s → 数据范围={st.get('数据范围', 0)}s")
 
 
 def selectable_count() -> int:

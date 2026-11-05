@@ -2,9 +2,9 @@
 from fastapi import HTTPException, APIRouter, Request, Depends
 from fastapi.responses import Response
 from typing import List, Dict, Optional
-import json, asyncio, time, re, inspect, threading
+import json, asyncio, time, re, inspect, threading, hashlib, gzip
 from datetime import date, datetime
-from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE)
+from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE, RECOMMEND_REVIEW_CACHE_ENABLED)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
 from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk, detect_quote_source, quote_route_status)
 from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
@@ -36,6 +36,94 @@ router = APIRouter()
 TENCENT_API = TENCENT_QUOTE_API
 MAX_RETRIES = 2
 
+# ========== 全站 SWR 缓存基础设施（2026-11-04 全站巡检） ==========
+# 统一口径：日级/分钟级只读数据过期先返旧值、重算放后台，绝不把冷算压在用户请求上。
+from services.support import swr as _swr
+_SWR_STALE_MAX = 86400.0           # 秒：旧值最长服役一天（后台刷新会持续把它更新）
+# 大盘指数 / 主题链 / 财联社梯队 / 本地K库统计等分钟级数据源共用一份缓存。
+# 键一律用 tuple，避免自由参数把缓存撑成可被远程清空的攻击面。
+_MISC_SWR_CACHE: Dict = {}
+
+# ========== 每日收评 SWR + ETag + 服务端分页（2026-11-04 P0-A / P0-B） ==========
+# P0-A：实测每次返回 30 天 × 约 24KB = 518235B（gzip 105KB），服务端 XPT 133ms，
+# 且无任何缓存头，而前端一页只渲染 1 条。→ 进程内缓存 + ETag/304 + 预压缩。
+# P0-B（22:45）：304 已经零传输，但**首次开页仍要下 105KB**。改为服务端按页返回，
+# 一页 1 条约 25KB（gzip 约 5KB），手机走隧道的开页成本再降一个数量级。
+# 口径：page=0 / 不传 = 全量（兼容脚本与其它消费方），page>=1 = 第 N 页。
+# **page_size 不给自由参数**：固定 1 条/页（前端本来就是 1 条），否则远程可用
+# ?page_size=1..N 把缓存撑成无数份（11-04 复盘缓存被 days 撑爆是同一个教训）。
+_DAILY_REVIEWS_CACHE: Dict = {}
+_DAILY_REVIEWS_TTL = 300.0     # 秒：5 分钟内直接复用；过期先返旧值、后台刷新
+
+
+def _reviews_entry(payload: dict) -> dict:
+    """把一个响应体预序列化 + 预压缩成可直接吐给客户端的条目。
+
+    ETag 用**弱校验器** `W/"..."`：同一 URL 会因 Accept-Encoding 返回 gzip /
+    identity 两种表示，强 ETag 跨表示复用严格说违反 RFC 7232；弱校验器表示
+    「语义等价」正是这个场景。Vary 仍保留。
+
+    Args:
+        payload: 待序列化的响应体字典。
+
+    Returns:
+        {'raw': bytes, 'gz': bytes, 'etag': str}
+    """
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'),
+                     default=str).encode('utf-8')
+    return {'raw': raw, 'gz': gzip.compress(raw, compresslevel=6),
+            'etag': 'W/"' + hashlib.md5(raw).hexdigest() + '"'}
+
+
+def _build_daily_reviews_entry():
+    """一次查库，构建「全量 + 每页」全部预压缩条目（在 to_thread 里跑）。
+
+    为什么整份 bundle 一次性构建而不是按页懒构建：懒构建会让第一次翻到某页
+    的请求现场付序列化 + 压缩，等于把 P0-A 刚干掉的「每请求重压」又请回来。
+    30 页 × (约 25KB raw + 约 5KB gz) ≈ 1MB 内存，换全部翻页零计算，划算。
+
+    Returns:
+        {'total': int, 'all': entry, 'pages': {page: entry}, 'recentFocus': list}
+    """
+    rows = load_daily_market_reviews()
+    total = len(rows)
+    # 前端 loadFocusQuotes 原来取 reviews.slice(0, 3) 的明日关注去重，
+    # 分页后前端只拿得到 1 条，故由后端把「最近 3 天」的关注票一并下发，
+    # 行为与改造前等价（甚至更准：翻到历史页时也仍拉最新 3 天的行情）。
+    focus, seen = [], set()
+    for row in rows[:3]:
+        for s in (row.get('tomorrowFocus') or []):
+            code = s.get('code') if isinstance(s, dict) else None
+            if code and code not in seen:
+                seen.add(code)
+                focus.append(s)
+    common = {'total': total, 'recentFocus': focus}
+    bundle = {
+        'total': total,
+        'recentFocus': focus,
+        'all': _reviews_entry({'success': True, 'data': rows,
+                               'page': 0, 'pageSize': total,
+                               'totalPages': 1, **common}),
+        'pages': {
+            i: _reviews_entry({'success': True, 'data': [row],
+                               'page': i, 'pageSize': 1,
+                               'totalPages': total, **common})
+            for i, row in enumerate(rows, 1)
+        },
+    }
+    return bundle
+
+
+def _invalidate_daily_reviews_cache():
+    """新收评落库后立刻失效，避免刚生成的收评要等 TTL 才可见。
+
+    2026-11-04 复查：必须走 `_swr.invalidate` 而不是 `clear()`。收评缓存构建要
+    序列化 518KB 再 gzip，后台刷新线程可能已拿着**旧快照**跑到一半；此时用户点
+    「生成今日收评」→ clear() → 刷新线程 put() 回来，新收评就被旧值覆盖，且 ts
+    是新的，接下来 5 分钟 fresh 全是旧数据（scripts/swr_selftest.py ⑭ 复现）。
+    """
+    _swr.invalidate(_DAILY_REVIEWS_CACHE)
+
 # ========== 批量扫描结果内存缓存（2026-08-31 性能优化） ==========
 _HOT_SCAN_CACHE: Dict[str, Dict] = {}
 # 2026-10-24：15s→45s。前端 30s 轮询下单用户 15s TTL 永不命中（每次都过期），
@@ -43,9 +131,13 @@ _HOT_SCAN_CACHE: Dict[str, Dict] = {}
 # 全量重扫频率减半，缓存数据最旧 45s（30s 一轮的筛选页可接受）。
 _HOT_SCAN_CACHE_TTL = 45  # 秒
 # 2026-10-30 陈旧兜底：45s TTL 一过，下一个请求就要白付全量重扫（实测冷 2.2s、
-# 缓存过期叠并发时 8.7s 甚至 53.9s）。过期但未超 10 分钟的数据先原样返回、由后台
+# 缓存过期叠并发时 8.7s 甚至 53.9s）。过期但未超上限的数据先原样返回、由后台
 # 线程刷新；筛选页是 30s 轮询的大盘画面，秒级新鲜度足够，页面耗时从此 ≤ 缓存命中。
-_HOT_SCAN_STALE_MAX = 600  # 秒
+# 2026-11-04 全站巡检修正：原上限 600s 太短——**隔夜 / 长时间无人访问后首开**
+# 仍会落进「无缓存可返」分支，同步重扫实测 10.008s，正好撞前端 10s 超时，
+# 页面显示「暂无扫描结果」。日级扫描结果旧一点没有决策损失（前端有 X-Scan-As-Of
+# 如实标注数据时刻，后台 20s 内刷新完、30s 轮询即拿新值），故放宽到 24 小时。
+_HOT_SCAN_STALE_MAX = 86400  # 秒
 _HOT_SCAN_REFRESHING: Dict[str, float] = {}   # {cache_key: 上次后台刷新时间}，20s 节流
 _HOT_SCAN_CTX = threading.local()             # 后台刷新线程内置 compute=True，避免递归再进缓存分支
 
@@ -53,6 +145,13 @@ def _invalidate_hot_scan_cache():
     """清空批量扫描缓存（添加/移除自选股后调用，避免脏缓存）"""
     _HOT_SCAN_CACHE.clear()
     _HOT_SCAN_REFRESHING.clear()
+    # 2026-11-04：扫描池详情也随池子变化，写后一并失效（60s SWR 缓存）。
+    # 同样用 invalidate 而不是 pop：键不含池子内容，后台刷新会原样写回旧详情。
+    _swr.invalidate(
+        _MISC_SWR_CACHE,
+        keys=[k for k in _MISC_SWR_CACHE
+              if isinstance(k, tuple) and k[:1] == ('scan-pool',)],
+    )
 
 
 def _spawn_hot_scan_refresh(cache_key: str, codes_raw: str, pool_only: bool):
@@ -441,7 +540,34 @@ async def get_stock_full(symbol: str):
         if cached and (now - cached[0]) < 3.0:
             raw, result, rps, fd, sm_data, val, risk_control = cached[1:8]
         else:
-            raw = await fetch_with_retry(sym)
+            # 2026-11-04：低频增强数据统一加超时闸门（stale-while-revalidate）。
+            # 冷路径分项实测：本地K线引擎首次初始化 6.7~8.0s、history_available() 全表统计
+            # 1.3~8s、龙虎榜东财 15s、腾讯行情重试最多 ~7s；旧写法把这些全串在单票请求
+            # 关键路径上，线上切票实测 16.7s / 23.9s。wait_for 只取消 Future，to_thread 的
+            # 线程会继续跑完并写各自缓存，下一次 2s 轮询自动补齐 → 首屏快、最终数据完整。
+            _ENRICH_TIMEOUT = 1.2
+            _timed_out: list = []
+
+            async def _guarded(label, coro, default):
+                try:
+                    return await asyncio.wait_for(coro, timeout=_ENRICH_TIMEOUT)
+                except asyncio.TimeoutError:
+                    _timed_out.append(label)
+                    return default
+                except Exception as e:
+                    print(f'[单票全量] 增强数据降级 {label}: {type(e).__name__}: {e}')
+                    return default
+
+            try:
+                raw = await asyncio.wait_for(fetch_with_retry(sym), timeout=3.0)
+            except asyncio.TimeoutError:
+                # 腾讯/新浪都卡住时，宁可回一份 10 分钟内的旧快照，也不让用户卡 spinner
+                from services.data.stock import _realtime_cache as _qcache
+                stale = _qcache.get(sym)
+                if stale and stale[1] and (time.time() - stale[0]) < 600:
+                    raw = stale[1]
+                else:
+                    raise HTTPException(status_code=504, detail='行情源响应超时，请稍后重试')
             parsed_list = parse_tencent_batch_data(raw)
             if not parsed_list:
                 raise HTTPException(status_code=502, detail="行情数据解析失败")
@@ -452,11 +578,11 @@ async def get_stock_full(symbol: str):
             # - get_holder_num_batch / get_fundamental_batch / get_dragon_tiger_symbol_map /
             #   get_valuation_batch 均为同步 IO 或本地 DB 查询，用 to_thread 并发执行
             rps_map, holder_map, fd_map, dt_map, val_map = await asyncio.gather(
-                get_rps_map(),
-                asyncio.to_thread(get_holder_num_batch, [sym]),
-                asyncio.to_thread(get_fundamental_batch, [sym]),
-                asyncio.to_thread(get_dragon_tiger_symbol_map, SMART_MONEY_DRAGON_TIGER_DAYS),
-                asyncio.to_thread(get_valuation_batch, [sym]),
+                _guarded('rps', get_rps_map(), {}),
+                _guarded('holder', asyncio.to_thread(get_holder_num_batch, [sym]), {}),
+                _guarded('fundamental', asyncio.to_thread(get_fundamental_batch, [sym]), {}),
+                _guarded('dragon', asyncio.to_thread(get_dragon_tiger_symbol_map, SMART_MONEY_DRAGON_TIGER_DAYS), {}),
+                _guarded('valuation', asyncio.to_thread(get_valuation_batch, [sym]), {}),
             )
             hd = holder_map.get(sym)
             rps = rps_map.get(normalize_local_symbol(sym))
@@ -467,7 +593,7 @@ async def get_stock_full(symbol: str):
                        'appearances': (sm or {}).get('appearances', 0)} if sm else None
             from services.strategy.trend import compute_trend_result
             _px = float(stock_data.get('priceRaw') or stock_data.get('price') or 0)
-            tr = await asyncio.to_thread(compute_trend_result, sym, _px)
+            tr = await _guarded('trend', asyncio.to_thread(compute_trend_result, sym, _px), None)
             result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
                                          fundamental_data=fd, smart_money_data=sm_data,
                                          trend_result=tr)
@@ -477,11 +603,12 @@ async def get_stock_full(symbol: str):
             risk_control = calc_risk_control(stock_data.get('price', 0), score_result=result,
                                              stock=stock_data, valuation=val,
                                              smart_money=sm_data, holder_ratio=_holder_ratio)
-            # 缓存评分结果（含 raw 字符串与衍生字段，缓存命中时无需重新拉取/计算）
-            _analysis_cache[sym] = (now, raw, result, rps, fd, sm_data, val, risk_control)
-            # 清理过期缓存（懒惰清理，超过 100 条时）
-            if len(_analysis_cache) > 100:
-                _analysis_cache.clear()
+            # 只在完整路径写缓存：降级结果不占 3s 缓存，下一次轮询立即重算补齐
+            if not _timed_out:
+                _analysis_cache[sym] = (now, raw, result, rps, fd, sm_data, val, risk_control)
+                # 清理过期缓存（懒惰清理，超过 100 条时）
+                if len(_analysis_cache) > 100:
+                    _analysis_cache.clear()
 
         base_scores = result.get('base_scores', {})
         details = []
@@ -661,6 +788,10 @@ def _invalidate_daily_recs_cache():
         _DAILY_RECS_CACHE['payload'] = None
         _DAILY_RECS_CACHE['ts'] = 0.0
         _DAILY_RECS_CACHE['generation'] += 1
+    # 复盘汇总（/api/recommend-review）的数据源就是这张表，同一批写入必须一起作废，
+    # 否则手工生成/删除推荐后，复盘页还会拿旧档再显示一轮（10 分钟 TTL）。
+    # 定时批次（09:45~14:45）不走这里，和 _DAILY_RECS_CACHE 一样只靠 TTL 收敛。
+    _REC_REVIEW_CACHE.clear()
 
 
 def _kick_daily_recs_refresh():
@@ -718,18 +849,113 @@ async def get_daily_recommendations():
         _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload)
     return payload
 
+_REC_REVIEW_CACHE: Dict = {}         # {days: {'ts': 计算完成时刻, 'data': 汇总结果}}
+_REC_REVIEW_TTL = 600                # 秒。数据源是推荐批次(09:45~14:45 五档)+日K，盘中确实会变，
+                                     # 但复盘页是"事后看"的页，10 分钟延迟不影响任何决策；
+                                     # 比 recommend-sim 的 1800s 保守，就是这个差别
+_REC_REVIEW_MAX_KEYS = 8             # 只是兜底防线（万一以后白名单加宽）；正常只有下面两档会进来
+_REC_REVIEW_CACHE_DAYS = (30, 120)   # **只有这两档进缓存**：`TabRecommend.vue` 用 days=30、
+                                     # `TabBacktest.vue` 用 days=120（全仓 grep 就这两个消费方）。
+                                     # 为什么不"任何 days 都留一份"：`days` 是自由参数、这接口不鉴权、
+                                     # 隧道又公开。11-04 实测一串 `?days=1..10` 能把前端真正在用的
+                                     # 两档从"最久未用"淘汰里挤光（此后每次都 0.3~0.5 秒现算），
+                                     # 等于把缓存做成可被远程清空的对象。白名单之外一律按请求现算：
+                                     # 代价就是回到改造前的耗时，但仍走 to_thread、不堵事件循环。
+
+
+def _rec_review_cacheable(key: int) -> bool:
+    return RECOMMEND_REVIEW_CACHE_ENABLED and key in _REC_REVIEW_CACHE_DAYS
+
+
+def _remember_rec_review(key: int, data, ts: float) -> None:
+    """写复盘缓存前先清掉已过期条目，仍超限就按"最久没被访问的先扔"淘汰。
+    缓存换来的是响应速度，不能拿"任何查询参数都永久占一份"去交换。
+    淘汰看 `used`（最后一次被请求读到的时刻）而不是 `ts`（数据算出的时刻）：
+    11-04 实测按 ts 淘汰时，一串 `?days=1..10` 会把前端真正在用的 30/120 两档挤出去，
+    回到"每次现算"；`ts` 还要留着算 cachedAgeSec，所以两个时间戳各管各的。"""
+    # 2026-11-04：SWR 下「过期」不再等于「作废」，旧值还要服役到 stale_max，
+    # 所以这里只能清真正超过服役上限的条目，否则会把自己刚返回的缓存删掉。
+    for k in [k for k, v in _REC_REVIEW_CACHE.items() if ts - v['ts'] >= _SWR_STALE_MAX]:
+        _REC_REVIEW_CACHE.pop(k, None)
+    while len(_REC_REVIEW_CACHE) >= _REC_REVIEW_MAX_KEYS:
+        least_used = min(_REC_REVIEW_CACHE,
+                         key=lambda k: _REC_REVIEW_CACHE[k].get('used', _REC_REVIEW_CACHE[k]['ts']))
+        _REC_REVIEW_CACHE.pop(least_used, None)
+    _REC_REVIEW_CACHE[key] = {'ts': ts, 'used': ts, 'data': data}
+
+
+def _touch_rec_review(key: int) -> None:
+    """命中即标记"这个档刚被读过"，供上面的最久未用淘汰用。"""
+    hit = _REC_REVIEW_CACHE.get(key)
+    if hit:
+        hit['used'] = time.time()
+
+
+def _review_with_meta(data, ts: float):
+    """给复盘汇总挂上"这份数是什么时候算的"（cachedAt / cachedAgeSec）。
+    与趋势扫描的 scanAt 同一套语义：延长缓存就必须让用户看得见数据的时刻，
+    否则等于拿看不见的新鲜度换响应速度。非 dict 原样返回，不猜。"""
+    if not isinstance(data, dict):
+        return data
+    d = dict(data)
+    d['cachedAt'] = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+    d['cachedAgeSec'] = int(time.time() - ts)
+    return d
+
+
 @router.get("/api/recommend-review", tags=["推荐记录"])
 async def get_recommend_review_api(days: int = 30):
-    """智能推荐复盘汇总（2026-10-12）：全量+近N天 T+1/T+3/T+5 胜率与盈亏、最好最差案例"""
+    """智能推荐复盘汇总（2026-10-12）：全量+近N天 T+1/T+3/T+5 胜率与盈亏、最好最差案例
+
+    缓存与线程（2026-11-03 第 3 步）：实测原来**每次请求都现算**（11-03 夜连取三次
+    1.82 / 1.16 / 0.88 秒，第二次不降＝根本没有缓存），而 `get_review_summary` 是同步
+    函数、原来直接调 —— 那 0.8~1.8 秒全程压在事件循环上，正是 recommend-sim 上面注释
+    写的"一进这页全站卡"那个教训的第三次重演。现在三件事一起做：TTL 命中直接返回
+    （实测 0.010~0.012 秒）、未命中丢 `asyncio.to_thread` 算、**只有 `_REC_REVIEW_CACHE_DAYS`
+    里那两档（前端真正在用的 30/120）进缓存**——自由参数 `days` 全收的话，缓存会被一串
+    一次性 days 挤空（11-04 实测），白名单之外一律按请求现算。命中/写入都会刷新 `used`，
+    超上限时按"最久没被访问"淘汰（`_remember_rec_review`/`_touch_rec_review`，兜底防线），
+    并把数据时刻
+    （cachedAt/cachedAgeSec）回给前端。
+    关掉 `RECOMMEND_REVIEW_CACHE_ENABLED` = 回到每次现算、缓存表不写（仍走线程、仍回传时刻）。
+    """
     try:
         from services.pick.recommend_review import get_review_summary
-        return {"success": True, "data": get_review_summary(days)}
+        key = int(days)
+        now = time.time()
+        hit = _REC_REVIEW_CACHE.get(key) if _rec_review_cacheable(key) else None
+        if hit and (now - hit['ts']) < _REC_REVIEW_TTL:
+            _touch_rec_review(key)
+            return {"success": True, "data": _review_with_meta(hit['data'], hit['ts'])}
+        if hit and (now - hit['ts']) < _SWR_STALE_MAX:
+            # 过期但未超服役上限：立即返旧值，重算放后台线程。
+            # 白名单外不进缓存的老行为保持不变。
+            def _compute():
+                return get_review_summary(days)
+
+            def _remember(data):
+                _remember_rec_review(key, data, time.time())
+
+            _swr.try_refresh(_REC_REVIEW_CACHE, key, _compute,
+                             label='rec-review', gap=120, max_keys=_REC_REVIEW_MAX_KEYS,
+                             on_done=_remember)
+            _touch_rec_review(key)
+            return {"success": True, "data": _review_with_meta(hit['data'], hit['ts'])}
+        data = await asyncio.to_thread(get_review_summary, days)
+        ts = time.time()
+        if _rec_review_cacheable(key):
+            _remember_rec_review(key, data, ts)
+        return {"success": True, "data": _review_with_meta(data, ts)}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐复盘失败: {str(error)}")
 
 _REC_SIM_CACHE: Dict = {}          # {(months, capital, gap, lots, bench): {ts, data}}
 _EXCESS_CACHE: Dict = {}           # 可执行超额单独一份：冷算实测 7.4s，别把 0.2 秒的曲线缓存挤掉
 _REC_SIM_TTL = 1800                # 秒：底层一天才变一次（14:45 推荐 + 16:10 复盘），算一次 0.2s
+# 2026-11-04 全站巡检：下面几个「TTL 过期即同步重算」是回测曲线页 23.5s /
+# 智能推荐页 10s 的共同根因。统一走文件顶部导入的 services.support.swr：
+# 过期先返旧值，重算放后台线程；24h 内绝不把冷算压在用户请求上。
+# 启动预热仍在 scheduler 里提前付掉首次 cold。
 
 @router.get("/api/recommend-sim", tags=["推荐记录"])
 async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
@@ -750,26 +976,25 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
     import time as _t
     key = (months, capital, gap, lots, bench)
     from services.pick import rec_sim
-    hit = _REC_SIM_CACHE.get(key)
-    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
-        data = dict(hit['data'])          # 浅拷贝：别把 daily 写回缓存里那份
-    else:
-        try:
-            data = await asyncio.to_thread(
-                rec_sim.simulate, months=months, capital=capital,
-                auction_max_gap=gap, whole_lots=lots, with_benchmark=bench)
-            _REC_SIM_CACHE[key] = {'ts': _t.time(), 'data': data}
-            if len(_REC_SIM_CACHE) > 12:
-                _REC_SIM_CACHE.clear()
-            data = dict(data)
-        except Exception as error:
-            raise HTTPException(status_code=500, detail=f"回测曲线计算失败: {str(error)}")
+
+    def _compute():
+        return rec_sim.simulate(months=months, capital=capital,
+                                auction_max_gap=gap, whole_lots=lots,
+                                with_benchmark=bench)
+
+    try:
+        raw, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
+                                  ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+                                  label='rec-sim', gap=120, max_keys=12)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"回测曲线计算失败: {str(error)}")
+    data = dict(raw)                       # 浅拷贝：别把 daily 写回缓存里那份
     try:
         data['daily'] = await asyncio.to_thread(rec_sim.daily_history, 40)
     except Exception as e:
         data['daily'] = []
         data['dailyError'] = str(e)[:120]
-    return {'success': True, 'data': data, 'cached': bool(hit)}
+    return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
 
 
 @router.get("/api/recommend-batches", tags=["推荐记录"])
@@ -812,21 +1037,20 @@ async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, 
     """上午档 vs 下午档拆批次回测（2026-10-21）：名单从 strategy_snapshot 还原
     （10-19 起才有），撮合/费用/封板判据与末批曲线同一引擎（rec_sim._curve_stats）。
     只读本地两个 SQLite、一次约 0.1s，丢线程池 + 30 分钟缓存，同 recommend-sim 的规矩。"""
-    import time as _t
     key = ('batch', months, capital, gap)
-    hit = _REC_SIM_CACHE.get(key)
-    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
-        return {'success': True, 'data': hit['data'], 'cached': True}
     from services.pick import rec_sim_batch
+
+    def _compute():
+        return rec_sim_batch.simulate_batch(months=months, capital=capital,
+                                            auction_max_gap=gap)
+
     try:
-        data = await asyncio.to_thread(
-            rec_sim_batch.simulate_batch, months=months, capital=capital, auction_max_gap=gap)
+        data, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
+                                   ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+                                   label='rec-sim-batch', gap=120, max_keys=12)
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"拆档回测计算失败: {str(error)}")
-    if len(_REC_SIM_CACHE) > 12:
-        _REC_SIM_CACHE.clear()
-    _REC_SIM_CACHE[key] = {'ts': _t.time(), 'data': data}
-    return {'success': True, 'data': data, 'cached': False}
+    return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
 
 
 @router.get("/api/recommend-excess", tags=["推荐记录"])
@@ -842,20 +1066,16 @@ async def get_recommend_excess_api(months: int = 6):
     基准是范围内**全部票**同一买入日、同一持有期等权，逐条配对后再平均。
     默认 6 个月而不是 3 个月：3 个月里 10 日样本不足 60 条，月度切片全是噪声。
     """
-    import time as _t
     key = (months,)
-    hit = _EXCESS_CACHE.get(key)
-    if hit and _t.time() - hit['ts'] < _REC_SIM_TTL:
-        return {'success': True, 'data': hit['data'], 'cached': True}
     from services.pick import rec_sim
     try:
-        data = await asyncio.to_thread(rec_sim.open_hold_excess, months=months)
+        data, state = _swr.swr_get(_EXCESS_CACHE, key,
+                                   lambda: rec_sim.open_hold_excess(months=months),
+                                   ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+                                   label='rec-excess', gap=120, max_keys=6)
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"可执行超额计算失败: {str(error)}")
-    if len(_EXCESS_CACHE) > 6:
-        _EXCESS_CACHE.clear()
-    _EXCESS_CACHE[key] = {'ts': _t.time(), 'data': data}
-    return {'success': True, 'data': data, 'cached': False}
+    return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
 
 
 def prewarm_recommend_excess(months: int = 6) -> float:
@@ -1245,9 +1465,35 @@ async def save_position_api(pos: Dict, user: Dict = Depends(current_user)):
 
         pos['symbol'] = symbol
         pos['name'] = name
+        # 流水留痕（2026-11-04）：这个接口是"symbol 重复即更新"，所以 create/edit 只能靠
+        # **保存前先查一次旧持仓**来区分。两者都记但 source 不同——回测只取 create+adjust_*，
+        # edit 是改历史，当成买卖会造出根本不存在的成交（这一点在表注释里也写了）。
+        from datetime import datetime as _dt
+        _old_pos = None
+        try:
+            from db.database import load_user_positions
+            _old_pos = next((p for p in load_user_positions(user_id=user['id'])
+                             if (p.get('symbol') or '').lower() == symbol), None)
+        except Exception as _q_err:
+            print(f'[流水] 查旧持仓失败（按 create 记）: {_q_err}')
         from db.database import save_user_position
         if not save_user_position(pos, user_id=user['id']):
             raise HTTPException(status_code=500, detail="保存失败")
+        try:
+            from db.database import save_position_trade_log
+            save_position_trade_log({
+                'trade_date': _dt.now().strftime('%Y-%m-%d'),
+                'symbol': symbol, 'name': name,
+                'source': 'edit' if _old_pos else 'create',
+                'shares_before': int(_old_pos.get('shares') or 0) if _old_pos else None,
+                'price': cost, 'qty': shares,
+                'shares_after': shares, 'cost_price_after': cost,
+                'realized_pnl': None,
+                'note': ('编辑持仓' if _old_pos
+                         else '首次录入（price=录入成本价，属近似成交价）'),
+            }, user_id=user['id'])
+        except Exception as _log_err:
+            print(f'[流水] save 留痕失败（不影响持仓）: {_log_err}')
         return {"success": True, "message": "持仓已保存", "data": {"symbol": symbol, "name": name}}
     except HTTPException:
         raise
@@ -1441,6 +1687,27 @@ async def adjust_position_api(body: Dict, user: Dict = Depends(current_user)):
         from db.database import add_user_realized_pnl
         realized_total = add_user_realized_pnl(res['realized_pnl'], user_id=user['id'])
 
+    # 流水留痕（2026-11-04）：只追加一张旁路表，不影响本接口的返回值、持仓或已实现盈亏。
+    # source 分 add/reduce/clear 三种——清仓要单独记，否则回测看不出持仓是哪一天消失的。
+    # 整块包 try：留痕写失败的代价上限是"少一条审计"，绝不能把用户的加减仓操作带崩。
+    try:
+        from db.database import save_position_trade_log
+        _mode = (body.get('mode') or '').strip()
+        save_position_trade_log({
+            'trade_date': datetime.now().strftime('%Y-%m-%d'),
+            'symbol': symbol, 'name': cur.get('name') or symbol,
+            'source': ('adjust_clear' if res['cleared']
+                       else 'adjust_add' if _mode == 'add' else 'adjust_reduce'),
+            'shares_before': int(cur.get('shares') or 0),
+            'price': price, 'qty': delta,
+            'shares_after': 0 if res['cleared'] else res['shares'],
+            'cost_price_after': None if res['cleared'] else res['cost_price'],
+            'realized_pnl': res['realized_pnl'],
+            'note': describe(res, cur.get('name') or symbol) or '',
+        }, user_id=user['id'])
+    except Exception as _log_err:
+        print(f'[流水] adjust 留痕失败（不影响持仓）: {_log_err}')
+
     msg = describe(res, cur.get('name') or symbol)
     return {"success": True, "message": msg,
             "data": {"symbol": symbol, 'cleared': res['cleared'],
@@ -1454,8 +1721,33 @@ async def delete_position_api(symbol: str, user: Dict = Depends(current_user)):
     """删除持仓（只能删自己的）"""
     try:
         from db.database import delete_user_position
+        # 流水留痕（2026-11-04）：删除到底是"清仓"还是"删掉一条记错的记录"，代码层面区分不了，
+        # 所以 source='delete' **只作审计、回测不许用**（load_position_trade_log 的 trade_only
+        # 口径里就没有它）。要真清仓请走 /api/positions/adjust 的减仓到 0，那条会记 adjust_clear。
+        from datetime import datetime as _dt
+        _old_pos = None
+        try:
+            from db.database import load_user_positions
+            _old_pos = next((p for p in load_user_positions(user_id=user['id'])
+                             if (p.get('symbol') or '').lower() == symbol.lower()), None)
+        except Exception as _q_err:
+            print(f'[流水] 删除前查旧持仓失败: {_q_err}')
         if not delete_user_position(symbol, user_id=user['id']):
             raise HTTPException(status_code=404, detail="未找到该持仓")
+        try:
+            from db.database import save_position_trade_log
+            save_position_trade_log({
+                'trade_date': _dt.now().strftime('%Y-%m-%d'),
+                'symbol': symbol, 'name': (_old_pos or {}).get('name') or symbol,
+                'source': 'delete',
+                'shares_before': int((_old_pos or {}).get('shares') or 0),
+                'price': (_old_pos or {}).get('cost_price'),
+                'qty': None, 'shares_after': 0,
+                'cost_price_after': None, 'realized_pnl': None,
+                'note': '删除记录（非交易动作，回测不计）',
+            }, user_id=user['id'])
+        except Exception as _log_err:
+            print(f'[流水] delete 留痕失败（不影响持仓）: {_log_err}')
         return {"success": True, "message": "持仓已删除"}
     except HTTPException:
         raise
@@ -1786,10 +2078,9 @@ async def update_stock_basic_info_api(data: Dict):
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
 
-@router.get("/api/custom-scan-pool", tags=["自定义扫描池"])
-async def get_user_scan_pool_api(user: Dict = Depends(current_user)):
+async def _load_scan_pool_detail(uid: int):
     try:
-        symbols = load_user_scan_pool(user_id=int(user.get('id') or 1))
+        symbols = load_user_scan_pool(user_id=uid)
         # 获取每只股票的名称 + 实时价 + 连涨连跌天数 + 是否在5日线上方
         stocks_info = []
         if symbols:
@@ -1848,6 +2139,24 @@ async def get_user_scan_pool_api(user: Dict = Depends(current_user)):
         import traceback
         print(f'[custom-scan-pool] 顶层异常: {error}\n{traceback.format_exc()}')
         raise HTTPException(status_code=500, detail=f"获取自定义扫描池失败: {error}")
+
+
+@router.get("/api/custom-scan-pool", tags=["自定义扫描池"])
+async def get_user_scan_pool_api(user: Dict = Depends(current_user)):
+    """扫描池详情（2026-11-04 加 60s SWR）。
+
+    原实现对池里每只票各拉一次日K（并发 8），热态实测 0.73s，是趋势发现页
+    首屏最重的一项；而池子详情是分钟级信息，切页重复取没有必要。过期先返旧值、
+    后台刷新；写接口走 _invalidate_hot_scan_cache() 一并把这份缓存失效。
+    """
+    uid = int(user.get('id') or 1)
+    data, state = await _swr.async_swr_get(
+        _MISC_SWR_CACHE, ('scan-pool', uid), lambda: _load_scan_pool_detail(uid),
+        ttl=60, stale_max=600, label='scan-pool', gap=30, max_keys=16)
+    if state == 'stale':
+        data = {**data, 'stale': True}
+    return data
+
 
 @router.get("/api/custom-scan-pool/symbols", tags=["自定义扫描池"])
 async def get_user_scan_pool_symbols_api(user: Dict = Depends(current_user)):
@@ -1924,6 +2233,9 @@ async def remove_from_user_scan_pool_api(data: Dict, user: Dict = Depends(curren
         current_pool = [s for s in current_pool if s not in symbols_to_remove]
         
         save_user_scan_pool(current_pool, user_id=int(user.get('id') or 1))
+        # 2026-11-04：原先漏了失效（add 有、remove 没有），移除后扫描结果会沿用旧池；
+        # 顺带也让新增的扫描池详情 SWR 缓存立即失效。
+        _invalidate_hot_scan_cache()
         return {"success": True, "data": {"symbols": current_pool, "count": len(current_pool)}}
     except HTTPException:
         raise
@@ -2106,6 +2418,16 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # 趋势分复用今日趋势扫描缓存（isUp 票）；全市场逐票现算 is_up_trend 成本过高，
         # 反弹股抑制已在单票评分/持仓/推荐/趋势扫描路径覆盖，此处作为明确边界。
         _t_score = time.time()
+        # 2026-11-04 代码层审查 P1：原来是循环内每票调 calc_stock_score_v2 且不传
+        # weights → 函数内部 load_strategy_factor_weights() 每票查一次 DB（进程内实测
+        # 14.31ms/次 × 59 只 ≈ 844ms，就是日志里「评分+趋势缓存 0.78s」的大头）。
+        # 典型 N+1：一次扫描内权重表不变，循环外查一次传进去，评分结果完全等价；
+        # 比「按单票缓存评分」干净得多——不引入配置过期、脏分数、深拷贝等新风险。
+        try:
+            scan_weights = await asyncio.to_thread(load_strategy_factor_weights)
+        except Exception as _we:
+            print(f'[批量扫描] 权重表预取失败（退回逐票读取）: {_we}')
+            scan_weights = None
         try:
             from services.strategy.trend import load_trend_scan_results
             _scan_trend = load_trend_scan_results().get('stocks', [])
@@ -2124,7 +2446,8 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             val = val_map.get(sym)
             sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                        'appearances': (sm or {}).get('appearances', 0)} if sm else None
-            stock['score'] = calc_stock_score_v2(stock, market_change=market_change,
+            stock['score'] = calc_stock_score_v2(stock, weights=scan_weights,
+                                                  market_change=market_change,
                                                   fund_flow_data=ff, holder_data=hd,
                                                   rps_data={'rps': rps},
                                                   fundamental_data=fd, smart_money_data=sm_data,
@@ -2430,10 +2753,12 @@ async def get_market_alert_api():
 
 @router.get("/api/market-index", tags=["大盘指数"])
 async def get_market_index_api():
-    """获取大盘指数数据"""
+    """获取大盘指数数据（SWR：60s 新鲜 + 后台刷新，2026-11-04）"""
     try:
-        result = await check_market_crash()
-        return {"success": True, "data": result}
+        result, state = await _swr.async_swr_get(
+            _MISC_SWR_CACHE, ('market-index',), lambda: check_market_crash(),
+            ttl=60, stale_max=3600, label='market-index', gap=20, max_keys=16)
+        return {"success": True, "data": result, "stale": state == 'stale'}
     except Exception as error:
         print(f'[大盘指数API] 错误: {str(error)}')
         raise HTTPException(status_code=500, detail=f"获取大盘指数失败: {str(error)}")
@@ -2468,9 +2793,14 @@ async def get_theme_index_api(theme: str = 'auto', days: int = 0, user: Dict = D
     if theme != 'auto' and not theme_index.known(theme):
         raise HTTPException(status_code=400, detail=f"未知主题: {theme}")
     try:
-        data = await theme_index.snapshot(theme, live=True)
+        data, state = await _swr.async_swr_get(
+            _MISC_SWR_CACHE, ('theme-index', theme, days),
+            lambda: theme_index.snapshot(theme, live=True),
+            ttl=60, stale_max=3600, label='theme-index', gap=60, max_keys=16)
         if days and data.get('series'):
             data = {**data, 'series': data['series'][-max(1, min(days, 250)):]}
+        if state == 'stale':
+            data = {**data, 'stale': True}
         return {"success": True, "data": data}
     except Exception as error:
         print(f'[主题温度API] 错误: {str(error)}')
@@ -2486,7 +2816,12 @@ async def get_cls_ladder_api(user: Dict = Depends(current_user)):
     """
     from services.ops import cls_pool
     try:
-        return {"success": True, "data": await cls_pool.snapshot(live=True)}
+        data, state = await _swr.async_swr_get(
+            _MISC_SWR_CACHE, ('cls-ladder',), lambda: cls_pool.snapshot(live=True),
+            ttl=60, stale_max=3600, label='cls-ladder', gap=60, max_keys=16)
+        if state == 'stale' and isinstance(data, dict):
+            data = {**data, 'stale': True}
+        return {"success": True, "data": data}
     except Exception as error:
         backup = cls_pool.peek(86400) or cls_pool.peek_from_db()
         if backup:
@@ -2627,6 +2962,7 @@ async def api_generate_daily_review():
         print('[收评API] 收评生成成功，正在保存...')
         
         save_daily_market_reviews([review])
+        _invalidate_daily_reviews_cache()   # 2026-11-04：写后失效，别等 5 分钟 TTL
         print('[收评API] 收评保存完成！')
         
         return {"success": True, "data": review}
@@ -2637,10 +2973,45 @@ async def api_generate_daily_review():
         return {"success": False, "error": str(error)}
 
 @router.get("/api/daily-reviews", tags=["收评"])
-async def get_daily_market_reviews():
+async def get_daily_market_reviews(request: Request, page: int = 0):
+    """收评列表（2026-11-04：SWR + ETag/304 + 预压缩 + 服务端分页）。
+
+    Args:
+        request: 用于读 `If-None-Match` / `Accept-Encoding`。
+        page: 0 或不传 = 全量（兼容既有脚本）；>=1 = 第 N 页，固定 1 条/页。
+
+    响应体在旧版 `{"success": True, "data": [...]}` 之上**只增不减**地追加
+    `page/pageSize/total/totalPages/recentFocus`，老消费方读 `data` 不受影响。
+    命中 If-None-Match 返回 304 空体；分页后首次开页从 105KB 降到约 5KB(gzip)。
+    """
     try:
-        reviews = load_daily_market_reviews()
-        return {"success": True, "data": reviews}
+        bundle, state = await asyncio.to_thread(
+            _swr.swr_get, _DAILY_REVIEWS_CACHE, 'all', _build_daily_reviews_entry,
+            ttl=_DAILY_REVIEWS_TTL, stale_max=_SWR_STALE_MAX,
+            label='daily-reviews', gap=60, max_keys=2)
+        if page <= 0:
+            entry = bundle['all']
+        elif page > bundle['total']:
+            # 越界页：不进缓存、现构一个极小响应，避免自由参数撑出无数条目
+            entry = _reviews_entry({'success': True, 'data': [],
+                                    'page': page, 'pageSize': 1,
+                                    'total': bundle['total'], 'totalPages': bundle['total'],
+                                    'recentFocus': bundle['recentFocus']})
+        else:
+            entry = bundle['pages'][page]
+        etag = entry['etag']
+        headers = {'ETag': etag, 'Cache-Control': 'private, no-cache',
+                   'X-Data-State': state, 'Vary': 'Accept-Encoding'}
+        inm = request.headers.get('if-none-match', '')
+        if inm and (etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*'):
+            return Response(status_code=304, headers=headers)
+        # 预压缩直出：GZipMiddleware 见已有 Content-Encoding 直接放行，不再重压。
+        if 'gzip' in request.headers.get('accept-encoding', '').lower():
+            headers['Content-Encoding'] = 'gzip'
+            return Response(content=entry['gz'], media_type='application/json',
+                            headers=headers)
+        return Response(content=entry['raw'], media_type='application/json',
+                        headers=headers)
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取收评失败: {str(error)}")
 
@@ -2819,10 +3190,19 @@ async def kline_history_stats_api():
     """
     try:
         from services.data.kline_history import get_engine, history_available
-        eng = get_engine()
-        stats = eng.get_db_stats(with_scope=True)
-        stats["available"] = history_available()
-        return {"success": True, "data": stats}
+
+        def _compute():
+            eng = get_engine()
+            s = eng.get_db_stats(with_scope=True)
+            s["available"] = history_available()
+            return s
+
+        # 346 万行全表统计实测 1.44s，原先直接压在事件循环上会拖住全站。
+        # 丢线程池 + 5 分钟 SWR 缓存；过期先返旧值、后台刷新。
+        stats, state = await asyncio.to_thread(
+            _swr.swr_get, _MISC_SWR_CACHE, ('kline-stats',), _compute,
+            ttl=300, stale_max=3600, label='kline-stats', gap=60, max_keys=16)
+        return {"success": True, "data": stats, "stale": state == 'stale'}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取历史库统计失败: {str(error)}")
 
@@ -2831,6 +3211,24 @@ async def kline_history_stats_api():
 # 为什么读和写的权限不一样：这些开关一拨就改变**所有账号**的选票范围与推送量，
 # 而 users 表没有角色列（自注册体系）—— 所以读=登录即可，写=只允许
 # `SETTINGS_WRITE_USER_IDS` 里的账号 id，改动人会记进 app_settings.updated_by 便于回溯。
+@router.get("/api/internal/ops-notify-limit", tags=["内部"])
+async def ops_notify_limit_api(request: Request):
+    """仓库外守护脚本（backend_watchdog / tunnel_watch）发运维通知前调用：取"每天最多几条"上限。
+
+    只接受本机调用；后端挂了时脚本用默认值兜底，不依赖本接口。返回页面对应的
+    ops_notify_daily_limit（live 即时生效），读不到时回落 2。
+    """
+    host = (request.client.host if request.client else '') or ''
+    if host not in ('127.0.0.1', '::1', 'localhost'):
+        raise HTTPException(status_code=403, detail='localhost only')
+    from services.support import app_settings as A
+    try:
+        limit = int(A.value('ops_notify_daily_limit'))
+    except Exception:
+        limit = 2
+    return {"success": True, "limit": limit}
+
+
 @router.get("/api/settings", tags=["配置"])
 async def get_settings_api(user: Dict = Depends(current_user)):
     """列出可改项（当前值/默认值/是否被覆盖/生效方式）+ 口径摘要与改动记录。

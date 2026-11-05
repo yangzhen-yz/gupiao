@@ -216,10 +216,19 @@ def _load_cap_map() -> Dict[str, float]:
         conn.close()
 
 
+# 11-04 观测用：本进程第一次装载市值表花了多久、装了多少行（启动那 190~751 秒定位用）
+LAST_LOAD_SEC = 0.0
+LAST_LOAD_ROWS = 0
+
+
 def cap_map() -> Dict[str, float]:
-    global _CAP_CACHE
+    global _CAP_CACHE, LAST_LOAD_SEC, LAST_LOAD_ROWS
     if _CAP_CACHE is None:
+        import time as _time
+        _t = _time.time()
         _CAP_CACHE = _load_cap_map()
+        LAST_LOAD_SEC = round(_time.time() - _t, 3)
+        LAST_LOAD_ROWS = len(_CAP_CACHE)
     return _CAP_CACHE
 
 

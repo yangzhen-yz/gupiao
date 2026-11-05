@@ -1,8 +1,5 @@
 <template>
   <div>
-    <!-- 大盘紧急提醒 -->
-    <div v-if="marketAlert" class="market-alert-container" v-html="marketAlert"></div>
-
     <div class="control-section">
       <div class="input-group">
         <div class="input-wrapper">
@@ -49,7 +46,12 @@
 
     <!-- 行情卡片 -->
     <div class="quote-section">
-      <div v-if="loading" class="price-card" style="text-align: center">
+      <!-- 切股票时保留旧卡片，不再整页 spinner；明确告知“正在加载谁 / 当前显示谁” -->
+      <div v-if="loading && quoteData" class="quote-switching">
+        <span class="quote-switching-dot"></span>
+        正在加载 {{ currentSymbol.toUpperCase() }}，下方暂显示 {{ quoteData.symbol.toUpperCase() }}
+      </div>
+      <div v-if="loading && !quoteData" class="price-card" style="text-align: center">
         <div class="loading-spinner"></div>
         <div style="font-size: 0.9rem; font-weight: 500; color: var(--text-secondary)">正在加载数据...</div>
       </div>
@@ -431,8 +433,11 @@
   const loading = ref(false)
   const error = ref('')
   const lastUpdateTime = ref('--:--:--')
-  const marketAlert = ref('')
   const collapsed = ref({ detail: true, score: false, plate: false, analysis: false })
+
+  // 切票竞态：轮询（2s）与手动查询会并发，旧请求晚到会把上一只票的数据盖到新票上。
+  // 只认最后一次请求的结果。
+  let _reqSeq = 0
 
   const isInHot = computed(() => {
     if (!quoteData.value) return false
@@ -560,6 +565,7 @@
 
   async function fetchStockQuote(symbol, silent = false) {
     if (!symbol) return
+    const seq = ++_reqSeq
     const formatted = symbol.toLowerCase()
     if (!/^(sh|sz)\d{6}$/.test(formatted)) {
       if (!silent) error.value = '请输入有效的A股代码'
@@ -573,6 +579,7 @@
     try {
       // 2026-07-08 性能优化：合并行情+评分为单一接口，从 2 个并行请求 → 1 个请求
       const resp = await fetch(`/api/stock/${formatted}/full`).then(r => r.json())
+      if (seq !== _reqSeq) return // 已有更新的请求，丢弃过期响应
       if (!resp || !resp.success) {
         throw new Error(resp?.detail || '数据获取失败')
       }
@@ -613,7 +620,7 @@
     } catch (e) {
       if (!silent) error.value = e.message
     } finally {
-      if (!silent) loading.value = false
+      if (!silent && seq === _reqSeq) loading.value = false
     }
   }
 
@@ -721,17 +728,6 @@
     }
   }
 
-  async function checkMarketPredict() {
-    try {
-      const result = await apiFetch('/api/market-predict')
-      if (result.success && result.data && result.data.alert) {
-        marketAlert.value = result.data.alert
-      }
-    } catch (e) {
-      /* silent */
-    }
-  }
-
   onMounted(async () => {
     await Promise.all([loadStockMap(), loadQuickStocks()])
     // 默认加载热门股票快捷查询中的第一只股票
@@ -745,7 +741,6 @@
     }
     fetchStockQuote(currentSymbol.value)
     startQuotePolling()
-    checkMarketPredict()
   })
 
   // 暴露给父组件的方法：搜索指定股票
@@ -764,6 +759,30 @@
     font-size: 10px;
     color: var(--text-tertiary);
     margin: 4px 0 2px;
+  }
+  /* 切票时的轻量进度条（2026-11-04）：替代整页 spinner，旧数据继续可见 */
+  .quote-switching {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: var(--accent-info-bg);
+    border: 1px solid var(--accent-info-border);
+    border-radius: var(--radius-pill);
+    padding: 6px 12px;
+    margin-bottom: 0.75rem;
+  }
+  .quote-switching-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-info);
+    animation: quote-pulse 1s ease-in-out infinite;
+  }
+  @keyframes quote-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
   }
   /* 行情来源标记：腾讯挂掉走新浪兜底时，避免用户把"缺字段的 0"当成真实值 */
   .quote-source-badge {

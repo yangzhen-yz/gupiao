@@ -604,15 +604,15 @@
   const reviews = ref([])
   const currentPage = ref(1)
   const stockTab = ref('gainer')
-  const PAGE_SIZE = 1
+  // 2026-11-04 P0-B：收评改服务端分页（一次只下 1 条，gzip 约 5KB，原来整包 105KB）。
+  // totalPages 与「最近 3 天明日关注」都由后端下发，前端不再持有全量 30 天数据。
+  const totalPages = ref(1)
+  const recentFocus = ref([])
 
   const sectorModal = reactive({ show: false, name: '', change: 0, code: '', loading: false, error: '', stocks: [] })
 
-  const totalPages = computed(() => Math.ceil(reviews.value.length / PAGE_SIZE))
-  const pagedReviews = computed(() => {
-    const start = (currentPage.value - 1) * PAGE_SIZE
-    return reviews.value.slice(start, start + PAGE_SIZE)
-  })
+  // 保留 computed 名以免动模板；后端已按页返回，这里只是原样透传
+  const pagedReviews = computed(() => reviews.value)
 
   // 过期检测：最新收评日期 ≠ 今日时，数据为历史快照（非今日收盘数据）
   const isStale = computed(() => {
@@ -892,12 +892,12 @@
     const now = Date.now()
     if (now - focusQuoteTs.value < 60000) return
     const need = []
-    for (const r of reviews.value.slice(0, 3)) {
-      for (const s of r.tomorrowFocus || []) {
-        // 每次按当前可见名单重拉（2026-10-26）：现价得是会动的现价，不能冻结在首次加载那一刻
-        const c = normalizeSymbol(s.code)
-        if (c && !need.includes(c)) need.push(c)
-      }
+    // 改造前是 reviews.value.slice(0, 3)（前 3 天明日关注）；分页后前端只有当前页，
+    // 改由后端在每页响应里下发同样口径的 recentFocus，语义不变。
+    for (const s of recentFocus.value) {
+      // 每次按当前可见名单重拉（2026-10-26）：现价得是会动的现价，不能冻结在首次加载那一刻
+      const c = normalizeSymbol(s.code)
+      if (c && !need.includes(c)) need.push(c)
     }
     if (!need.length) return
     focusQuoteTs.value = now
@@ -1000,12 +1000,16 @@
     }, 50)
   }
 
-  async function loadDailyReviews() {
+  async function loadDailyReviews(page = 1) {
     try {
-      const result = await apiFetch('/api/daily-reviews')
+      const p = Math.max(1, Number(page) || 1)
+      const result = await apiFetch(`/api/daily-reviews?page=${p}`)
+      // 翻页响应竞态：只认与当前页一致的那一次，快速连翻不会被旧响应覆盖
+      if (p !== currentPage.value) return
       if (result.success && result.data) {
         reviews.value = result.data
-        currentPage.value = 1
+        totalPages.value = Math.max(1, Number(result.totalPages) || 1)
+        recentFocus.value = result.recentFocus || []
         // 2026-10-31：删掉原来的 `/eastmoney/...` 前端补全。生产代理对 clist 实测 502，
         // 这条兜底从来没成功过，只会白打 4 个请求；板块改由后端（财联社）兜底并落库。
         // 若 topGainers 为空，用热搜榜数据做降级
@@ -1016,6 +1020,7 @@
               if (hsr.success && hsr.data?.stocks?.length) {
                 const stocks = hsr.data.stocks
                 // 按 hotRank 排序，涨幅>0为涨幅榜，<0为跌幅榜
+                if (p !== currentPage.value) return
                 reviews.value.forEach(r => {
                   if (!r.topGainers?.length)
                     r.topGainers = stocks
@@ -1044,8 +1049,8 @@
     loadDailyReviews().then(loadFocusQuotes)
     // 热门查询当前名单：决定每只票的按钮显示「加入」还是「已在热门」
     loadQuickStocks()
-    // 翻到历史收评时，该页明日关注的涨跌幅也要补拉
-    watch(currentPage, loadFocusQuotes)
+    // 服务端分页后，翻页要按页重新取；再补该页明日关注的涨跌幅
+    watch(currentPage, p => loadDailyReviews(p).then(loadFocusQuotes))
   })
 </script>
 

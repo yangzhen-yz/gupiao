@@ -822,6 +822,7 @@ def get_engine() -> HistoryKlineEngine:
 
 _AVAILABLE_CACHE = {'ts': 0.0, 'value': None}
 _AVAILABLE_TTL = 300.0      # 本地库"有没有回填好"这种事实，5 分钟内不会变
+_available_probe_lock = threading.Lock()
 
 
 def history_available() -> bool:
@@ -830,15 +831,35 @@ def history_available() -> bool:
     必须缓存：它在趋势扫描里被**逐只**调用（池子 280 只就是 280 次），
     而同步 SQLite 查询压在 asyncio 主循环上会拖慢整个服务（2026-10-17 实测 1.3~1.9 秒/次
     × 280 ≈ 420 秒）。按进程记 5 分钟，一天真正会变的时间点只有盘后同步那一下。
+
+    2026-11-04 改 SWR：缓存过期时**先返回旧值**，探测放后台线程。实测重启后首次探测
+    get_db_stats()（346 万行全表统计）要 8.0s，旧写法把这段压在第一个打开单票行情页
+    的用户请求上；而这个布尔值一天里几乎不变，晚几秒刷新毫无影响。
     """
     now = time.time()
-    if _AVAILABLE_CACHE['value'] is not None and now - _AVAILABLE_CACHE['ts'] < _AVAILABLE_TTL:
-        return _AVAILABLE_CACHE['value']
-    try:
-        eng = get_engine()
-        stats = eng.get_db_stats()
-        value = bool(stats["symbolCount"] > 0 and stats["barCount"] > 0)
-    except Exception:
-        value = False
-    _AVAILABLE_CACHE.update(ts=now, value=value)
-    return value
+    cached = _AVAILABLE_CACHE['value']
+    if cached is not None and now - _AVAILABLE_CACHE['ts'] < _AVAILABLE_TTL:
+        return cached
+
+    def _probe():
+        try:
+            eng = get_engine()
+            stats = eng.get_db_stats()
+            value = bool(stats["symbolCount"] > 0 and stats["barCount"] > 0)
+        except Exception:
+            value = False
+        _AVAILABLE_CACHE.update(ts=time.time(), value=value)
+
+    if cached is not None:
+        if _available_probe_lock.acquire(blocking=False):
+            def _run():
+                try:
+                    _probe()
+                finally:
+                    _available_probe_lock.release()
+            threading.Thread(target=_run, daemon=True, name='kline-history-probe').start()
+        return cached
+
+    # 首次冷启动没有旧值可返回，只能同步探一次（由启动预热线程提前付掉，用户不再撞上）
+    _probe()
+    return bool(_AVAILABLE_CACHE['value'])

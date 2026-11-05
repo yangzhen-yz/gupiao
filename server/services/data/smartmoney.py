@@ -11,6 +11,7 @@
 - 所有数据缺失均降级,不阻塞主流程
 """
 import time
+import threading
 from typing import (Dict, List)
 from datetime import datetime, timedelta
 import requests
@@ -29,6 +30,12 @@ DRAGON_COLUMNS = ('TRADE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,SECUCODE,'
 
 # 缓存(龙虎榜日级变动,1 小时 TTL 足够)
 _dt_cache: Dict = {'ts': 0, 'days': 0, 'map': {}, 'list': []}
+# 2026-11-04：刷新后台化（SWR）。旧实现缓存一失效就同步拉东财，timeout=15s，
+# 直接把 /api/stock/{symbol}/full 拖到 16.7~23.9s（线上实测）。龙虎榜是日级数据，
+# 晚一两分钟更新对评分毫无影响，绝不该压在用户请求的关键路径上。
+_dt_refresh_lock = threading.Lock()
+_dt_last_attempt = {'ts': 0.0}
+_DT_REFRESH_MIN_GAP = 120.0   # 秒：数据日期滞后于「今天」时，最多每 2 分钟试一次，防反复打东财
 _NB_CACHE_TTL = 600
 _nb_cache: Dict = {'ts': 0, 'data': None}
 
@@ -68,7 +75,8 @@ def _fetch_dragon_page(page_size: int = 1000) -> List[Dict]:
         'sortTypes': -1,
         'ut': 'b2884a393a59ad64002292a3e90d46a5',
     }
-    r = requests.get(DRAGON_API, params=params, headers=DRAGON_HEADERS, timeout=15)
+    # 从 15s 单超时收紧为 (连接 3s, 读取 6s)：后台刷新线程可以慢慢等，请求链路不等
+    r = requests.get(DRAGON_API, params=params, headers=DRAGON_HEADERS, timeout=(3, 6))
     r.raise_for_status()
     data = r.json()
     if not data.get('success'):
@@ -127,6 +135,34 @@ def _aggregate(days: int = 5) -> Dict:
     return symbol_map, sorted_list, latest_trade_date
 
 
+def _refresh_dt_cache(days: int = 5) -> None:
+    """拉东财并原子替换缓存。只允许后台刷新线程 / 展示页手动 force 调用。"""
+    symbol_map, sorted_list, latest_trade_date = _aggregate(days)
+    _dt_cache.update({'ts': time.time(), 'days': days, 'map': symbol_map,
+                      'list': sorted_list, 'latest_trade_date': latest_trade_date})
+
+
+def _spawn_dt_refresh(days: int = 5) -> bool:
+    """后台刷新（SWR）：已在刷新或距上次尝试过近时直接跳过，返回是否真的起了线程。"""
+    now = time.time()
+    if now - _dt_last_attempt['ts'] < _DT_REFRESH_MIN_GAP:
+        return False
+    if not _dt_refresh_lock.acquire(blocking=False):
+        return False
+    _dt_last_attempt['ts'] = now
+
+    def _run():
+        try:
+            _refresh_dt_cache(days)
+        except Exception as e:
+            print(f'[聪明钱] 龙虎榜后台刷新失败（沿用旧缓存）: {type(e).__name__}: {e}')
+        finally:
+            _dt_refresh_lock.release()
+
+    threading.Thread(target=_run, daemon=True, name='dragon-tiger-refresh').start()
+    return True
+
+
 def get_dragon_tiger(days: int = 5, top_n: int = 30, force: bool = False) -> Dict:
     """获取近 days 日龙虎榜聚合(带缓存)
 
@@ -141,15 +177,23 @@ def get_dragon_tiger(days: int = 5, top_n: int = 30, force: bool = False) -> Dic
     """
     now = time.time()
     target = _latest_settled_trade_date()
-    if (not force and _dt_cache['ts'] and _dt_cache['days'] == days
-            and now - _dt_cache['ts'] < 3600
-            and _dt_cache.get('latest_trade_date') == target):
-        sorted_list = _dt_cache['list']
-        latest_trade_date = _dt_cache.get('latest_trade_date', '')
-    else:
-        symbol_map, sorted_list, latest_trade_date = _aggregate(days)
-        _dt_cache.update({'ts': now, 'days': days, 'map': symbol_map, 'list': sorted_list,
-                          'latest_trade_date': latest_trade_date})
+    hit = (not force and _dt_cache['ts'] and _dt_cache['days'] == days
+           and now - _dt_cache['ts'] < 3600
+           and _dt_cache.get('latest_trade_date') == target)
+    if not hit:
+        # 展示页 force=手动刷新才同步等；否则后台刷新，先拿旧数据渲染（SWR）
+        if force and _dt_refresh_lock.acquire(blocking=False):
+            _dt_last_attempt['ts'] = now
+            try:
+                _refresh_dt_cache(days)
+            except Exception as e:
+                print(f'[聪明钱] 龙虎榜手动刷新失败（沿用旧缓存）: {type(e).__name__}: {e}')
+            finally:
+                _dt_refresh_lock.release()
+        else:
+            _spawn_dt_refresh(days)
+    sorted_list = _dt_cache['list']
+    latest_trade_date = _dt_cache.get('latest_trade_date', '')
     return {
         'updateTime': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'days': days,
@@ -160,17 +204,29 @@ def get_dragon_tiger(days: int = 5, top_n: int = 30, force: bool = False) -> Dic
 
 
 def get_dragon_tiger_symbol_map(days: int = 5, force: bool = False) -> Dict[str, Dict]:
-    """扫描注入用:返回 {symbol: {net_amt, appearances}}"""
+    """扫描/单票评分注入用：返回 {symbol: {net_amt, appearances}}。
+
+    2026-11-04 改 SWR：**永远立即返回现有缓存**，过期只触发后台刷新，绝不同步等东财。
+    旧实现在 `latest_trade_date != 今天` 时缓存判定恒为假（18:00 后但当日榜单尚未入库），
+    于是每换一只股票都重拉一次东财，单次最多 15s —— 这是单票行情页 16.7~23.9s 的主因。
+    """
     now = time.time()
     target = _latest_settled_trade_date()
-    if (not force and _dt_cache['ts'] and _dt_cache['days'] == days
-            and now - _dt_cache['ts'] < 3600
-            and _dt_cache.get('latest_trade_date') == target and _dt_cache['map']):
-        return _dt_cache['map']
-    symbol_map, sorted_list, latest_trade_date = _aggregate(days)
-    _dt_cache.update({'ts': now, 'days': days, 'map': symbol_map, 'list': sorted_list,
-                      'latest_trade_date': latest_trade_date})
-    return symbol_map
+    hit = (not force and _dt_cache['map'] and _dt_cache['days'] == days
+           and now - _dt_cache['ts'] < 3600
+           and _dt_cache.get('latest_trade_date') == target)
+    if not hit:
+        if force and _dt_refresh_lock.acquire(blocking=False):
+            _dt_last_attempt['ts'] = now
+            try:
+                _refresh_dt_cache(days)
+            except Exception as e:
+                print(f'[聪明钱] 龙虎榜手动刷新失败（沿用旧缓存）: {type(e).__name__}: {e}')
+            finally:
+                _dt_refresh_lock.release()
+        else:
+            _spawn_dt_refresh(days)
+    return _dt_cache['map']
 
 
 def get_northbound_market(force: bool = False) -> Dict:

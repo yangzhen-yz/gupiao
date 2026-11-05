@@ -52,6 +52,7 @@
     <div v-if="reviewData.available" class="review-summary-box">
       <div class="review-summary-title">
         📊 推荐复盘（近{{ reviewData.recent_days }}天 · 共{{ reviewData.total?.t1?.n || 0 }}期）
+        <span v-if="reviewCachedNote" class="review-gen">{{ reviewCachedNote }}</span>
       </div>
       <div class="review-summary-row">
         <span class="review-metric">
@@ -445,6 +446,9 @@
   const recommendStats = ref('--')
   const generating = ref(false)
   const reviewData = ref({})
+  // 复盘接口 2026-11-03 起有 10 分钟缓存：缓存本身不该静默生效，这里把"这份数算于何时"
+  // 拼成一句话显示（≥60 秒才补"几分钟前"，刚算完的不啰嗦）。空字符串 = 不显示。
+  const reviewCachedNote = ref('')
 
   const HISTORY_PAGE_SIZE = 3
   const historyPage = ref(1)
@@ -550,6 +554,11 @@
       const result = await apiFetch('/api/recommend-review?days=30')
       if (result.success && result.data) {
         reviewData.value = result.data
+        const at = result.data.cachedAt || ''
+        const age = Number(result.data.cachedAgeSec || 0)
+        reviewCachedNote.value = at
+          ? `· 数据算于 ${at}${age >= 60 ? `（${Math.floor(age / 60)} 分钟前）` : ''}`
+          : ''
       }
     } catch (e) {
       console.error('加载推荐复盘失败:', e)
@@ -649,6 +658,14 @@
     font-weight: 700;
     color: #854d0e;
     margin-bottom: 0.5rem;
+  }
+  /* 缓存新鲜度（2026-11-03 第 3 步）：复盘接口改成 TTL 缓存后，"这份数什么时候算的"
+     必须可见；用中性灰、不换行，避免在窄屏被挤成一列单字。 */
+  .review-gen {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: #6b7280;
+    white-space: nowrap;
   }
   .review-summary-row {
     display: flex;

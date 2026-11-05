@@ -193,42 +193,95 @@ export function setUnauthorizedHandler(fn) {
 // 用户看到的就是"每个页面都很慢、而且卡住不动"。超时后快速失败，页面其余部分照常可用。
 export const API_TIMEOUT_MS = 10000
 
+// ========== 5xx 重试 / 离线提示（2026-11-04，代码层审查遗留的正确性待办） ==========
+// 旧行为：HTTP 5xx 既不抛异常也不提示，只是 resolve 一个 `{detail}` 对象。
+// 调用方普遍只判 `result.success`，于是页面会挂着「正在算…」或静默显示空数据，
+// 比直接报错更误导。这里对**幂等请求**重试 2 次；重试耗尽仍按旧形状返回，
+// 避免破坏那些没有 try/catch 的老调用方，但打日志并节流弹一次全局提示。
+// **非幂等方法（POST/PUT/DELETE）绝不自动重试**：重复下单/重复生成收评代价太大。
+export const API_MAX_SERVER_RETRY = 2
+export const API_RETRY_BASE_DELAY_MS = 200
+let _lastServiceNoticeTs = 0
+
+function _isIdempotent(method) {
+  return !method || ['GET', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())
+}
+
+function _notifyServiceIssue(kind) {
+  const now = Date.now()
+  if (now - _lastServiceNoticeTs < 30000) return // 一次故障别刷屏
+  _lastServiceNoticeTs = now
+  const msg = kind === 'offline'
+    ? '网络连接不可用，请检查网络或稍后重试'
+    : '服务暂时不可用，请稍后刷新'
+  console.warn(`[apiFetch] ${msg}`)
+  try {
+    useNotification().showNotification(msg, 'error', 5000)
+  } catch {
+    /* 通知组件尚未挂载时不阻断请求链路 */
+  }
+}
+
 // API 请求封装：自动附带登录 token；私有接口返回 401 时清理登录态并通知上层
 export async function apiFetch(url, options = {}) {
   const { timeout = API_TIMEOUT_MS, expectText = false, withMeta = false, ...rest } = options
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeout)
+  const _canRetry = _isIdempotent(rest.method)
   // 2026-10-30：把每个请求的耗时记进 utils/perf.js（内存态，页面耗时条用它）。
   // 服务端处理时间来自 X-Process-Time，缺失时为 null（差额即传输/隧道排队）。
-  const _t0 = performance.now()
-  const _tok = beginRequest(url)
+  // 重试时先结算当前这一跳、再重新 begin，页面耗时条看到的是「每次尝试」而非合并值。
+  let _t0 = performance.now()
+  let _tok = beginRequest(url)
   let _status = 0
   let _serverMs = null
   let _asOf = null
   try {
-    const opts = { ...rest, signal: ctrl.signal }
-    const token = getToken()
-    if (token) {
-      opts.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` }
+    for (let attempt = 0; ; attempt++) {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), timeout)
+      try {
+        const opts = { ...rest, signal: ctrl.signal }
+        const token = getToken()
+        if (token) {
+          opts.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` }
+        }
+        const resp = await fetch(url, opts)
+        _status = resp.status
+        const _proc = resp.headers.get('X-Process-Time')
+        if (_proc !== null) _serverMs = Number(_proc)
+        // 2026-10-30：X-Scan-As-Of = 扫描数据实际算出来的时刻（陈旧兜底期间会早于现在）
+        const _asOfRaw = resp.headers.get('X-Scan-As-Of')
+        if (_asOfRaw !== null) _asOf = _asOfRaw
+        if (resp.status === 401 && !url.startsWith('/api/auth/')) {
+          clearAuth()
+          if (_unauthorizedHandler) _unauthorizedHandler()
+          const err = new Error('未登录或登录已过期')
+          err.status = 401
+          throw err
+        }
+        if (resp.status >= 500 && _canRetry && attempt < API_MAX_SERVER_RETRY) {
+          // 消费掉响应体，让底层连接能复用；随后线性退避 200 / 400ms。
+          try { await resp.text() } catch { /* 空体也算消费完 */ }
+          console.warn(`[apiFetch] ${resp.status}，第 ${attempt + 1} 次重试: ${url}`)
+          endRequest(_tok, {
+            ms: performance.now() - _t0, status: _status, serverMs: _serverMs, ok: false,
+          })
+          await new Promise(r => setTimeout(r, API_RETRY_BASE_DELAY_MS * (attempt + 1)))
+          _t0 = performance.now()
+          _tok = beginRequest(url)
+          _status = 0
+          _serverMs = null
+          continue
+        }
+        if (resp.status >= 500) _notifyServiceIssue('server')
+        // 4xx（除 401）一律不重试：参数错/没权限，重试只会放大流量且误导用户。
+        // 腾讯行情那类接口返回的是文本不是 JSON，用 expectText 走同一条超时逻辑。
+        // withMeta=true 时包一层 { data, meta }——只有显式传参的调用方才拿到的形状。
+        const _payload = expectText ? await resp.text() : await resp.json()
+        return withMeta ? { data: _payload, meta: { scanAsOf: _asOf, serverMs: _serverMs } } : _payload
+      } finally {
+        clearTimeout(timer)
+      }
     }
-    const resp = await fetch(url, opts)
-    _status = resp.status
-    const _proc = resp.headers.get('X-Process-Time')
-    if (_proc !== null) _serverMs = Number(_proc)
-    // 2026-10-30：X-Scan-As-Of = 扫描数据实际算出来的时刻（陈旧兜底期间会早于现在）
-    const _asOfRaw = resp.headers.get('X-Scan-As-Of')
-    if (_asOfRaw !== null) _asOf = _asOfRaw
-    if (resp.status === 401 && !url.startsWith('/api/auth/')) {
-      clearAuth()
-      if (_unauthorizedHandler) _unauthorizedHandler()
-      const err = new Error('未登录或登录已过期')
-      err.status = 401
-      throw err
-    }
-    // 腾讯行情那类接口返回的是文本不是 JSON，用 expectText 走同一条超时逻辑。
-    // withMeta=true 时包一层 { data, meta }——只有显式传参的调用方才拿到的形状，别的调用方不受影响。
-    const _payload = expectText ? await resp.text() : await resp.json()
-    return withMeta ? { data: _payload, meta: { scanAsOf: _asOf, serverMs: _serverMs } } : _payload
   } catch (e) {
     if (e.name === 'AbortError') {
       const err = new Error(`请求超时（${Math.round(timeout / 1000)}s）: ${url}`)
@@ -236,10 +289,13 @@ export async function apiFetch(url, options = {}) {
       console.warn(err.message)
       throw err
     }
-    if (e.status !== 401) console.error(`API请求失败: ${url}`, e)
+    if (e.status !== 401) {
+      console.error(`API请求失败: ${url}`, e)
+      // e.status 为空 = 网络层失败（fetch 直接 reject），不是 HTTP 错误
+      if (!e.status) _notifyServiceIssue('offline')
+    }
     throw e
   } finally {
-    clearTimeout(timer)
     endRequest(_tok, {
       ms: performance.now() - _t0,
       status: _status,

@@ -126,7 +126,8 @@ xc.fetch_fund_flow = lambda syms, date=None: _fake_ff
 xc.fetch_quotes = lambda syms, date=None: _fake_qt
 _orig_collect_universe = xc.collect_universe  # 先存原函数，再打桩（顺序反了会存到桩）
 xc.collect_universe = lambda: ['sh600000', 'sh600001', 'sh600002']
-xc.collect_our_values = lambda: dict(_fake_our)
+_orig_collect_our = xc.collect_our_values        # 先存真实现，下面才打桩（与 collect_universe 同一踩坑）
+xc.collect_our_values = lambda *a, **k: dict(_fake_our)
 
 _sum = xc.run(date_key='2099-01-02', dry_run=False)
 ck(len(_saved_snap) == 3, '快照落库 3 条', f'实得 {len(_saved_snap)}')
@@ -145,11 +146,38 @@ ck(_sum['quote_agreed'] == 2 and _sum['quote_checked'] == 3,
 ck(len(_sum['direction_conflicts']) == 1, '摘要：符号冲突 1 只')
 # 未比对三态：本地无值的票 quote_agreed=None
 _fake_our2 = {'sh600000': {'change_pct': 1.0, 'main_inflow': 8e7}}
-xc.collect_our_values = lambda: dict(_fake_our2)
+xc.collect_our_values = lambda *a, **k: dict(_fake_our2)
 _saved_check.clear()
 xc.run(date_key='2099-01-03', dry_run=False)
 _by2 = {r['symbol']: r for r in _saved_check}
 ck(_by2['sh600001']['quote_agreed'] is None, '本地无值 → quote_agreed=None（未比对，不与不一致混淆）')
+
+# ---- 2026-11-05 回归：本地快照非当日必须判「不可校验」而不是写假冲突 ----
+# 背景：原实现无条件读最新快照，--date 补跑历史日期时等于用今天行情比前天行情，
+# `quote_agreed` 一致率在 1.1%～97.2% 之间乱跳、direction_conflict 被虚增。
+from datetime import datetime as _dt
+_ts_1104 = _dt(2026, 11, 4, 16, 30).timestamp()
+_fake_snap = {'ts': _ts_1104, 'data': {'inflow': [{'symbol': 'sh600000', 'changePercent': 1.0,
+                                                    'mainNetInflow': 8e7}], 'outflow': []}}
+_db.load_fund_flow_snapshot = lambda k: (dict(_fake_snap) if k == 'stocks'
+                                         else {'ts': _ts_1104, 'data': []})
+ck(_orig_collect_our('2026-11-02') == {},
+   '快照日 11-04 ≠ 校验日 11-02 → 本地侧不可校验（返回空表）')
+ck(bool(_orig_collect_our('2026-11-04')),
+   '快照日与校验日一致 → 正常返回本地值')
+ck(_orig_collect_our() != {}, '不传日期 → 不做日期校验（向后兼容）')
+ck(xc._snapshot_date({'ts': _ts_1104}) == '2026-11-04', '_snapshot_date 本地时区取日')
+ck(xc._snapshot_date({}) is None and xc._snapshot_date(None) is None, '_snapshot_date 无 ts → None')
+
+_saved_snap.clear(); _saved_check.clear()
+xc.collect_our_values = lambda date_key=None: {}
+_sum3 = xc.run(date_key='2026-11-02', dry_run=False)
+ck(len(_saved_check) == 0, '不可校验 → data_cross_check 一行不写（全 NULL 行会撑大一致率分母）',
+   f'实得 {len(_saved_check)} 行')
+ck(len(_saved_snap) == 3, '不可校验 → westock 权威快照照常落库（数据不丢）',
+   f'实得 {len(_saved_snap)} 行')
+ck(_sum3.get('skipped_compare') == 'local_snapshot_not_same_day', '摘要标明跳过原因')
+ck(_sum3.get('our_side_usable') is False, '摘要 our_side_usable=False')
 
 # ========== [5] 快照字段映射 ==========
 print('[5] 快照字段映射')

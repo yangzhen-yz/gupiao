@@ -197,7 +197,10 @@
         <div v-if="!theme" class="ml-none">主题温度暂不可用，稍后刷新（服务端计算超时）</div>
         <header v-else class="block-head">
           <h3>🌡️ {{ theme.name }}</h3>
-          <span class="block-meta">{{ theme.memberCount }} 只等权 · 截至 {{ theme.asOf }}</span>
+          <span class="block-meta"
+            >{{ theme.memberCount }} 只等权 · 截至 {{ theme.asOf
+            }}<b v-if="theme.isLive" class="live-tag"> · 盘中 {{ theme.liveAt }}</b></span
+          >
         </header>
 
         <!-- 为什么今天展示这条链（2026-10-31）：链是财联社板块榜每天动态选的前 3 热门板块，
@@ -284,8 +287,8 @@
             <div class="sent-extra-item">口径：{{ theme.note }}</div>
             <div class="sent-extra-item">温度：{{ theme.tempBasis }}</div>
             <div class="sent-extra-item">
-              当日：涨停 {{ theme.last.zt || 0 }} 家 · 炸板 {{ theme.last.zb || 0 }} 家 · 上涨占比
-              {{ Math.round((theme.last.upRatio || 0) * 100) }}% · 成交 {{ theme.last.amount || 0 }} 亿
+              当日：涨停 {{ theme.zt }} 家 · 炸板 {{ theme.zb }} 家 · 上涨占比
+              {{ Math.round((theme.upRatio || 0) * 100) }}% · 成交 {{ theme.amount }} 亿
             </div>
             <div class="sent-extra-item">位置：{{ theme.posText }}</div>
             <div class="sent-extra-item">
@@ -824,7 +827,12 @@
   const theme = computed(() => {
     const t = themeRaw.value
     if (!t || t.error || !Array.isArray(t.series) || t.series.length < 2) return null
+    // 盘中实时行（后端 _quote_aggregate 产出）：有就用"今天"的数，没有才回落到最近收盘。
+    // 之前只用 last（已收盘的最近一根），所以交易时段卡片一直显示昨天（2026-11-04 修复）。
+    const live = t.live && typeof t.live === 'object' ? t.live : null
     const levels = t.series.map(s => Number(s.idx)).filter(v => Number.isFinite(v))
+    // 盘中把今日实时点接到曲线尾部，让走势延续到今天
+    if (live && Number.isFinite(Number(live.idx))) levels.push(Number(live.idx))
     if (levels.length < 2) return null
     const min = Math.min(...levels)
     const max = Math.max(...levels)
@@ -838,8 +846,11 @@
       })
       .join(' ')
     const last = t.last || {}
-    const temp = t.temp == null ? null : Number(t.temp)
-    const dd = last.dd == null ? null : Number(last.dd) * 100
+    const cur = live || last
+    const _temp = live ? live.temp : t.temp
+    const temp = _temp == null ? null : Number(_temp)
+    const _dd = live ? live.dd : last.dd
+    const dd = _dd == null ? null : Number(_dd) * 100
     const rp = t.recentPeak || {}
     const pctText = v => (v == null || !Number.isFinite(Number(v)) ? '—' : `${Number(v).toFixed(1)}%`)
     return {
@@ -854,9 +865,11 @@
       // rank 是板块榜名次（不是链强度排名），只有动态链才有
       rank: t.rank || null,
       memberCount: t.memberCount || 0,
-      asOf: String(t.asOf || '').slice(5),
-      idx: last.idx == null ? '--' : Number(last.idx).toFixed(1),
-      retPct: last.ret == null ? null : Number(last.ret) * 100,
+      asOf: live ? String(live.date || '').slice(5) : String(t.asOf || '').slice(5),
+      isLive: !!live,
+      liveAt: live && live.at ? String(live.at) : '',
+      idx: cur.idx == null ? '--' : Number(cur.idx).toFixed(1),
+      retPct: cur.ret == null ? null : Number(cur.ret) * 100,
       temp,
       tempText: temp == null ? '—' : temp.toFixed(0),
       // 配色只区分"温度档"，与红涨绿跌无关：热=橙、偏热=黄、冷=蓝、中性=灰
@@ -873,7 +886,12 @@
                 ? '冰点区'
                 : '中性',
       ddPct: dd,
-      stateLabel: t.stateLabel || '',
+      stateLabel: (live && live.stateLabel) || t.stateLabel || '',
+      // 当日分项：盘中取 live、收盘后取 last（供"口径与分项"展开区）
+      zt: cur.zt == null ? 0 : Number(cur.zt),
+      zb: cur.zb == null ? 0 : Number(cur.zb),
+      upRatio: cur.upRatio == null ? 0 : Number(cur.upRatio),
+      amount: cur.amount == null ? 0 : Number(cur.amount),
       points,
       seriesLen: levels.length,
       banner: t.banner || null,
@@ -1283,6 +1301,12 @@
     font-size: 0.75rem;
     color: var(--text-tertiary);
     font-variant-numeric: tabular-nums;
+  }
+  /* 盘中实时标记（2026-11-04）：点出"截至 11-04 · 盘中 10:24"里的实时时段，
+     让用户一眼分清"今天盘中"与"昨天收盘"，不做告警色。 */
+  .block-meta .live-tag {
+    font-weight: 500;
+    color: var(--primary-color, #d4380d);
   }
   /* 收盘定版标记（2026-10-23）：与"实时"区分开，但不做成告警色——它不是异常。 */
   .final-chip {

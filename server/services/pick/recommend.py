@@ -420,11 +420,15 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
             else:
                 timing['execHint'] = RECOMMEND_EXEC_HINT
         # 打板票的默认出口径（写进卡片，不留给临场决定）：`docs/短线买法-2026-10.md` §2
-        # 用 1094 口径实测过"封板票怎么卖"，次日开盘即走是唯一均值最高、尾部最薄的卖法。
+        # 实测过"封板票怎么卖"，次日开盘即走是均值最高、尾部最薄的卖法。
+        # 2026-11-05 改文案（阈值与动作都没动）：那 +2.0% 条件在"到收盘还封着"上，
+        # 摸板就买的整体期望是 −0.28%（`analysis_out/sealed_board_selection_check.py` L5），
+        # 所以卡片先讲前提再讲数字——旧文案写 +2.05%/64.6% 是 10-18 那版的 1094 口径数。
         if timing.get('type') == 'auction':
             timing['exitNote'] = (
                 '默认出口径：次日 9:15-9:25 竞价挂卖、开盘即走。'
-                '封板票次日开盘卖 +2.05%/胜率 64.6%、亏超 5% 只有 2.4%；'
+                '+2.0% 只在"到收盘还封着"时才拿得到（封板票次日开盘卖 +2.01%/胜率 64.3%）；'
+                '摸板就买整体 −0.28%（32.1% 当天炸板、那批 −5.15%）——确认封死才买。'
                 '持有到次日收盘只 +1.97%/59.3%，亏超 5% 涨到 11.4%。'
                 '竞价高开超过 5% 不追（高开 +5~8% 追板持有到次日收盘 -0.11%/46.5%、亏超 5% 30.7%）')
     except Exception as e:
@@ -1351,6 +1355,15 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
         except Exception as e:
             print(f'[智能推荐] 增发公告预取失败（降级为无数据）: {e}')
         from services.strategy.trend import compute_trend_result
+        # 2026-11-04 代码层审查 P1：与 hot-stocks-scan 同一个 N+1 —— 循环内每票
+        # calc_stock_score_v2 不传 weights，函数内部就每票查一次权重表（14.31ms/次）。
+        # 一次推荐扫描内权重不变，循环外查一次传入，评分结果完全等价。
+        try:
+            from db.database import load_strategy_factor_weights
+            rec_weights = await asyncio.to_thread(load_strategy_factor_weights)
+        except Exception as _we:
+            print(f'[智能推荐] 权重表预取失败（退回逐票读取）: {_we}')
+            rec_weights = None
         for stock in all_results:
             sym = stock.get('symbol', '').lower()
             # 近期增发标签：placement_map 的 key 为 6 位纯代码
@@ -1369,7 +1382,8 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
             val = val_map.get(sym)
             sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
                        'appearances': (sm or {}).get('appearances', 0)} if sm else None
-            stock['score'] = calc_stock_score_v2(stock, market_change=market_change,
+            stock['score'] = calc_stock_score_v2(stock, weights=rec_weights,
+                                                 market_change=market_change,
                                                  trend_result=trend, fund_flow_data=ff,
                                                  holder_data=hd,
                                                  fundamental_data=fd, smart_money_data=sm_data)

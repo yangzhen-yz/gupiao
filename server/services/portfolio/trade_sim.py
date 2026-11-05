@@ -16,7 +16,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import datetime, date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from db.database import get_db_conn, load_daily_recommendations
 from services.data.stock import fetch_with_retry, parse_tencent_batch_data
@@ -75,9 +75,14 @@ def _load_positions(user_id: int) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
-def _load_orders(user_id: int, status: Optional[str] = None, limit: int = 200) -> List[Dict]:
+def _load_orders(user_id: int, status: Optional[Union[str, tuple, list]] = None, limit: int = 200) -> List[Dict]:
     conn = get_db_conn()
-    if status:
+    if isinstance(status, (tuple, list)):
+        ph = ','.join('?' for _ in status)
+        rows = conn.execute(
+            f'SELECT * FROM sim_orders WHERE user_id=? AND status IN ({ph}) ORDER BY id DESC LIMIT ?',
+            (user_id, *status, limit)).fetchall()
+    elif status:
         rows = conn.execute(
             'SELECT * FROM sim_orders WHERE user_id=? AND status=? ORDER BY id DESC LIMIT ?',
             (user_id, status, limit)).fetchall()
@@ -163,7 +168,14 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
     cash_v, mv, total, day_start, day_pnl = await _portfolio(user_id, positions)
     qmap = await _quotes([p['symbol'] for p in positions] +
                          ([s for s in (symbols or [])]))
-    created, rejected = [], []
+    created, rejected, skipped = [], [], 0
+    # 去重：加载已有 pending + filled 单，避免反复点「生成建议」刷出重复建议 / 重复成交。
+    # 关键：自动跑逻辑是 generate→execute 一气呵成，execute 后单子变 filled，
+    # 若只按 pending 去重，下一次循环 pending 已空 → 重新生成 → 再次成交（这就是之前刷重复单的根因）。
+    # 改为对 (symbol, 方向, 来源) 的「已生成(pending)或已成交(filled)」单去重，
+    # 同一信号源对同票同方向的建议只生成一次；rejected 不在去重范围内（价格偏离被拒的可重新生成）。
+    _seen_keys = {(o.get('symbol', '').lower(), o.get('side'), o.get('source'))
+                  for o in _load_orders(user_id, status=('pending', 'filled'))}
 
     # 持仓只数上限（用户规则：最多持有 3 只）。加仓已有持仓不计入新增只数。
     held_symbols = set(p['symbol'].lower() for p in positions)
@@ -179,7 +191,14 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
         queued_new.add((sym or '').lower())
 
     def _add(side, sym, name, price, qty, source, reason):
-        nonlocal created, rejected
+        nonlocal created, rejected, skipped
+        key = ((sym or '').lower(), side, source)
+        # 同一 (symbol, 方向, 来源) 的待执行建议已存在 → 跳过，不重复生成
+        # （修复：反复点「生成建议」会刷出一模一样的重复单）
+        if key in _seen_keys:
+            skipped += 1
+            return
+        _seen_keys.add(key)
         # 买入受「最多持有 N 只」约束
         if side == 'buy' and _cap_reached(sym):
             rejected.append({'symbol': sym, 'side': side,
@@ -325,7 +344,8 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
             _add('buy', sym, q.get('name', sym), round(price, 2), qty, 'screener', '筛选/趋势选中生成')
 
     return {'success': True, 'created': created, 'rejected': rejected,
-            'created_count': len(created), 'rejected_count': len(rejected)}
+            'created_count': len(created), 'rejected_count': len(rejected),
+            'skipped_count': skipped}
 
 
 # ---------- 手动卖出 ----------

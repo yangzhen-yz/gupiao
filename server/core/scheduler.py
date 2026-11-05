@@ -30,6 +30,8 @@ from services.strategy.sentiment import get_sentiment
 from services.pick.candidate_pool import build_pool as build_candidate_pool
 from app.config import CANDIDATE_POOL_TIME
 from app.config import MATRIX_RERUN_ENABLED, MATRIX_RERUN_TIME
+from app.config import SENTIMENT_FINAL_SNAPSHOT_TIME
+from app.config import INDEX_DAILY_SYNC_TIME
 from app.config import (MARKET_CAP_REFRESH_TIME, MARKET_CAP_REFRESH_WEEKDAY,
                         INDUSTRY_SYNC_TIME, INDUSTRY_SYNC_WEEKDAY,
                         CANDIDATE_POOL_MAX, KLINE_POOL_MIN_COVERAGE)
@@ -124,6 +126,12 @@ async def generate_review_task():
         if not ok:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 收评保存返回 False（详见 db 日志）')
             return
+        # 2026-11-04：收评接口已上 SWR 缓存，写后立刻失效，别等 5 分钟 TTL
+        try:
+            from app.api.routes import _invalidate_daily_reviews_cache
+            _invalidate_daily_reviews_cache()
+        except Exception as _ce:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 收评缓存失效失败（不影响主流程）: {_ce}')
         print(f'[定时任务 {datetime.now():%H:%M:%S}] 今日收评生成完成！ 情绪分={review.get("aiAnalysis",{}).get("sentimentScore") if review.get("aiAnalysis") else "N/A"}')
     except Exception as error:
         print(f'[定时任务 {datetime.now():%H:%M:%S}] 生成收评失败: {str(error)}')
@@ -186,6 +194,35 @@ async def auto_optimization_task():
         print(f'  堆栈: {traceback.format_exc()[:500]}')
 
 
+# 启动预热串行闸门（2026-11-04，根治「重启后 12 分钟全站不可用」）
+# 事故：15:10 看护重启后，5 个预热/保活线程同时跑全市场计算，抢 SQLite 写锁与 GIL。
+# 日志实锤：[批量扫描] 阶段 候选+范围 670.36s（正常 2~8s）、预热链累计 769.5s；
+# 期间 /api/stock-map 22s、stock/full 60s 超时、/api/health 排队 9.4s（X-Process-Time
+# 只有 4ms，说明时间全花在排队而非计算），用户页面卡在 spinner 三分钟。
+# 修法：同一时刻只允许一个预热/保活在跑；启动先让出 15s 给 uvicorn 完全就绪，
+# 项与项之间再留 2s 空窗让主事件循环处理用户请求。各项业务逻辑一字未动。
+_PREWARM_GATE = threading.Lock()
+_PREWARM_START_DELAY = 15   # 秒：启动后先不预热，保证重启瞬间页面可访问
+_PREWARM_GAP = 2            # 秒：相邻预热项之间的空窗
+
+
+def _serial_prewarm(fn):
+    """启动预热项装饰器：延迟启动 + 全局串行 + 项间让出，不改原函数体。"""
+    from functools import wraps
+
+    @wraps(fn)
+    def _wrapper(*args, **kwargs):
+        time.sleep(_PREWARM_START_DELAY)
+        with _PREWARM_GATE:
+            print(f'[预热 {datetime.now():%H:%M:%S}] ▸ {fn.__name__} 开始')
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                print(f'[预热 {datetime.now():%H:%M:%S}] ◂ {fn.__name__} 结束')
+                time.sleep(_PREWARM_GAP)
+    return _wrapper
+
+
 def run_scheduler():
     # 2026-10-17 启动预热：universe 选票范围首算要 ~5s（流动性聚合），
     # 不预热则重启后第一次开配置页白等 5s。放后台线程跑，不阻塞调度器注册。
@@ -194,9 +231,10 @@ def run_scheduler():
     # 配置页/海选）实测要再付 3~8s 冷算（10-30 16:13 筛选页 8.71s 即此因）。
     # 改为每 540s 后台刷新一次，永远赶在过期前；先算好再原子换入
     # （universe.refresh_caches），刷新窗口内请求继续用旧值，不撞冷路径。
-    def _keepwarm_universe():
+    @_serial_prewarm
+    def _prewarm_universe_first():
         import time as _time
-        from services.data import liquidity, universe
+        from services.data import universe
         _t = _time.time()
         try:
             universe.selectable_count()
@@ -212,16 +250,41 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] 配置页口径摘要缓存完成（{_time.time() - _t2:.1f}s）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 口径摘要预热失败（首次请求会现算兜底）: {e}')
+
+    @_serial_prewarm
+    def _keepwarm_round():
+        import time as _time
+        try:
+            from app.config import (LIQ_STATS_KEEPWARM_MAX_AGE_SEC,
+                                    LIQ_STATS_KEEPWARM_FORCE)
+            from services.data import liquidity, universe
+            from services.support import settings_preview
+            _t = _time.time()
+            # 流动性统计不再每轮 force 重算（2026-11-04）：它的输入是本地日K，盘中根本不变，
+            # 而单算一次实测 14.9s（346.5 万行、无 date 前导索引），线上那一行日志因此是
+            # 12~170s，每 9 分钟跟推送扫描/同步抢一轮资源。判据抽成纯函数便于自测。
+            _need = liquidity.should_keepwarm_refresh(
+                _time.time(), liquidity.last_stats_ts(),
+                LIQ_STATS_KEEPWARM_MAX_AGE_SEC, LIQ_STATS_KEEPWARM_FORCE)
+            _tl = 0.0
+            if _need:
+                _t0 = _time.time()
+                liquidity.stats_map(force=True)
+                _tl = _time.time() - _t0
+            universe.refresh_caches()          # 再重算两层范围并原子换入
+            settings_preview.compute_summary() # 配置页摘要随热缓存重算（热路径 <1s）
+            _liq_txt = ('流动性重算 %.1fs' % _tl) if _need else '流动性跳过（日K未变）'
+            print(f'[预热 {datetime.now():%H:%M:%S}] universe/口径摘要保活完成'
+                  f'（{_time.time() - _t:.1f}s；{_liq_txt}）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] universe 保活刷新失败（不影响请求，下轮再试）: {e}')
+
+    def _keepwarm_universe():
+        # 启动段与后续每 9 分钟的保活轮都进同一把串行闸门，不与其它预热叠加。
+        _prewarm_universe_first()
         while True:
-            _time.sleep(540)  # 9 分钟 < 600s TTL
-            try:
-                _t = _time.time()
-                liquidity.stats_map(force=True)   # 先刷流动性统计（universe 重算要用）
-                universe.refresh_caches()          # 再重算两层范围并原子换入
-                settings_preview.compute_summary() # 配置页摘要随热缓存重算（热路径 <1s）
-                print(f'[预热 {datetime.now():%H:%M:%S}] universe/流动性/口径摘要保活刷新完成（{_time.time() - _t:.1f}s）')
-            except Exception as e:
-                print(f'[预热 {datetime.now():%H:%M:%S}] universe 保活刷新失败（不影响请求，下轮再试）: {e}')
+            time.sleep(540)  # 9 分钟 < 600s TTL
+            _keepwarm_round()
     threading.Thread(target=_keepwarm_universe, daemon=True, name='prewarm-universe').start()
 
     # 批量扫描预热（2026-10-30）：重启后第一次打开筛选页要付一次全量冷算
@@ -229,6 +292,7 @@ def run_scheduler():
     # （与前端传参同源，load_user_scan_pool() 无参=所有人池子合并），启动后台
     # 预扫一次，首开即命中缓存；即使之后池子变了 key 不一致，也只是退回
     # "首开冷算一次"的旧行为，不会更差。失败不致命。
+    @_serial_prewarm
     def _prewarm_hot_scan():
         import time as _time
         try:
@@ -257,6 +321,7 @@ def run_scheduler():
     # 可执行超额预热（2026-10-27）：`/api/recommend-excess` 冷算实测 7.4s，而前端默认 10s
     # 超时——重启后第一个开「回测曲线」页的人正好撞上（当天实拍：超额没算出来：请求超时（10s））。
     # 放后台线程预热一次，让第一个请求命中缓存；失败不致命（页面还有 30s 超时 + 一次重试兜底）。
+    @_serial_prewarm
     def _prewarm_excess():
         try:
             from app.api import routes
@@ -271,6 +336,7 @@ def run_scheduler():
     # 事件循环上等它几百毫秒——偏偏那一刻正是"开盘后第一时间出推荐"的关键路径（同一个坑
     # 在 2026-10-17 的 history_available 上踩过一次）。开关关着就一行都不查：
     # 关掉的代价必须严格等于改造前，一次多余的库访问也不给留。
+    @_serial_prewarm
     def _prewarm_vol():
         try:
             from services.support import app_settings
@@ -283,6 +349,164 @@ def run_scheduler():
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 波动率预热失败（不致命，带宽退回核心值）: {e}')
     threading.Thread(target=_prewarm_vol, daemon=True, name='prewarm-vol').start()
+
+    # 单票行情页依赖预热（2026-11-04）：/api/stock/{symbol}/full 首次访问会连付三笔冷启动
+    # 成本：history_available() 全表统计 8.0s、compute_trend_result 首只 6.7s、龙虎榜东财
+    # 1～15s，线上切票实测 16.7s / 23.9s。这些都是**进程级一次性初始化**，放启动后台
+    # 预热即可；同一把 _PREWARM_GATE 保证不与其它预热抢 SQLite / 线程池。
+    @_serial_prewarm
+    def _prewarm_quote_deps():
+        import time as _time
+        try:
+            from services.data.kline_history import history_available
+            _t = _time.time()
+            history_available()
+            print(f'[预热 {datetime.now():%H:%M:%S}] 本地K线库可用性探测完成（{_time.time() - _t:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] K线可用性探测失败（不致命，请求侧有超时闸门）: {e}')
+        try:
+            from services.strategy.trend import compute_trend_result
+            _t = _time.time()
+            compute_trend_result('sh603985', 0)   # 任意一只即可触发引擎单例 + 首条趋势 memo
+            print(f'[预热 {datetime.now():%H:%M:%S}] 单票趋势引擎预热完成（{_time.time() - _t:.1f}s）')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 趋势引擎预热失败（不致命）: {e}')
+        try:
+            from services.data.smartmoney import get_dragon_tiger_symbol_map
+            from app.config import SMART_MONEY_DRAGON_TIGER_DAYS
+            get_dragon_tiger_symbol_map(SMART_MONEY_DRAGON_TIGER_DAYS)  # 触发一次后台 SWR 刷新
+            print(f'[预热 {datetime.now():%H:%M:%S}] 龙虎榜后台刷新已触发')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 龙虎榜预热失败（不致命）: {e}')
+    threading.Thread(target=_prewarm_quote_deps, daemon=True, name='prewarm-quote-deps').start()
+
+    # 分钟级只读数据源预热（2026-11-04 全站巡检）：热态基准实测 /api/theme-index 2.92s、
+    # /api/kline-history/stats 1.44s、/api/market-index 1.19s、/api/cls-ladder 1.16s。
+    # 这四个接口已统一走 routes._MISC_SWR_CACHE（过期返旧值 + 后台刷新），但**重启后
+    # 首次 cold 仍要现场付一次**。放启动串行闸门里提前算好，重启后首开即命中。
+    # 与 _prewarm_hot_scan 同样用 asyncio.run 在预热线程自己的 loop 里跑，
+    # 失败只打日志（请求侧 cold 兜底仍在），不影响其它预热项。
+    @_serial_prewarm
+    def _prewarm_misc():
+        import asyncio as _aio
+        import time as _time
+        try:
+            from app.api import routes as _r
+            from services.support import swr as _swr
+            from services.ops import theme_index, cls_pool
+            jobs = [
+                (('market-index',), lambda: _r.check_market_crash(), 'market-index'),
+                (('theme-index', 'auto', 0), lambda: theme_index.snapshot('auto', live=True), 'theme-index'),
+                (('cls-ladder',), lambda: cls_pool.snapshot(live=True), 'cls-ladder'),
+            ]
+            for key, factory, label in jobs:
+                try:
+                    t0 = _time.time()
+                    _aio.run(_swr.async_swr_get(
+                        _r._MISC_SWR_CACHE, key, factory, ttl=60, stale_max=3600,
+                        label=label, gap=60, max_keys=16))
+                    print(f'[预热 {datetime.now():%H:%M:%S}] {label} 缓存完成（{_time.time() - t0:.1f}s）')
+                except Exception as e:
+                    print(f'[预热 {datetime.now():%H:%M:%S}] {label} 预热失败（首开会现算）: {e}')
+            try:
+                from services.data.kline_history import get_engine, history_available
+                t0 = _time.time()
+                eng = get_engine()
+                stats = eng.get_db_stats(with_scope=True)
+                stats['available'] = history_available()
+                _swr.put(_r._MISC_SWR_CACHE, ('kline-stats',), stats, 16)
+                print(f'[预热 {datetime.now():%H:%M:%S}] 本地K库统计缓存完成（{_time.time() - t0:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] K库统计预热失败（首开会现算）: {e}')
+            # 2026-11-04 P0-A：收评 518KB 的查库+序列化+ETag 计算提前付掉。
+            # SWR 只保证「缓存有值」时不阻塞，不预热的话重启后第一个打开收评页的
+            # 用户仍要付一次 cold（实测 133ms，在 to_thread 里不堵主循环但自己要等）。
+            try:
+                t0 = _time.time()
+                _swr.swr_get(_r._DAILY_REVIEWS_CACHE, 'all',
+                             _r._build_daily_reviews_entry,
+                             ttl=_r._DAILY_REVIEWS_TTL, stale_max=_r._SWR_STALE_MAX,
+                             label='daily-reviews', gap=60, max_keys=2)
+                print(f'[预热 {datetime.now():%H:%M:%S}] 收评缓存完成（{_time.time() - t0:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] 收评预热失败（首开会现算）: {e}')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 分钟级数据源预热整体失败（不致命）: {e}')
+    threading.Thread(target=_prewarm_misc, daemon=True, name='prewarm-misc').start()
+
+    # 重计算冷缓存预热（2026-11-04 全站巡检第 2 轮）：SWR 只保证「缓存里有值」时不阻塞，
+    # 重启后第一次访问仍会撞 cold。冷/热态基准实测重启后首访：
+    #   /api/recommend-sim?bench=1 15.645s（要算基准曲线）、/api/fund-flow 6.664s、
+    #   /api/custom-scan-pool 1.55s、/api/daily_recommendations 1.43s、
+    #   /api/recommend-review 1.33s；热态对应 31ms / 18ms / 10ms / 47ms / 15ms。
+    # 这些全是本地 SQLite + 日级数据，一天才变，放启动串行闸门里一次算好即可。
+    @_serial_prewarm
+    def _prewarm_heavy():
+        import asyncio as _aio
+        import time as _time
+        try:
+            from app.api import routes as _r
+            from services.support import swr as _swr
+            from services.pick import rec_sim, rec_sim_batch, recommend_review
+            from app.config import (FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N,
+                                    FUND_FLOW_HIDDEN_CHANGE_THRESHOLD,
+                                    FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N)
+
+            # 1) 回测曲线：bench=0 / bench=1 两个前端在用的口径 + 拆档
+            for bench in (False, True):
+                try:
+                    t0 = _time.time()
+                    key = (3, 100000.0, 5.0, True, bench)
+                    data = rec_sim.simulate(months=3, capital=100000.0,
+                                            auction_max_gap=5.0, whole_lots=True,
+                                            with_benchmark=bench)
+                    _swr.put(_r._REC_SIM_CACHE, key, data, 12)
+                    print(f'[预热 {datetime.now():%H:%M:%S}] 回测曲线 bench={int(bench)} '
+                          f'缓存完成（{_time.time() - t0:.1f}s）')
+                except Exception as e:
+                    print(f'[预热 {datetime.now():%H:%M:%S}] 回测曲线 bench={int(bench)} 预热失败: {e}')
+            try:
+                t0 = _time.time()
+                key = ('batch', 3, 100000.0, 5.0)
+                data = rec_sim_batch.simulate_batch(months=3, capital=100000.0,
+                                                    auction_max_gap=5.0)
+                _swr.put(_r._REC_SIM_CACHE, key, data, 12)
+                print(f'[预热 {datetime.now():%H:%M:%S}] 拆档回测缓存完成（{_time.time() - t0:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] 拆档回测预热失败: {e}')
+
+            # 2) 复盘汇总（30 / 120 两档）+ 历史推荐
+            for days in (30, 120):
+                try:
+                    t0 = _time.time()
+                    data = recommend_review.get_review_summary(days)
+                    _r._remember_rec_review(days, data, _time.time())
+                    print(f'[预热 {datetime.now():%H:%M:%S}] 复盘汇总 days={days} '
+                          f'缓存完成（{_time.time() - t0:.1f}s）')
+                except Exception as e:
+                    print(f'[预热 {datetime.now():%H:%M:%S}] 复盘汇总 days={days} 预热失败: {e}')
+            try:
+                t0 = _time.time()
+                payload = _aio.run(_r._build_daily_recs_payload())
+                _r._DAILY_RECS_CACHE.update(ts=_time.time(), payload=payload)
+                print(f'[预热 {datetime.now():%H:%M:%S}] 历史推荐记录缓存完成（{_time.time() - t0:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] 历史推荐预热失败: {e}')
+
+            # 3) 资金流快照（外部源冷算 6.7s；休市时服务内部会优先用 DB 收盘快照）
+            try:
+                from services.data.fundflow import get_fund_flow_summary
+                t0 = _time.time()
+                _aio.run(get_fund_flow_summary(
+                    stock_top_n=FUND_FLOW_STOCK_TOP_N, sector_top_n=FUND_FLOW_SECTOR_TOP_N,
+                    change_threshold=FUND_FLOW_HIDDEN_CHANGE_THRESHOLD,
+                    hot_top_n=FUND_FLOW_HIDDEN_HOT_TOP_N, hidden_top_n=FUND_FLOW_HIDDEN_TOP_N))
+                print(f'[预热 {datetime.now():%H:%M:%S}] 资金流快照缓存完成（{_time.time() - t0:.1f}s）')
+            except Exception as e:
+                print(f'[预热 {datetime.now():%H:%M:%S}] 资金流预热失败（首开会现算）: {e}')
+        except Exception as e:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 重计算预热整体失败（不致命）: {e}')
+    threading.Thread(target=_prewarm_heavy, daemon=True, name='prewarm-heavy').start()
 
     def job_update_hot_search_ranking():
         asyncio.run(update_hot_search_ranking_task())
@@ -338,7 +562,16 @@ def run_scheduler():
         # 为避免浪费，非交易日跳过
         if not _today_is_trading():
             return
-        asyncio.run(scan_trend_task())
+        # 2026-11-04 修复（数据整天冻结）：调度器跑在**独立线程**，原来用 force=False 调用会命中
+        # stale-while-revalidate 分支——那一支立即返回旧数据，把重扫挂到 `asyncio.create_task` 上，
+        # 而任务挂在本函数 `asyncio.run` 的**临时 loop** 上：asyncio.run 一返回就把它取消，
+        # **扫描没跑完就不会落库**。实测证据：`server_supervised.log` 里当天 12 条"缓存过期…已启动后台
+        # 重扫"（没有一条"已在跑"），而 age 每 30 分钟单调增长 1776s→14372s，说明每次都真的起了任务、
+        # 只是从没跑完 → 当天数据冻结在第一次扫描（09:00:31）。注意 `_swr_refresh_inflight` 本身没有
+        # 卡死：asyncio.run 收尾会取消挂起任务并执行它的 finally，探针与上面那 12 条日志都印证标志正常复位，
+        # 所以别按"标志卡住"去排查。调度器的职责本就是按时刷新落库，这里直接 force=True 现扫：
+        # 跑在本线程 loop 上、扫完即落库刷新，不再依赖后台任务。
+        asyncio.run(scan_trend_task(force=True))
 
     def job_trend_backtest():
         if not _today_is_trading():
@@ -398,6 +631,23 @@ def run_scheduler():
                       f"上午 {w.get('recCountAm')} 条 / 下午 {w.get('recCountPm')} 条）")
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 拆档回测落库失败: {e}')
+
+    def job_exit_seal_shadow():
+        """出口分叉影子落库（2026-11-05，影子台账第 15 条）：把当天推荐的三条出口
+        （拿隔夜 / 当日收盘走 / "封住拿隔夜、没封住当天走"）各算一遍存 exit_seal_shadow。
+        **只记录**——不改出口文案、不改推送、不改门槛。
+        排 20:35：当天日K 18:15~20:15 分五批同步，20:30 那条拆档回测也确认了这个前提；
+        再早就会把当天名单整批判成"缺当日K"。真缺了也不要紧，模块里两条腿都留 NULL
+        并在下一轮自愈回补（`close_ret_pct IS NULL OR next_open_ret_pct IS NULL` 都捞）。"""
+        try:
+            from services.pick import exit_seal_shadow as _ess
+            if not _ess.enabled():
+                return
+            r = _ess.run_daily()
+            if r.get('error'):
+                print(f"[出口分叉影子] 未落库: {r['error']}")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 出口分叉影子落库失败: {e}')
 
     def job_sector_persistence():
         """板块持续性预热（2026-10-22，主线判定的分母）。
@@ -473,6 +723,45 @@ def run_scheduler():
             print(f'[财联社板块] 收盘落库 {plates} 行')
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 财联社板块落库失败: {e}')
+
+    def job_sentiment_final():
+        """情绪收盘定版落库（2026-11-03，#11 减仓回测的前置）。
+
+        把"当天的最终档位"写成 `sentiment_final_daily` 一行（一天一行、幂等）。
+        只新增旁路留痕，**不改任何现有读取路径**——页面与行动台仍走原来的读时兜底，
+        所以这一步对线上表现零影响。
+        15:30 抓一次（收评 15:10 已生成、优化器 15:35 之前），16:05 再试一次当重试：
+        `persist_final_snapshot` 内部宁缺不假（当天既无当日收评也无当日快照就不写），
+        所以重复跑无害，也不会拿昨天的档位顶替今天。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            from services.strategy.sentiment import persist_final_snapshot
+            r = persist_final_snapshot()
+            if not r.get('written'):
+                print(f'[情绪定版] 本轮未落库：{r.get("reason")}')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 情绪定版落库失败: {e}')
+
+    def job_index_daily():
+        """大盘指数日线落库（2026-11-03，#12 抗跌因子的前置）。
+
+        把上证/深成/创业板指/沪深300 的日K落到本地 `index_daily`（腾讯 fqkline，
+        一次可取 700 根，所以首次就能回填全历史）。只新增本地表、不改任何现有读取路径——
+        现在读指数的地方仍读它自己的 kline_cache，切过来是下一步的事。
+        单只指数失败不影响其他（sync_all 内部逐只 try）。仅交易日跑。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            from services.data.index_daily import sync_all
+            r = sync_all()
+            if r.get('disabled'):
+                return
+            print(f'[指数日线] 本轮写入 {sum(v for v in r.values() if isinstance(v, int))} 行')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 指数日线同步失败: {e}')
 
     def job_shadow_eval_daily():
         """影子对照日常监控（2026-10-18，实施计划"工具：影子对照脚本"）：
@@ -855,6 +1144,18 @@ def run_scheduler():
                 print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库同步后 RPS 刷新完成：{res}')
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ RPS 向量化刷新异常: {e}')
+        # 流动性统计跟着日K走（2026-11-04）：日K刚写进来，20 日窗口就该换新一天，否则保活兜底
+        # 最长要 6 小时才补——选票范围的"流动性"那层会整天停在昨天的窗口上。单独一段 try：
+        # 它失败只让范围变旧，不拖住日K同步的结论（与上面的 RPS、下面的名录同法）。
+        try:
+            from services.data import liquidity as _liq
+            _t = time.time()
+            _n = len(_liq.stats_map(force=True))
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地日K同步后 流动性统计刷新完成：'
+                  f'{_n} 只（{time.time() - _t:.1f}s）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 流动性统计刷新异常'
+                  f'（选票范围会用旧窗口，最长到保活兜底 6 小时）: {e}')
         # 名录（代码→名称、在市/退市、ST 标记）每天跟着刷一次：股票范围里"剔除 ST/*ST"
         # 完全依赖这张表，而 ST 帽子是随时戴随时摘的 —— 名录过期就等于范围失效。
         # 单独一段 try，且放在新鲜度自检之前：它失败只让范围变旧，不该拖住日K同步的结论。
@@ -998,6 +1299,9 @@ def run_scheduler():
     # 当天名单才不会被判"无当日K线"；落 rec_sim_batch_daily
     schedule.every().day.at('20:30').do(_warp_trading_only(job_rec_sim_batch_daily))
 
+    # 出口分叉影子（2026-11-05，台账第 15 条）：同样必须排在日K五批（18:15~20:15）之后
+    schedule.every().day.at('20:35').do(_warp_trading_only(job_exit_seal_shadow))
+
     # 板块持续性预热（2026-10-22，主线判定的分母）：09:05 供盘前用、20:25 收当天
     schedule.every().day.at('09:05').do(_warp_trading_only(job_sector_persistence))
     schedule.every().day.at('20:25').do(_warp_trading_only(job_sector_persistence))
@@ -1070,6 +1374,13 @@ def run_scheduler():
     # 财联社题材梯队（2026-10-31，影子）：15:10 收盘定版落库，15:45 跟着主题链一起重试
     schedule.every().day.at("15:10").do(job_cls_ladder_sync)
     schedule.every().day.at("15:45").do(job_cls_ladder_sync)
+    # 情绪收盘定版（2026-11-03，#11 减仓回测的前置）：15:30 抓一次、16:05 重试一次（仅交易日）。
+    # 只写旁路表 sentiment_final_daily，不改任何读取路径；一天一行幂等，重复跑无害。
+    schedule.every().day.at(SENTIMENT_FINAL_SNAPSHOT_TIME).do(job_sentiment_final)
+    schedule.every().day.at("16:05").do(job_sentiment_final)
+    # 大盘指数日线（2026-11-03，#12 前置）：15:15 收盘后同步（收评 15:10 后、回测 15:20 前，仅交易日）。
+    # 一次可取 700 根，首日即回填全历史；只写本地新表，不改现有读取路径。
+    schedule.every().day.at(INDEX_DAILY_SYNC_TIME).do(job_index_daily)
 
     # 企业微信选股推送：开盘前 9:25 推送今日关注池预览（仅交易日）
     schedule.every().day.at(WECOM_PUSH_PREVIEW_TIME).do(job_push_daily_preview)
@@ -1099,6 +1410,8 @@ def run_scheduler():
           f'一切"放宽/多推"提案的验收基线）')
     print(f'[定时任务]   - 20:30: 上午档/下午档拆批次回测（名单从 strategy_snapshot 还原，'
           f'落 rec_sim_batch_daily；10-19 起才有快照）')
+    print(f'[定时任务]   - 20:35: 出口分叉影子落库（当天推荐算三条出口：拿隔夜/当日收盘走/分叉，'
+          f'落 exit_seal_shadow；只记录，不改出口文案与推送）')
     print(f'[定时任务]   - 09:05/20:25: 板块持续性预热（本地日K×行业聚合近10日收益，'
           f'主线判定的分母，落 sector_persistence_daily）')
     print(f'[定时任务]   - {INDUSTRY_SYNC_WEEKDAY} {INDUSTRY_SYNC_TIME}: 行业分类周更'
@@ -1135,6 +1448,18 @@ def run_scheduler():
     print(f'[定时任务]   - 盘中 09:15~15:05 每180秒: 短线情绪温度计刷新（涨停池/炸板池/跌停池/宽度→周期+主线板块，仅交易日）')
     print(f'[定时任务]   - 盘中 09:40~15:05 每300秒: 动态热门板块链跟随（财联社板块榜→行动台前3链，仅交易日）')
     print(f'[定时任务]   - 15:12 / 15:47: 重建动态链 + 主题链成分当日OHLC落库（板块榜15:10之后，仅交易日）')
+    # 下面四条是 2026-11-03 新加的。清单是硬编码 print（不是遍历 schedule.get_jobs()），
+    # 所以**注册了就必须在这里补一行**，否则日志清单与实际不符、排查时会以为没挂上。
+    # 时刻一律引用常量，避免改了 config 这里还在写死旧值。
+    print(f'[定时任务]   - {SENTIMENT_FINAL_SNAPSHOT_TIME} / 16:05: 情绪收盘定版档位落库'
+          f'（sentiment_final_daily，仅交易日；#11 回测前置——此前"当天最终档位"从来没落过库）')
+    print(f'[定时任务]   - {INDEX_DAILY_SYNC_TIME}: 大盘指数日线同步（index_daily，4 指数×700 根，'
+          f'仅交易日；只写本地新表，不改现有读指数的路径）')
+    print(f'[定时任务]   - 盘中 09:10~15:10 每60秒: 写锁哨兵探测（独立连接试 BEGIN IMMEDIATE，'
+          f'等超阈值推企微；开关 db_lock_sentinel_enabled，拿到锁立刻回滚、自己不持锁）')
+    print(f'[定时任务]   - 盘中持仓快反每{POSITION_WATCH_INTERVAL_SEC}秒附带: 情绪减仓影子'
+          f'（exit_signal_log，退潮/冰点按先验比例算"该减多少"，**不执行**；'
+          f'EXIT_SENTIMENT_SHADOW_ENABLED）')
     print(f'[定时任务]   - 盘中 {POSITION_WATCH_START}~{POSITION_WATCH_END} 每{POSITION_WATCH_INTERVAL_SEC}秒: 持仓止损/止盈/炸板快反推送（仅交易日，避开竞价与午休）')
     print(f'[定时任务]   - 盘中 {INTRADAY_DRAGON_START}~{INTRADAY_DRAGON_END} 每{INTRADAY_DRAGON_INTERVAL_SEC}秒: '
           f'龙头通道分钟级形态打分（仅交易日；'
@@ -1163,6 +1488,8 @@ def run_scheduler():
     _last_chain_ts = 0.0
     # 盘中龙头通道（2026-11-01）：独立于 60s 主推送，开盘后 09:31~10:15 用更密的节奏看形态
     _last_dragon_ts = 0.0
+    # 盘中写锁哨兵（2026-11-03）：每分钟探一次，独立 try 隔离，坏了不拖累推送与自愈
+    _last_lock_sentinel_ts = 0.0
 
     while True:
         try:
@@ -1185,6 +1512,22 @@ def run_scheduler():
                         asyncio.run(push_candidates_task())
                     except Exception as push_err:
                         print(f'[定时任务 {_now:%H:%M:%S}] 选股推送异常: {push_err}')
+
+            # ---- 盘中写锁哨兵（2026-11-03）----
+            # 独立连接试 BEGIN IMMEDIATE，等超阈值仍拿不到写锁就推企微，并附上「主库距最后一次
+            # 成功写入几分钟」与最近任务锚点。为什么要有它：11-03 那次锁从 15:20 就坏了，用户
+            # 16:5x 打不开页面才发现，定位又花约两小时、中间还误判过一次。哨兵改的是**发现时间**
+            # 和**起点信息**，不替人处理。它拿到锁立刻 ROLLBACK，自己不会变成新的持锁者。
+            # 只在盘中跑：收盘后锁竞争的表现是页面慢，用户自己会撞上，不值得为它发告警；
+            # 盘中错过 09:45 / 14:45 批次才是真损失。整块单独 try 隔离，异常不拖累推送与自愈。
+            if _hm >= '09:10' and _hm <= '15:10' and _today_is_trading():
+                if time.time() - _last_lock_sentinel_ts >= 60:
+                    _last_lock_sentinel_ts = time.time()
+                    try:
+                        from services.ops.db_sentinel import check_and_alert as _lock_sentinel
+                        _lock_sentinel()
+                    except Exception as _ls_err:
+                        print(f'[定时任务 {_now:%H:%M:%S}] 写锁哨兵异常（已隔离，不影响其它任务）: {_ls_err}')
 
             # ---- 盘中龙头通道（2026-11-01，默认关；T2.7 接频率状态机）----
             # 与上面的 60s 主推送完全分开：只做分钟级形态打分，影子期写 intraday_dragon_shadow。

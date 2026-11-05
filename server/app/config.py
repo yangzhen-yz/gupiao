@@ -5,6 +5,27 @@ from datetime import datetime
 # ========== 数据库配置 ==========
 SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'gupiao.db')
 
+# ---- 写锁分级（2026-11-03）----
+# 背景：get_db_conn() 用 isolation_level='IMMEDIATE' + busy_timeout=30000，而 WAL 同时只允许
+# 一个写者。2026-11-03 实测：回测补验在事务里等外部 K 线，把写锁占了 1 小时以上，期间连
+# /api/health 都要排队 8~30 秒（X-Process-Time 只有 1~2ms，耗时全在中间件之前）。根治办法是
+# 别在事务里等 IO（已改），但锁竞争还会以别的形态出现（多个定时任务同时写），所以这里顺手把
+# **失败方式**改掉：缓存类写入抢不到锁就快速失败（读侧有旧数据兜底，丢一次下次重拉），
+# 留痕类继续长等（strategy_snapshot / 推荐批次 / 用户持仓这类写失败就是永久丢行）。
+# 为什么不走 app_settings 覆盖表：app_settings.py 顶层就 `from db.database import get_db_conn`，
+# 它的 value() 自己要用数据库连接——接进来会无限递归。所以这两项**改完要重启后端**才生效
+# （写 server/data/backend_restart_requested 让看护重启），配置页里看不到它们是有原因的。
+DB_FAST_FAIL_ENABLED = True            # 总开关。False=所有写入仍用 30000ms，逐字节等于改造前
+DB_CACHE_WRITE_BUSY_TIMEOUT_MS = 2000  # 缓存/快照类写入的 busy_timeout（毫秒），留痕类不受影响
+
+# ---- 盘中写锁哨兵（2026-11-03）----
+# 独立连接试 BEGIN IMMEDIATE，等超阈值就拿不到 → 推企微，附"最后写入几分钟前 + 最近任务锚点"。
+# 这三项已接进 app_settings 覆盖表（配置页「数据库与写锁」，live=True 可盘中热改），
+# 这里是厂默认值。哨兵拿到锁会立刻 ROLLBACK，它自己不会变成持锁者。
+DB_LOCK_SENTINEL_ENABLED = True        # 关掉=完全不探测、不推送
+DB_LOCK_SENTINEL_THRESHOLD_SEC = 2     # 等超过这么多秒仍拿不到写锁就告警（1~10）
+DB_LOCK_SENTINEL_COOLDOWN_MIN = 10     # 同一状态多久内只推一次，防刷屏（1~60）
+
 # ========== API 地址配置 ==========
 TENCENT_QUOTE_API = 'https://qt.gtimg.cn/q='
 TENCENT_KLINE_API = 'https://ifzq.gtimg.cn/appstock/app/fqkline/get'
@@ -38,13 +59,26 @@ FUND_FLOW_SECTOR_TOP_N = 30         # 板块（行业/概念）净流入/净流�
 FUND_FLOW_HIDDEN_CHANGE_THRESHOLD = 3.0   # “非热点但上涨不错”的最低涨幅阈值（%）
 FUND_FLOW_HIDDEN_HOT_TOP_N = 30     # 排除热搜榜前 N 名（视为“近期热点”）
 FUND_FLOW_HIDDEN_TOP_N = 50         # “非热点上涨股”最多返回 N 只
-FUND_FLOW_CACHE_TTL = 20            # 资金流向汇总接口内存缓存有效期（秒）
+FUND_FLOW_CACHE_TTL = 20            # 资金流向汇总接口内存缓存有效期（秒）——按设计**只该管盘中**
+FUND_FLOW_CLOSED_CACHE_TTL = 7200   # 收盘后的内存缓存有效期（秒，2 小时），与 fundflow._STALE_AFTER_SEC 对齐。
+                                    # 不写成"无限"的两个理由：盘后资金流仍有修正数据；以及收盘后第一次
+                                    # 取到的可能是盘中某一刻的数，2 小时后该重新走一遍取数判新鲜
+FUND_FLOW_CACHE_TTL_FIX = True      # 2026-11-03 修「盘中/收盘后判据写反」的总开关。
+                                    # False＝逐字节回到改造前（含盘中 TTL 不生效那个症状），见 fundflow.py 命中判断处
 
 
 # ========== 扫描配置 ==========
 SCAN_CONCURRENCY = 25  # 扫描并发数
 SCAN_KLINE_TIMEOUT = 12.0  # 扫描K线超时时间
 SCAN_CACHE_TTL = 300  # 扫描缓存过期时间（秒）默认300秒
+# stale-while-revalidate（2026-11-03）：内存缓存是**今天的**但已过 TTL 时，不再让打开趋势页的
+# 用户同步扛一轮现扫——实测现扫 6.6 / 17.8 / 41.7 秒（取决于外部行情源快慢），且扫描期间
+# 事件循环被占，并发实验实测连 /api/health 都被拖到 4.8 秒。改成先返回旧数据（带 stale 标记
+# 与 scanAt 扫描时刻，前端可见）+ 后台起一轮重扫。
+# 注意 TTL(300s) 与定时扫描周期(1800s，09:00~15:00)本来就不匹配 → 一天里只有约 17% 的时间
+# 缓存算"新鲜"，其余时间打开页面都要现扫；这也是为什么单靠延长 TTL 治不了收盘后的场景。
+# 关掉本开关 = 逐字节回到改造前（过期即同步现扫）。
+TREND_STALE_WHILE_REVALIDATE = True
 
 # 2026-10-24（性能）：asyncio.to_thread 全项目共用 asyncio 默认线程池
 # （min(32, CPU+4)，本机 12 核 = 16 线程），而趋势扫描并发 25、每票至少占
@@ -649,6 +683,9 @@ RECOMMEND_TREND_STALE_FACTOR = 0.4         # 打折系数（97.6分→39分，�
 # （5 日超额 +0.12pp）。只落 strategy_snapshot 影子列、不改候选/分数/门槛；
 # 攒 20 个交易日后按可成交净期望 + 最深回撤与修②同批裁决。
 RECOMMEND_REV20_SHADOW_ENABLED = True
+# 复盘汇总接口缓存（2026-11-03 第3步）：原来每次现算 0.32~0.81 秒，且同步函数直接调、
+# 全程压在事件循环上。开=TTL 600 秒命中返缓存 + 未命中走 to_thread；关=逐字节等于改造前。
+RECOMMEND_REVIEW_CACHE_ENABLED = True
 
 # ========== 死猫反弹趋势门控（2026-10-13，修"下跌趋势短暂反弹股评分高于趋势良好股"） ==========
 # 根因：① calc_stock_score_v2 多数调用点(单票评分/持仓/趋势扫描/扫描)未传 trend_result，
@@ -798,6 +835,7 @@ WECOM_PUSH_SCAN_RECOMMEND_POOL = True   # False 就退回"只扫用户池"的老
 WECOM_PUSH_POOL_TOP_N = 60              # 海选池按 20 日强度取前 N 只并入（控制单轮耗时）
 WECOM_PUSH_REC_TOP_N = 5                # 再把当日已生成推荐的前 N 只一起盯（它们可能还在涨）
 WECOM_PUSH_DAILY_LIMIT = 6              # 达标推送每天最多几只票（与持仓快反的额度分开算）
+WECOM_OPS_NOTIFY_DAILY_LIMIT = 2       # 运维通知类（服务重启/自愈/隧道拉起）每天最多推几条；页面用 ops_notify_daily_limit 可调（live 即时生效）
 # 命中这些矩阵档位就不推（2026-10-16 分钟矩阵实测的明确负期望档）；
 # "当天不追/不接力"只做标注不删，避免又变成一个没人知道的黑箱否决。
 WECOM_PUSH_MATRIX_VETO = ('排除', '减仓日')
@@ -1039,6 +1077,50 @@ AUCTION_SNAPSHOT_BATCH = 60          # 每批代码数；腾讯 URL 不宜过长
 MINUTE5_FORWARD_ENABLED = False
 MINUTE5_FORWARD_TIME = '15:05'
 
+# ========== 大盘指数日线本地化（2026-11-03，#12 抗跌因子的前置）==========
+# 本地原本一个指数都没有：history_kline.db.stock_daily 的 symbol 全是 6 位个股纯代码，
+# 上证指数只能靠主库 kline_cache 里 200 根、每次现拉外部源的 JSON。没有本地指数日线，
+# "相对大盘回撤"就只能每次请求走网络——和资金流那个 9 秒是同一类毛病。
+# 源：腾讯 web.ifzq.gtimg.cn/appstock/app/fqkline/get（2026-11-03 实测可用，一次可取 700 根，
+# 所以首日就能回填全历史，不必像板块表那样干等攒数）。
+INDEX_DAILY_ENABLED = True
+INDEX_DAILY_BARS = 700              # 每次取多少根（700 ≈ 本地个股日K的 685 个交易日，对齐便于联算）
+INDEX_DAILY_SYNC_TIME = '15:15'     # 收盘后同步（收评 15:10 之后、回测 15:20 之前，仅交易日）
+
+
+# ========== 情绪减仓影子（2026-11-03，#11）==========
+# 情绪进入坏周期（退潮/冰点）时，给每个持仓算一条"该减多少"落 exit_signal_log，
+# **不执行、不改推送、不参与任何现有判定**——只攒对照数据，≥20 个交易日后再裁决要不要接进动作链。
+# 按本仓惯例，"只记录类"影子默认开（同 RECOMMEND_REV20_SHADOW_ENABLED / 四维影子闸门）；
+# 关掉 EXIT_SENTIMENT_SHADOW_ENABLED 时一个信号都不落，逐字节等于改造前。
+EXIT_SENTIMENT_SHADOW_ENABLED = True
+# 减仓比例是**先验值、未做参数寻优**（用户心法：情绪差先降敞口，但减多少没实测依据）。
+# 冰点减一半、退潮减三成；A股卖出按手取整（floor 到 100 股），不足一手记 0 并写明原因。
+EXIT_SENTIMENT_REDUCE_RATIO = {'冰点': 0.5, '退潮': 0.3}
+
+
+# ========== 情绪收盘定版（2026-11-03）：#11 减仓回测的前置 ==========
+# 现状：盘中快照每 300 秒落一行 market_sentiment_snapshots，但**当天最终档位从来没有落过库**——
+# `final` 只是 payload 里的一个字段、盘中恒 False，收盘定版靠 _fallback_from_review(final=True)
+# 在**读时**兜底。结果是 #11 想回测"情绪转弱那天该减多少"时，找不到一行可信的当日定版。
+# 为什么单独一张表而不往 snapshots 加 final 列：那张表主键是 (sent_date, ts)，且
+# _latest_live_snapshot 按 ts 取最新——塞定版行进去会被当成"最新盘中快照"读出来
+# （'FINAL' 这类字符串按 ASCII 排序比时间戳大），等于直接改变现有页面行为。
+# 独立表 = 盘中序列一行不动，本步只新增留痕、不改任何读取路径。
+SENTIMENT_FINAL_SNAPSHOT_ENABLED = True
+SENTIMENT_FINAL_SNAPSHOT_TIME = '15:40'   # 首版排 15:30，撞上已有的"15:30 趋势评分回测"，改到 15:40
+                                          # （15:05/15:10 收评/15:12/15:20 回测/15:30/15:35/15:45/15:47
+                                          # 都有任务，15:40 是唯一空档；重试仍留 16:05）
+
+
+# ========== 持仓交易流水（2026-11-03）：卖出侧三条主线的回测地基 ==========
+# 只追加、不参与任何决策读取，写入失败只打一行日志。关掉后一行都不写，逐字节等于改造前。
+# 为什么现在必须有：#11 该减多少 / #12 抗跌阈值 / #13 结构确认，三条的判据全靠"卖出之后的结果"，
+# 而 position_adjust.py 当初刻意不建流水表（note 是自由文本、还截断 200 字符），回放不出
+# "哪天买、成本多少、持有多少天"。表设计与 source 五种取值的口径见 db/database.py。
+POSITION_TRADE_LOG_ENABLED = True
+
+
 # ========== 卖出规则统一（2026-10-22）：影子先跑，实盘开关默认关 ==========
 # 三套止损（risk_control / position 分档 / review 明日计划）口径不一致是已知短板。
 # exit_rules 生成"固定/逻辑/时间"三机制的统一建议，先作为 exit_plan 影子字段展示；
@@ -1049,6 +1131,14 @@ EXIT_RULES_LIVE_ENABLED = False
 EXIT_RULES_TIME_STOP_DAYS = 5        # 持有满 N 个自然日仍没有 +3% 浮盈 → 时间止损提示
 EXIT_RULES_TIME_STOP_MIN_PNL = 3.0   # 时间止损的"及格线"（%）
 EXIT_RULES_LOGIC_MA_DAYS = 20        # 逻辑止损参考均线（收盘跌破 MA20）
+
+# ========== 出口分叉影子（2026-11-05，影子台账第 15 条 exit_seal_split）==========
+# 每天 20:35 把当天推荐的三条出口结果各算一遍落 `exit_seal_shadow`：①拿到次日开盘（现状默认）
+# ②当日收盘就走 ③分叉"封住就拿隔夜、没封住当天收盘走"。样本内实测（201 条/91 交易日，成本=推荐当时的价，
+# 双边 0.13%）净口径 ①+0.23% t=1.22 / ②−0.26% / ③+0.68% t=3.17，且③把"亏超 5%"从 9.0% 压到 4.5%。
+# **不执行、不改出口文案、不改推送**——只攒前向对照，≥20 个交易日后按 `evaluate()` 的判据裁决。
+# 关掉 EXIT_SEAL_SHADOW_ENABLED 时一个字段都不写，逐字节等于改造前。
+EXIT_SEAL_SHADOW_ENABLED = True
 
 # ========== 自动优化目标 C（2026-11-01 T1.3）：可回滚 ==========
 # v2 = 验证窗 D5−D1 分位差改善 pp + 强制 walk-forward + 连续负向回落；
@@ -1171,6 +1261,21 @@ LIQ_AMOUNT_ENABLED = True          # 日均成交额
 LIQ_TURNOVER_ENABLED = True        # 日均换手率
 LIQ_PRICE_ENABLED = True           # 最低股价
 LIQ_STATS_WINDOW = 20              # 统计窗口：近 20 个交易日（与用户口径一致）
+# 流动性统计（stats_map）的重算节奏（2026-11-04 改）
+# 它的输入是本地日K `stock_daily`（实测 346.5 万行，索引只有 (symbol,date)），
+# 一次 force 重算单独计时 **14.9 秒**；而此前调度器每 9 分钟的保活循环里都无条件 force 重算，
+# 线上日志实测那一行是 **12~170 秒**（长尾=与每 20 秒的推送扫描/日K同步抢资源）。
+# 可是日K只在收盘后才变——盘中重算 100% 是白算，代码里 `_STATS_TTL` 的注释自己都写着
+# "一天只随行情变一次"。现在保活循环只在"距上次刷新超过兜底上限"时才重算，
+# 正常路径改为**日K同步完成后立刻刷一次**（见 core/scheduler.py::job_sync_history）。
+# `LIQ_STATS_KEEPWARM_FORCE=True` 逐字节回到"每轮都 force"。
+LIQ_STATS_KEEPWARM_MAX_AGE_SEC = 21600   # 保活兜底上限 6 小时：同步钩子失灵时最迟 6 小时补一次
+LIQ_STATS_KEEPWARM_FORCE = False
+# 启动/保活那步"universe 选票范围缓存完成"线上实测 190.2s（15:11 那次）与 751.1s（15:27 那次），
+# 而进程外单独计时同样这几层只有 ~15 秒——差值要么在某一层的冷缓存装载，要么在排队等资源。
+# 下面这个阈值只控制"总耗时超过多少秒才打一行分段耗时"，纯观测、不参与任何判定；
+# 设成很大（如 99999）就是完全静音。
+UNIVERSE_STEP_LOG_SEC = 5.0
 LIQ_MIN_AVG_AMOUNT = 8e7           # 日均成交额下限（元）= 8000 万
 LIQ_MIN_AVG_TURNOVER_PCT = 1.5     # 日均换手率下限（%）
 LIQ_MIN_PRICE = 3.0                # 最新收盘价下限（元）；前复权最后一根 = 实盘价
@@ -1242,6 +1347,18 @@ SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC = 21600
 # 备源给不了连板梯队/炸板/昨日溢价，快照会如实标 gap 并 stale（只提示不否决）。
 # 关掉即回到"东财挂→直接退快照/收评"的旧行为。
 SENTIMENT_ALT_FALLBACK = True
+# 快照落库的 stale 判据（2026-11-04 修，用户"大盘这么好为什么没推"顺带查出）：
+# `_maybe_save` 原来写的是"stale 一律不落库"。这条禁令的本意是防**沿用旧值**把当天
+# live 行覆盖掉（`_latest_live_snapshot` 兜底读的是 stale=0 的行）——但它连"数字是此刻
+# 采的、只是某一维取不到"一起拒了：东财涨停池取不到时主路 `stale=not zt_pool` 为真，
+# 新浪备源（11-03 接线）返回也固定 `stale=True`。东财连续两天不可用 ⇒
+# `market_sentiment_snapshots` 11-03/11-04 **两天 0 行**（最后一条停在 11-02 13:01），
+# 盘中情绪档的审计链整段断了，11-03 新加的"情绪减仓影子"读的就是这个档位。
+# 现在按来源分面：`SENTIMENT_SNAPSHOT_FRESH_SOURCES` 里的是"当场采集"（intraday 主路、
+# alt_source 备源），stale 也落库；不在里面的（snapshot_fallback / snapshot_final /
+# review_fallback，都是复用旧值）继续拒绝。开关关掉＝逐字节回到"stale 一律不落库"。
+SENTIMENT_SNAPSHOT_SAVE_STALE_FRESH = True
+SENTIMENT_SNAPSHOT_FRESH_SOURCES = ('intraday', 'alt_source')
 SENTIMENT_ZT_POOL_PAGESIZE = 600      # 涨停池单页拉取上限（全市场涨停极少超过此数）
 SENTIMENT_PREMIUM_MAX_CODES = 200     # 昨日涨停溢价最多查多少只（与 review 口径一致）
 # 情绪周期 → 精选推荐最低分：改门槛而非改扣分，纪律不该被其他因子平均掉

@@ -104,6 +104,28 @@ def _window_dates(conn, n: int) -> List[str]:
         'SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT ?', (n,)).fetchall()]
 
 
+def last_stats_ts() -> float:
+    """`_STATS` 最后一次重算完成的时刻（0.0 = 从未算过）。"""
+    return _STATS_TS
+
+
+def should_keepwarm_refresh(now: float, last_ts: float, max_age_sec: float,
+                            force_flag: bool) -> bool:
+    """保活循环这一轮要不要 force 重算流动性统计。抽成纯函数是为了能被自测直接跑，
+    而不是在测试里另抄一遍条件表达式。
+
+    `force_flag=True` 时无条件刷新——那是 2026-11-04 之前的行为，留作一键回滚。
+    否则只在"距上次刷新超过 max_age_sec"时刷新：日K每天收盘后才变，正常路径由
+    `job_sync_history` 同步完成后立刻刷，这个兜底负责"同步钩子没跑成"的日子。
+    `last_ts=0`（进程刚起、从没算过）必然刷新。
+    """
+    if force_flag:
+        return True
+    if not last_ts:
+        return True
+    return (now - last_ts) >= max_age_sec
+
+
 def stats_map(force: bool = False) -> Dict[str, Dict[str, float]]:
     """{裸码: {'amount': 日均成交额元, 'volume': 日均成交量股, 'price': 最新收盘}}"""
     global _STATS, _STATS_TS
