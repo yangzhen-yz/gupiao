@@ -1056,7 +1056,10 @@ REC_SIM_MAX_EXPOSURE_PCT = 0.60     # 同日总敞口上限（持仓＋当天新
 # 拿三五天的差集去改线上门槛，等于用噪声做决策 —— 不足天数只报数、不给结论。
 SHADOW_EVAL_ENABLED = True
 SHADOW_EVAL_TIME = '16:25'
-SHADOW_EVAL_MIN_DAYS = 10            # 少于 10 个交易日不下结论（10-14 上线，10-30 窗口闭合）
+# 2026-11-05 调整：原 10 天门槛导致 13 期全「样本不足」、闸门空转（realKeptDays 仅 4~7）。
+# 降到 5 天让闸门能出结论，但同步在 verdict 里附 n 与 95% 置信区间（见 shadow_eval._verdict/summarize），
+# 把"低样本"如实标注为「低(参考)」级，不让小样本被当成定论。两组事件数仍各自 ≥ MIN_EVENTS(20)。
+SHADOW_EVAL_MIN_DAYS = 5             # 少于 5 个「有真放行名单」的交易日不下结论（10-14 上线，11-05 由 10 降至 5）
 
 # ========== 评估基座：因子体检（2026-10-22）==========
 # 每周六盘前跑一次本地日K体检，落 eval_lab_runs。只读 history_kline.db/gupiao.db，

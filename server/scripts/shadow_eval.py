@@ -19,7 +19,7 @@
     能凑齐就同时算这一列 —— 这才是"人真能成交的价"。快照价和复权序列对不上的行
     （|收盘/快照价-1| > 涨停幅度+1%）判为除权漂移，**从这一列剔除**并计数。
 
-样本不足时只报进度、不下结论：交易日数 < `SHADOW_EVAL_MIN_DAYS`（默认 10）时，
+样本不足时只报进度、不下结论：交易日数 < `SHADOW_EVAL_MIN_DAYS`（默认 5，2026-11-05 由 10 降至 5）时，
 输出里 `enough=False`、`verdict='样本不足'`，只打印"还差几个交易日"。
 影子每天只对分数前 15 只候选复算（`SHADOW_EVAL_POOL`），样本本来就攒得慢，
 拿 3 天的 5 次对比去决定要不要改线上门槛，是这个仓库最不能干的事。
@@ -46,6 +46,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
+import statistics
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -351,6 +352,27 @@ def summarize(events, gap, n_days, kept_src=None, min_days=None):
     real_days = len({e['date'] for e in base
                      if e['group'] == '影子放行' and e.get('src') == 'payload'})
     enough, verdict = _verdict(kc, ec, real_days, n_days, min_days)
+    # 置信区间 + 置信度（2026-11-05：降到 5 天的同时必须附 n 与区间，避免小样本被当结论）。
+    # 用「主口径次日收盘收益」的原始序列做两独立样本均值差的正态近似 95% CI。
+    kept_rc = [x['rc'] for x in by['影子放行'] if isinstance(x.get('rc'), (int, float))]
+    excl_rc = [x['rc'] for x in by['影子挡掉'] if isinstance(x.get('rc'), (int, float))]
+    ci_gap = None
+    if len(kept_rc) >= 2 and len(excl_rc) >= 2:
+        m1, s1, n1 = statistics.mean(kept_rc), statistics.stdev(kept_rc), len(kept_rc)
+        m2, s2, n2 = statistics.mean(excl_rc), statistics.stdev(excl_rc), len(excl_rc)
+        se = (s1 * s1 / n1 + s2 * s2 / n2) ** 0.5
+        diff = m1 - m2
+        ci_gap = [round(diff - 1.96 * se, 2), round(diff + 1.96 * se, 2)]
+    # 置信度随真实放行天数分级：MIN_DAYS=5 后 5~6 天仅「参考级」，不让它显得很稳
+    if real_days >= 10:
+        confidence = '高'
+    elif real_days >= 7:
+        confidence = '中'
+    else:
+        confidence = '低(参考)'
+    if enough and ci_gap is not None:
+        verdict = (f"{verdict}（n=放行{len(kept_rc)}/被挡{len(excl_rc)}，"
+                   f"差值95%CI [{ci_gap[0]:+.1f},{ci_gap[1]:+.1f}]%）")
     return {
         'available': bool(events),
         'days': n_days,
@@ -368,6 +390,10 @@ def summarize(events, gap, n_days, kept_src=None, min_days=None):
         'gap': dict(gap),
         'snapCoverage': sum(1 for e in events if e['hasSnap']),
         'verdict': verdict,
+        'confidence': confidence,
+        'ciGap': ci_gap,
+        'keptN': len(kept_rc),
+        'exclN': len(excl_rc),
         'gapAvg': round(kc['avg'] - ec['avg'], 2) if (kc and ec) else None,
         'gapWin': round(kc['win'] - ec['win'], 1) if (kc and ec) else None,
         'generatedAt': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -493,11 +519,18 @@ def print_report(d, as_json=False):
     if d.get('enough'):
         print(f'判定：{d["verdict"]}　放行-被挡 均值差 {d["gapAvg"]:+.2f}%、'
               f'胜率差 {d["gapWin"]:+.1f} 个百分点')
+        print(f'　置信度：{d["confidence"]}（放行 n={d["keptN"]} / 被挡 n={d["exclN"]}，'
+              f'差值 95%CI {d["ciGap"]}）')
         print('　（第1批 P0-2 的上线判据就是这一行；方向不支持就别上，代码留在原地等下一次窗口）')
     else:
-        print(f'样本不足：判定要求 {d["minDays"]} 个**有真放行名单**的交易日，'
-              f'现在 {d["realKeptDays"]} 个（窗口内共 {d["days"]} 个交易日有影子日志），'
-              f'还需 {d["needMore"]} 天 —— 只报数，不下结论。')
+        if d['realKeptDays'] < d['minDays']:
+            reason = (f'还需 {d["needMore"]} 个「有真放行名单」的交易日'
+                      f'（现 {d["realKeptDays"]}/{d["minDays"]}）')
+        else:
+            reason = (f'天数已够，但放行/被挡事件数各需 ≥{MIN_EVENTS}，'
+                      f'实得 放行{d["keptN"]}/被挡{d["exclN"]}（差值95%CI {d["ciGap"]}、'
+                      f'置信度{d["confidence"]}，仅作参考）')
+        print(f'样本不足：{reason} —— 只报数，不下结论。')
 
 
 def main():
