@@ -1,5 +1,5 @@
 """database.py - split from main.py"""
-import sqlite3, json, time
+import sqlite3, json, time, threading
 from typing import List, Dict, Optional
 from datetime import date, datetime, timedelta
 from app.config import SQLITE_DB_PATH, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_TREND_RESULTS_LIMIT, QUERY_MARKET_REVIEWS_LIMIT, HOT_SEARCH_TOP_N, HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS, DEFAULT_WEIGHTS
@@ -1100,6 +1100,30 @@ def _payload_hash(recs: List[Dict]) -> str:
     return hashlib.md5(json.dumps(slim, ensure_ascii=False).encode('utf-8')).hexdigest()
 
 
+# ========== 推荐表写版本（2026-11-05）==========
+# 背景：/api/daily_recommendations 的 SWR 缓存以前只有 POST/DELETE 两个**HTTP 写接口**
+# 会主动清档；定时批次（09:45/10:00/13:30/14:05/14:45）与手动生成都是直接从
+# services 层调 save_daily_recommendations 写库，缓存对此一无所知，只能等 300s TTL。
+# 11-05 实测事故：14:45 收盘前定稿已落库（漫步者/九阳股份/福莱新材），但当天首次
+# 打开推荐页时拿到的仍是昨晚构建的旧档（里面没有 11-05 记录），前端显示
+# "今日推荐尚未生成"，用户被迫手动点生成，反而把收盘前定稿覆盖掉了。
+# 修法：在 db 层给"推荐表被写过"计数，任何路径写成功都自增；缓存侧比对版本号
+# 与构建自然日，不一致立即重建。这样不用给 6 个调用方逐个打补丁，也不会漏。
+_DAILY_RECS_WRITE_VERSION = 0
+_DAILY_RECS_WRITE_LOCK = threading.Lock()
+
+
+def daily_recs_write_version() -> int:
+    """当前推荐表写版本号（进程内单调；缓存校验用，不落库）。"""
+    return _DAILY_RECS_WRITE_VERSION
+
+
+def _bump_daily_recs_write_version():
+    global _DAILY_RECS_WRITE_VERSION
+    with _DAILY_RECS_WRITE_LOCK:
+        _DAILY_RECS_WRITE_VERSION += 1
+
+
 def save_daily_recommendations(daily_recommendations: List[Dict],
                                batch_time: str = '', source: str = '') -> bool:
     """保存推荐（当日行覆盖）**并把这一批另存进 recommendation_batches**。
@@ -1171,6 +1195,7 @@ def save_daily_recommendations(daily_recommendations: List[Dict],
                 ))
         conn.commit()
         conn.close()
+        _bump_daily_recs_write_version()   # 2026-11-05：让读缓存立即知道"库被写过了"
         return True
     except Exception as error:
         print(f'保存推荐记录失败: {str(error)}')
@@ -1219,6 +1244,7 @@ def delete_daily_recommendations_by_date(rec_date: str) -> bool:
         deleted = cursor.rowcount
         conn.commit()
         conn.close()
+        _bump_daily_recs_write_version()   # 2026-11-05：删除同样是写，缓存不能继续用旧档
         if deleted:
             print(f'删除推荐记录: {rec_date}（{deleted} 行）')
         return True

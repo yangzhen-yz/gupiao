@@ -5,7 +5,7 @@ from typing import List, Dict, Optional
 import json, asyncio, time, re, inspect, threading, hashlib, gzip
 from datetime import date, datetime
 from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE, RECOMMEND_REVIEW_CACHE_ENABLED)
-from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records)
+from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records, daily_recs_write_version)
 from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk, detect_quote_source, quote_route_status)
 from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
 from services.strategy.trend import scan_trend_scan_results, scan_and_remove_below_ma10, calc_pool_stock_indicators
@@ -776,7 +776,11 @@ async def _build_daily_recs_payload() -> Dict:
 #   · 无旧档（冷启动/被写接口清掉）：同步算，这一次不可避免
 # generation：写接口清缓存时 +1，后台刷新完成时若 generation 已变（说明期间有新写入）
 # 则丢弃刷新结果，避免把用户刚保存/删除的档又被后台旧数据覆盖回去。
-_DAILY_RECS_CACHE: Dict = {'ts': 0.0, 'payload': None, 'generation': 0}
+_DAILY_RECS_CACHE: Dict = {'ts': 0.0, 'payload': None, 'generation': 0,
+                           'version': -1, 'built_date': ''}
+# version / built_date（2026-11-05）：分别兜住"库被定时批次写过但没人通知缓存"和
+# "跨天旧档里 isToday 标签已过期"两类静默错误。旧档缺当天记录时前端会显示
+# 「今日推荐尚未生成」——这正是 11-05 那次误判的成因，不能只靠 TTL 收敛。
 _DAILY_RECS_FRESH_TTL = 300.0          # 新鲜期秒数：历史推荐盈亏是分钟级信息量
 _DAILY_RECS_REFRESH_LOCK = threading.Lock()
 _DAILY_RECS_REFRESHING = False         # 防并发重复刷新（锁保护）
@@ -788,10 +792,42 @@ def _invalidate_daily_recs_cache():
         _DAILY_RECS_CACHE['payload'] = None
         _DAILY_RECS_CACHE['ts'] = 0.0
         _DAILY_RECS_CACHE['generation'] += 1
+        _DAILY_RECS_CACHE['version'] = -1
+        _DAILY_RECS_CACHE['built_date'] = ''
     # 复盘汇总（/api/recommend-review）的数据源就是这张表，同一批写入必须一起作废，
     # 否则手工生成/删除推荐后，复盘页还会拿旧档再显示一轮（10 分钟 TTL）。
-    # 定时批次（09:45~14:45）不走这里，和 _DAILY_RECS_CACHE 一样只靠 TTL 收敛。
+    # 定时批次（09:45~14:45）不经过 HTTP 写接口，改由 db 层写版本号 +
+    # 下方 _daily_recs_cache_valid() 统一兜住，不再只靠 TTL 收敛（2026-11-05）。
     _REC_REVIEW_CACHE.clear()
+
+
+def _daily_recs_cache_valid() -> bool:
+    """这份缓存档还能不能返给前端（2026-11-05）。
+
+    两个判据缺一不可：
+      · version  == db 层当前写版本：定时批次/手动生成/保存/删除后必须重建，
+        否则旧档里没有当天记录，前端会误显示「今日推荐尚未生成」；
+      · built_date == 今天：跨天后旧档里的 isToday 标签是昨天算的，会把昨天
+        的记录当成"今日推荐"（或反过来找不到今天），同样不能返。
+    """
+    if _DAILY_RECS_CACHE.get('payload') is None:
+        return False
+    try:
+        ver = daily_recs_write_version()
+    except Exception:
+        ver = -1
+    return (_DAILY_RECS_CACHE.get('version') == ver
+            and _DAILY_RECS_CACHE.get('built_date') == date.today().isoformat())
+
+
+def _stamp_daily_recs_cache(payload):
+    """写回缓存时记录"这份档对应哪个写版本 / 哪一天"。"""
+    try:
+        ver = daily_recs_write_version()
+    except Exception:
+        ver = -1
+    _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload,
+                             version=ver, built_date=date.today().isoformat())
 
 
 def _kick_daily_recs_refresh():
@@ -809,7 +845,7 @@ def _kick_daily_recs_refresh():
             payload = asyncio.run(_build_daily_recs_payload())
             with _DAILY_RECS_REFRESH_LOCK:
                 if gen == _DAILY_RECS_CACHE['generation']:
-                    _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload)
+                    _stamp_daily_recs_cache(payload)
                 else:
                     # 刷新期间发生了写入：丢弃本次结果，让下一个请求同步重建
                     pass
@@ -834,19 +870,20 @@ async def get_daily_recommendations():
     """
     now = time.time()
     cached = _DAILY_RECS_CACHE.get('payload')
-    if cached is not None:
+    if cached is not None and _daily_recs_cache_valid():
         age = now - _DAILY_RECS_CACHE['ts']
         if age < _DAILY_RECS_FRESH_TTL:
             return cached                      # 新鲜期：直接返
         _kick_daily_recs_refresh()             # 过期：返旧档 + 后台刷新
         return cached
-    # 冷启动或被写接口清档：同步算（唯一不可避免的等待路径）
+    # 冷启动 / 写接口清档 / 版本或自然日已变：同步重建（唯一不可避免的等待路径）。
+    # 2026-11-05：旧档失效时**绝不返旧档**——它缺当天记录，会骗用户去手动生成。
     try:
         payload = await _build_daily_recs_payload()
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取推荐记录失败: {str(error)}")
     with _DAILY_RECS_REFRESH_LOCK:
-        _DAILY_RECS_CACHE.update(ts=time.time(), payload=payload)
+        _stamp_daily_recs_cache(payload)
     return payload
 
 _REC_REVIEW_CACHE: Dict = {}         # {days: {'ts': 计算完成时刻, 'data': 汇总结果}}
