@@ -86,6 +86,13 @@ Settings → Branches → Add branch protection rule，分支名 `main`（然后
 
 **② 建分支、逐路径暂存、提交**
 
+> 前置：**全树清点（多人协作，强制）**。本项目多人／多会话共写同一个工作树，一次 push 是"全树事务"而不是"我这一路的事务"：
+> 先把 `git status --porcelain`、`git diff --stat`、`git log --oneline origin/main..HEAD` 三份一起看，列出工作树里**所有**改动路径
+> （包括不是我改的与未跟踪的），再逐路径按 `AGENTS.md`「入库范围」归属。本次清单里的路径必须在**同一次 push** 里全部落到远程
+> （可按主题拆成多笔提交），不许留"只推了 A、B 还挂在本地"的中间态；别人的半成品在 PR 描述里如实标归属，不冒充已完成。
+> 若工作树里存在别人的在建改动（M／?? 且不是本次范围），**不得对这些路径做 `switch` / `merge` / `rebase` / `stash`**，先与用户确认
+> ——2026-11-05 的实测事故：另一路会话把 HEAD 切回 `main` 提交重构，`git checkout` 静默收回了刚上线的模拟盘修复与其文档行。
+
 ```sh
 git fetch origin main
 git switch -c docs/<描述>          # 或 feat/ fix/

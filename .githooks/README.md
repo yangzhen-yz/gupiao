@@ -27,6 +27,7 @@ git config --local --unset core.hooksPath
 | B5 文档同步 | 改了 `server/**` 或 `client-vue/src/**` 但没暂存任何文档 | **只提醒**（不阻断） | 按 AGENTS.md 清单同步 5 份文档 |
 | B6 事务持锁 | 本次**新增行**落在"同一函数体内第一条 DML 之后、下一个 `commit()` 之前"的窗口里，且窗口内出现 `await` / `requests` / `fetch_*` / `sleep` 等外部 IO（判据在 `server/scripts/tx_holding_scan.py`，白名单式） | **只提醒**（不阻断） | 外部拉数挪到事务之外，或逐条写完就 `conn.commit()` 把写锁交还 |
 | pre-push | 远程 sha 不在本地历史里（非快进） | **阻断** | `git fetch` + `git rebase` 后正常 push；个人分支最多用 `--force-with-lease` |
+| pre-push 全树 | push 时工作树里仍有**已跟踪但未提交**的改动（`M`/`A`/`D`/`R`；未跟踪 `??` 不拦） | **阻断** | 按 CONTRIBUTING 第 6 节的清单把这些路径也逐路径提交（别人的就在提交说明里标归属），或与用户确认后 `git stash push` 这批路径 |
 
 B1 特别说明：`fetch` 失败（离线/代理异常）时**放行并打印警告**。这台机器常在代理异常状态，
 把网络问题变成"提交不了"会让人直接停用整套机制，那比偶发漏检更糟。
@@ -46,6 +47,14 @@ B6 特别说明（2026-11-03 新增）：这一项**只提醒不阻断**，因�
 （首跑就是栽在 Windows python 按 GBK 写 stdout、以及 `subprocess` 按 GBK 解码 git 输出，
 后者会让行号区间取空、判据永不命中——两处都已在脚本里修掉并留了注释）。
 
+pre-push 全树 特别说明（2026-11-05 新增，规矩出处见 AGENTS.md「推送是全树事务」与 CONTRIBUTING 第 6 节 ② 的前置清单）：
+本项目多人／多会话共写同一个目录、同一个分支，"只推自己那部分"留下的**已跟踪**改动会在下一次
+`git switch` / `git checkout` 时被静默收回——11-05 实测：模拟盘修复 21:41 提交、21:47 由看护加载上线，另一路
+21:54~21:58 把 HEAD 切回 `main` 提交 routes 拆分，磁盘上的 `server/services/portfolio/trade_sim.py` 与那批文档行当场换版，
+只有分支里还留着那份，线上内存与磁盘从此不一致。**上线时当场反证过**：工作树存在 `M server/db/database.py` 时脚本退出码 1
+并列出全部残留路径；`hooks.pushwhole.enabled false` 之后同一条命令退出码 0、零输出。未跟踪（`??`）故意不拦——
+切分支不会带走未跟踪文件，而本仓常年有几十个在建/产物文件，拦它们会天天误伤到逼人停用整套机制（那比漏检更糟）。
+
 ## 单独关某一项（每项独立开关，关掉必须完全等于没这项检查）
 
 ```sh
@@ -56,6 +65,7 @@ git config --local hooks.secret.enabled    false   # B4
 git config --local hooks.docsync.enabled   false   # B5
 git config --local hooks.txlock.enabled    false   # B6
 git config --local hooks.pushforce.enabled false   # pre-push
+git config --local hooks.pushwhole.enabled false   # pre-push 全树
 ```
 
 恢复：`git config --local --unset hooks.<名>.enabled`（缺省即启用）。

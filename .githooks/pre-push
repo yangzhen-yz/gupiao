@@ -43,4 +43,29 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
 done
 
+# ---------------------------------------------------------------------------
+# 第二道（2026-11-05 加）：push 时工作树不许留下"已跟踪但未提交"的改动
+#
+# 起因：多人／多会话共写同一个工作树。已跟踪的 M/A/D/R 改动在别人（或自己）下一次
+# git switch / git checkout 时会被**静默收回**——11-05 实测：模拟盘修复 21:41 提交、
+# 21:47 看护加载上线，另一路 21:54~21:58 把 HEAD 切回 main 提交 routes 拆分，
+# 磁盘上的 trade_sim.py 与那批文档行当场换版，只剩分支里还有一份。
+# 规矩见 AGENTS.md「推送是全树事务」与 CONTRIBUTING.md 第 6 节 ② 的前置清单。
+#
+# 未跟踪（??）不拦：切分支不会带走它，本仓又常年有几十个在建/产物文件，拦了会天天误伤。
+# 开关：git config --local hooks.pushwhole.enabled false（用完记得打开）
+# ---------------------------------------------------------------------------
+if [ "$(git config --bool hooks.pushwhole.enabled 2>/dev/null)" != "false" ]; then
+    dirty="$(git -C "$(git rev-parse --show-toplevel)" status --porcelain 2>/dev/null | grep -v '^??' || true)"
+    if [ -n "$dirty" ]; then
+        echo "⛔ 工作树里还有已跟踪、未提交的改动——本次 push 只带走部分改动，剩下的会在下一次切分支时被静默收回。"
+        echo "$dirty" | sed 's/^/   /'
+        echo "   正确做法（三选一）："
+        echo "   ① 按 CONTRIBUTING 第 6 节的全树清单，把这些路径也逐路径 add 并提交（不是自己的改动就在提交说明/PR 里标归属）；"
+        echo "   ② 与用户确认后 git stash push 这些路径，切完分支再 pop；"
+        echo "   ③ 只属临时放行：git config --local hooks.pushwhole.enabled false（用完记得开回来，别写成默认关）。"
+        blocked=1
+    fi
+fi
+
 exit $blocked
