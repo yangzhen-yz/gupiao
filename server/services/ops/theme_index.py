@@ -569,8 +569,11 @@ async def _compute(theme: str, live: bool) -> Dict:
         'last': {k: last.get(k) for k in ('date', 'idx', 'ret', 'zt', 'zb', 'upRatio',
                                           'amount', 'temp', 'dd', 'dd60', 'ma20', 'ret5',
                                           'ret3', 'state', 'peak20', 'peak20Date')},
+        # 盘中临时行（今日未收盘）：前端用它覆盖卡片头条（指数/当日/温度/距高点/状态），
+        # 让盘中看到的是"今天"而不是昨天收盘。收盘后 sync_today 落库、live 自动为 None。
         'live': ({**{k: live_row.get(k) for k in ('date', 'idx', 'ret', 'zt', 'zb', 'upRatio',
-                                                  'amount', 'temp', 'dd')},
+                                                  'amount', 'temp', 'dd', 'state')},
+                  'stateLabel': _STATE_LABEL.get(live_row.get('state') or '', ''),
                   'at': datetime.now().strftime('%H:%M')} if live_row else None),
         'peak': {'date': peak['date'], 'idx': peak['idx']},
         'recentPeak': {'date': last.get('peak20Date'), 'idx': last.get('peak20')},
