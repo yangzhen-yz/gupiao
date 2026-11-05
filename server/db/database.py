@@ -7,16 +7,33 @@ from app.config import SQLITE_DB_PATH, QUERY_DAILY_RECOMMENDATIONS_LIMIT, QUERY_
 # ========== SQLite 配置 ==========
 SQLITE_DB_PATH = SQLITE_DB_PATH
 
-def get_db_conn():
-    """获取 SQLite 数据库连接"""
+def get_db_conn(fast_fail: bool = False):
+    """获取 SQLite 数据库连接
+
+    fast_fail=True 只给**缓存/快照类**写入用：抢不到写锁就按 DB_CACHE_WRITE_BUSY_TIMEOUT_MS
+    （默认 2 秒）快速失败，调用方原有的 try/except 会把它变成"这次没缓存上，下次重拉"，
+    而不是把请求线程压成 30 秒排队。决策留痕（strategy_snapshot / 推荐批次 / 收评 / 权重）
+    与用户数据（持仓 / 自选 / 本金）**不要**传这个参数——那些行丢了就永久答不了，宁可等。
+    为什么这样分级：WAL 同时只允许一个写者，而 2026-11-03 的实测里锁被占了 1 小时以上，
+    期间连 /api/health 都排队 8~30 秒（X-Process-Time 只有 1~2ms，说明耗时全在中间件之前）。
+    """
+    timeout_ms = 30000
+    if fast_fail:
+        try:
+            from app.config import DB_FAST_FAIL_ENABLED, DB_CACHE_WRITE_BUSY_TIMEOUT_MS
+            if DB_FAST_FAIL_ENABLED:
+                # 下限 100ms：防止配置页/手改成 0 之后变成"永远抢不到锁"
+                timeout_ms = max(100, int(DB_CACHE_WRITE_BUSY_TIMEOUT_MS))
+        except Exception:
+            timeout_ms = 30000      # 读不到配置就退回改造前的 30 秒，绝不因新开关而变短
     # isolation_level='IMMEDIATE'：写语句隐式以 BEGIN IMMEDIATE 开启事务，一开始就抢写锁。
     # 避免 DEFERRED 事务「先读后写」升级锁时 SQLite 不重试 busy_timeout 直接返回 SQLITE_BUSY。
-    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=30, isolation_level='IMMEDIATE')
+    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=timeout_ms / 1000.0, isolation_level='IMMEDIATE')
     conn.row_factory = sqlite3.Row
     # busy_timeout 必须先于 journal_mode 设置：切换 WAL 本身也需要抢数据库锁。
     # 30s 是上限而非典型等待耗时：定时任务并发时单个写事务可能持续数秒，
     # 原来的 5s 会在这种情况下直接抛 "database is locked"。
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=%d" % timeout_ms)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -805,6 +822,36 @@ def init_db():
                 trades INTEGER NOT NULL DEFAULT 0,
                 updated_at DATETIME DEFAULT (datetime('now', '+8 hours')))''')
 
+        # 持仓交易流水（2026-11-04 建，卖出侧三条主线的地基）。
+        # position_adjust.py 当初**刻意不建**这张表，理由是"多一张表就多一处要和
+        # user_positions 对齐的状态"——这个顾虑站得住，所以做法是改掉它的前提，不是无视：
+        #   · 本表是**只追加的旁路留痕**，没有任何决策读它（持仓仍只由 user_positions 决定），
+        #     所以某行没写进去也不会算错持仓或买卖，代价上限是"少一条审计"；
+        #   · 写入一律包在 try 里、失败只打日志，绝不向上抛（见 routes 的三个接入点）；
+        #   · 独立开关 POSITION_TRADE_LOG_ENABLED，关掉后一行都不写，逐字节等于改造前。
+        # 为什么现在必须有：#11 该减多少、#12 抗跌阈值、#13 结构确认的判据全靠"卖出之后的结果"，
+        # 而 note 是自由文本且截断 200 字符，回放不出"哪天买、成本多少、持有多少天"。
+        # source 必须分开记（见 save_position_trade_log）：回测只用 adjust_*，edit/delete 只作审计——
+        # 因为「编辑持仓」与「改历史」在代码层面区分不了，混进回测会造出根本不存在的买卖。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS position_trade_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                ts DATETIME DEFAULT (datetime('now', '+8 hours')),
+                user_id INTEGER NOT NULL DEFAULT 1,
+                symbol TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                source TEXT NOT NULL,
+                shares_before INTEGER,
+                price REAL,
+                qty INTEGER,
+                shares_after INTEGER,
+                cost_price_after REAL,
+                realized_pnl REAL,
+                note TEXT DEFAULT '')''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ptl_user_symbol_date ON position_trade_log(user_id, symbol, trade_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ptl_date ON position_trade_log(trade_date)')
+
         # user_positions 增加 user_id。
         # 存量表 symbol 是「全局 UNIQUE」—— 多用户持有同一只票会直接冲突，
         # 而 SQLite 不支持 ALTER 唯一约束，故整表重建为 UNIQUE(user_id, symbol)。
@@ -1548,7 +1595,7 @@ def load_stock_basic_info() -> Dict:
 
 def save_stock_basic_info(stock_basic_info: Dict) -> bool:
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM stock_basic_info')
         for symbol, name in stock_basic_info.items():
@@ -1569,7 +1616,7 @@ def save_stock_industry(industry_map: Dict[str, str]) -> bool:
     if not industry_map:
         return False
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         for symbol, industry in industry_map.items():
             if not industry:
@@ -1643,7 +1690,7 @@ def save_holder_num_batch(records: List[Dict]) -> bool:
                    'notice_date', 'updated_at'}]
     """
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         for r in records:
             cursor.execute('''INSERT OR REPLACE INTO stock_holder_num
@@ -1711,7 +1758,7 @@ def save_fundamental_batch(records: List[Dict]) -> bool:
         records: [{'symbol', 'report_date', 'roe', 'net_profit_yoy', 'eps', 'updated_at'}]
     """
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         for r in records:
             cursor.execute('''INSERT OR REPLACE INTO stock_fundamental
@@ -1776,7 +1823,7 @@ def save_valuation_batch(records: List[Dict]) -> int:
     if not records:
         return 0
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         for r in records:
             cursor.execute('''INSERT OR REPLACE INTO stock_valuation
@@ -2019,6 +2066,66 @@ def delete_user_position(symbol: str, user_id: int = 1) -> bool:
         return False
 
 
+# ===== 持仓交易流水（2026-11-04，卖出侧回测的地基）=====
+# 单独一组函数的理由：这张表**只写不读进决策**——持仓与买卖口径全部仍由 user_positions 决定，
+# 它只服务回测与审计。所以失败处理原则是"绝不影响调用方"：写不进去就打一行日志、返回 False，
+# 三个接入点都忽略返回值。这正是为了回应 position_adjust.py 当初"多一张表就多一处要对齐的
+# 状态"的顾虑：不对齐的后果被限制在"少一条审计"，而不是算错持仓。
+# source 固定五种，回测只该取前三类加 create：
+#   adjust_add / adjust_reduce / adjust_clear —— 用户在持仓页真按了加仓/减仓/清仓
+#   create —— 首次录入一条持仓（price 取录入的成本价，是**近似**成交价，回测要标注这点）
+#   edit / delete —— 改历史或删记录，**不是交易**；混进回测会造出根本不存在的买卖
+
+def save_position_trade_log(rec: Dict, user_id: int = 1) -> bool:
+    """追加一条持仓流水。开关关掉或写入失败都只返回 False，绝不向上抛。"""
+    try:
+        from app.config import POSITION_TRADE_LOG_ENABLED
+        if not POSITION_TRADE_LOG_ENABLED:
+            return False
+    except Exception:
+        return False
+    try:
+        conn = get_db_conn()
+        conn.execute('''INSERT INTO position_trade_log
+            (trade_date, user_id, symbol, name, source, shares_before, price, qty,
+             shares_after, cost_price_after, realized_pnl, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (rec.get('trade_date') or '', int(user_id), (rec.get('symbol') or '').lower(),
+             rec.get('name', ''), rec.get('source', ''),
+             rec.get('shares_before'), rec.get('price'), rec.get('qty'),
+             rec.get('shares_after'), rec.get('cost_price_after'),
+             rec.get('realized_pnl'), (rec.get('note') or '')[:200]))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print(f'[流水] 写入失败（不影响持仓）: {str(error)}')
+        return False
+
+
+def load_position_trade_log(user_id: int = 1, symbol: str = '', limit: int = 200,
+                            trade_only: bool = False) -> list:
+    """读流水（只给回测与审计页用，不参与任何决策）。
+    trade_only=True 只返回 adjust_*/create——回测默认要用这个口径，否则编辑历史会被当成买卖。"""
+    try:
+        conn = get_db_conn()
+        sql = 'SELECT * FROM position_trade_log WHERE user_id = ?'
+        args: list = [int(user_id)]
+        if symbol:
+            sql += ' AND symbol = ?'
+            args.append(symbol.lower())
+        if trade_only:
+            sql += " AND source IN ('adjust_add','adjust_reduce','adjust_clear','create')"
+        sql += ' ORDER BY id DESC LIMIT ?'
+        args.append(int(limit))
+        rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+        conn.close()
+        return rows
+    except Exception as error:
+        print(f'读取持仓流水失败: {str(error)}')
+        return []
+
+
 def get_user_capital(user_id: int = 1) -> float:
     """读账号初始本金；未设置返回 0（调用方据此回退到旧的"市值/市值"口径）"""
     try:
@@ -2227,7 +2334,7 @@ def load_stock_concept_tags() -> Dict[str, List[str]]:
 
 def save_stock_concept_tags(tags: Dict[str, List[str]]) -> bool:
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM stock_concept_tags')
         for symbol, tag_list in tags.items():
@@ -2476,7 +2583,7 @@ def save_kline_cache(symbol: str, trade_date: str, kline: List, updated_at: str 
     try:
         from datetime import datetime
         updated_at = updated_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         cursor.execute('''INSERT OR REPLACE INTO kline_cache
             (symbol, trade_date, kline_json, updated_at)
@@ -2501,6 +2608,9 @@ def save_fund_flow_snapshot(snap_key: str, data) -> bool:
     conn = None
     try:
         from datetime import datetime
+        # 2026-11-03 从 fast_fail 摘回 30 秒：这是"最后成功快照"，写失败的代价不是"这次没缓存上"，
+        # 而是让 fundflow 的 fresh_snap 判假 → 收盘后每次重走新浪补算（实测重启后首次 8.99 秒）。
+        # 11-03 15:20~19:46 写锁被占死那段时间快照全没落库，就是这个后果的现场。
         conn = get_db_conn()
         conn.execute('''INSERT INTO fund_flow_snapshot (snap_key, snap_json, updated_at)
             VALUES (?, ?, ?)
@@ -2551,7 +2661,7 @@ def save_westock_snapshot(date_key: str, rows: List[Dict]) -> int:
         return 0
     conn = None
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         n = 0
         for r in rows:
@@ -2599,7 +2709,7 @@ def save_cross_check(date_key: str, rows: List[Dict]) -> int:
         return 0
     conn = None
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         n = 0
         for r in rows:
@@ -2721,7 +2831,7 @@ def load_hot_search_ranking() -> Dict:
 
 def save_hot_search_ranking(data: Dict) -> bool:
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(fast_fail=True)
         cursor = conn.cursor()
         # 2026-10-23：熔断/降级时抓不到任何榜单，不能拿空结果覆盖上一份可用缓存。
         # 否则封禁期一次服务重启（启动时会拉热搜）就会把当日榜单清成 0 只，
@@ -2960,6 +3070,9 @@ def save_api_usage_daily(rows) -> int:
     if not rows:
         return 0
     try:
+        # 2026-11-03 从 fast_fail 摘回 30 秒（昨天分类分错了）：这不是"可重拉的缓存"，
+        # 而是接口调用量的**审计留痕**——它是"东财 fail 比率为什么暴涨""哪个调用方没接闸门"
+        # 这些判断的唯一依据，丢一天就永久补不回来（计数是累加值，没有源头可重算）。
         conn = get_db_conn()
         cursor = conn.cursor()
         cursor.executemany(

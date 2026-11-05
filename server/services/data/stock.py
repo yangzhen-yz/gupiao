@@ -911,6 +911,18 @@ def split_batch_raw(raw: str) -> Dict[str, str]:
             out[piece[2:eq_idx].lower()] = piece
     return out
 
+def _fmt_quote_date(v: str) -> str:
+    """腾讯行情第 30 位是成交时刻 'YYYYMMDDHHMMSS'，取日期段成 'YYYY-MM-DD'。
+
+    用途：判断这条"实时"行情到底是今天的还是上一交易日的快照（盘前/竞价时腾讯
+    返回的是昨收快照，若不识别就会被当成今天的价，2026-11-04 连涨天数全 0 的根因）。
+    """
+    v = (v or '').strip()
+    if len(v) >= 8 and v[:8].isdigit():
+        return f'{v[:4]}-{v[4:6]}-{v[6:8]}'
+    return ''
+
+
 def parse_realtime_fields(data: str) -> Optional[Dict]:
     try:
         lines = data.split(';')
@@ -927,6 +939,8 @@ def parse_realtime_fields(data: str) -> Optional[Dict]:
                         'high': float(fields[33]) if fields[33] else 0,
                         'low': float(fields[34]) if fields[34] else 0,
                         'volume': float(fields[36]) if fields[36] else 0,
+                        # 成交日期（判断行情是否昨天的快照；盘前/竞价时会滞后）
+                        'tradeDate': _fmt_quote_date(fields[30] if len(fields) > 30 else ''),
                         'quoteSource': 'sina' if fields[0] == '2' else 'tencent',
                     }
     except Exception as e:
@@ -1131,7 +1145,9 @@ def parse_tencent_batch_data(data: str) -> List[Dict]:
             'weibi': weibi,
             'avgPrice': avg_price,
             'avgPriceDeviation': avg_price_deviation,
-            'outerRatio': outer_ratio
+            'outerRatio': outer_ratio,
+            # 成交日期（盘前/竞价时为上一交易日，用来识别"昨收快照"）
+            'tradeDate': _fmt_quote_date(fields[30] if len(fields) > 30 else ''),
         })
     
     return results

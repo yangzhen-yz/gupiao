@@ -672,17 +672,23 @@ def _fmt_markdown(stocks: list, title: str) -> str:
 # ---------- 任务入口 ----------
 
 async def push_candidates_task():
-    """盘中推送主任务：扫描用户池 → 过滤 → 去重 → 推送。失败不抛异常（由 scheduler 兜底）。"""
+    """盘中推送主任务：扫描用户池 → 过滤 → 去重 → 推送。失败不抛异常（由 scheduler 兜底）。
+
+    限频：个股只数（push_daily_limit，页面可配，默认 6 只/天），每只票一天只推一次。
+    （服务重启/自愈类运维通知的"每天最多 N 条"限频在仓库外守护脚本侧，不在此处。）
+    """
     if not WECOM_PUSH_ENABLED:
         return
     try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        _ensure_table()
+
         stocks = _scan_pool()
         if not stocks:
             print(f'[推送 {datetime.now():%H:%M:%S}] 扫描无结果，跳过')
             return
 
-        today = datetime.now().strftime('%Y-%m-%d')
-        _ensure_table()
+        # ② 个股只数上限（每只一天只推一次）
         left = push_daily_limit() - pushed_today(today)
         if left <= 0:
             print(f'[推送 {datetime.now():%H:%M:%S}] 今日达标推送已用满 {push_daily_limit()} 只额度，'

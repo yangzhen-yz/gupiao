@@ -3,7 +3,7 @@ import asyncio, time
 from typing import List, Dict, Optional
 from datetime import date
 from fastapi import HTTPException
-from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED)
+from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, TREND_STALE_WHILE_REVALIDATE, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED)
 from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry, list_user_ids)
 from services.data.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, parse_realtime_fields, fetch_stock_data, get_stock_name,
@@ -43,6 +43,13 @@ async def _load_kline_for_scan(symbol: str, realtime_raw_prefetched: Optional[st
                         if realtime_raw:
                             fields = parse_realtime_fields(realtime_raw)
                             if fields and fields['price']:
+                                # 盘前/集合竞价（2026-11-04 实锤）：腾讯行情还是"上一交易日快照"，
+                                # 直接当今日 bar 追加会造出一根与昨收完全相同的假 bar，导致
+                                # 连涨/连跌 = 0/0（两循环都因相等立即 break），且涨跌幅取成昨日涨幅。
+                                # 用行情自带成交日期识别：日期非今日 → 不合并、不返回实时串（前端显示 -）。
+                                qdate = fields.get('tradeDate') or ''
+                                if qdate and qdate != today:
+                                    return local, None
                                 latest = local[-1]
                                 latest_date = latest[0]
                                 open_val = fields['open'] or fields['price']
@@ -71,6 +78,9 @@ async def _load_kline_for_scan(symbol: str, realtime_raw_prefetched: Optional[st
 _last_scan_result = None
 _last_scan_date = ''
 _last_scan_ts = 0.0
+# stale-while-revalidate 的"后台重扫是否已在跑"（2026-11-03）：同一时刻只允许一个，
+# 否则 5 个用户同时打开过期页面就会并发发起 5 轮全市场扫描。
+_swr_refresh_inflight = False
 # 2026-07-22 修复：跨事件循环问题
 # 早期修复（2026-07-06）只做了"懒初始化"，但全局缓存导致：
 #   - 第一次扫描在 loop A 创建 Lock/Semaphore
@@ -104,6 +114,76 @@ def _ensure_today_date(data: Dict) -> Dict:
     # 2026-07-06 : 已合并到 services.utils.ensure_today_date，此处保留薄壳透传以最小化改动
     from services.data.utils import ensure_today_date
     return ensure_today_date(data)
+
+
+def _scan_meta(ts: float) -> Dict:
+    """给趋势扫描返回体注入"这份数据是什么时候算出来的"。
+
+    为什么必须加：
+      · 接口里唯一的 `scanTime` 字段语义是**扫描耗时**（DB `trend_scan_results.scan_time`
+        存的是 '17.7s'、'77.5s' 这种字符串），不是时刻——名字容易误读，所以新字段叫 `scanAt`；
+      · 前端 `TabTrend.vue` 显示的 `lastScan` 是 `new Date().toLocaleTimeString()`，
+        即**客户端时钟**。于是"页面写着 22:26:03、数据其实是 22:06 那轮扫的"这种误导
+        完全看不出来——与 10-30 治过的「读取于 14:00:00 vs 数据是 13:52 算的」同一类问题
+        （见 docs/工程知识库.md 第 1 节）。
+      · 更重要的是第 2 步（延长 TTL / stale-while-revalidate）之前必须先有这个，
+        否则就是拿用户看不见的新鲜度去换响应速度。
+    时刻未知（ts=0，例如锁被占且当天没有内存缓存、只能读 DB 那一支）时**如实标 stale=True
+    并把 scanAt 留空**，不猜一个时间糊过去。
+    """
+    from datetime import datetime as _dt
+    if not ts:
+        return {'scanAt': '', 'scanAgeSec': None, 'stale': True}
+    age = max(0.0, time.time() - ts)
+    return {'scanAt': _dt.fromtimestamp(ts).strftime('%H:%M:%S'),
+            'scanAgeSec': int(age), 'stale': bool(age > SCAN_CACHE_TTL)}
+
+
+def _with_scan_meta(payload: Dict, ts: float) -> Dict:
+    """把 `_scan_meta` 挂到 payload['data'] 上。只新增 key，原有字段一个不动；
+    data 不是 dict 或出任何异常都原样返回，绝不因为元信息把接口打挂。"""
+    try:
+        if isinstance(payload.get('data'), dict):
+            payload['data'].update(_scan_meta(ts))
+    except Exception:
+        pass
+    return payload
+
+
+def _start_bg_rescan() -> None:
+    """后台起一轮重扫，不阻塞当前请求。同一时刻只允许一个在跑。
+
+    为什么不会自递归：这里调 `scan_trend_task(force=True)` → `scan_trend_scan_results(force=True)`，
+    而 stale-while-revalidate 那一支的条件是 `not force`，force=True 直接走锁内现扫，
+    扫完刷新 `_last_scan_result/_last_scan_ts`（前端随后重新拉一次就拿到新数据）。
+
+    注意（2026-11-04）：这里用 `asyncio.create_task` 只在**同一个事件循环**里安全（API 请求
+    路径就是这个循环，任务能跑完并复位 `_swr_refresh_inflight`）。**调度器线程**用
+    `asyncio.run(scan_trend_task())` 调进来时，任务挂在临时 loop 上、asyncio.run 一返回就被取消，
+    扫描没跑完也就不落库 → 当天数据冻结在第一次扫描（实测 09:00:31；日志里 12 条"已启动后台重扫"、
+    age 每 30 分钟递增，可见任务每次都起了、只是每次都没跑完）。标志本身**没有**卡死：收尾时
+    `finally` 会执行并把它复位。所以调度器已改成直接 `force=True` 现扫（见
+    core/scheduler.py::job_scan_trend），不再走这一支。
+    """
+    global _swr_refresh_inflight
+
+    async def _run():
+        global _swr_refresh_inflight
+        try:
+            await scan_trend_task(force=True)
+        except Exception as e:
+            print(f'[趋势扫描] 后台重扫失败（已返回的旧数据不受影响）: {e}')
+        finally:
+            _swr_refresh_inflight = False
+
+    if _swr_refresh_inflight:
+        return
+    try:
+        _swr_refresh_inflight = True
+        asyncio.create_task(_run())
+    except Exception as e:
+        _swr_refresh_inflight = False
+        print(f'[趋势扫描] 后台重扫未能启动: {e}')
 
 def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     """计算 RSI（相对强弱指数，2026-08-03 新增）
@@ -850,7 +930,11 @@ def is_up_trend(kline_data: List[List], realtime_price: Optional[float] = None,
     }
 
 
-_ONDEMAND_TREND_CACHE: Dict[str, Dict] = {}
+# 2026-11-04：原来是**永久 memo**（进程生命周期内同票只算一次），导致盘中价格变了、
+# 隔天日K更新了，趋势分还停在第一次算的值。改为 (交易日, 时间戳, 结果) 三元组，
+# 按日失效 + 5 分钟 TTL；热路径重算仅 0.02~0.04s，不影响响应速度。
+_ONDEMAND_TREND_CACHE: Dict[str, tuple] = {}
+_ONDEMAND_TREND_TTL = 300.0
 
 
 def compute_trend_result(symbol: str, price: float = 0) -> Optional[Dict]:
@@ -867,8 +951,11 @@ def compute_trend_result(symbol: str, price: float = 0) -> Optional[Dict]:
         与 is_up_trend 同构的 dict（含 score/details/isUp 等），或 None。
     """
     key = symbol.lower()
-    if key in _ONDEMAND_TREND_CACHE:
-        return _ONDEMAND_TREND_CACHE[key]
+    day = date.today().isoformat()
+    now = time.time()
+    hit = _ONDEMAND_TREND_CACHE.get(key)
+    if hit and hit[0] == day and now - hit[1] < _ONDEMAND_TREND_TTL:
+        return hit[2]
     try:
         if not (KLINE_HISTORY_ENABLED and history_available()):
             return None
@@ -876,7 +963,12 @@ def compute_trend_result(symbol: str, price: float = 0) -> Optional[Dict]:
         if not kline or len(kline) < TREND_MIN_KLINE_DAYS:
             return None
         res = is_up_trend(kline, realtime_price=(price if price and price > 0 else None))
-        _ONDEMAND_TREND_CACHE[key] = res
+        if len(_ONDEMAND_TREND_CACHE) > 2000:
+            # 按 ts 淘汰最旧的一半，不整表 clear（工程知识库 §8.6：核弹式清空会连
+            # 刚预热/刚算过的热票一起抹掉；这里 key 是受正则约束的 symbol，逐条淘汰很便宜）
+            for k, _ in sorted(_ONDEMAND_TREND_CACHE.items(), key=lambda kv: kv[1][1])[:1000]:
+                _ONDEMAND_TREND_CACHE.pop(k, None)
+        _ONDEMAND_TREND_CACHE[key] = (day, now, res)
         return res
     except Exception as e:
         print(f'[趋势补齐] compute_trend_result 失败(回退纯日内分): {symbol}: {e}')
@@ -1664,16 +1756,36 @@ async def scan_trend_scan_results(force: bool = False):
     
     if not force and _last_scan_result and _last_scan_date == today and (now_ts - _last_scan_ts) < SCAN_CACHE_TTL:
         print(f'[趋势扫描] 使用内存缓存（{_last_scan_date}，{now_ts - _last_scan_ts:.0f}s前扫描）')
-        return {"success": True, "data": _ensure_today_date(_last_scan_result.copy())}
+        return _with_scan_meta({"success": True, "data": _ensure_today_date(_last_scan_result.copy())}, _last_scan_ts)
     
+    # stale-while-revalidate（2026-11-03，第 2 步）：缓存是**今天的**但已过 TTL →
+    # 先把旧数据带着 stale 标记返回（前端已显示「数据扫描于 HH:MM:SS（N 秒前）· 已超出缓存有效期」），
+    # 同时后台起一轮重扫。不再让打开趋势页的用户同步扛 6.6~41.7 秒，也不再让扫描期间
+    # 占住事件循环（并发实验实测：扫描跑着的时候 /api/health 被拖到 4.8 秒）。
+    # 只在"当天确实扫出过东西"时走这一支——当天一次都没扫成功就返回空数据等于骗人，
+    # 那种情况照旧落到下面的锁内现扫，首次拿到数据是该付的代价。
+    if (TREND_STALE_WHILE_REVALIDATE and not force and _last_scan_result
+            and _last_scan_date == today and (now_ts - _last_scan_ts) >= SCAN_CACHE_TTL):
+        _bg = ''
+        if not _swr_refresh_inflight:
+            _start_bg_rescan()
+            _bg = '，已启动后台重扫'
+        else:
+            _bg = '，后台重扫已在跑'
+        print(f'[趋势扫描] 缓存过期（{now_ts - _last_scan_ts:.0f}s > TTL {SCAN_CACHE_TTL}s）'
+              f'→ 返回旧数据并标 stale{_bg}')
+        return _with_scan_meta({"success": True, "data": _ensure_today_date(_last_scan_result.copy())}, _last_scan_ts)
+
     if _get_scan_lock().locked():
         if _last_scan_result and _last_scan_date == today:
-            return {"success": True, "data": _ensure_today_date(_last_scan_result.copy())}
-        return {"success": True, "data": _ensure_today_date(load_trend_scan_results())}
+            return _with_scan_meta({"success": True, "data": _ensure_today_date(_last_scan_result.copy())}, _last_scan_ts)
+        # 这一支是"扫描锁被占 + 当天没有内存缓存"，只能读 DB；而 DB 的 scan_time 存的是
+        # **耗时**不是时刻，所以元信息如实留空并标 stale=True——不猜一个时间糊过去。
+        return _with_scan_meta({"success": True, "data": _ensure_today_date(load_trend_scan_results())}, 0.0)
     
     async with _get_scan_lock():
         if not force and _last_scan_result and _last_scan_date == today and (time.time() - _last_scan_ts) < SCAN_CACHE_TTL:
-            return {"success": True, "data": _ensure_today_date(_last_scan_result.copy())}
+            return _with_scan_meta({"success": True, "data": _ensure_today_date(_last_scan_result.copy())}, _last_scan_ts)
         
         t0 = time.time()
         hot_search_ranking_data = load_hot_search_ranking()
@@ -2081,7 +2193,7 @@ async def scan_trend_scan_results(force: bool = False):
             _last_scan_ts = time.time()
             print(f'[趋势扫描] 完成，发现 {len(trend_scan_results)} 只趋势股，耗时 {result["scanTime"]}')
             
-            return {"success": True, "data": _ensure_today_date(result)}
+            return _with_scan_meta({"success": True, "data": _ensure_today_date(result)}, _last_scan_ts)
         except Exception as error:
             print(f'趋势扫描失败: {str(error)}')
             raise HTTPException(status_code=500, detail="趋势扫描失败")
