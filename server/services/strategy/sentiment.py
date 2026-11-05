@@ -38,7 +38,10 @@ from app.config import (SENTIMENT_ENABLED, SENTIMENT_REFRESH_TTL_SEC,
                         SENTIMENT_LADDER_COLLAPSE_RATE, SENTIMENT_LEADER_FAIL_CHANGE,
                         SENTIMENT_LADDER_MIN_BASE, CYCLE_RULES,
                         SENTIMENT_SNAPSHOT_FALLBACK_MAX_AGE_SEC,
-                        SENTIMENT_ALT_FALLBACK)
+                        SENTIMENT_ALT_FALLBACK,
+                        SENTIMENT_SNAPSHOT_FRESH_SOURCES)
+# `SENTIMENT_SNAPSHOT_SAVE_STALE_FRESH` 故意**不进上面的列表**：它要走配置页热改
+# （app_settings 覆盖表），所以每次取值现读；列表里的常量是导入时绑死的，改了不重启不生效。
 from db.database import get_db_conn
 from services.ops.review import (_em_zt_pool_get, _em_zb_pool_get, _em_batch_change_percent,
                              _fetch_market_breadth, _calc_lianban_ladder,
@@ -531,10 +534,27 @@ def _fallback_snapshot(now: datetime, final: bool = False) -> Optional[Dict]:
 
 def _maybe_save(data: Dict):
     global _LAST_SAVE_TS
-    # 兜底快照不回写：它的 asOf 是原快照时间，INSERT OR REPLACE 会把同一条 live 行
-    # 覆盖成 stale=1，几次冷却之后当天快照就被自己吃光了。
-    if not data or data.get('stale'):
+    if not data:
         return
+    # stale 有两副面孔，11-04 之前被当成一种处理，把该落的也拒了：
+    #   ①「复用旧值」——`_latest_live_snapshot`/`_fallback_from_review` 把几十分钟甚至昨天
+    #     的数挂回今天（`asOf` 是原时刻）。这种**必须**继续拒：兜底值一旦 INSERT OR REPLACE
+    #     就把同一条 live 行覆盖成 stale=1，几次冷却之后当天快照就被自己吃光了（原注释的担忧）。
+    #   ②「数字是此刻采的，只是某一维取不到」——主路 `stale = not zt_pool`（东财涨停池挂了，
+    #     但涨跌家数/跌停/梯队都取到了）、以及 11-03 接线的新浪备源 `source='alt_source'`
+    #     （连板梯队/炸板/昨日溢价置缺）。这种不落库就是**整天没有审计链**：东财连续两天不可用
+    #     ⇒ market_sentiment_snapshots 11-03/11-04 各 0 行，最后一条停在 11-02 13:01。
+    # 判据用 `source`（采集方写死的字符串），不用"有没有 gap"——主路缺维时也写 dataGaps。
+    if data.get('stale'):
+        fresh = data.get('source') in SENTIMENT_SNAPSHOT_FRESH_SOURCES
+        try:
+            from services.support import app_settings
+            allow = bool(app_settings.value('sentiment_snapshot_save_stale_fresh'))
+        except Exception:
+            import app.config as _cfg
+            allow = bool(getattr(_cfg, 'SENTIMENT_SNAPSHOT_SAVE_STALE_FRESH', False))
+        if not (fresh and allow):
+            return
     if time.time() - _LAST_SAVE_TS < SENTIMENT_SNAPSHOT_SAVE_SEC:
         return
     _LAST_SAVE_TS = time.time()
@@ -550,6 +570,111 @@ def _maybe_save(data: Dict):
         conn.close()
     except Exception as e:
         print(f'[情绪] 快照落库失败: {e}')
+
+
+# ===== 收盘定版落库（2026-11-03，#11 减仓回测的前置）=====
+# 只做一件事：把"当天的最终档位"写成一行落库。**不改变任何现有读取路径**——页面/行动台仍走
+# 原来的读时兜底，所以这一步对线上表现零影响，纯粹是给回测留一张可信的表。
+# 为什么值得单独一张表：market_sentiment_snapshots 里全是盘中值（payload 的 final 恒 False），
+# 收盘定版从来没落过库；而 #11 要回答"情绪转弱那天该减多少"，必须先有"那天最终是什么档"。
+# 不往 snapshots 加 final 列的理由见 app/config.py：那张表按 ts 取最新，塞进去会被当盘中值读。
+
+_FINAL_DDL = '''CREATE TABLE IF NOT EXISTS sentiment_final_daily (
+    sent_date  TEXT PRIMARY KEY,
+    cycle      TEXT,
+    score      INTEGER,
+    source     TEXT,
+    data_ts    TEXT,
+    indicators TEXT,
+    payload    TEXT,
+    created_at DATETIME DEFAULT (datetime('now', '+8 hours'))
+)'''
+
+
+def _ensure_final_table() -> bool:
+    try:
+        conn = get_db_conn()
+        conn.execute(_FINAL_DDL)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f'[情绪定版] 建表失败: {e}')
+        return False
+
+
+def persist_final_snapshot(now: Optional[datetime] = None) -> Dict:
+    """把当天收盘定版档位写进 sentiment_final_daily（一天一行，INSERT OR REPLACE 幂等）。
+
+    来源优先级，且**必须是今天的那一条**：
+      1) 当天收评（15:10 生成）→ source='review'
+      2) 当天最后一个盘中快照 → source='snapshot'
+    两个来源返回的 date 都是"数据自己的日期"而不是今天：10-23 实拍过收评兜底把 10-22 的
+    「最高连板 5 板」挂到今天的卡片上。定版要是也这么取，回测就是在拿昨天的情绪算今天的减仓，
+    所以日期不符就**宁可不写**。
+    """
+    from app.config import SENTIMENT_FINAL_SNAPSHOT_ENABLED
+    if not SENTIMENT_FINAL_SNAPSHOT_ENABLED:
+        return {'written': False, 'reason': 'disabled'}
+    now = now or datetime.now()
+    today = now.strftime('%Y-%m-%d')
+
+    picked, source = None, ''
+    try:
+        fb = _fallback_from_review(final=True)
+    except Exception as e:
+        print(f'[情绪定版] 读收评失败: {e}')
+        fb = None
+    if fb and fb.get('date') == today:
+        picked, source = fb, 'review'
+    if picked is None:
+        try:
+            snap = _latest_live_snapshot(now, final=True)
+        except Exception as e:
+            print(f'[情绪定版] 读当日快照失败: {e}')
+            snap = None
+        if snap and snap.get('date') == today:
+            picked, source = snap, 'snapshot'
+    if picked is None:
+        print(f'[情绪定版] {today} 既无当日收评也无当日盘中快照，本轮不写（不拿旧日期顶替）')
+        return {'written': False, 'reason': 'no_source_today'}
+    if not picked.get('cycle'):
+        print(f'[情绪定版] {today} 来源 {source} 的 cycle 为空，不写')
+        return {'written': False, 'reason': 'empty_cycle'}
+
+    try:
+        if not _ensure_final_table():
+            return {'written': False, 'reason': 'table_missing'}
+        conn = get_db_conn()
+        conn.execute('INSERT OR REPLACE INTO sentiment_final_daily '
+                     '(sent_date, cycle, score, source, data_ts, indicators, payload) '
+                     'VALUES (?,?,?,?,?,?,?)',
+                     (today, picked.get('cycle'), int(picked.get('cycleScore') or 0),
+                      source, str(picked.get('asOf') or ''),
+                      json.dumps(picked.get('indicators') or {}, ensure_ascii=False),
+                      json.dumps(picked, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+        print(f'[情绪定版] {today} 已落库：{picked.get("cycle")} '
+              f'{int(picked.get("cycleScore") or 0)} 分，来源={source}，数据时刻={picked.get("asOf")}')
+        return {'written': True, 'source': source, 'cycle': picked.get('cycle'),
+                'score': int(picked.get('cycleScore') or 0), 'date': today}
+    except Exception as e:
+        print(f'[情绪定版] 落库失败: {e}')
+        return {'written': False, 'reason': str(e)[:60]}
+
+
+def load_final_snapshot(sent_date: str) -> Optional[Dict]:
+    """读某天的收盘定版（给回测与减仓影子用）。线上页面不走这里。"""
+    try:
+        conn = get_db_conn()
+        row = conn.execute('SELECT * FROM sentiment_final_daily WHERE sent_date = ?',
+                           (sent_date,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f'[情绪定版] 读取失败: {e}')
+        return None
 
 
 def _empty_snapshot(reason: str) -> Dict:
