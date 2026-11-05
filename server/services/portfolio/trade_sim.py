@@ -94,6 +94,85 @@ def _load_orders(user_id: int, status: Optional[Union[str, tuple, list]] = None,
     return [dict(r) for r in rows]
 
 
+# ---------- 卖出建议的两处修复（2026-11-05，用户"修复一下"）----------
+# 症状：模拟盘的卖出建议只有一个来源（generate_proposals 的 diagnosis 分支），它遍历全部
+# 未平仓持仓、不限买入日，本该每天重新评估；但去重键是 (symbol, side, source)、取自最近
+# 200 条 pending+filled 订单、**不带日期**，于是某只票只要历史上出过一次同来源卖单
+# （哪怕那张单一直挂着没执行、或当时卖掉后来又买回来），以后同一来源对它的卖出建议就**永久不再产生**。
+# 反过来旧单滑出 200 条窗口后又会重复出单——两头都不对。
+# 另一头是僵尸单：pending 卖单没有任何跨天作废机制（查过，没有过期逻辑），
+# 用户不执行就一直挂着，既占着去重键、建议价也早过期了。
+SELL_EXPIRE_REASON = '建议卖单跨天未执行，自动作废（今天会按最新价重新评估）'
+
+
+def _flag(name: str, default: bool) -> bool:
+    """独立开关：先热读配置页覆盖表，读不到退回 app/config.py 默认值。"""
+    try:
+        from services.support import app_settings
+        v = app_settings.value(name)
+        if v is not None:
+            return bool(v)
+    except Exception:
+        pass
+    try:
+        from app import config
+        return bool(getattr(config, name.upper(), default))
+    except Exception:
+        return default
+
+
+def sell_dedupe_flags() -> Dict[str, bool]:
+    """两条开关各管各的：关掉任意一条，那一条的行为逐字节回到改造前。"""
+    return {'by_day': _flag('sim_sell_dedupe_by_day', True),
+            'expire': _flag('sim_sell_pending_expire', True)}
+
+
+def _sell_keys_today(user_id: int, today: str) -> set:
+    """**当天**的卖单去重键（pending + filled）。
+    仍然含 filled：同一天内"生成→执行"自动跑完了不能再出一张重复卖单（这是原设计的初衷）。"""
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT symbol, source FROM sim_orders WHERE user_id=? AND side='sell' "
+            "AND status IN ('pending','filled') AND substr(created_at,1,10)=?",
+            (user_id, today)).fetchall()
+    finally:
+        conn.close()
+    return {(str(sym or '').lower(), 'sell', src) for sym, src in rows}
+
+
+def expire_stale_pending_sells(user_id: int, today: Optional[str] = None) -> int:
+    """把"隔夜仍未执行"的 pending 卖单置为 rejected，让当天能按最新价重新评估。
+
+    为什么落到 rejected 而不是新增一个 expired 状态：①rejected 本来就不进去重键
+    （原注释写得很清楚"rejected 不在去重范围内"），旧单让位正是我们要的效果；
+    ②前端与统计只认 pending/filled/rejected 三态，加新状态页面会显示不出来。
+    作废原因写进 reject_reason，用户在建议列表里看得见为什么这张单没了。"""
+    today = today or _today()
+    conn = get_db_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE sim_orders SET status='rejected', reject_reason=? WHERE user_id=? "
+            "AND side='sell' AND status='pending' AND substr(created_at,1,10) < ?",
+            (SELL_EXPIRE_REASON, user_id, today))
+        n = cur.rowcount or 0
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
+def apply_sell_dedupe(seen: set, user_id: int, today: str, by_day: bool) -> set:
+    """把"全部历史 pending+filled"算出来的去重键，按开关调整成卖出侧当日口径。
+
+    单独成一个函数是为了能被自测直接打（generate_proposals 整体会拉实时行情，测不起）。
+    买入侧原样保留：它的 filled 去重是防"generate→execute 自动跑"反复建仓，动它会复活老 bug。
+    """
+    if not by_day:
+        return seen
+    return {k for k in seen if k[1] != 'sell'} | _sell_keys_today(user_id, today)
+
+
 async def _quotes(symbols: List[str]) -> Dict[str, Dict]:
     if not symbols:
         return {}
@@ -164,6 +243,15 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
     """从信号源生成 pending 建议订单。sources ∈ recommend / tomorrow_plan / diagnosis / screener
     其中 recommend（智能推荐）按系统预期收益由高到低优先，且账户最多持有 SIM_MAX_HOLD 只股票。"""
     _ensure_sim_account(user_id)
+    today = _today()
+    flags = sell_dedupe_flags()
+    # 先把隔夜没执行的 pending 卖单作废，再算去重键——顺序反了它还会占着键挡今天的重新评估
+    expired_sells = expire_stale_pending_sells(user_id, today) if flags['expire'] else 0
+    print(f"[模拟盘] 生成建议开始：卖出去重={'当日' if flags['by_day'] else '全部历史(pending+filled)'}"
+          f"、隔夜未执行卖单作废 {expired_sells} 张")
+    if expired_sells:
+        print(f'[模拟盘] 作废的卖单 reject_reason=「{SELL_EXPIRE_REASON}」，'
+              f'这些票今天会按最新价重新评估')
     positions = _load_positions(user_id)
     cash_v, mv, total, day_start, day_pnl = await _portfolio(user_id, positions)
     qmap = await _quotes([p['symbol'] for p in positions] +
@@ -174,8 +262,10 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
     # 若只按 pending 去重，下一次循环 pending 已空 → 重新生成 → 再次成交（这就是之前刷重复单的根因）。
     # 改为对 (symbol, 方向, 来源) 的「已生成(pending)或已成交(filled)」单去重，
     # 同一信号源对同票同方向的建议只生成一次；rejected 不在去重范围内（价格偏离被拒的可重新生成）。
-    _seen_keys = {(o.get('symbol', '').lower(), o.get('side'), o.get('source'))
-                  for o in _load_orders(user_id, status=('pending', 'filled'))}
+    _seen_keys = apply_sell_dedupe(
+        {(o.get('symbol', '').lower(), o.get('side'), o.get('source'))
+         for o in _load_orders(user_id, status=('pending', 'filled'))},
+        user_id, today, flags['by_day'])
 
     # 持仓只数上限（用户规则：最多持有 3 只）。加仓已有持仓不计入新增只数。
     held_symbols = set(p['symbol'].lower() for p in positions)
@@ -345,7 +435,11 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
 
     return {'success': True, 'created': created, 'rejected': rejected,
             'created_count': len(created), 'rejected_count': len(rejected),
-            'skipped_count': skipped}
+            'skipped_count': skipped,
+            # 本次修复的可观测字段：前端不改也能在建议列表里看到作废原因，这里带上是为了日志/自测对账
+            'expired_pending_sells': expired_sells,
+            'sell_dedupe_by_day': bool(flags['by_day']),
+            'sell_pending_expire_on': bool(flags['expire'])}
 
 
 # ---------- 手动卖出 ----------

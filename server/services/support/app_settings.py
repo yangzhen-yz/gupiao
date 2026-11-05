@@ -457,6 +457,23 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'sim_sell_dedupe_by_day', 'cfg': 'SIM_SELL_DEDUPE_BY_DAY', 'kind': 'bool',
+        'label': '模拟盘卖出建议按「当日」去重', 'group': '模拟盘', 'live': True,
+        'note': '改造前：去重键 (symbol,side,source) 取自最近 200 条 pending+filled、不带日期，'
+                '某只票历史上出过一次同来源卖单（或那张单一直挂着），以后就永久不再产生卖出建议。'
+                '打开后卖出侧只看当天的卖单；**买入侧不变**（仍防自动跑重复建仓）。关掉逐字节回到改造前',
+        'impact': None,
+    },
+    {
+        'key': 'sim_sell_pending_expire', 'cfg': 'SIM_SELL_PENDING_EXPIRE', 'kind': 'bool',
+        'label': '隔夜未执行的卖单自动作废', 'group': '模拟盘', 'live': True,
+        'note': '每次生成建议前，把 created_at 早于今天的 pending 卖单置为 rejected'
+                '（原因写明"跨天未执行，自动作废"），这样同一只票能按最新价重新评估、'
+                '建议价也不会一直挂着过期。用 rejected 而非新状态：rejected 本来就不进去重键，'
+                '且前端只认 pending/filled/rejected 三态',
+        'impact': None,
+    },
+    {
         'key': 'exit_seal_shadow_enabled', 'cfg': 'EXIT_SEAL_SHADOW_ENABLED', 'kind': 'bool',
         'label': '出口分叉影子：封住拿隔夜/没封住当天走', 'group': '卖出规则', 'live': True,
         'note': '每天 20:35（日K五批同步之后）把当天推荐的三条出口（拿隔夜 / 当天收盘走 / 分叉）各算一遍落 '
