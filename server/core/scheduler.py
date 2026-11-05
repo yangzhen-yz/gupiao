@@ -999,6 +999,37 @@ def run_scheduler():
         except Exception as e:
             print(f'[DB维护] 异常: {e}')
 
+    def job_db_backup():
+        """每日 03:30 自动备份 SQLite（2026-11-05，P0-3 资产不丢）。
+
+        库是唯一不可再生产资产（日K库 507MB+），此前仅靠两个手动目录、scheduler 零调用。
+        周六跑全量、平日跑增量（对 SQLite 都是整库在线拷贝，区别只在 manifest 标记）；
+        保留最近 7 天、硬上限 30 份。用 sqlite3 在线备份 API，服务在写也不阻塞。
+        以脱离进程方式拉起（与 job_matrix_rerun 同款），不阻塞调度线程。
+        """
+        import subprocess, sys
+        server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(server_dir, 'scripts', 'db_backup.py')
+        if not os.path.exists(script):
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 备份脚本缺失: {script}')
+            return
+        # 周六全量，其余增量
+        mode = 'full' if datetime.now().weekday() == 5 else 'incremental'
+        log = os.path.join(server_dir, 'analysis_out', 'db_backup.log')
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            flags = 0
+            if os.name == 'nt':
+                flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+            with open(log, 'a', encoding='utf-8') as fh:
+                p = subprocess.Popen([sys.executable, '-u', script, '--mode', mode],
+                                     cwd=server_dir, stdout=fh, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, creationflags=flags)
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 数据库自动备份已拉起'
+                  f'（{mode}，pid {p.pid}，日志 analysis_out/db_backup.log）')
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 数据库备份拉起失败: {e}')
+
     def job_api_usage_flush():
         """每 60s 把内存计数器落库（api_usage_daily），跨天自动归档，防丢当日计数。"""
         try:
@@ -1387,6 +1418,10 @@ def run_scheduler():
 
     # 数据库维护：每周六凌晨3点清理过期缓存+VACUUM（防 SQLite 膨胀）
     schedule.every().saturday.at("03:00").do(job_db_maintenance)
+    print(f'[定时任务]   - 03:30: 数据库自动备份（周六全量/平日增量，保留7天，analysis_out/db_backup_*）')
+
+    # 数据库自动备份：每日 03:30（周六全量/平日增量，保留7天；2026-11-05 P0-3 资产不丢）
+    schedule.every().day.at("03:30").do(job_db_backup)
 
     # 接口用量：每 60s 把内存计数器落库（2026-10-19，防第三方平台封禁的观测手段）
     schedule.every(60).seconds.do(job_api_usage_flush)
