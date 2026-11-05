@@ -2,7 +2,15 @@
   <div>
     <div class="refresh-controls">
       <div class="toggle-section"><span class="toggle-label">📊 自动刷新中</span></div>
-      <div class="last-update">{{ lastScan }}</div>
+      <!-- 数据时刻改为读**服务端**的 scanAt（2026-11-03）。
+           原来这里显示的是 lastScan = new Date().toLocaleTimeString()，那是客户端时钟，
+           只能说"我什么时候点的扫描"，不能说"这份数据是什么时候算的"；而趋势扫描
+           实测耗时 6.6~77.5 秒、内存缓存 TTL 只有 300 秒，两者差几分钟是常态。 -->
+      <div class="last-update">
+        <span v-if="scanMeta.at">数据扫描于 {{ scanMeta.at }}<template v-if="scanMeta.ageSec !== null">（{{ scanMeta.ageSec }} 秒前）</template></span>
+        <span v-else>扫描时刻未知</span>
+        <span v-if="scanMeta.stale" class="scan-stale">· 已超出缓存有效期</span>
+      </div>
     </div>
 
     <!-- 市场温度计：每日趋势扫描数量历史 -->
@@ -539,6 +547,10 @@
   const trendStocks = ref([])
   const poolStocks = ref([])
   const lastScan = ref('--')
+  // 服务端扫描元信息（2026-11-03）：at/ageSec/stale 全部来自接口返回体，前端不自己猜时间。
+  // lastScan 保留但不再作为主显示——它是客户端时钟，留着是因为其它地方可能有依赖，
+  // 且删它属于另一件事（改动范围最小化）。
+  const scanMeta = ref({ at: '', ageSec: null, stale: false })
   const expanded = ref(null)
   const addInput = ref('')
   const autoAddThreshold = ref(80)
@@ -736,6 +748,19 @@
         if (typeof result.data.autoAddThreshold === 'number') {
           autoAddThreshold.value = result.data.autoAddThreshold
         }
+        // 读服务端给的扫描时刻（缺字段时按"未知"显示，不退回客户端时间冒充）
+        scanMeta.value = {
+          at: result.data.scanAt || '',
+          ageSec: typeof result.data.scanAgeSec === 'number' ? result.data.scanAgeSec : null,
+          stale: !!result.data.stale,
+        }
+        // 后端标了 stale = 它已把这一轮降级为"旧数据 + 后台重扫"，前端负责等重扫落地后补拉。
+        // 拿到新数据（stale=false）就把计数清零，下次过期还能再补。
+        if (scanMeta.value.stale) {
+          scheduleStaleRefetch()
+        } else {
+          _staleRefetchTries = 0
+        }
         // 检查是否需要自动重新扫描
         if (!_autoRescanTriggered) {
           const today = new Date().toISOString().slice(0, 10)
@@ -762,6 +787,19 @@
   // 仅在组件生命周期内自动重扫一次，避免每次刷新都触发
   let _autoRescanTriggered = false
 
+  // stale 自动补拉（2026-11-03）：后端把过期请求降级成"旧数据 + 后台重扫"后，
+  // 由前端等重扫落地再拉一次。等待档位按实测扫描耗时分布定（6.6 / 17.8 / 41.7 秒），
+  // 五档累计约 148 秒；用完就停在旧数据上——页面持续显示"已超出缓存有效期"，
+  // 不会让用户误以为看到的是新数据。
+  const STALE_REFETCH_WAITS = [8000, 15000, 25000, 35000, 65000]
+  let _staleRefetchTries = 0
+  function scheduleStaleRefetch() {
+    if (_staleRefetchTries >= STALE_REFETCH_WAITS.length) return
+    const wait = STALE_REFETCH_WAITS[_staleRefetchTries]
+    _staleRefetchTries += 1
+    setTimeout(() => { loadTrendStocks() }, wait)
+  }
+
   async function scanTrendStocks() {
     try {
       const result = await apiFetch('/api/scan-trend-stocks')
@@ -776,6 +814,14 @@
           showNotification(`已自动加入 ${lastAutoAdded.value.length} 只≥${autoAddThreshold.value}分股票到股票池`)
         }
         lastScan.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+        // 刚扫完这一支：用**响应里的**服务端时刻（loadTrendStocks 随后也会覆盖一次，两者同源）
+        if (result.data && result.data.scanAt) {
+          scanMeta.value = {
+            at: result.data.scanAt,
+            ageSec: typeof result.data.scanAgeSec === 'number' ? result.data.scanAgeSec : 0,
+            stale: !!result.data.stale,
+          }
+        }
         // 扫描完成后刷新温度计历史数据
         loadTrendHistoryCounts()
       }
@@ -1017,6 +1063,13 @@
 </script>
 
 <style scoped>
+  /* 数据过期提示（2026-11-03）：用琥珀色警示，**不用红也不用绿**——本仓配色纪律是
+     A股红涨绿跌，把"数据旧"染红会被读成"跌"，染绿会被读成"跌"的反面，两种都误导。 */
+  .scan-stale {
+    color: #b45309;
+    margin-left: 0.35rem;
+  }
+
   /* ========== 市场温度计（Redesigned 2026-07-08） ========== */
   .thermometer-section {
     background: #fff;

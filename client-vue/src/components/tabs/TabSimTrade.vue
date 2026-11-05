@@ -58,6 +58,11 @@
       <div class="src-group" v-if="sources.includes('screener')">
         <input class="sym-input" v-model="symbolsText" placeholder="筛选源股票代码，逗号分隔，如 sh600036,sz000001" />
       </div>
+      <div class="src-group">
+        <label class="src-item"
+          ><input type="checkbox" v-model="autoRunOnLoad" /> 页面加载时自动「生成建议 + 执行模拟成交」</label
+        >
+      </div>
       <div class="btn-group">
         <button class="btn primary" @click="onGenerate" :disabled="busy">从信号生成建议</button>
         <button class="btn" @click="onExecute" :disabled="busy">执行模拟成交</button>
@@ -184,6 +189,7 @@
             <th class="hide-sm">建议价</th>
             <th>成交价</th>
             <th>数量</th>
+            <th class="hide-sm time-col">操作时间</th>
             <th class="reason">来源 / 拒绝原因</th>
           </tr>
         </thead>
@@ -202,6 +208,8 @@
             <td class="num hide-sm">{{ o.proposed_price }}</td>
             <td class="num">{{ o.filled_price || '-' }}</td>
             <td class="num">{{ o.filled_qty || o.proposed_qty }}</td>
+            <!-- 操作时间：成交单显示成交时间(filled_at)，其余显示生成时间(created_at) -->
+            <td class="num hide-sm mono time-col">{{ fmtOpTime(o.filled_at || o.created_at) }}</td>
             <!-- 被拒的单子这列是中文拒因（后端本来就写中文）；成交/待执行的单子这列是来源，
                  之前直接印 o.source 把 recommend 这种内部枚举名甩给了用户 -->
             <td class="reason" v-if="o.status === 'rejected'">{{ o.reject_reason }}</td>
@@ -214,8 +222,14 @@
   </div>
 </template>
 
+<script>
+  // 模块级标记：保证「页面加载自动生成+成交」在一个页面生命周期内只跑一次
+  // （切换 Tab 重挂载也不重复触发；整页刷新后模块重载，标记归零会再跑一次，符合预期）
+  let _autoRanThisLoad = false
+</script>
+
 <script setup>
-  import { ref, computed, onMounted } from 'vue'
+  import { ref, computed, onMounted, watch } from 'vue'
   import { apiFetch, useNotification } from '../../utils/helpers'
   import { fmtNum } from '../../utils/format'
   import DataFreshness from '../DataFreshness.vue'
@@ -225,6 +239,10 @@
   const sources = ref(['recommend', 'tomorrow_plan', 'diagnosis', 'screener'])
   const symbolsText = ref('')
   const busy = ref(false)
+  // 页面加载自动「生成建议 + 执行成交」开关（localStorage 记住勾选状态，仅当前页生效）
+  const AUTO_RUN_KEY = 'sim_auto_run_on_load'
+  const autoRunOnLoad = ref(localStorage.getItem(AUTO_RUN_KEY) === '1')
+  watch(autoRunOnLoad, v => localStorage.setItem(AUTO_RUN_KEY, v ? '1' : '0'))
   // 新鲜度（2026-10-13）：此前本页既无轮询也没有"更新于"，看不出看到的是不是今天的账户状态
   const fetchedAt = ref('')
 
@@ -252,6 +270,14 @@
   }
   function stLabel(s) {
     return { pending: '待执行', filled: '已成交', rejected: '已拒绝' }[s] || s
+  }
+  // 审计日志「操作时间」：sqlite 存的是 "YYYY-MM-DD HH:MM:SS"（已是北京时间），
+  // 截成 "MM-DD HH:MM" 显示；解析失败就原样返回，避免空白。
+  function fmtOpTime(t) {
+    if (!t) return '-'
+    const s = String(t).trim()
+    const m = s.match(/^\d{4}-(\d{2}-\d{2}) (\d{2}:\d{2})/)
+    return m ? `${m[1]} ${m[2]}` : s
   }
 
   async function load() {
@@ -283,7 +309,8 @@
         body: JSON.stringify({ sources: sources.value, symbols }),
       })
       if (d.success) {
-        showNotification(`已生成 ${d.created_count ?? 0} 条建议，${d.rejected_count ?? 0} 条被护栏拦截`)
+        const skip = d.skipped_count ? `，${d.skipped_count} 条已存在跳过` : ''
+        showNotification(`已生成 ${d.created_count ?? 0} 条建议，${d.rejected_count ?? 0} 条被护栏拦截${skip}`)
         await load()
       }
     } catch (e) {
@@ -355,7 +382,19 @@
     }
   }
 
-  onMounted(load)
+  onMounted(async () => {
+    await load()
+    // 页面加载自动「生成建议 + 执行成交」：每个页面生命周期只跑一次（切 Tab 重挂载不重复触发）
+    if (autoRunOnLoad.value && !_autoRanThisLoad && sources.value.length) {
+      _autoRanThisLoad = true
+      try {
+        await onGenerate()
+        if (state.value.pending.length) await onExecute()
+      } catch (e) {
+        /* 自动跑失败静默，不阻塞页面 */
+      }
+    }
+  })
 </script>
 
 <style scoped>
