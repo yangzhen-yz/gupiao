@@ -355,9 +355,18 @@ SPEC: List[Dict[str, Any]] = [
     },
     {
         'key': 'push_daily_limit', 'cfg': 'WECOM_PUSH_DAILY_LIMIT', 'kind': 'int',
-        'label': '每天最多推送条数', 'group': '推送', 'live': True,
-        'min': 1, 'max': 30, 'step': 1, 'unit': '条',
-        'note': '用满之后只记日志不再推（避免盘中扫描把手机刷屏）',
+        'label': '每天最多推送只数（去重后）', 'group': '推送', 'live': True,
+        'min': 1, 'max': 30, 'step': 1, 'unit': '只',
+        'note': '按"只"限（每只票一天只推一次）；用满之后本轮只记不推',
+        'impact': None,
+    },
+    {
+        'key': 'ops_notify_daily_limit', 'cfg': 'WECOM_OPS_NOTIFY_DAILY_LIMIT', 'kind': 'int',
+        'label': '运维通知每天最多推送条数', 'group': '推送', 'live': True,
+        'min': 0, 'max': 20, 'step': 1, 'unit': '条',
+        'note': '仅限"服务重启/自愈/隧道拉起"类运维通知（由仓库外守护脚本发送）。默认 2 条/天，'
+                '用满后当天不再推这类消息；业务推送（选股/盘前预览/T+1 预案/收评/市场情绪等）不受此限。'
+                '改完即时生效（守护脚本每次发通知前会来读这个值，后端挂了时按默认 2 兜底）。',
         'impact': None,
     },
     {
@@ -448,6 +457,15 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'exit_seal_shadow_enabled', 'cfg': 'EXIT_SEAL_SHADOW_ENABLED', 'kind': 'bool',
+        'label': '出口分叉影子：封住拿隔夜/没封住当天走', 'group': '卖出规则', 'live': True,
+        'note': '每天 20:35（日K五批同步之后）把当天推荐的三条出口（拿隔夜 / 当天收盘走 / 分叉）各算一遍落 '
+                'exit_seal_shadow 表。样本内 201 条：净口径 +0.23% / −0.26% / +0.68%，'
+                '分叉那条把"亏超 5%"从 9.0% 压到 4.5%。**只记录，不改出口文案、不改推送**；'
+                '≥20 个交易日后按判据裁决（影子台账第 15 条）',
+        'impact': None,
+    },
+    {
         'key': 'westock_crosscheck_enabled', 'cfg': 'WESTOCK_CROSSCHECK_ENABLED', 'kind': 'bool',
         'label': '每日双源数据校验（16:30，westock 权威）', 'group': '策略快照', 'live': True,
         'note': '把本地资金流/行情与 westock（腾讯自选股）比对，落 westock_snapshot 与 '
@@ -494,6 +512,41 @@ SPEC: List[Dict[str, Any]] = [
                 '新卡出问题时打开可立刻回到旧观感',
         'impact': 'desk',
     },
+    {
+        'key': 'db_lock_sentinel_enabled', 'cfg': 'DB_LOCK_SENTINEL_ENABLED', 'kind': 'bool',
+        'label': '盘中写锁哨兵', 'group': '数据库与写锁', 'live': True,
+        'note': '独立连接试 BEGIN IMMEDIATE，等超阈值仍拿不到写锁就推企微，附「主库距最后一次成功写入'
+                '几分钟」与最近任务锚点。哨兵拿到锁立刻 ROLLBACK，自己不会变成新的持锁者。'
+                '关掉＝完全不探测也不推送，盘中锁死只能等用户撞上来',
+    },
+    {
+        'key': 'db_lock_sentinel_threshold_sec', 'cfg': 'DB_LOCK_SENTINEL_THRESHOLD_SEC', 'kind': 'int',
+        'label': '写锁等待告警阈值', 'group': '数据库与写锁', 'live': True,
+        'min': 1, 'max': 10, 'step': 1, 'unit': '秒',
+        'note': '超过这个秒数还拿不到写锁就告警。2026-11-03 那次锁被占了 1 小时以上，阈值定多小都抓得到；'
+                '但定太小会在正常的并发写（多个定时任务同时落库）时误报，默认 2 秒',
+    },
+    {
+        'key': 'db_lock_sentinel_cooldown_min', 'cfg': 'DB_LOCK_SENTINEL_COOLDOWN_MIN', 'kind': 'int',
+        'label': '写锁告警冷却', 'group': '数据库与写锁', 'live': True,
+        'min': 1, 'max': 60, 'step': 5, 'unit': '分钟',
+        'note': '同一状态多久内只推一次。锁一直不放时哨兵每分钟都会探测到，不冷却就会推 60 条',
+    },
+    {
+        'key': 'sentiment_snapshot_save_stale_fresh', 'cfg': 'SENTIMENT_SNAPSHOT_SAVE_STALE_FRESH',
+        'kind': 'bool', 'label': '情绪快照允许落"当场采集但缺维"的 stale 行',
+        'group': '策略快照', 'live': True,
+        'note': '11-04 修：`_maybe_save` 原来对所有 stale 一律不落库，把"数字是此刻采的、只是东财'
+                '涨停池/某一维取不到"（source=intraday/alt_source）也一起拒了——东财连续两天不可用'
+                '就导致 market_sentiment_snapshots 两天 0 行，盘中情绪档断了审计链。现在只有'
+                '"复用旧值"那类（snapshot_fallback/snapshot_final/review_fallback）继续拒绝。'
+                '关掉＝逐字节回到"stale 一律不落库"',
+        'impact': 'snapshot',
+    },
+    # 注意：DB_FAST_FAIL_ENABLED 与 DB_CACHE_WRITE_BUSY_TIMEOUT_MS **故意不注册在这里**——
+    # 它们是 get_db_conn() 自己要用的值，而 app_settings.value() 内部就走 get_db_conn 读覆盖表，
+    # 接进来就是无限递归。那两项只能改 app/config.py 并重启后端（写
+    # server/data/backend_restart_requested 由看护重启），配置页看不到它们是有原因的。
 ]
 
 _SPEC_INDEX = {s['key']: s for s in SPEC}
