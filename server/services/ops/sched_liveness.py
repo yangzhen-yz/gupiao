@@ -62,8 +62,9 @@ _BEAT = {'ts': 0.0, 'since': None, 'loop_errors': 0}
 _STATE = {
     'started_ts': 0.0,
     'stop': False,
-    'last_alert': {'A': 0.0, 'B': ''},
+    'last_alert': {'A': 0.0, 'B': '', 'E': ''},
     'last_skip_reason': '',      # 上一轮"为什么不发"的原因，变了才打印
+    'last_chain_error': '',      # 上一轮 B 判据查库的异常文本，变了才报（修⑩-5）
     'thread': None,
 }
 _LOCK = threading.Lock()
@@ -127,18 +128,24 @@ def _rows(conn, table: str, date_col: str, day: str) -> int:
 def _count_chain(day: str) -> Dict:
     from db.dal_state import get_db_conn
     out = {'alive': 0, 'decision': {}, 'errors': ''}
-    conn = get_db_conn()
+    conn = None
+    # 11-07 修⑩-5 顺带抓到的第二处：**取连接这一步原来在 try 外面**。
+    # 而"库被锁死/打不开"恰恰是最需要它活着的那一种失败——原来异常直接从 `_count_chain`
+    # 逃出去，B 判据一条没判，观察线程只留下一行"本轮异常"。现在连取连接一起包进来，
+    # 失败就如实写进 `errors`，由 `alert_and_record` 的 E 类出声。
     try:
+        conn = get_db_conn()
         out['alive'] = max(0, _rows(conn, _ALIVE_TABLE[0], _ALIVE_TABLE[1], day))
         for t, col in _DECISION_TABLES:
             out['decision'][t] = max(0, _rows(conn, t, col, day))
     except Exception as e:
         out['errors'] = f'{type(e).__name__}: {e}'
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return out
 
 
@@ -256,6 +263,19 @@ def _render(a: Dict, beat: Dict, now: datetime, covered: bool) -> str:
     return '\n'.join([head, body, anchor + rows, tail, act]) + yr
 
 
+def _render_blind(err: str, day: str, now: datetime) -> str:
+    """E 类正文：说的不是"今天没事"，而是"今天我没能力判断"。"""
+    return '\n'.join([
+        '[调度链看护] 判据无法评估 %s' % now.strftime('%m-%d %H:%M'),
+        f'查 {day} 当天决策链行数时抛异常：{err}',
+        '含义：B（决策链空档）这一档今天不会告警——不是"没事"，是"看不见"。'
+        '心跳那条（A）不依赖库，仍然有效。',
+        '处置：优先看是不是写锁长占（日志 database is locked）、`app_settings` 之类'
+        '的表还没建、或库文件异常；推送按天去重（一天最多一条），异常文本每次变化'
+        '都会在日志里再打一行，不至于因为去重而漏掉新情况。',
+    ])
+
+
 def _send(text: str) -> bool:
     try:
         from services.support.push import push_wecom_webhook
@@ -290,6 +310,20 @@ def alert_and_record(res: Dict, force: bool = False) -> Dict:
         if _STATE.get('last_skip_reason') != why:
             _STATE['last_skip_reason'] = why
             print(f'[调度失活 {datetime.now():%H:%M:%S}] 本轮不发：{why}')
+
+    # E「判据自己瞎了」——修⑩-5：这一档原来只把异常塞进 res['chain_errors'] 就再没人看，
+    # 结果恰恰在**库查不动**（写锁、表缺、库损坏）的时候 B 不会告警，也没人知道它没判。
+    # 哨兵最该出声的两种情况是"事情坏了"和"我看不见了"，第二种原来完全沉默。
+    err = res.get('chain_errors') or ''
+    if err and _STATE.get('last_chain_error') != err:
+        _STATE['last_chain_error'] = err
+        day = res.get('day') or datetime.now().strftime('%Y-%m-%d')
+        text = _render_blind(err, day, datetime.now())
+        print(f'[调度失活 {datetime.now():%H:%M:%S}] 判据无法评估（B 这一档今天不会告警）：{err}')
+        if force or _STATE['last_alert'].get('E') != day:
+            if _send(text):
+                _STATE['last_alert']['E'] = day
+                print(f'[调度失活 {datetime.now():%H:%M:%S}] E 类（看不见）已推送，当天不再重复')
     return {'sent': sent, 'alerts': len(res.get('alerts', []))}
 
 

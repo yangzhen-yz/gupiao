@@ -344,8 +344,11 @@ def save_hot_search_ranking(data: Dict) -> bool:
         cutoff = (date.today() - timedelta(days=HOT_SEARCH_SNAPSHOT_CLEANUP_DAYS)).isoformat()
         try:
             cursor.execute('DELETE FROM hot_search_daily_snapshot WHERE snapshot_date < ?', (cutoff,))
-        except Exception:
-            pass
+        except Exception as e:
+            # 11-07 修⑩-6：原来 `except Exception: pass`，删除失败照样 commit/return True。
+            # 现在这张表确实在按 60 天收口（实测 8394 行、最早 2026-09-08 正卡保留线），
+            # 所以这不是"正在漏"，而是"哪天坏了没人知道"——保留清理失败必须出声。
+            print(f'[热搜快照] 保留期清理失败（表会继续涨）: {type(e).__name__}: {e}')
         conn.commit()
         conn.close()
         _db_cache_invalidate('hot_search_ranking')

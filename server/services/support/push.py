@@ -427,6 +427,27 @@ def _expected_gain(stock) -> float | None:
     return (sell - price) / price * 100
 
 
+def _st_name_veto(stock) -> bool:
+    """名称层 ST 复核（True=否决）。抽成函数是为了能被自测直接跑，含"判据坏了"那一支。
+
+    11-07 修⑩-6：这一段原来是 `except Exception: pass`——判据坏了就静默放行，
+    而它存在的理由就是"ST/退 永不推"（可交易范围的第一条），
+    一个只在正常时才生效的闸门等于没有闸门。现在**坏了就否决这一只**并打一行。
+    `is_st_name` 是纯字符串判断（`services/data/universe.py:64`），能抛异常的只有导入本身
+    坏掉；真到那一步整条推送链都该被看见，不该静默把 ST 推出去。
+    """
+    try:
+        from services.data.universe import is_st_name as _is_st
+        if _is_st(stock.get('name')):
+            print(f"[推送] ST 名称否决 {stock.get('name')}（{stock.get('symbol')}）")
+            return True
+        return False
+    except Exception as e:
+        print(f'[推送] ST 名称复核不可用，本轮对该票保守否决: {type(e).__name__}: {e}'
+              f'（{stock.get("name") or stock.get("symbol")}）')
+        return True
+
+
 def _pass_filter(stock) -> bool:
     """是否满足推送条件（与用户确认方案）：
     评分≥阈值 + 未涨停 + 预期涨幅≥阈值 + 量比≥阈值。
@@ -434,13 +455,8 @@ def _pass_filter(stock) -> bool:
     """
     # 名称层 ST 复核（2026-11-01）：与智能推荐同一条判据，堵"推荐不推、推送推"的漏口。
     # 扫描接口虽然也走范围过滤，但它读的是本地名录；行情名称是当下的，多挡一次不花成本。
-    try:
-        from services.data.universe import is_st_name as _is_st
-        if _is_st(stock.get('name')):
-            print(f"[推送] ST 名称否决 {stock.get('name')}（{stock.get('symbol')}）")
-            return False
-    except Exception:
-        pass
+    if _st_name_veto(stock):
+        return False
     try:
         score = float(stock.get('score') or 0)
     except (TypeError, ValueError):

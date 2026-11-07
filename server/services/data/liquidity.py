@@ -43,6 +43,7 @@ import sys
 import time
 from typing import Dict, Iterable, List, Optional
 
+from app import config as sys_cfg      # 退路用门面本体（不是星号拷贝），见 _flag/_num
 from app.config import (KLINE_HISTORY_DB_PATH, LIQ_AMOUNT_ENABLED, LIQ_MIN_AVG_AMOUNT,
                         LIQ_MIN_AVG_TURNOVER_PCT, LIQ_MIN_PRICE, LIQ_PRICE_ENABLED,
                         LIQ_STATS_WINDOW, LIQ_TURNOVER_ENABLED, LIQUIDITY_FILTER_ENABLED)
@@ -64,6 +65,14 @@ def enabled() -> bool:
 
 
 def _flag(key: str, cfg_name: str) -> bool:
+    """覆盖表优先、config 兜底。
+
+    2026-11-07 修⑩-2：兜底那一行原来写的是 `getattr(sys_cfg, cfg_name)`，而 `sys_cfg`
+    在这个模块里**从未定义过**（全仓 grep 只有这两处引用它）——意思是"覆盖表读不到"这个
+    退路本身必炸：`app_settings.value()` 一旦抛异常（库被锁、app_settings 表还没建），
+    这里抛的是 `NameError: name 'sys_cfg' is not defined`，而不是退回 config 默认值。
+    成交额/换手/3 元这三条**入场资格**开关正好走这条路，等于在最需要降级的时候没降级。
+    """
     try:
         from services.support import app_settings
         return bool(app_settings.value(key))
@@ -72,7 +81,10 @@ def _flag(key: str, cfg_name: str) -> bool:
 
 
 def _num(key: str, cfg_name: str) -> float:
-    """取阈值并换算回 config 单位（覆盖表里 `value()` 给的是界面单位：万元 / % / 元）。"""
+    """取阈值并换算回 config 单位（覆盖表里 `value()` 给的是界面单位：万元 / % / 元）。
+
+    退路同 `_flag`：以前也是 `getattr(sys_cfg, ...)` 的死引用，一并修掉。
+    """
     try:
         from services.support import app_settings
         v = float(app_settings.value(key))

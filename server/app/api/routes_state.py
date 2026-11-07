@@ -209,10 +209,18 @@ def _spawn_hot_scan_refresh(cache_key: str, codes_raw: str, pool_only: bool):
     def _run():
         _HOT_SCAN_CTX.compute = True
         try:
+            # 2026-11-07 修⑩-1：这个名字必须在这里现取，不能指望模块顶层有它。
+            # `hot_stock_buttons_scan` 定义在 `app/api/routers/scan.py`，而 scan 又是
+            # `from ..routes_state import *`（反向再引一次就是循环导入），所以 routes_state
+            # 的 globals 里从来不会有它——11-06 路由拆分（267cfb8）之后这条路径每次都抛
+            # NameError，再被下面那个 except 吞成一行"后台刷新失败"。日志实拍：最后一次
+            # "[批量扫描] 后台刷新完成" 停在 11-05/06，11-07 08:0x 只留下一条
+            # `name 'hot_stock_buttons_scan' is not defined`，即陈旧缓存的补算整条失效了一周。
+            from app.api.routers.scan import hot_stock_buttons_scan
             asyncio.run(hot_stock_buttons_scan(codes=codes_raw, force=False, pool_only=pool_only))
             print(f'[批量扫描] 后台刷新完成 {cache_key[:40]}…')
         except Exception as e:
-            print(f'[批量扫描] 后台刷新失败（旧缓存保留）: {e}')
+            print(f'[批量扫描] 后台刷新失败（旧缓存保留）: {type(e).__name__}: {e}')
     threading.Thread(target=_run, daemon=True, name='hot-scan-refresh').start()
 
 

@@ -835,20 +835,24 @@ def reset_value(key: str, user: str = '') -> Dict[str, Any]:
     invalidate()
     # 同 set_value：只有「选股范围」组才需要清范围缓存，纯界面项别把热缓存打掉
     if _invalidates_scope(key):
+        # 11-07 修⑩-6：这一段原来是 `except Exception: pass`（而 set_value 里同样的逻辑
+        # 11-06 就已经带打印）。"恢复默认"改了选股范围却没清缓存时，页面显示的是新默认值、
+        # 实际还在供旧名单，而且一声不响——两条写入口径必须一致，所以照 set_value 补齐。
         for mod in ('services.data.universe', 'services.data.liquidity', 'services.data.market_cap'):
             try:
                 import importlib
                 m = importlib.import_module(mod)
-                if hasattr(m, 'invalidate_cache'):
-                    m.invalidate_cache()
-            except Exception:
-                pass
+                for fn in ('invalidate_cache', 'clear_cache'):
+                    if hasattr(m, fn):
+                        getattr(m, fn)()
+            except Exception as e:
+                print(f'[配置覆盖] {mod} 缓存清理跳过: {type(e).__name__}: {e}')
         # 2026-10-30：同 set_value，口径摘要后台重算
         try:
             from services.support import settings_preview as _sp
             _sp.refresh_summary_async()
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f'[配置覆盖] 口径摘要重算触发失败（不影响本次清除）: {type(_e).__name__}: {_e}')
     return {'ok': True, 'key': key, 'value': default_value(key)}
 
 
