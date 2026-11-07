@@ -27,6 +27,7 @@ git config --local --unset core.hooksPath
 | B5 文档同步 | 改了 `server/**` 或 `client-vue/src/**` 但没暂存任何文档 | **只提醒**（不阻断） | 按 AGENTS.md 清单同步 5 份文档 |
 | B6 事务持锁 | 本次**新增行**落在"同一函数体内第一条 DML 之后、下一个 `commit()` 之前"的窗口里，且窗口内出现 `await` / `requests` / `fetch_*` / `sleep` 等外部 IO（判据在 `server/scripts/tx_holding_scan.py`，白名单式） | **只提醒**（不阻断） | 外部拉数挪到事务之外，或逐条写完就 `conn.commit()` 把写锁交还 |
 | B7 自测换库 | 暂存的 `server/scripts/*selftest*.py` 里「会写库却没有任何隔离（没 `use_db_path`、没把 `get_db_conn` 换成桩、也不是全临时路径）」，或给 `database`/`config`/`dal_state` 的 `SQLITE_DB_PATH` 赋值（11-05 拆分后静默无效），或直连 `gupiao.db`/`history_kline.db` 且没写 `mode=ro`（判据在 `server/scripts/db_hygiene_check.py`，规则 R1/R2/R3） | **阻断**（`analysis_out/` 里的同名一次性脚本只提示） | 顶部加 `import db.database as dbmod; dbmod.use_db_path(临时库)`；只读复核就写 `sqlite3.connect("file:…?mode=ro", uri=True)` |
+| B8 日志编码兜底 | `app/ core/ services/` 里运行期 `print` 有 GBK 编不出的字符并不可怕（入口兜底覆盖着），**可怕的是保护本身没了**：`server/app/main.py` 里那段 stdout `reconfigure` 缺任一要件——没有字样／有字样但没真调用／GBK 家族编码探测被摘／调用没包在 `try` 里／**函数还定义着但顶层那行调用被注释掉**（判据在 `server/scripts/log_encoding_guard.py`，规则 L1 阻断、L2 只报风险面计数） | **阻断**（L2 计数不拦，只打印"当前多少处"） | 把 `_make_log_utf8_safe()` 那块恢复回来（探到 gbk/cp936/gb2312/gb18030 才动手、收 UTF-8 + `errors='replace'`、整块包 `try`、顶层真的调它）；若确实要换策略，得说明那 25 处 print 改由什么保护 |
 | pre-push | 远程 sha 不在本地历史里（非快进） | **阻断** | `git fetch` + `git rebase` 后正常 push；个人分支最多用 `--force-with-lease` |
 | pre-push 全树 | push 时工作树里仍有**已跟踪但未提交**的改动（`M`/`A`/`D`/`R`；未跟踪 `??` 不拦） | **阻断** | 按 CONTRIBUTING 第 6 节的清单把这些路径也逐路径提交（别人的就在提交说明里标归属），或与用户确认后 `git stash push` 这批路径 |
 
@@ -58,6 +59,8 @@ pre-push 全树 特别说明（2026-11-05 新增，规矩出处见 AGENTS.md「�
 
 B7 特别说明（2026-11-07 新增）：这一项**阻断**，和 B5/B6 只提醒不同，理由是它的失效方式是「不报错」——写错库的自测照样打印全绿，假数据却进了生产库。本仓实拍两次：10-19 把 `2099-` 测试日期写进 `westock_snapshot`/`data_cross_check`，11-06 又一次污染；第二次的处置是「退出前连真库 DELETE 擦干净」，那等于拿生产库当擦布（11-07 已把 `fundflow_selftest`/`westock_crosscheck_selftest` 两处改成只读核对 + 漏了判 FAIL）。判据两次踩坑都写在检查器文件头：整行正则会被「函数名长名单字符串」骗（误报 `database_split_selftest`），整段调用原文会被「坏样本源码字符串」骗（误报它自己的长期自测）；现在只看 AST 的 callee 名判写、只看 `connect`/`execute` 的参数判路径与 SQL。双向验证：`python server/scripts/selftest_db_hygiene_selftest.py` 28/28（含「合法写法必须放行」那一侧），`db_hygiene_check.py --all` 对 `server/scripts/` 报 0 处阻断。
 
+B8 特别说明（2026-11-07 新增）：这一项**只对 L1 阻断**，L2 永远只报数——因为本仓的设计本来就是「一处入口兜底覆盖同类问题，不逐行改文案」（11-02 定的），逼人改 `⚠` 反而会把日志写得失去信息量。L1 拦的是**保护消失**：看护把 stdout 重定向进 GBK 管道，10-26 起 `[推荐模式]` 那条告警就抛 `UnicodeEncodeError` 崩了 16 次、连带吞掉后面的汇总日志，全靠入口那段 `reconfigure` 治住。风险面读数（`--all` 实测）：**25 处 GBK 编不出的运行期 print / 扫 140 个文件**，11-02 文档写的是 17 处——它担心的「计数随新增日志无感增长」确实发生了，所以更要把兜底钉住。判据踩过的坑（写在检查器与自测里）：整行 grep 会漏多行 f-string（`print(` 在第一行、`⚠` 在第三行，两行单独都能编进 GBK），也会误报注释里的 `⚠`；改用 AST 取整条 print 语句。而 L1 的第一版更险——`ast.walk(stmt)` 会钻进函数体，把定义里的 `reconfigure` 当成「顶层调用过」，于是「函数还定义着、调用那行被注释掉」这种最像人犯的错**报不出红**；补了 `_top_level_call_names()` 显式跳过 def/class 子树，并把这个形态固化成反证②/⑤。
+
 ## 单独关某一项（每项独立开关，关掉必须完全等于没这项检查）
 
 ```sh
@@ -68,6 +71,7 @@ git config --local hooks.secret.enabled    false   # B4
 git config --local hooks.docsync.enabled   false   # B5
 git config --local hooks.txlock.enabled    false   # B6
 git config --local hooks.dbhygiene.enabled false   # B7
+git config --local hooks.logencoding.enabled false  # B8
 git config --local hooks.pushforce.enabled false   # pre-push
 git config --local hooks.pushwhole.enabled false   # pre-push 全树
 ```
@@ -99,6 +103,21 @@ printf %s\n 'import db.database as d' 'd.SQLITE_DB_PATH="/tmp/x.db"' \
 git add server/scripts/zz_probe_selftest.py
 git hook run pre-commit; echo $?    # 期望：打印 R2/R1 并非 0（拦住了）
 git reset -q server/scripts/zz_probe_selftest.py && rm server/scripts/zz_probe_selftest.py
+
+# B8 判据双向验证（同一条规矩：先拿坏样本反证，再说它拦得住）
+python server/scripts/log_encoding_guard_selftest.py   # 期望：21/21（五种坏法 + 合法写法放行那一侧）
+python server/scripts/log_encoding_guard.py --all      # 期望：退出码 0，并打印"GBK 编不出 N 处 / 扫 M 个文件"
+# 现场演一次"真能拦住"（只注释入口那行调用、不产生提交，跑完原样还原）：
+python - <<'EOF'
+import io
+p='server/app/main.py'; s=io.open(p,encoding='utf-8').read()
+io.open(p,'w',encoding='utf-8',newline='').write(s.replace('    _make_log_utf8_safe()\n','    # _make_log_utf8_safe()\n'))
+EOF
+git add server/app/main.py
+python server/scripts/log_encoding_guard.py --staged; echo $?   # 期望：打印 L1「顶层没有调用它」并返回 1
+# 还原（顺序要对：先把 index 退回 HEAD，再从 index 取回磁盘那份；反了会把坏版本又拿回来）：
+git reset -q server/app/main.py && git checkout -- server/app/main.py
+python server/scripts/log_encoding_guard.py --all | tail -1     # 期望：放行（退出码 0），且 `git status` 里 main.py 干净
 ```
 
 ## 还缺的一层（只能人工在网页做）
