@@ -1,10 +1,10 @@
 """scheduler - 定时任务调度"""
-import asyncio, schedule, time, threading
+import asyncio, os, schedule, time, threading
 from datetime import datetime, timedelta
 
 from app.config import (SCHEDULE_UPDATE_HOT_SEARCH_TIMES, SCHEDULE_MA10_CHECK_TIME, SCHEDULE_DAILY_REVIEW_TIME, SCHEDULE_BACKTEST_TIME, SCHEDULE_RECOMMENDATION_TIMES, SCHEDULE_PRE_CLOSE_SNAPSHOT_TIME, RECOMMEND_REVIEW_TIME, SCHEDULE_TREND_SCAN_INTERVAL_MIN, SCHEDULE_TREND_SCAN_START, SCHEDULE_TREND_SCAN_END, SCHEDULE_TREND_BACKTEST_TIME, SHAREHOLDER_UPDATE_TIME, FUNDAMENTAL_UPDATE_TIME, VALUATION_UPDATE_TIME, SCHEDULE_MARKET_ALERT_TIMES, SMART_MONEY_UPDATE_TIME, WECOM_PUSH_INTERVAL_SEC, REC_SIM_DAILY_TIME, SHADOW_EVAL_TIME, SHADOW_EVAL_MIN_DAYS, WECOM_PUSH_START, WECOM_PUSH_END, WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_PREVIEW_TIME, KLINE_HISTORY_SYNC_TIME, KLINE_HISTORY_SYNC_TIMES, KLINE_HISTORY_SYNC_LAST,
                         KLINE_HISTORY_ENABLED, RPS_PERIOD_DAYS,
-                        KLINE_RESTATE_TIME, KLINE_RESTATE_LIMIT)
+                        KLINE_RESTATE_TIME, KLINE_RESTATE_LIMIT, ZHABAN_SHADOW_TIME)
 
 from services.data.stock import fetch_eastmoney_hot_list
 from db.database import save_hot_search_ranking, save_daily_market_reviews
@@ -33,6 +33,7 @@ from app.config import MATRIX_RERUN_ENABLED, MATRIX_RERUN_TIME
 from app.config import SENTIMENT_FINAL_SNAPSHOT_TIME
 from app.config import INDEX_DAILY_SYNC_TIME
 from app.config import (MARKET_CAP_REFRESH_TIME, MARKET_CAP_REFRESH_WEEKDAY,
+                        MARKET_CAP_REFRESH_WEEKDAY2,
                         INDUSTRY_SYNC_TIME, INDUSTRY_SYNC_WEEKDAY,
                         CANDIDATE_POOL_MAX, KLINE_POOL_MIN_COVERAGE)
 from app.config import (POSITION_WATCH_ENABLED, POSITION_WATCH_INTERVAL_SEC,
@@ -112,6 +113,57 @@ async def update_hot_search_ranking_task():
         print(f'[定时任务 {datetime.now():%H:%M:%S}] 更新热搜榜失败: {str(error)}')
         import traceback
         print(f'  堆栈: {traceback.format_exc()[:300]}')
+
+
+def _run_pending_guarded() -> None:
+    """跑一轮定时任务，但**绝不让一个坏 job 冻结整条调度**。
+
+    为什么不能直接 `schedule.run_pending()`：它的实现是
+    `for job in sorted(runnable_jobs): self._run_job(job)`，而 `Job.run()` 是
+    「先执行 job_func、执行完才推进 next_run」。所以 job_func 一抛异常：
+      · next_run 没推进 ⇒ 这个 job 下一轮仍然"到点"，而且按 next_run 排序永远排第一；
+      · for 循环被异常打断 ⇒ 排在它后面的 job **这一轮一个都轮不到**；
+      · 下一轮 10 秒后再来一遍 —— 于是整条定时任务链被这一个坏 job 永久卡死。
+
+    11-06 实拍：03:30 的 `job_db_backup` 缺一个 `import os`，从 03:30:01 起每 10 秒抛一次，
+    结果 09:00 盘前海选、09:15 竞价快照、09:45/10:00/13:30/14:05 智能推荐、15:35 自动优化、
+    每 60s 接口用量落库**全天一条都没执行**（`daily_candidate_pool`/`daily_recommendations`/
+    `strategy_snapshot`/`auction_snapshot`/`cls_plate_daily` 当天全是 0 行），当天既没推票、
+    也没推大盘提醒；只有主循环里的收评自愈、回测自愈在 15:10/15:20 把两项补了回来
+    （`[定时任务自愈 15:10:09] 检测到今日(2026-11-06)收评缺失`）。日志里那 4115 条
+    run_pending 异常只是这座冰山的露尖部分。
+
+    做法：自己按 `next_run` 顺序遍历到点的 job，**每个 job 单独 try**——坏 job 抛异常时
+    照样推进它自己的 `next_run`（当天跳过它，不再每 10 秒重复抛），后面的 job 继续执行。
+    语义与 `run_pending()` 一致的地方：同样尊重 `CancelJob` 返回值；不一致的地方只有一处
+    ——异常不再打断这一轮。这样"忘了 import"这类错误的代价从"整天没有推荐"降级成
+    "那一个任务当天没跑，并且日志里点名是谁"。
+    """
+    now = datetime.now()
+    try:
+        due = [j for j in schedule.get_jobs() if j.should_run]
+    except Exception as e:
+        print(f'[定时任务 {now:%H:%M:%S}] 取到期任务失败（本轮跳过）: {type(e).__name__}: {e}')
+        return
+    for job in sorted(due, key=lambda j: (j.next_run or now)):
+        name = getattr(getattr(job, 'job_func', None), '__name__', None) or repr(job.job_func)[:60]
+        try:
+            ret = job.run()
+            if isinstance(ret, schedule.CancelJob) or ret is schedule.CancelJob:
+                schedule.cancel_job(job)
+        except Exception as e:
+            # job.run() 里 job_func 抛异常时 next_run 不会被推进，这里补一刀把它推到下一次；
+            # 推进失败就退回按周期加，绝不能让这个 job 留在"永远到点"的状态
+            try:
+                job._schedule_next_run()
+            except Exception:
+                try:
+                    job.next_run = datetime.now() + timedelta(hours=24)
+                except Exception:
+                    pass
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 定时 job「{name}」抛异常（已隔离，'
+                  f'本轮其余任务继续执行）: {type(e).__name__}: {e}；'
+                  f'该任务已跳过一次，下次执行时间 {job.next_run:%m-%d %H:%M}')
 
 
 async def generate_review_task():
@@ -297,11 +349,13 @@ def run_scheduler():
         import time as _time
         try:
             import asyncio as _aio
-            from app.api import routes as _r
+            # routes.py 拆分（2026-11-05）后端点函数不再从聚合模块再导出，
+            # 这个预热必须直接取 routers.scan 里的实现，否则启动即 NameError 式失败
+            from app.api.routers.scan import hot_stock_buttons_scan
             from db.database import load_user_scan_pool
             _codes = ','.join(load_user_scan_pool()) or 'sh600519'
             _t = _time.time()
-            _aio.run(_r.hot_stock_buttons_scan(codes=_codes, force=False, pool_only=False))
+            _aio.run(hot_stock_buttons_scan(codes=_codes, force=False, pool_only=False))
             print(f'[预热 {datetime.now():%H:%M:%S}] 批量扫描缓存完成（{_time.time() - _t:.1f}s）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 批量扫描预热失败（首开会现算）: {e}')
@@ -551,6 +605,32 @@ def run_scheduler():
             except Exception as e:
                 print(f'[定时任务 {datetime.now():%H:%M:%S}] T+1 预案推送异常(账号{uid}): {e}')
 
+    def job_overnight_exit_advice():
+        """9:15 竞价前：过夜仓"今天按默认出口该做什么"（2026-11-07，修⑥②，默认关）。
+
+        与上面那班 T+1 预案的分工：预案只管"昨天盘中真的响过、因 T+1 压到今天"的票；
+        这一班管的是**时间止损到期 / MA20 就在头顶 / P0 基线次日开盘卖**这三条从没响过的。
+        两个开关独立（`OVERNIGHT_EXIT_ADVICE_ENABLED` 总开关、`OVERNIGHT_EXIT_PUSH_ENABLED`
+        只决定推不推），关掉时这行日志都不会有——现状逐字节不变。
+        """
+        if not _today_is_trading():
+            return
+        try:
+            from services.portfolio import overnight_exit
+            if not overnight_exit.enabled():
+                return
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 过夜出口提醒模块加载失败: {e}')
+            return
+        for uid in (watch_targets() or [1]):
+            try:
+                r = asyncio.run(overnight_exit.run(user_id=uid))
+                if r.get('advised'):
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] 过夜出口提醒(账号{uid}): '
+                          f'{r}')
+            except Exception as e:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 过夜出口提醒异常(账号{uid}): {e}')
+
     def job_generate_review():
         asyncio.run(generate_review_task())
 
@@ -648,6 +728,24 @@ def run_scheduler():
                 print(f"[出口分叉影子] 未落库: {r['error']}")
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 出口分叉影子落库失败: {e}')
+
+    def job_zhaban_shadow():
+        """炸板次数影子（2026-11-06，影子台账第 17 条）：用腾讯 1 分钟分时把东财涨停池的
+        `zbc` 另算一遍，与东财真值并排落 `zhaban_shadow`。**只记录**——不改情绪评分、
+        不改封板质量、不改门槛、不改推送。
+        东财三池当天 0 行（pools 家族也停调的日子）就直接跳过：没有真值的对照没有裁决价值，
+        把它写进表里会让人误以为"已经接成备源了"。"""
+        try:
+            from services.data import zhaban_shadow as _zs
+            if not _zs.enabled():
+                return
+            r = _zs.run_day()
+            if r.get('skipped'):
+                print(f"[炸板影子] 跳过：{r['skipped']}")
+            elif r.get('error'):
+                print(f"[炸板影子] 未落库: {r['error']}")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 炸板影子落库失败: {e}')
 
     def job_sector_persistence():
         """板块持续性预热（2026-10-22，主线判定的分母）。
@@ -951,7 +1049,9 @@ def run_scheduler():
             from services.data.market_cap import refresh as _refresh_cap
             r = _refresh_cap()
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 市值刷新完成：新入库 {r.get("ok")}，'
-                  f'未取到 {r.get("fail")}（限流则下次续补）')
+                  f'本轮尝试 {r.get("total")}，未取到 {r.get("fail")}'
+                  + (f'（来源 {r.get("source")}）' if r.get('source') else '')
+                  + (f'（{r.get("reason")}）' if r.get('reason') else ''))
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 市值刷新异常: {e}')
 
@@ -1293,6 +1393,8 @@ def run_scheduler():
 
     # T+1 预案（2026-10-15）：昨天买的今天才能卖，提醒时点放在 9:15 竞价
     schedule.every().day.at(PUSH_T1_PLAN_TIME).do(job_push_t1_plan)
+    # 过夜默认出口提醒（2026-11-07，修⑥②）：排在 T+1 预案之后，同一分钟两班各管各的
+    schedule.every().day.at(PUSH_T1_PLAN_TIME).do(job_overnight_exit_advice)
 
     schedule.every().day.at(SCHEDULE_DAILY_REVIEW_TIME).do(job_generate_review)
 
@@ -1390,7 +1492,11 @@ def run_scheduler():
     schedule.every().day.at(KLINE_RESTATE_TIME).do(job_restate_queue)
 
     # 总市值表每周刷新（2026-10-16）：选票/K线/分时线据此剔除 <35亿 小微盘，防量化操控；非交易日也跑
+    # 2026-11-07 起两班（周日 + 周三）：`refresh()` 的单轮上限是 1600 只（避开 10-16 那次
+    # "猛拉 1100 只被限流"的形状），而待补口径是"缺失或超龄 7 天"≈ 全表 3054 只，
+    # 一班拉不完，两班才保证每只票实际刷新周期 ≤7 天——否则又回到"表冻结在某一天的价格"。
     getattr(schedule.every(), MARKET_CAP_REFRESH_WEEKDAY).at(MARKET_CAP_REFRESH_TIME).do(job_refresh_market_cap)
+    getattr(schedule.every(), MARKET_CAP_REFRESH_WEEKDAY2).at(MARKET_CAP_REFRESH_TIME).do(job_refresh_market_cap)
 
     # 行业分类周更（2026-10-19）：东财被封时，资金流向的行业列与板块聚合都靠这张本地表
     getattr(schedule.every(), INDUSTRY_SYNC_WEEKDAY).at(INDUSTRY_SYNC_TIME).do(job_sync_industry_map)
@@ -1405,6 +1511,9 @@ def run_scheduler():
     # 财联社题材梯队（2026-10-31，影子）：15:10 收盘定版落库，15:45 跟着主题链一起重试
     schedule.every().day.at("15:10").do(job_cls_ladder_sync)
     schedule.every().day.at("15:45").do(job_cls_ladder_sync)
+    # 炸板次数影子（2026-11-06，台账第 17 条）：15:52 排在 15:45/15:47 那两条之后，
+    # 此时收盘分时已完整、东财三池盘中已落库；一轮 ~54 只 × 0.15s ≈ 20 秒，只写旁路表。
+    schedule.every().day.at(ZHABAN_SHADOW_TIME).do(_warp_trading_only(job_zhaban_shadow))
     # 情绪收盘定版（2026-11-03，#11 减仓回测的前置）：15:30 抓一次、16:05 重试一次（仅交易日）。
     # 只写旁路表 sentiment_final_daily，不改任何读取路径；一天一行幂等，重复跑无害。
     schedule.every().day.at(SENTIMENT_FINAL_SNAPSHOT_TIME).do(job_sentiment_final)
@@ -1435,6 +1544,9 @@ def run_scheduler():
     print(f'[定时任务]   - {CANDIDATE_POOL_TIME}: 盘前海选候选池（范围：沪深主板、剔除ST，'
           f'上限 {CANDIDATE_POOL_MAX} 只，喂给 {"/".join(SCHEDULE_RECOMMENDATION_TIMES)} 的推荐）')
     print(f'[定时任务]   - {PUSH_T1_PLAN_TIME}: T+1 可卖预案推送（昨日买入当天卖不掉的票，今天竞价提醒）')
+    print(f'[定时任务]   - {PUSH_T1_PLAN_TIME}: 过夜仓"默认出口"提醒（时间止损到期/逼近MA20/'
+          f'次日开盘卖基线；开关 overnight_exit_advice_enabled，推送另有 '
+          f'overnight_exit_push_enabled，两个默认关）')
     print(f'[定时任务]   - {SCHEDULE_DAILY_REVIEW_TIME}: 自动生成每日收评（仅交易日，含 AI 情绪评分/操作建议）')
     print(f'[定时任务]   - {SCHEDULE_BACKTEST_TIME}: 回测验证昨日预测并调整策略权重（仅交易日）')
     print(f'[定时任务]   - {SCHEDULE_TREND_BACKTEST_TIME}: 趋势评分回测验证（1/3/5日跑赢大盘胜率，仅交易日）')
@@ -1530,10 +1642,10 @@ def run_scheduler():
         try:
             # 2026-09-18 稳定性修复：run_pending 单独 try 隔离。
             # 任何定时 job 抛异常只记录，不再拖累下方的企业微信推送轮询与自愈检查。
-            try:
-                schedule.run_pending()
-            except Exception as _sched_err:
-                print(f'[定时任务 {datetime.now():%H:%M:%S}] run_pending 异常（已隔离，不影响推送）: {_sched_err}')
+            # 2026-11-06 升级为 _run_pending_guarded()：只"记录"是不够的——schedule 在
+            # job_func 抛异常时不推进 next_run，坏 job 会永远排在第一轮，把后面所有
+            # 定时任务一起冻死（当天实拍：03:30 一个 NameError 卡掉整天海选/推荐/竞价）。
+            _run_pending_guarded()
             _now = datetime.now()
             _hm = _now.strftime('%H:%M')
             _today_str = _now.strftime('%Y-%m-%d')

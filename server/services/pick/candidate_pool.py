@@ -82,6 +82,31 @@ def near_high_ratio() -> float:
     return float(_set('candidate_near_high_pct', 'CANDIDATE_POOL_NEAR_HIGH', 0.92)) / 100.0
 
 
+def condition_masks(frame) -> Dict[str, object]:
+    """海选四条门槛的逐条布尔掩码（2026-11-06 从 build_pool 里抽出来）。
+
+    抽出来只有一个目的：**让影子层与线上筛选共用同一份表达式**。影子
+    （`candidate_pool_shadow.record_day`）要按"被哪一条挡掉"归因，如果它自己再抄一遍条件，
+    哪天这里改了阈值或加了条件，影子就会静默失真。自测里有一条逐元素等价断言守着它。
+    掩码全部作用在含 close/ma20/ma60/hi60/v5/chg/rank_pct 的当天切片上。
+    """
+    return {
+        'ma': (frame.close > frame.ma20) & (frame.ma20 > frame.ma60),
+        'near': frame.close >= near_high_ratio() * frame.hi60,
+        'chg': frame.chg > 0,
+        'vol': frame.volume >= frame.v5,
+        'rank': frame.rank_pct >= rps_top_pct(),
+    }
+
+
+def all_pass(masks: Dict[str, object]):
+    """四条同时满足（与改造前的表达式逐元素等价，顺序无关）。"""
+    keep = None
+    for m in masks.values():
+        keep = m if keep is None else (keep & m)
+    return keep if keep is not None else None
+
+
 def _prefixed(code: str) -> str:
     """本地日K库用裸 6 位码，推荐链路用 sh/sz 前缀码。北交所一律排除
     （下游 `^(sh|sz)\\d{6}$` 的正则本来也不认 bj）。"""
@@ -219,13 +244,12 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
         d = d[bars.reindex(d.index).fillna(CANDIDATE_POOL_MIN_BARS) >= CANDIDATE_POOL_MIN_BARS]
         full = df.dropna(subset=['ma60', 'hi60', 'v5', 'r20', 'chg']).copy()
         full['rank_pct'] = full.groupby('date')['r20'].rank(pct=True) * 100
-        sel = full[full['date'] == fresh['latest']]
-        n_base = len(sel)          # 当天指标齐全、进入海选的只数（= 选股范围内当天有K线的）
-        sel = sel[(sel.close > sel.ma20) & (sel.ma20 > sel.ma60)
-                  & (sel.close >= near_high_ratio() * sel.hi60)
-                  & (sel.chg > 0) & (sel.volume >= sel.v5)
-                  & (sel.rank_pct >= rps_top_pct())]
-        sel = sel.sort_values('r20', ascending=False).head(pool_max())
+        day = full[full['date'] == fresh['latest']].copy()
+        n_base = len(day)          # 当天指标齐全、进入海选的只数（= 选股范围内当天有K线的）
+        day['near_high_pct'] = day['close'] / day['hi60'] * 100
+        day['n_bars'] = bars.reindex(day.index).fillna(0).astype(int)
+        masks = condition_masks(day)
+        sel = day[all_pass(masks)].sort_values('r20', ascending=False).head(pool_max())
         pool = []
         for row in sel.itertuples():
             sym = _prefixed(str(row.symbol))
@@ -237,6 +261,16 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
               f"当天指标齐全 {n_base} 只 → 过趋势/量能/RPS 阈值 {len(sel)} 只（上限 {pool_max()}）")
         if persist and pool:
             _save_pool(fresh['latest'], pool)
+        # 海选层影子（2026-11-06）：只写 candidate_pool_shadow，不参与任何判定。
+        # 记录的是"当天全范围每只票被哪条挡掉"，不是"池子"。任何异常都不许影响海选本身。
+        try:
+            from services.pick import candidate_pool_shadow as _cps
+            # persist=False 的调用（手工试算）不写池子，in_pool 也不能标 1
+            _cps.record_day(fresh['latest'], day, masks,
+                            in_pool={p['symbol'] for p in pool} if persist else set())
+            _cps.fill_outcomes()
+        except Exception as _e:
+            print(f'[候选池影子] 记录/回填失败（不影响海选）: {type(_e).__name__}: {_e}')
         return pool
     except Exception as e:
         print(f'[候选池] 海选异常（退回热搜池）: {type(e).__name__}: {e}')
@@ -244,7 +278,7 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
 
 
 def _save_pool(pool_date: str, pool: List[Dict]):
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         conn.execute(_DDL)
         conn.execute('DELETE FROM daily_candidate_pool WHERE pool_date=?', (pool_date,))
