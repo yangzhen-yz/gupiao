@@ -15,6 +15,7 @@
 #   git config --local hooks.secret.enabled   false   # B4 凭据/本机绝对路径写进代码
 #   git config --local hooks.docsync.enabled  false   # B5 文档未同步（只提醒，本来就不拦）
 #   git config --local hooks.txlock.enabled   false   # B6 事务内等外部 IO（只提醒，2026-11-03 新增）
+#   git config --local hooks.dbhygiene.enabled false  # B7 自测没换库就写库（阻断，2026-11-07 新增）
 # 整体停用：git config --local --unset core.hooksPath
 #
 # 失败信息一律给出"怎么改对"，不给出"怎么绕过"（不提供 --no-verify 建议）。
@@ -127,7 +128,7 @@ if enabled docsync; then
     if [ -n "$code_staged" ] && [ -z "$doc_staged" ]; then
         echo "⚠ 本次改了代码但没有 staged 任何文档。AGENTS.md 要求同步检查这几份："
         echo "      README.md / docs/工程知识库.md / docs/系统更新日志.md"
-        echo "      docs/优化实施计划-2026-10-18.md / docs/选股策略取长补短-2026-10-22.md"
+        echo "      docs/影子实验台账.md / docs/后续计划.md   # 11-02 文档收敛后的五件套（原两份计划文档已删）"
         echo "   这条不阻断：真拦会诱导'为了过关写一句空话'，反而污染文档。"
         echo "   自检办法是改完 grep 自己写入的独有关键串，命中 0 就是没落进去（或被另一路会话覆盖了）。"
     fi
@@ -156,6 +157,35 @@ if enabled txlock; then
         fi
     else
         echo "⚠ 没找到 python 解释器，事务持锁检查已跳过（本次放行）"
+    fi
+fi
+
+# ------------------------------------ B7 自测没换库就写库（阻断，2026-11-07 新增）
+# 三条规则 R1/R2/R3、判据的两次踩坑（正则被长名单字符串骗、整段调用原文被"坏样本字符串"骗）、
+# 以及"为什么只拦 scripts/ 而对 analysis_out/ 只提示"都写在 server/scripts/db_hygiene_check.py 文件头；
+# 正反用例钉在 server/scripts/selftest_db_hygiene_selftest.py（28/28）。
+# 为什么这条要阻断而 B5/B6 只提醒：写错库的自测**不会报错**——它绿着把假数据写进生产库。
+# 本仓实拍两次：10-19 把 `2099-` 测试日期写进 westock_snapshot/data_cross_check，
+# 11-06 又一次污染；第二次的处置是"退出前连真库 DELETE 擦干净"，那等于拿生产库当擦布。
+if enabled dbhygiene; then
+    py_bin=''
+    for cand in python python3 py; do
+        if command -v "$cand" >/dev/null 2>&1; then py_bin="$cand"; break; fi
+    done
+    if [ -n "$py_bin" ]; then
+        if ! "$py_bin" server/scripts/db_hygiene_check.py --staged; then
+            echo "✗ 已拦截：暂存的自测里有「会写库却没换到临时库」的写法（见上面 R1/R2/R3 的行号）。"
+            echo "  改法（三选一）："
+            echo "    1) 文件顶部加  import db.database as dbmod  然后  dbmod.use_db_path(临时库路径)"
+            echo "    2) 把 get_db_conn 换成桩：  某模块.get_db_conn = lambda: sqlite3.connect(临时文件)"
+            echo "    3) 只读复核真库就显式声明：  sqlite3.connect('file:…?mode=ro', uri=True)"
+            echo "  为什么不能用「dbmod.SQLITE_DB_PATH = 路径」这种赋值：11-05 db 拆分后它静默无效，"
+            echo "  自测会绿着把数据写进生产库（10-19 与 11-06 各实拍一次）。"
+            echo "  停用（不建议）：git config --local hooks.dbhygiene.enabled false"
+            exit 1
+        fi
+    else
+        echo "⚠ 没找到 python 解释器，自测换库检查已跳过（本次放行）"
     fi
 fi
 

@@ -21,18 +21,36 @@ import westock_crosscheck as xc
 
 
 def _cleanup_db():
-    """退出前清掉测试日期数据（防漏写真库——2026-10-19 踩过：打桩方式错导致
-    2099 测试日期写进真实 gupiao.db）。"""
+    """退出前**只读**核对真库：发现 2099 测试日期就记 FAIL（11-07 从"DELETE 擦干净"改的）。
+
+    老写法是退出时连真库 DELETE 掉 `2099-%`（2026-10-19 踩过一次：打桩方式错导致测试日期
+    写进真实 gupiao.db）。擦掉有两个坏处：一是自测在改线上状态（`westock_snapshot` 是
+    16:30 对照任务的输入），二是擦完没人知道曾经漏过。现在只查不删：漏了就报红，
+    本自测的写入本来已被 `_db.save_westock_snapshot` / `_db.save_cross_check` 两个桩接住，
+    真报红就说明桩漏了。规则出处见 `scripts/db_hygiene_check.py` 的 R3。
+    """
+    rows = []
     try:
         import sqlite3
         from db.database import SQLITE_DB_PATH
-        con = sqlite3.connect(SQLITE_DB_PATH, timeout=10)
-        con.execute("DELETE FROM westock_snapshot WHERE date LIKE '2099-%'")
-        con.execute("DELETE FROM data_cross_check WHERE date LIKE '2099-%'")
-        con.commit()
-        con.close()
+        con = sqlite3.connect(f'file:{SQLITE_DB_PATH}?mode=ro', uri=True, timeout=10)
+        try:
+            rows = con.execute(
+                "SELECT (SELECT COUNT(*) FROM westock_snapshot WHERE date LIKE '2099-%'), "
+                "(SELECT COUNT(*) FROM data_cross_check WHERE date LIKE '2099-%')").fetchone()
+        finally:
+            con.close()
     except Exception as e:
-        print(f'[自测清洗] 失败（不影响判定）: {e}')
+        print(f'[自测护栏] 真库只读核对失败（不判定，只提示）: {e}')
+        return
+    if rows and (rows[0] or rows[1]):
+        msg = f'真库残留 2099 测试日期（westock_snapshot={rows[0]} / data_cross_check={rows[1]}）'
+        _fail = globals().get('FAIL')          # atexit 可能跑在列表定义之前（脚本早退时）
+        if _fail is not None:
+            _fail.append(msg)
+        print(f'  [✗] {msg}')
+    else:
+        print('[自测护栏] 真库无 2099 残留（只读核对通过）')
 
 
 import atexit
