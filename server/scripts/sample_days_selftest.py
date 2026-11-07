@@ -198,36 +198,61 @@ print('[10] describe()：一行日志要能回答"今天天数怎么没涨"，�
 txt = SD.describe(SD.filter_sample_days(DATES, batch=BATCH, cal=CAL))
 for d in ('2026-11-07', '2026-10-01', '2026-10-05', '2026-10-08'):
     ck(d in txt, f'被排除的 {d} 打印出来了')
-ck('日历来源' not in txt, '日历正常（injected/stock_daily）时不硬加一句警告')
+ck('日历来源' not in txt, '日历走主路/injected 时不硬加一句警告（kline_calendar 也算可信，不警告）')
 fallback = SD.filter_sample_days(['2026-11-07'], batch=['2026-11-07'], cal=[])
 ck('日历来源=weekday_fallback' in SD.describe(fallback),
    f'降级时日志必须把来源打在行尾，让人当场看出这读数不可全信：{SD.describe(fallback)}')
 # print_eval 手里的是 evaluate() 的返回值（键是 sampleDays），describe 只认 counted 就会 KeyError
 ck(SD.describe({'sampleDays': ['2026-11-03', '2026-11-04'], 'skipped': [],
-                'calendarSource': 'stock_daily'}) == '样本日 2 天（无排除）',
+                'calendarSource': 'trading_calendar'}) == '样本日 2 天（无排除）',
    'describe() 也吃 evaluate() 那种返回值（sampleDays 键）——真库副本实测撞过这个 KeyError')
 
-# ========== [11] 真日历只读 smoke：日历到底认不认节假日 ==========
-def _cal_src():
-    return SD._CAL.get('source', '?')
+# ========== [11] 真日历只读 smoke：主路必须是仓里那份官方日历 ==========
+print('[11] 真日历只读：主路=官方公告表(trading_calendar)；日K 只作交叉校验与跨年降级')
+import datetime as _dt
+from services.data.trading_calendar import CLOSED_DATES, is_calendar_covered
+from services.data.trading_calendar import is_trading_day as _official
 
+_kd = SD.kline_days(refresh=True)
+ck(len(_kd) > 600, f'日K 交叉日历读到 {len(_kd)} 个交易日（2024-01-02 ~ 2026-11-06）')
 
-print('[11] 真库/真日K 只读：交易日历来自 stock_daily，节假日与周六都不在日历里')
-try:
-    cal = SD.trading_days(refresh=True)
-    ck(len(cal) > 600, f'日历覆盖 600+ 个交易日（实得 {len(cal)}，来源 {_cal_src()}）')
-    ck('2026-11-07' not in cal, '11-07（周六）不在日历里 —— 不再靠"星期几"猜')
-    for hol in ('2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06'):
-        ck(hol not in cal, f'{hol}（工作日但是国庆假期）不在日历里')
-    ck('2026-11-06' in cal, '11-06 是**交易日**（日K 有 2460 只的 bar），只是那天没出推荐')
-    ck(SD.filter_sample_days(['2026-11-06', '2026-11-07', '2026-10-05'],
-                             batch=['2026-11-07', '2026-10-05', '2026-11-03'])['counted'] == [],
-       '真日历下：周六批次、假期批次、冻结空日三个都不算样本')
-    _r11 = SD.filter_sample_days(['2026-11-06'], batch=['2026-11-03'])     # 日历真、批次里没 11-06
-    ck(_r11['counted'] == [] and _r11['skipped'][0]['reason'].startswith('空日'),
-       f"真日历把 11-06 归成『交易日但 0 批次』而不是『非交易日』（实得 {_r11['skipped']}）")
-except sqlite3.OperationalError as e:
-    print('     日K 库读不了（跳过本组）：', e)
+_only_kline = sorted(d for d in _kd if is_calendar_covered(d) and not _official(d))
+ck(_only_kline == [], f'① 日K 有 bar 但官方表判非交易日的日子（实得 {len(_only_kline)} 个）')
+
+_cur, _miss = _dt.date(2026, 1, 1), []
+while _cur.isoformat() < _dt.date.today().isoformat():
+    if _official(_cur) and _cur.isoformat() not in _kd:
+        _miss.append(_cur.isoformat())
+    _cur += _dt.timedelta(days=1)
+ck(_miss == [], f'② 官方表判交易日但日K 没 bar 的日子（2026 至今，实得 {len(_miss)} 个）'
+   ' —— 双向零分歧，主路才敢换成官方表')
+
+_hol_wd = sorted(d for d in CLOSED_DATES if _dt.date.fromisoformat(d).weekday() < 5
+                 and d < _dt.date.today().isoformat())
+ck(len(_hol_wd) >= 15,
+   f'2026 官方休市表里"周一至周五"的假期有 {len(_hol_wd)} 天 —— 第一版靠星期几会把这 {len(_hol_wd)} 天'
+   '全算成样本，这就是那条判据被推翻的量化代价')
+for _d in _hol_wd[:4]:
+    ck(not SD.is_trading_day(_d), f'{_d}（周{_dt.date.fromisoformat(_d).weekday() + 1}）'
+       '官方表判休市，本模块也说不是交易日')
+
+ck(SD.is_trading_day('2026-11-06'), '11-06 是交易日（官方表与日K 双向都认），只是那天没出推荐 ⇒ 归"空日"')
+ck(not SD.is_trading_day('2026-11-07'), '11-07 周六不是交易日 —— 官方日历能判"今天/明天"，'
+   '日K 判不了，这正是主路必须换成官方日历的原因')
+ck(SD.calendar_source('2026-11-05') == 'trading_calendar', '2026 年走主路 trading_calendar')
+ck(SD.calendar_source('2024-06-18') == 'kline_calendar', '官方表没覆盖 2024 ⇒ 降级到 kline_calendar')
+ck(SD.calendar_source('2027-01-05') == 'weekday_fallback',
+   '跨年又没有日K 数据 ⇒ weekday_fallback（读数必须自己承认在猜）')
+
+_r11 = SD.filter_sample_days(['2026-11-06'], batch=['2026-11-03'])
+ck(_r11['counted'] == [] and _r11['skipped'][0]['reason'].startswith('空日'),
+   f'日历说是交易日、批次里没有 ⇒ 归『空日』（实得 {_r11["skipped"]}）')
+_r11b = SD.filter_sample_days(['2026-10-05'], batch=['2026-10-05'])
+ck(_r11b['skipped'][0]['reason'].startswith('非交易日'),
+   '假期手工批次 ⇒ 归『非交易日』，不跟"空日"混成一个数')
+ck(_r11b['calendarSource'] == 'trading_calendar',
+   f'真日历路径下来源标注跟着出来（实得 {_r11b["calendarSource"]}）')
+
 
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
 if FAIL:

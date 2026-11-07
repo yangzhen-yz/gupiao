@@ -13,16 +13,23 @@
 
     **样本日 = 当天在交易日历里（本地日K `stock_daily` 有那一天的 bar）且当天有推荐批次（`daily_recommendations` 有行）。**
 
-第一版写的是"且当天是周一至周五"，被用户一句反问推翻：**工作日不等于交易日**——
-10-01（周四）、10-05（周一）这类法定节假日照样不开市，靠星期几会把它们当样本。
-日K 表天然只在有行情的那些天写行，它就是这台机器上现成的、零第三方依赖的日历，
-实测覆盖 688 个交易日（2024-01-02 ~ 2026-11-06），国庆 10-01~10-07 **一个都没有**。
-日K 表读不到时才退回"周一至周五"近似，并把 `calendarSource` 标成 `weekday_fallback`
-——降级期间节假日的手工批次会误算一天，所以这个来源必须跟着读数一起出来。
+判"是不是交易日"走的是**仓里那份按交易所公告维护的官方日历**
+`services/data/trading_calendar.py`（2026 休市表 + 调休补班 + 跨年守卫），不是我自己另造的。
+这一段有两次更正，都留着：
+  · **二次更正（11-07，用户反问"节假日不也没 K 线吗"）**：第一版第二条写"周一至周五"，
+    工作日不等于交易日——2026 年官方休市表里就有 **19 个日子是周一至周五**
+    （1/1、1/2、2/16~2/20、2/23、4/6、5/1、5/4、5/5、6/19、9/25、10/1~10/7），
+    靠星期几会把这 19 天全算成样本。当时改成"看本地日K 有没有那一天的 bar"。
+  · **三次更正（同日，自查发现）**：仓里**本来就有一张权威交易日历**，我拿日K 又造了一张——
+    两套日历迟早分叉，而且日K 只有过去，判不了"今天/明天是不是交易日"（盘中告警正需要这个）。
+    实测两套在重叠区间**零分歧**（688 个日K 日期 vs 官方表：双向都 0 处不一致），
+    所以主路换成官方表，日K 退成交叉校验 + 官方表没覆盖年份（2024/2025 那 485 个日子）的降级。
+    来源用 `calendar_source()` 标出来：`trading_calendar` / `kline_calendar` / `weekday_fallback`，
+    最后一档是"跨年又没数据、只能猜星期几"，读数要能看出自己不可全信。
 
 两条判据各堵一个实拍漏口（更正后依然成立，但分工变了）：
 - **日历那一半**管住"手工产出的非交易日"：11-07 是周六，手工点一次"生成建议"也给
-  `daily_recommendations` 留了 1 行，而日K 表里没有 11-07 ⇒ 不算样本；
+  `daily_recommendations` 留了 1 行 ⇒ 不算样本（国庆 10-05 那个周一同理，靠星期几就会漏）；
 - **批次那一半**管住"交易日但系统没出票"：11-06 是周五、日K 有 2460 只的 bar，
   但推荐/快照/候选池全 0 行（调度链被冻 12 小时且不可回补）⇒ 是"空日"，不算样本。
   同一类还有 10-08：日K、指数都正常，那天就是没出推荐——**这种日子该被诚实计入
@@ -50,18 +57,19 @@ from datetime import date
 from typing import Dict, Iterable, List, Optional, Sequence
 
 __all__ = [
-    'RULE', 'enabled', 'batch_days', 'trading_days', 'is_trading_day',
-    'is_trading_weekday', 'filter_sample_days', 'count', 'describe',
+    'RULE', 'enabled', 'batch_days', 'kline_days', 'trading_days',
+    'is_trading_day', 'calendar_source', 'is_trading_weekday',
+    'filter_sample_days', 'count', 'describe',
 ]
 
-RULE = ('样本日 = 当天在交易日历里（本地日K `stock_daily` 有那一天的 bar）'
-        '且当天有推荐批次（`daily_recommendations` 有行）（修⑧，11-07 二次更正）')
+RULE = ('样本日 = 当天是 A 股交易日（以仓里现成的 `services/data/trading_calendar.is_trading_day()` 为准）'
+        '且当天有推荐批次（`daily_recommendations` 有行）（修⑧，11-07 三次更正：不另造日历）')
 
 REASON_NO_BATCH = '空日：是交易日，但当天 0 推荐批次（调度没跑/数据不可回补，如 11-06）'
 REASON_NOT_TRADING = '非交易日：周末或法定节假日，日K 表里根本没有这一天（手工点出来的批次不算样本）'
 
-# 交易日历缓存：{'day': 今天, 'set': {...}, 'source': 'stock_daily'|'weekday_fallback'}
-_CAL: Dict = {'day': '', 'set': frozenset(), 'source': ''}
+# 日K 交叉日历缓存（只作校验/跨年降级；主日历是 services/data/trading_calendar）
+_KLINE: Dict = {'day': '', 'set': None}
 
 
 def enabled() -> bool:
@@ -86,7 +94,7 @@ def enabled() -> bool:
 
 def is_trading_weekday(d: str) -> bool:
     """按 ISO 日期判周1~周5。**只是兜底**，不是判据：节假日也是工作日。
-    11-07 第一版把它当主判据，被实测推翻（见 `trading_days()` 顶部）。解析不了则放行。
+    11-07 第一版把它当主判据，被实测推翻；现在它只是**最末一级降级**（见 `is_trading_day()`）。解析不了则放行。
     """
     try:
         return date.fromisoformat(str(d)[:10]).weekday() < 5
@@ -94,55 +102,73 @@ def is_trading_weekday(d: str) -> bool:
         return True
 
 
-def trading_days(refresh: bool = False) -> frozenset:
-    """本地日K 表里出现过的日期集合 = 交易日历（只读，一天缓存一次）。
+def kline_days(refresh: bool = False) -> frozenset:
+    """本地日K 表里出现过的日期。**只作交叉校验与跨年降级，不当主日历。**
 
-    为什么用日K 而不是"周一至周五"（11-07 二次更正，用户的反问是对的）：
-    周末判据只管得住周六周日，管不住**法定节假日**——10-01（周四）、10-05（周一）这种
-    工作日但不开市的日子，靠星期几会被当成交易日。而日K 表天然只在有行情的那些天写行，
-    它就是现成的日历，不需要接第三方交易日历接口（实测 `history_kline.db` 的 `stock_daily`
-    有 688 个不同日期、2024-01-02 ~ 2026-11-06，国庆 10-01~10-07 一个都没有）。
-    日K 表读不到时退回"周一至周五"并标 `source='weekday_fallback'`——**这是降级，不是等价**：
-    降级期间节假日的手工批次会被误算一天，所以读数要带出来。
+    11-07 三次更正的由来：第二版把这里当交易日历的主来源，理由是"没开市就没有 bar"——
+    话是对的，但仓里**本来就有一份按交易所公告维护的权威日历**
+    `services/data/trading_calendar.py`（含 2026 休市表、调休补班、跨年守卫），
+    我另造一套等于留两个真相，迟早分叉。而且日K 有个硬缺陷：**它只有过去**，
+    判不了"今天/明天是不是交易日"，而盘中告警要的恰恰是这个。
+    实测两套日历在重叠区间零分歧（688 个日K 日期 vs 官方表，双向都 0 处不一致），
+    所以主路走官方表、日K 退成交叉校验 + 官方表没覆盖年份（2024/2025 共 485 个日子）的降级，
+    代价只是多一次只读查询，收益是日历只剩一个权威。
     """
     today = date.today().isoformat()
-    if not refresh and _CAL['day'] == today and _CAL['set']:
-        return _CAL['set']
+    if not refresh and _KLINE['set'] is not None and _KLINE['day'] == today:
+        return _KLINE['set']
     ds: frozenset = frozenset()
-    source = 'weekday_fallback'
     try:
         import os
         import sqlite3
         from app.config import KLINE_HISTORY_DB_PATH
-        p = os.path.abspath(KLINE_HISTORY_DB_PATH)
-        conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)
+        pth = os.path.abspath(KLINE_HISTORY_DB_PATH)
+        conn = sqlite3.connect(f'file:{pth}?mode=ro', uri=True)
         try:
-            row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
-                               "AND name='stock_daily'").fetchone()
-            if row:
+            if conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                            "AND name='stock_daily'").fetchone():
                 cols = [r[1] for r in conn.execute('PRAGMA table_info(stock_daily)')]
                 dcol = 'date' if 'date' in cols else ('trade_date' if 'trade_date' in cols else None)
                 if dcol:
                     ds = frozenset(str(r[0])[:10] for r in
                                    conn.execute(f'SELECT DISTINCT {dcol} FROM stock_daily'))
-                    if ds:
-                        source = 'stock_daily'
         finally:
             conn.close()
     except Exception as e:
-        print(f'[样本日] 交易日历读不到（退回"周一至周五"近似，读数会标 weekday_fallback）：'
+        print(f'[样本日] 日K 交叉日历读不到（只影响跨年降级，不影响主路）：'
               f'{type(e).__name__}: {e}')
-    _CAL.update({'day': today, 'set': ds, 'source': source})
+    _KLINE.update({'day': today, 'set': ds})
     return ds
 
 
-def is_trading_day(d: str) -> bool:
-    """这一天是不是交易日。日历可用时**只认日历**；日历不可用（空集合）才退回星期几。"""
-    cal = trading_days()
-    dd = str(d)[:10]
-    if not cal:
-        return is_trading_weekday(dd)
-    return dd in cal
+def calendar_source(d=None) -> str:
+    """这天走的是哪一路日历，读数必须能看出来：
+    `trading_calendar`（官方表覆盖的年份，主路）／`kline_calendar`（跨年降级，看日K）／
+    `weekday_fallback`（跨年又没日K，只能猜星期几——已知会漏 19 个"工作日假期"/年）。
+    """
+    from services.data.trading_calendar import is_calendar_covered
+    ds = str(d or date.today())[:10]
+    if is_calendar_covered(ds):
+        return 'trading_calendar'
+    if ds in kline_days():
+        return 'kline_calendar'
+    return 'weekday_fallback'
+
+
+def is_trading_day(d) -> bool:
+    """是不是 A 股交易日。主路＝仓里那份按公告维护的官方日历（含调休补班）；
+    官方表没维护到的年份才降级：过去看日K，日K 也没就看星期几（并在 `calendar_source()` 里可见）。
+    """
+    from services.data.trading_calendar import is_calendar_covered, is_trading_day as _official
+    ds = str(d)[:10]
+    if is_calendar_covered(ds):
+        return bool(_official(ds))
+    k = kline_days()
+    if ds in k:
+        return True
+    if ds < date.today().isoformat():
+        return False                       # 过去的日子：日K 里没有就是没开市
+    return date.fromisoformat(ds).weekday() < 5 if len(ds) == 10 else True
 
 
 def batch_days(since: Optional[str] = None, until: Optional[str] = None,
@@ -173,25 +199,31 @@ def batch_days(since: Optional[str] = None, until: Optional[str] = None,
 
 def filter_sample_days(dates: Iterable[str], batch: Optional[Sequence[str]] = None,
                        cal: Optional[Sequence[str]] = None) -> Dict:
-    """把一批日期分成"算样本"与"不算"。batch=None 时自己去库里取批次日；
-    cal=None 时用本地日K 交易日历（自测里传假日历，不去碰真库）。
+    """把一批日期分成"算样本"与"不算"。
 
-    ⚠️ 批次集合**读不到（空表/被清理）时降级为不过滤**，并打印一条警告、返回值里带
-    `degraded=True`。理由是两种错的量级不一样：漏排一个空日只是分母虚高一天，
-    而"批次表被保留策略清过"会让样本钟**当场归零**，于是每个影子都显示"样本不足"、
-    没人去看是数据没了还是真没到期。宁可少过滤，也不静默清零（第 [7] 组用例反证过）。
+    batch=None 时自己去库里取批次日；cal=None 时逐日问 `is_trading_day()`（主路是官方日历）。
+    自测里注入 cal（一批交易日清单）就能完全离线跑，不必碰真库。
+    cal 注入成**空集合**表示"模拟日历不可用"，这时退回星期几近似，
+    且 `calendarSource` 会是 `weekday_fallback`——降级要看得见。
+
+    ⚠️ 批次集合读不到（空表/被清理）时**降级为不过滤**并打印警告，返回 `degraded=True`。
+    理由是两种错的量级不一样：漏排一个空日只是分母虚高一天，而"批次表被保留策略清过"
+    要是当成"所有日子都不是样本日"，样本钟当场归零，每个影子都显示"样本不足"，
+    没人会去查是数据没了还是真没到期。这条不是假设——`shadow_eval_selftest` 第一轮
+    就是这么报红的（假库没有推荐表 → 真名单天数从 8 掉到 0）。
     """
     uniq = sorted({str(d)[:10] for d in dates if d})
     if batch is None:
         batch = batch_days()
     bset = set(batch)
     injected_cal = cal is not None
-    cset = {str(x)[:10] for x in cal} if injected_cal else set(trading_days())
-    if not cset:
-        # 日历不可用（真库读不到，或自测故意注入空日历模拟这个状态）→ 退回星期几近似
+    cset = {str(x)[:10] for x in cal} if injected_cal else None
+    if cset:
+        cal_src = 'injected'
+    elif cset is not None:                      # 注入的是空集合＝模拟日历不可用
         cal_src = 'weekday_fallback'
     else:
-        cal_src = 'injected' if injected_cal else (_CAL.get('source') or 'weekday_fallback')
+        cal_src = '+'.join(sorted({calendar_source(d) for d in uniq})) or calendar_source()
     if not enabled():
         return {'counted': uniq, 'skipped': [], 'rule': RULE + '（开关关：不过滤，逐字节等于改造前）',
                 'enabled': False, 'degraded': False, 'batchTotal': len(bset),
@@ -203,8 +235,10 @@ def filter_sample_days(dates: Iterable[str], batch: Optional[Sequence[str]] = No
                 'enabled': True, 'degraded': True, 'batchTotal': 0, 'calendarSource': cal_src}
     counted, skipped = [], []
     for d in uniq:
-        # 日历可用只认日历；不可用时才退回星期几近似（来源已写在 calendarSource）
-        in_cal = (d in cset) if cset else is_trading_weekday(d)
+        if cset is not None:
+            in_cal = (d in cset) if cset else is_trading_weekday(d)   # 空集合→星期几近似
+        else:
+            in_cal = is_trading_day(d)
         if not in_cal:
             skipped.append({'date': d, 'reason': REASON_NOT_TRADING})
         elif d not in bset:
@@ -229,13 +263,13 @@ def describe(res: Dict) -> str:
     `evaluate()` 转出来的返回值（键 `sampleDays`）——`print_eval` 手里只有后者，
     只认一种就会在那儿抛 KeyError（11-07 真库副本实测撞过一次）。
 
-    日历来源不是本地日K（`weekday_fallback`）时把来源打在行尾——降级期间节假日的手工批次
+    日历来源是 `weekday_fallback`（官方表跨年没维护、日K 也没数据）时把来源打在行尾——
     会误算一天，这行日志要能让人当场看出这个读数不可全信。
     """
     counted = res.get('counted', res.get('sampleDays', []))
     src = res.get('calendarSource', '')
-    tail = '' if src in ('stock_daily', 'injected', '') \
-        else f'  ⚠ 日历来源={src}（靠星期几近似，节假日的手工批次会误算，别当结论）'
+    tail = '' if src in ('trading_calendar', 'kline_calendar', 'injected', '') \
+        else f'  ⚠ 日历来源={src}（跨年没数据，只能猜星期几；工作日期假的手工批次会误算，别当结论）'
     if not res.get('skipped'):
         return f'样本日 {len(counted)} 天（无排除）{tail}'
     ex = '、'.join(f"{s['date']}({s['reason'].split('：')[0]})" for s in res['skipped'])
