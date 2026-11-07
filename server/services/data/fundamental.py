@@ -30,7 +30,14 @@ def _fetch_page(pn: int) -> Tuple[List[Dict], int]:
     """同步拉取单页(100条)基本面数据,返回 (rows, total_count)
 
     用 requests + asyncio.to_thread 包装(项目硬约束:禁用 httpx 直连东方财富)
+
+    2026-11-06 接入共享熔断（scope 'datacenter'，域名 datacenter-web）：此前封禁日照打，
+    每次都是 15s 超时。停调时返回空页，上层 `fetch_all_fundamental` 拿到空第一页就 return {}，
+    而基本面读侧 (`get_fundamental_batch`) 本来就只读 DB 旧值 → 页面不空洞，只是当天不更新。
     """
+    from services.data import eastmoney_guard
+    if eastmoney_guard.skip('datacenter'):
+        return [], 0
     params = {
         'reportName': FUND_REPORT,
         'columns': FUND_COLUMNS,

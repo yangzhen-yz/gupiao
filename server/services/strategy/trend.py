@@ -1,13 +1,13 @@
 """trend.py - split from main.py"""
 import asyncio, time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import date
 from fastapi import HTTPException
-from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, TREND_STALE_WHILE_REVALIDATE, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED)
+from app.config import (TREND_MIN_SCORE, TREND_MIN_KLINE_DAYS, TREND_LIMIT_UP_THRESHOLD, TREND_LIMIT_DOWN_THRESHOLD, TREND_IS_UP_MIN_SCORE, USE_INTRADAY_BREAK_CHECK, SCAN_CONCURRENCY, SCAN_CACHE_TTL, TREND_STALE_WHILE_REVALIDATE, HOT_STOCK_POOL, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, SCAN_KLINE_TIMEOUT, TREND_AUTO_ADD_POOL_THRESHOLD, TREND_POOL_MAX_SIZE, TREND_D1_TREND_FULL, TREND_D1_TREND_PARTIAL, TREND_D1_TREND_BARE, TREND_D1_DIVERGENCE_PENALTY_TIERS, TREND_D2_LIMIT_UP_TIERS, TREND_D2_YANG_LINE_TIERS, TREND_D2_CONSECUTIVE_BOARD_TIERS, TREND_D3_RATIO_TIERS, TREND_D3_SLOPE_TIERS, TREND_D3_STABILITY_TIERS, TREND_DEDUCT_POSITION_HIGH, TREND_DEDUCT_MA60_MA120_BEAR, TREND_DEDUCT_POSITION_MID, TREND_DEDUCT_MA20_BROKEN, TREND_DEDUCT_LIMIT_DOWN, TREND_DEDUCT_SHRINK_VOL, TREND_DEDUCT_VOLUME_DIVERGENCE, TREND_DEDUCT_EXTREME_VOLATILITY, TREND_DEDUCT_SINGLE_DAY_CRASH, TREND_DEDUCT_NON_MAIN_BOARD, TREND_DEDUCT_GROUPS, TREND_POSITION_BREAKTHROUGH_GAIN, TREND_SIDEWAYS_LOW_PCT, TREND_SIDEWAYS_MID_PCT, TREND_SIDEWAYS_BONUS, TREND_BONUS_BULL_ALIGNMENT, TREND_BONUS_VOLUME_BREAKOUT, TREND_BONUS_CONSECUTIVE_YANG, TREND_BONUS_POCKET_PIVOT, TREND_BONUS_STEADY_UPTREND, TREND_BONUS_ACCELERATING, TREND_SECTOR_FACTOR_TIERS, TREND_SECTOR_FACTOR_COLD, TREND_EXCLUDE_MARKET_CAP_MIN, TREND_RANGE_20D_FLAT_MIN, TREND_RSI_PERIOD, TREND_RSI_EXTREME_OVERBOUGHT, TREND_RSI_OVERBOUGHT, TREND_RSI_OVERBOUGHT_DEDUCT, TREND_CONSECUTIVE_BOARD_EXHAUSTION, TREND_CONSECUTIVE_BOARD_EXHAUSTION_DEDUCT, TREND_CHIP_FACTOR_MAX, TREND_CHIP_FACTOR_MIN, TREND_CHIP_COST_ABOVE_BOTH, TREND_CHIP_COST_BELOW_BOTH, TREND_CHIP_COST_BETWEEN, TREND_CHIP_TURNOVER_LOCKED, TREND_CHIP_TURNOVER_LOOSE, TREND_CHIP_TURNOVER_NORMAL, TREND_CHIP_MAIN_ACCUMULATE, TREND_CHIP_MAIN_DISTRIBUTE, TREND_CHIP_MAIN_NEUTRAL, TREND_CHIP_CV_STABLE, TREND_CHIP_CV_VOLATILE, TREND_CHIP_CV_NORMAL, TREND_DYNAMIC_MARKET_BULL_CHANGE, TREND_DYNAMIC_MARKET_BEAR_CHANGE, TREND_TOTAL_FACTOR_CAP, TREND_DYNAMIC_THRESHOLDS, TREND_DYNAMIC_DEFAULTS, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, KLINE_DATA_LIMIT, KLINE_HISTORY_ENABLED, ANN_UNKNOWN_POOL_GUARD)
 from db.database import (load_trend_scan_results, save_trend_scan_results, save_predictions, load_user_scan_pool, save_user_scan_pool, load_hot_search_ranking, load_stock_basic_info, load_hot_stock_buttons, load_stock_concept_tags, save_stock_industry, list_user_ids)
 from services.data.stock import (has_delisting_risk, is_main_board, get_kline_data,
     calculate_ma, get_cached_stock_name, fetch_with_retry, parse_realtime_fields, fetch_stock_data, get_stock_name,
-    parse_tencent_batch_data, has_negative_announcement, split_batch_raw)
+    parse_tencent_batch_data, has_negative_announcement, announcement_check, split_batch_raw)
 from services.strategy.strategy import calc_stock_score_v2, load_strategy_factor_weights, apply_industry_neutralization
 from services.strategy.pattern import detect_volume_price_pattern
 from services.pick.early_signals import detect_early_signals
@@ -1708,11 +1708,45 @@ def check_consecutive_down(kline_data: List[List], min_days: int = 2,
         }
 
 
+def ann_rollup(cleaned_results: List[Dict]) -> Dict:
+    """本轮公告检查的汇总：`{checked, unknown, withAnn, suspect}`。
+
+    为什么连 `withAnn / suspect` 也要算：2026-11-07 实测公告接口要**裸 6 位码**，
+    传 `sh600519` 这种带前缀的写法照样回 HTTP 200 但 `list` 恒空 —— 于是利空否决从上线
+    那天起就没生效过，而"全市场一条公告都没有"这个形状只有靠人盯才看得见。
+    现在把它挑出来：查过的票够多（≥50）而查到的公告条数合计为 0，几乎不可能是真的，
+    `suspect=True`，扫描日志直接报出来（含停调的那批不计入分母，避免误报）。
+    老结果（11-07 之前落库的行）没有这些键，按 ok / 0 计 —— 历史数据不倒推成"当时也瞎了"。
+    """
+    checked = unknown = with_ann = counted_ok = 0
+    for r in cleaned_results:
+        d = r.get('details') or {}
+        st = d.get('annStatus') or 'ok'
+        if d.get('annStatus') is None:
+            checked += 1          # 老数据：只算查过，不据它判断可疑
+            continue
+        checked += 1
+        if st != 'ok':
+            unknown += 1
+            continue
+        counted_ok += 1
+        if int(d.get('annCount') or 0) > 0:
+            with_ann += 1
+    suspect = counted_ok >= 50 and with_ann == 0
+    return {'checked': checked, 'unknown': unknown, 'withAnn': with_ann,
+            'checkedOk': counted_ok, 'suspect': suspect}
+
+
 def auto_add_high_score_to_pool(trend_results: List[Dict]) -> List[str]:
     """
     将评分 ≥ TREND_AUTO_ADD_POOL_THRESHOLD 的趋势股自动加入用户股票池。
     阈值 ≤ 0 时关闭自动加入。
     返回实际新增的股票代码列表（已在池中的会自动去重）。
+
+    2026-11-07：`ANN_UNKNOWN_POOL_GUARD=True` 时，`details.annStatus != 'ok'`（公告**没查到**）
+    的票跳过自动加池。理由是这两件事的风险不对称：趋势名单只是展示（利空判定层一字未改，
+    unknown 绝不当成有利空），而加池会写进**每个人**的自选池并被后续推荐复用，属不可逆动作——
+    利空检查瞎的时候不该替用户做这个决定。关掉开关＝完全回到"查没查到都加"。
     """
     threshold = TREND_AUTO_ADD_POOL_THRESHOLD
     if threshold <= 0:
@@ -1721,13 +1755,23 @@ def auto_add_high_score_to_pool(trend_results: List[Dict]) -> List[str]:
     current_pool = [s.lower() for s in load_user_scan_pool()]
     pool_set = set(current_pool)
     to_add = []
+    _skipped_unknown = 0
 
     for r in trend_results:
         score = r.get('score', 0)
         symbol = (r.get('symbol') or '').lower()
-        if score >= threshold and symbol and symbol not in pool_set:
-            to_add.append(symbol)
-            pool_set.add(symbol)
+        if not (score >= threshold and symbol and symbol not in pool_set):
+            continue
+        if (ANN_UNKNOWN_POOL_GUARD
+                and ((r.get('details') or {}).get('annStatus') or 'ok') != 'ok'):
+            _skipped_unknown += 1
+            continue
+        to_add.append(symbol)
+        pool_set.add(symbol)
+
+    if _skipped_unknown:
+        print(f'[趋势加池] 公告未查到，本轮跳过 {_skipped_unknown} 只高分票不自动加池'
+              f'（开关 ANN_UNKNOWN_POOL_GUARD，关掉即回到改造前）')
 
     if to_add:
         # 2026-10-13 按用户隔离：高分股写进每个人的池，池上限也按人各自裁剪
@@ -2024,13 +2068,27 @@ async def scan_trend_scan_results(force: bool = False):
                     if not trend_result['isUp']:
                         return None
 
-                    # 趋势技术面已通过，才拉取近 20 日公告做利空检测（失败不阻塞，仅视为无利空）
+                    # 趋势技术面已通过，才拉取近 20 日公告做利空检测。
+                    # 2026-11-07 三态化（修"利空静默放行"）：老注释写的"失败不阻塞，仅视为无利空"
+                    # 就是问题本身——东财 ann 停调或请求失败时，"没查到"被当成"查过且没有"，
+                    # 否决权在那种日子里整块失效且无人可见。现在判定层照旧（unknown 不剔除，
+                    # 绝不把接口抖动判成利空，与 momentum_zone 同口径），但把状态如实留在明细里：
+                    #   · `details.annStatus` 随 details_json 落库，趋势页/巡检都读得到；
+                    #   · 状态非 ok 的票不再走"趋势高分自动进股票池"（见 auto_add_high_score_to_pool）。
                     try:
-                        neg_ann = await asyncio.wait_for(has_negative_announcement(symbol), timeout=4)
-                    except Exception:
-                        neg_ann = {'hasNegative': False, 'hits': []}
+                        neg_ann = await asyncio.wait_for(announcement_check(symbol), timeout=4)
+                    except Exception as _ann_err:      # 超时/异步层异常同样是"没查到"，不是"没有利空"
+                        neg_ann = {'hasNegative': False, 'hits': [], 'status': 'error',
+                                   'unknown': True,
+                                   'reason': f'{type(_ann_err).__name__}: 公告检查 4s 超时'}
                     if neg_ann and neg_ann.get('hasNegative'):
                         return None
+                    _ann_status = neg_ann.get('status') or 'ok'
+                    if isinstance(trend_result.get('details'), dict):
+                        trend_result['details']['annStatus'] = _ann_status
+                        trend_result['details']['annCount'] = neg_ann.get('annCount', 0)
+                        if _ann_status != 'ok':
+                            trend_result['details']['annReason'] = neg_ann.get('reason', '')[:120]
 
                     if has_delisting_risk(name, symbol):
                         return None
@@ -2170,6 +2228,10 @@ async def scan_trend_scan_results(force: bool = False):
             # 自动将高分趋势股加入用户股票池（阈值由 config.py 控制）
             auto_added = auto_add_high_score_to_pool(trend_scan_results)
 
+            # 本轮"利空检查有多少只是瞎的"（2026-11-07）：拿不到公告不再伪装成"没有利空"，
+            # 而是把只数如实带出去——否则东财 ann 停调整天，没人能从结果里看出否决权没生效。
+            _ann = ann_rollup(cleaned_results)
+
             result = {
                 'date': today,
                 'totalScanned': len(scan_pool),
@@ -2179,6 +2241,10 @@ async def scan_trend_scan_results(force: bool = False):
                 'source': source,
                 'autoAdded': auto_added,
                 'autoAddThreshold': TREND_AUTO_ADD_POOL_THRESHOLD,
+                'annChecked': _ann['checked'],
+                'annUnknown': _ann['unknown'],
+                'annWithCount': _ann['withAnn'],
+                'annSuspect': _ann['suspect'],
             }
             
             save_trend_scan_results(result)
@@ -2192,6 +2258,16 @@ async def scan_trend_scan_results(force: bool = False):
             _last_scan_date = today
             _last_scan_ts = time.time()
             print(f'[趋势扫描] 完成，发现 {len(trend_scan_results)} 只趋势股，耗时 {result["scanTime"]}')
+            if _ann['unknown']:
+                print(f'[趋势扫描] 利空检查有 {_ann["unknown"]}/{_ann["checked"]} 只没查到'
+                      f'（判定层未把它们当成有利空，但本轮不进自动加池；'
+                      f'明细里 details.annStatus 逐票可查）')
+            if _ann['suspect']:
+                print(f'[趋势扫描] ⚠️ 公告查过且成功的有 {_ann["checkedOk"]} 只，'
+                      f'但查到的公告条数合计 0 —— 几乎不可能是真的，'
+                      f'多半是接口参数/返回结构又改版了（11-07 就栽在 stock_list 要裸码、'
+                      f'带前缀照样回 200 但恒空），利空否决此刻等于整块失效，去查 '
+                      f'services/data/stock.py:_fetch_announcements')
             
             return _with_scan_meta({"success": True, "data": _ensure_today_date(result)}, _last_scan_ts)
         except Exception as error:
