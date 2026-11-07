@@ -108,7 +108,9 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
     try:
         raw, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
                                   ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                  label='rec-sim', gap=120, max_keys=12)
+                                  label='rec-sim', gap=120, max_keys=12,
+                                  cacheable=rec_params_cacheable(months, capital, gap,
+                                                                 lots, bench))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"回测曲线计算失败: {str(error)}")
     data = dict(raw)                       # 浅拷贝：别把 daily 写回缓存里那份
@@ -170,7 +172,8 @@ async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, 
     try:
         data, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
                                    ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                   label='rec-sim-batch', gap=120, max_keys=12)
+                                   label='rec-sim-batch', gap=120, max_keys=12,
+                                   cacheable=rec_params_cacheable(months, capital, gap))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"拆档回测计算失败: {str(error)}")
     return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
@@ -195,7 +198,8 @@ async def get_recommend_excess_api(months: int = 6):
         data, state = _swr.swr_get(_EXCESS_CACHE, key,
                                    lambda: rec_sim.open_hold_excess(months=months),
                                    ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                   label='rec-excess', gap=120, max_keys=6)
+                                   label='rec-excess', gap=120, max_keys=6,
+                                   cacheable=rec_params_cacheable(months))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"可执行超额计算失败: {str(error)}")
     return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}

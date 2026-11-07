@@ -137,13 +137,23 @@ def try_refresh(store: Dict, key: Any, compute: Callable[[], Any], *,
 def swr_get(store: Dict, key: Any, compute: Callable[[], Any], *,
             ttl: float, stale_max: float, label: str,
             gap: float = 60.0, max_keys: Optional[int] = None,
-            on_done: Optional[Callable[[Any], None]] = None) -> Tuple[Any, str]:
+            on_done: Optional[Callable[[Any], None]] = None,
+            cacheable: bool = True) -> Tuple[Any, str]:
     """取缓存命中或计算新值。
 
     - ``fresh``：age < ttl，直接返回。
     - ``stale``：ttl ≤ age < stale_max，立即返回旧值 + 后台刷新。
     - ``cold``：无缓存或 age ≥ stale_max，同步 compute（仅启动预热未覆盖时发生）。
+
+    ``cacheable=False``（2026-11-07 加，修④）：**既不读也不写缓存，每次现算**。
+    这是给"参数白名单"用的：像 `/api/recommend-excess?months=7` 这种前端根本不会发的组合，
+    以前也会占一份缓存位，而 `max_keys` 的淘汰是按时间把**最旧的**扔掉——于是来一串
+    垃圾参数就能把前端真正在用的那份挤出去，代价是一次 7.4 秒的冷算。
+    白名单外的组合不入表，才真正把"任何人都能远程清空别人的缓存"这条关掉；
+    光调大上限或改淘汰策略都不解决（键空间是自由参数时，有多少槽都会被占满）。
     """
+    if not cacheable:
+        return compute(), 'cold'
     now = time.time()
     hit = store.get(key)
     if isinstance(hit, dict):

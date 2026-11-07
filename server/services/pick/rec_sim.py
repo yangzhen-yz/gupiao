@@ -359,7 +359,18 @@ def run(orders: List[Dict], capital: float, whole_lots: bool = True,
                     continue
                 cost = shares * o['entry_price'] + _fee_buy(shares * o['entry_price'])
                 while cost > cash and shares > 0:
+                    _prev = shares
                     shares = shares - 100 if whole_lots else shares * 0.98
+                    # 两道收手，缺一都会出事（2026-11-07 实拍：有人打
+                    # `/api/recommend-sim?capital=1&gap=0.5&lots=false`，这个 while 再也不出来，
+                    # 而它跑在事件循环上 ⇒ 从那一刻起整个后端不响应任何请求，只能重启）：
+                    # ① 佣金有最低 5 元（`FEE_MIN`），现金连最低佣金都不够时，再怎么缩股都买不进去，
+                    #    老写法要一路缩到浮点下溢才可能出来；
+                    # ② `whole_lots=False` 是乘法缩股，缩到最小次正规数（5e-324）后 `×0.98` 舍回它自己，
+                    #    `shares` 不再单调下降 —— 这才是真正的死循环点。
+                    if shares >= _prev or _fee_buy(0.0) > cash:
+                        shares = 0.0
+                        break
                     cost = (shares * o['entry_price'] + _fee_buy(shares * o['entry_price'])
                             if shares > 0 else 0)
                 if shares <= 0:
@@ -724,7 +735,7 @@ def record_daily(capital: float = 100000.0, months: int = 3) -> Dict:
              c['trades'], c['skipped'], c['winRate'], c['avgEqual'], c['avgWeighted'],
              res['window']['since'], res['window']['until'], capital,
              now.strftime('%Y-%m-%d %H:%M:%S')) for c in res['curves']]
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         conn.execute(_DDL_DAILY)
         conn.execute('DELETE FROM rec_sim_daily WHERE run_date=?', (run_date,))
