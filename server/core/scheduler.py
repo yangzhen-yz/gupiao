@@ -29,6 +29,7 @@ from services.strategy.sentiment import get_sentiment
 # 盘前全市场海选候选池（2026-10-15）：替代"只看东财人气榜"的窄入口
 from services.pick.candidate_pool import build_pool as build_candidate_pool
 from app.config import CANDIDATE_POOL_TIME
+from app.config import SCHED_HEARTBEAT_STALE_MIN, SCHED_CHAIN_CHECK_TIMES
 from app.config import MATRIX_RERUN_ENABLED, MATRIX_RERUN_TIME
 from app.config import SENTIMENT_FINAL_SNAPSHOT_TIME
 from app.config import INDEX_DAILY_SYNC_TIME
@@ -145,13 +146,17 @@ def _run_pending_guarded() -> None:
     except Exception as e:
         print(f'[定时任务 {now:%H:%M:%S}] 取到期任务失败（本轮跳过）: {type(e).__name__}: {e}')
         return
+    _ran = 0
+    _errs = 0
     for job in sorted(due, key=lambda j: (j.next_run or now)):
         name = getattr(getattr(job, 'job_func', None), '__name__', None) or repr(job.job_func)[:60]
         try:
             ret = job.run()
             if isinstance(ret, schedule.CancelJob) or ret is schedule.CancelJob:
                 schedule.cancel_job(job)
+            _ran += 1
         except Exception as e:
+            _errs += 1
             # job.run() 里 job_func 抛异常时 next_run 不会被推进，这里补一刀把它推到下一次；
             # 推进失败就退回按周期加，绝不能让这个 job 留在"永远到点"的状态
             try:
@@ -164,6 +169,15 @@ def _run_pending_guarded() -> None:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 定时 job「{name}」抛异常（已隔离，'
                   f'本轮其余任务继续执行）: {type(e).__name__}: {e}；'
                   f'该任务已跳过一次，下次执行时间 {job.next_run:%m-%d %H:%M}')
+    # 调度心跳（2026-11-07）：跑完一轮就记一次，给 `services/ops/sched_liveness.py` 的观察线程看。
+    # 记在这里而不是观察者那边，是因为"循环还转着但什么都不执行"这种 11-06 形态，
+    # 光有心跳抓不到——所以心跳只用来抓"循环彻底不转"，另一条判据去看产出行数。
+    # 整块包 try：记心跳失败绝不能反过来影响定时任务本身。
+    try:
+        from services.ops.sched_liveness import mark_loop_beat
+        mark_loop_beat(ran=_ran, errors=_errs)
+    except Exception:
+        pass
 
 
 async def generate_review_task():
@@ -1602,6 +1616,11 @@ def run_scheduler():
           f'（sentiment_final_daily，仅交易日；#11 回测前置——此前"当天最终档位"从来没落过库）')
     print(f'[定时任务]   - {INDEX_DAILY_SYNC_TIME}: 大盘指数日线同步（index_daily，4 指数×700 根，'
           f'仅交易日；只写本地新表，不改现有读指数的路径）')
+    print(f'[定时任务]   - 观察线程（独立于本循环、每 60 秒一轮）: 调度心跳阈值 '
+          f'{SCHED_HEARTBEAT_STALE_MIN} 分钟；决策链空档检查时点 '
+          f'{"/".join(SCHED_CHAIN_CHECK_TIMES)}（要当天情绪快照有行而决策表全 0 才算，'
+          f'免得把 9 月那种"功能还没上线"的 0 推荐日报成事故）；'
+          f'开关 sched_liveness_enabled，关掉连线程都不起')
     print(f'[定时任务]   - 盘中 09:10~15:10 每60秒: 写锁哨兵探测（独立连接试 BEGIN IMMEDIATE，'
           f'等超阈值推企微；开关 db_lock_sentinel_enabled，拿到锁立刻回滚、自己不持锁）')
     print(f'[定时任务]   - 盘中持仓快反每{POSITION_WATCH_INTERVAL_SEC}秒附带: 情绪减仓影子'
@@ -1637,6 +1656,16 @@ def run_scheduler():
     _last_dragon_ts = 0.0
     # 盘中写锁哨兵（2026-11-03）：每分钟探一次，独立 try 隔离，坏了不拖累推送与自愈
     _last_lock_sentinel_ts = 0.0
+
+    # 调度链失活观察线程（2026-11-07）：**必须在主循环之前起**——放循环里就等于让被观察者
+    # 判自己的死。11-06 那次循环一直在转、心跳根本不陈旧，靠的是这个独立线程
+    # 加"决策链表全 0 行但情绪快照有行"的第二条判据。开关关掉时连线程都不起。
+    try:
+        from services.ops.sched_liveness import start_watchdog
+        start_watchdog()
+    except Exception as _lw_err:
+        print(f'[定时任务 {datetime.now():%H:%M:%S}] 调度失活观察线程没起来（不致命，'
+              f'只是当天再出 11-06 那种冻结不会自动通知）: {type(_lw_err).__name__}: {_lw_err}')
 
     while True:
         try:
