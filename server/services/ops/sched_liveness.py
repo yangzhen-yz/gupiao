@@ -63,6 +63,7 @@ _STATE = {
     'started_ts': 0.0,
     'stop': False,
     'last_alert': {'A': 0.0, 'B': ''},
+    'last_skip_reason': '',      # 上一轮"为什么不发"的原因，变了才打印
     'thread': None,
 }
 _LOCK = threading.Lock()
@@ -236,10 +237,21 @@ def _render(a: Dict, beat: Dict, now: datetime, covered: bool) -> str:
                    a['rows']['decision'].get('strategy_snapshot_batch', -1),
                    a['rows']['decision'].get('strategy_snapshot', -1),
                    a['rows']['decision'].get('daily_candidate_pool', -1)))
-    tail = ('\n含义：定时任务链今天不产出了。盘中这会错过 09:45/10:00/13:30/14:05 批次，'
-            '页面看得到数据但推荐是空的。')
-    act = ('处置：先翻 server/server_supervised.log 里 "[定时任务" 有没有异常；'
-           '确认卡住就写 server/data/backend_restart_requested 让看护重启（不要 taskkill）。')
+    if a['kind'] == 'A':
+        # A 是"循环不转了"，B 是"循环在转但决策不出数"——两句话原来共用，结果 A 的正文
+        # 也写着"错过 09:45 批次"，那是 B 的含义（11-07 合并后线上点验时看到的）。
+        # 处置动作也不一样：A 先找卡在哪个 job / 线程还在不在，B 先看是哪一环断了产。
+        tail = ('\n含义：调度主循环这一段时间没跑完（线程可能退了，或卡在某个 job 里出不来）。'
+                '期间所有定时任务都不执行——海选、批次推荐、竞价与收盘快照、落库全停。')
+        act = ('处置：先在 server/server_supervised.log 找最后一条 "[定时任务" 与 "[预热"，'
+               '看卡在谁身上；确认循环停了就写 server/data/backend_restart_requested '
+               '让看护重启（不要 taskkill）。')
+    else:
+        tail = ('\n含义：循环还在转、心跳也新鲜，但决策链今天一条都没落。盘中这会错过 '
+                '09:45/10:00/13:30/14:05 批次，页面看得到行情但推荐是空的。')
+        act = ('处置：看上面那份行数——情绪快照有行说明进程活着，问题出在推荐/批次这一环；'
+               '先翻日志里 "[定时任务" 有没有 job 抛异常（11-06 就是一个坏 job 卡死整条链），'
+               '必要时写 server/data/backend_restart_requested 让看护重启。')
     yr = ('' if covered else '\n[警告] 交易日历没覆盖当前年份（trading_calendar.CALENDAR_YEARS），判据按星期几走，先补年度休市表。')
     return '\n'.join([head, body, anchor + rows, tail, act]) + yr
 
@@ -271,7 +283,13 @@ def alert_and_record(res: Dict, force: bool = False) -> Dict:
                                     '；'.join(f"{s['kind']} 推送={'成功' if s['pushed'] else '失败'}"
                                               f"（{s['why']}）" for s in sent)))
     elif res.get('skipped'):
-        print(f'[调度失活 {datetime.now():%H:%M:%S}] 本轮不发：{res["skipped"]}')
+        # 只在**原因变了**的那一次打一行。原来无条件打，11-07 合并后实测周六每 60 秒
+        # 一条"本轮不发：非交易日"= 1440 行/天，等于用一种刷屏换掉另一种刷屏；
+        # 日志里塞满"本轮不发"之后，真出事那一行反而更难找。
+        why = res['skipped']
+        if _STATE.get('last_skip_reason') != why:
+            _STATE['last_skip_reason'] = why
+            print(f'[调度失活 {datetime.now():%H:%M:%S}] 本轮不发：{why}')
     return {'sent': sent, 'alerts': len(res.get('alerts', []))}
 
 

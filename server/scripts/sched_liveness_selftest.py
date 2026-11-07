@@ -307,6 +307,69 @@ try:
 except sqlite3.OperationalError as e:
     print('     真库读不了（跳过本组）：', e)
 
+# ========== [11] 线上看到的两个小毛病（正文分型 + 不打刷屏） ==========
+print('[11] 正文分型与"本轮不发"只打一次（11-07 合并后线上核验抓出来的）')
+_b11 = {'ts': time.time() - 20 * 60, 'since': dt.datetime.now() - dt.timedelta(minutes=20),
+        'age_min': 20.0, 'last_ran': 0, 'loop_errors': 0, 'started': 0.0}
+_a_txt = L._render({'kind': 'A', 'why': '距最后一次调度心跳 20.0 分钟（阈值 15 分钟）'},
+                   _b11, dt.datetime(2026, 11, 9, 14, 11), True)
+_b_txt = L._render({'kind': 'B', 'why': '到 14:10 决策链全 0 行',
+                    'rows': {'alive': 53, 'decision': {k: 0 for k, _ in L._DECISION_TABLES}}},
+                   _b11, dt.datetime(2026, 11, 9, 14, 11), True)
+ck('09:45/10:00/13:30/14:05 批次' in _b_txt, 'B 的正文保留"错过哪几个批次"（这才是 B 的含义）')
+ck('09:45/10:00/13:30/14:05 批次' not in _a_txt, 'A 的正文**不**写"错过批次"——那是 B 的话（原来共用一段）')
+ck('所有定时任务都不执行' in _a_txt, 'A 说的是"循环没跑完、期间所有任务都停"')
+ck(_a_txt != _b_txt, '两类正文不同文（同文就等于有一类在误导人）')
+
+import builtins
+tmp11, c11 = _mk_db('quiet')
+dbmod.use_db_path(tmp11)
+_buf, _old_print = [], builtins.print
+
+
+def _cap(*a, **k):
+    line = ' '.join(str(x) for x in a)
+    if '本轮不发' in line:          # 只截这一类，其它照原样输出（否则 ck 的回显也被吞）
+        _buf.append(line)
+    else:
+        _old_print(line, **k)
+
+
+try:
+    L._STATE.pop('last_skip_reason', None)
+    _reset_state()
+    builtins.print = _cap
+    try:
+        for _ in range(3):           # 周六连查 3 轮：改造前会打 3 行
+            L.alert_and_record(L.check_once(now=dt.datetime(2026, 11, 7, 10, 0)))
+    finally:
+        builtins.print = _old_print
+    ck(len(_buf) == 1, f'同一原因连查 3 轮只打 1 行（实得 {len(_buf)} 行）——改造前每 60 秒一行 = 1440 行/天')
+
+    _buf.clear()
+    L._STATE['last_skip_reason'] = ''
+    builtins.print = _cap
+    try:
+        L.alert_and_record(L.check_once(now=dt.datetime(2026, 11, 7, 10, 0)))    # 第一次：非交易日
+        L.alert_and_record(L.check_once(now=dt.datetime(2026, 11, 9, 21, 0)))    # 换原因：窗口外
+    finally:
+        builtins.print = _old_print
+    ck(len(_buf) == 2, f'原因变了就重新打一行（实得 {len(_buf)} 行：{[x[-16:] for x in _buf]}）')
+
+    _buf.clear()
+    L._STATE['last_skip_reason'] = '故意预置成别的原因'
+    builtins.print = _cap
+    try:
+        L.alert_and_record(L.check_once(now=dt.datetime(2026, 11, 7, 10, 0)))
+    finally:
+        builtins.print = _old_print
+    ck(len(_buf) == 1, '原因与上次不同 ⇒ 必须打（证明判据真在比对，不是一律沉默）')
+finally:
+    c11.close()
+    dbmod.use_db_path(_ORIGIN_DB)
+    os.remove(tmp11)
+
+
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
 if FAIL:
     for m in FAIL:
