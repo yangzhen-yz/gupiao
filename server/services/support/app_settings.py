@@ -429,6 +429,19 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'shadow_sample_skip_empty_days', 'cfg': 'SHADOW_SAMPLE_SKIP_EMPTY_DAYS',
+        'kind': 'bool',
+        'label': '影子样本钟跳过空日（修⑧）', 'group': '策略快照', 'live': True,
+        'note': '样本日 = 当天在交易日历里（本地日K stock_daily 有那一天）且当天有推荐批次'
+                '（daily_recommendations 有行）。管的是"攒够 20 个交易日才裁决"那三个钟'
+                '（海选层/出口分叉/影子规则对照）：交易日但 0 批次（11-06 调度冻结）算空日，'
+                '非交易日的手工批次（11-07 周六点了一次）也不算——日历读不到时才退回'
+                '"周一至周五"近似并在日志标 weekday_fallback。关掉 = 各 evaluate() 回到'
+                '"数自己表里的日期"，逐字节等于改造前（被排除的日期仍会打印，不会静默少算）；'
+                '炸板影子与盘中龙头特征不套这条（它们数的是"当天有没有可比行"）',
+        'impact': None,
+    },
+    {
         'key': 'eval_lab_enabled', 'cfg': 'EVAL_LAB_ENABLED', 'kind': 'bool',
         'label': '每周六跑因子体检（08:30）', 'group': '策略快照', 'live': True,
         'note': '本地日K上算 20 日反转/低波/缩量/60日动量/涨停拥挤度的 IC 与分组超额，'

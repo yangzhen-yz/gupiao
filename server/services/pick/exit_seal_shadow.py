@@ -408,7 +408,18 @@ def evaluate(min_days: int = 20) -> Dict:
                                 'se_pct': round(se, 3),
                                 't': round(net_mean / se, 2) if se else None}
         r = conn.execute('SELECT COUNT(DISTINCT rec_date), COUNT(*) FROM exit_seal_shadow').fetchone()
-        out['days'], out['rows'] = int(r[0] or 0), int(r[1] or 0)
+        out['rows'] = int(r[1] or 0)
+        # 修⑧：天数按统一样本日口径算（只数"当天确实生成过推荐批次"且是周一至周五的日子），
+        # 11-06 那种 0 批次空日与周六手工点出来的一天都不进样本钟；被排除的日期如实带回。
+        from services.support import sample_days
+        _dates = [str(x[0])[:10] for x in
+                  conn.execute('SELECT DISTINCT rec_date FROM exit_seal_shadow').fetchall()]
+        _sd = sample_days.filter_sample_days(_dates)
+        out['days'] = len(_sd['counted'])
+        out['sampleDays'] = _sd['counted']
+        out['skipped'] = _sd['skipped']
+        out['calendarSource'] = _sd['calendarSource']
+        out['clockRule'] = _sd['rule']
         out['ready'] = out['days'] >= min_days and bool(out['legs'])
     except Exception as e:
         out['error'] = f'{type(e).__name__}: {e}'

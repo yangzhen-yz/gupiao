@@ -349,8 +349,13 @@ def summarize(events, gap, n_days, kept_src=None, min_days=None):
     kc, ec = kept.get('close'), excl.get('close')
     # 判定只认**真放行名单**（payload 里有 kept 的那些天）：反推出来的名单不含
     # "过门槛但没进前 3"的长尾，拿它算出来的放行均值会偏，绝不能凑天数。
-    real_days = len({e['date'] for e in base
-                     if e['group'] == '影子放行' and e.get('src') == 'payload'})
+    # 修⑧：在这些天之上再套一层统一样本日口径——11-06 那种 0 推荐批次的空日、
+    # 以及周六手工点一次"生成建议"留下的非交易日，都不进样本钟（被排除的日期如实带回）。
+    from services.support import sample_days as _smp
+    _kept_dates = {str(e['date'])[:10] for e in base
+                   if e['group'] == '影子放行' and e.get('src') == 'payload'}
+    _sd = _smp.filter_sample_days(_kept_dates)
+    real_days = len(_sd['counted'])
     enough, verdict = _verdict(kc, ec, real_days, n_days, min_days)
     # 置信区间 + 置信度（2026-11-05：降到 5 天的同时必须附 n 与区间，避免小样本被当结论）。
     # 用「主口径次日收盘收益」的原始序列做两独立样本均值差的正态近似 95% CI。
@@ -377,6 +382,9 @@ def summarize(events, gap, n_days, kept_src=None, min_days=None):
         'available': bool(events),
         'days': n_days,
         'realKeptDays': real_days,
+        'sampleDays': _sd['counted'],
+        'skippedSampleDays': _sd['skipped'],
+        'sampleDayRule': _sd['rule'],
         'keptSource': kept_src,
         'minDays': min_days,
         'enough': enough,
@@ -460,6 +468,10 @@ def record_daily(days=0):
         print(f"[影子对照] {d['days']}个交易日（放行名单来自 payload 的有 {d['realKeptDays']} 天）"
               f"/{d['events']}个事件：放行 {_p(kc)} vs 被挡 {_p(ec)} → {d['verdict']}"
               + ('' if d.get('enough') else f"（真名单还差 {d.get('needMore')} 个交易日）"))
+        if d.get('skippedSampleDays'):
+            _ex = '、'.join(f"{s['date']}({s['reason'].split('：')[0]})"
+                            for s in d['skippedSampleDays'])
+            print(f"        样本钟排除：{_ex}   ← 这些天不进 {d['minDays']} 天的判据")
     else:
         print('[影子对照] 还没有影子日志可算（影子机制由智能推荐任务在盘中批次写入）')
     return d
