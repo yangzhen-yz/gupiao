@@ -37,8 +37,15 @@ async def add_stock_concept_tags_api(symbol: str, data: Dict):
 
 
 @router.delete("/api/stock-tags/{symbol}", tags=["股票标签"])
-async def remove_stock_tag_api(symbol: str, data: Dict = {}):
+async def remove_stock_tag_api(symbol: str, data: Optional[Dict] = None):
     try:
+        # 11-07 修⑩-6：原来写的是 `data: Dict = {}`——可变默认参数在 FastAPI 里是
+        # "请求体可省"的老写法，默认值那个 dict 跨请求共享。本函数只读不改它，
+        # 所以没造成过实际错误，但留着就是给下一个"顺手 data['x']=..."的人挖坑。
+        # 换成 None，并补 isinstance：这样非法 body（字符串/列表）由 422 兜住，
+        # 而不是在 data.get(...) 上抛 AttributeError 再被下面的 except 包成 500。
+        if not isinstance(data, dict):
+            data = {}
         tag_to_remove = data.get('tag') if data else None
         if not tag_to_remove:
             # 删除该股票的所有标签

@@ -191,10 +191,30 @@ ck(_d25['dataSource']['stocks'] == 'snapshot', 'closed 分支标记 snapshot')
 ck(_d25['stale'] is False, '2 小时内的快照不标 stale')
 ck(_d25['updateTime'] != '--' and _d25['updateTime'][11:13] != '', 'updateTime 是数据真实时间')
 ck('fetchTime' in _d25, '新增 fetchTime 字段（调用时间）')
-# 把快照时间推到 3 小时前 → stale
+# 把快照时间推到"超龄"那一侧 → stale
 # 注意：新实现（2026-10-19 外部演进）closed+过期快照会**先走新浪补算**，补算成功则数据
 # 新鲜、不 stale；只有补算也失败才回落过期快照并亮 stale。所以这里要桩掉新浪排行。
-ff._LAST_GOOD['stocks']['ts'] = _now - 3 * 3600
+#
+# **11-07 改：时间戳必须按判据自己校准，不能再写死"往前推 3 小时"（修⑩-4）**。
+# 2026-10-31 线上加了 `_snapshot_final(ts)`：ts 不早于「最近一个交易日 15:05」就当**收盘定版**
+# 快照——休市期间数据不会再变，重算出来的还是同一份，所以既不算旧、也不触发新浪全市场重算
+# （原来的做法是周末每 2 小时重算一遍，实测首开约 15 秒挂在"加载"上）。
+# 于是"now − 3h 就是超龄"这个前提从那天起就不成立了：周六 12:43 跑，now−3h 是周六上午，
+# 比周五 15:05 还晚 ⇒ 算定版 ⇒ 既不补算也不标旧 ⇒ 这一组必红（`fundflow_fallback_selftest`
+# 那 5 条同一个根因）。代码没错，是测试写法过期，而且红着的时间足够长会把真回归埋掉。
+# 现在用判据本身把两种日子各挑出来，两条腿都必须跑出各自的结论。
+def _pick_ts(final: bool, base: float) -> float:
+    """往回逐小时找一个落在指定那一侧、且龄期 > 2h 的快照时间戳。"""
+    step = 0
+    while step < 400:
+        ts = base - step * 3600
+        if (base - ts) > ff._STALE_AFTER_SEC and bool(ff._snapshot_final(ts)) == final:
+            return ts
+        step += 1
+    raise AssertionError('找不到落在期望那一侧的快照时间戳（判据本身又变了？）')
+
+
+ff._LAST_GOOD['stocks']['ts'] = _pick_ts(False, _now)
 ff._CACHE.clear()
 _orig_sina_rank = ff._sina_stock_rankings
 
@@ -207,7 +227,7 @@ ff._sina_stock_rankings = _sina_rank_none
 _d_stale = asyncio.run(ff.get_fund_flow_summary(stock_top_n=25, sector_top_n=5,
                                                 change_threshold=3.0, hot_top_n=30, hidden_top_n=20))
 ff._sina_stock_rankings = _orig_sina_rank
-ck(_d_stale['stale'] is True, '超过 2h 的快照 + 新浪补算失败 → 标 stale')
+ck(_d_stale['stale'] is True, '未定版的超龄快照 + 新浪补算失败 → 标 stale')
 # 补算成功路径：新浪排行有数据 → 数据新鲜、不 stale
 _orig_sina_rank2 = ff._sina_stock_rankings
 
@@ -222,7 +242,29 @@ _d_fresh = asyncio.run(ff.get_fund_flow_summary(stock_top_n=25, sector_top_n=5,
                                                 change_threshold=3.0, hot_top_n=30, hidden_top_n=20))
 ff._sina_stock_rankings = _orig_sina_rank2
 ck(_d_fresh['stale'] is False and _d_fresh['dataSource']['stocks'] == 'sina',
-   'closed+过期快照 → 新浪补算成功 → 数据新鲜不 stale')
+   '未定版超龄快照 → 新浪补算成功 → 数据新鲜不 stale')
+
+# 定版那一侧（10-31 那条优化）：休市时超龄快照既不重算也不标旧——不测这一侧，
+# 下次有人"顺手把定版判据删掉"照样全绿。
+_ts_final = _pick_ts(True, _now)
+ff._LAST_GOOD['stocks']['ts'] = _ts_final
+ff._CACHE.clear()
+_sina_calls = {'n': 0}
+
+
+async def _sina_rank_counter(top_n):
+    _sina_calls['n'] += 1
+    return None
+
+
+ff._sina_stock_rankings = _sina_rank_counter
+_d_final = asyncio.run(ff.get_fund_flow_summary(stock_top_n=25, sector_top_n=5,
+                                                change_threshold=3.0, hot_top_n=30, hidden_top_n=20))
+ff._sina_stock_rankings = _orig_sina_rank2
+ck(ff._snapshot_final(_ts_final) is True, f'挑出的时间戳确实在定版那一侧（{_ts_final:.0f}）')
+ck(_d_final['dataSource']['stocks'] == 'snapshot' and _d_final['stale'] is False,
+   '收盘定版快照（休市）不重算、也不标旧')
+ck(_sina_calls['n'] == 0, '定版那一侧压根不叫新浪补算（省下首开约 15 秒的全市场重算）')
 # DB 里存的是去参数化 key（closed 分支不落盘，需切盘中刷新路径验证）
 ff._in_trading_window = lambda: True  # 盘中
 _calls3 = []

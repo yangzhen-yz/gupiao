@@ -243,6 +243,52 @@ finally:
     os.remove(tmp_nots)
 ck(rc_nots == 0, '名字不像自测的文件不判（业务代码/运维脚本不该被这条拦住）')
 
+# ========== [8] R4：门面桩不算隔离（11-07 体检实拍漏口） ==========
+print('\n[8] R4「桩打在门面/共享层」：既不许被当成隔离，也要单独点名')
+_FACADE_STUB = '''
+from db import database as db
+def main():
+    db.get_db_conn = lambda: None
+    db.save_daily_recommendations([{"date": "2026-11-07"}])
+'''
+_r = rules(_FACADE_STUB)
+ck('R4' in _r, f'`db.get_db_conn = 桩` + 真写库函数 → 报 R4（实得 {sorted(_r)}）')
+ck('R1' in _r,
+   '同一份源码同时报 R1（老版本把这种赋值算成"已隔离"，'
+   '于是 scripts/daily_recs_cache_selftest.py 一路往真库写假批次、检查器一路绿）')
+ck('R4' not in rules('''
+from db import database as db
+def main():
+    db.use_db_path("/tmp/x.db")
+    db.get_db_conn = lambda: (_ for _ in ()).throw(RuntimeError("故障注入"))
+    db.save_daily_recommendations([{"date": "2026-11-07"}])
+'''), '同一文件里已有 use_db_path ⇒ 门面桩只算故障注入，不报 R4（sched_liveness 那种写法）')
+ck('R4' not in rules('''
+from db.dal import recommend as dal_rec
+def main():
+    dal_rec.get_db_conn = lambda: None
+    dal_rec.save_daily_recommendations([{"date": "2026-11-07"}])
+'''), '反误报：桩打在**真正执行写入的那个模块**上是有效隔离，不报')
+ck('R1' not in rules('''
+from db.dal import recommend as dal_rec
+def main():
+    dal_rec.get_db_conn = lambda: None
+    dal_rec.save_daily_recommendations([{"date": "2026-11-07"}])
+'''), '同上也不报 R1（否则本次修好的那份自测自己就会被拦）')
+for form in ('dbmod.get_db_conn = f', 'database.get_db_conn = f', 'dal_state.get_db_conn = f',
+             'db.dal_state.get_db_conn = f'):
+    src = '''
+import db.database as database
+import db.database as dbmod
+import db.dal_state as dal_state
+def main():
+    __STUB__
+    database.save_strategy_snapshot([dict(a=1)])
+'''.replace('__STUB__', form)
+    ck('R4' in rules(src), f'门面别名也拦得住：{form}')
+ck(rules(_FACADE_STUB, rel='server/services/pick/recommend.py') == set(),
+   '业务代码不判 R4（这条只管自测文件，判据与 R1~R3 同一条文件名门槛）')
+
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
 if FAIL:
     for m in FAIL:

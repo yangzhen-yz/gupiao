@@ -73,7 +73,9 @@ def _stub_push(ok=True):
 
 
 def _reset_state():
-    L._STATE['last_alert'] = {'A': 0.0, 'B': ''}
+    L._STATE['last_alert'] = {'A': 0.0, 'B': '', 'E': ''}
+    L._STATE['last_skip_reason'] = ''
+    L._STATE['last_chain_error'] = ''
     L._STATE['started_ts'] = time.time()
     L._BEAT.update({'ts': time.time(), 'since': dt.datetime.now(), 'last_ran': 1, 'loop_errors': 0})
 
@@ -368,6 +370,118 @@ finally:
     c11.close()
     dbmod.use_db_path(_ORIGIN_DB)
     os.remove(tmp11)
+
+
+# ========== [12] E 类：判据自己查不动时必须出声（修⑩-5） ==========
+print('\n[12] E 类：B 判据查库失败时，"看不见"必须被说出来（原来是静默）')
+import builtins
+import db.dal_state as _ds
+
+tmp12, c12 = _mk_db('blind')
+_ORIGIN_DB12 = dbmod.current_db_path()
+dbmod.use_db_path(tmp12)
+_reset_state()
+L.mark_loop_beat(ran=3)
+_EBUF, _EOLD = [], builtins.print
+_orig_get = _ds.get_db_conn
+
+
+def _ecap(*a, **k):
+    line = ' '.join(str(x) for x in a)
+    if '判据无法评估' in line:        # 只截这一类，其余照原样输出（不吞 ck 的回显）
+        _EBUF.append(line)
+    else:
+        _EOLD(line, **k)
+
+
+def _failing_conn(*a, **k):
+    raise RuntimeError('模拟写锁：database is locked')
+
+
+def _failing_conn2(*a, **k):
+    raise OSError('模拟另一只脚：no such table app_settings')
+
+
+_orig_push12 = _stub_push(ok=True)
+try:
+    _now12 = dt.datetime(2026, 11, 9, 14, 11)      # 周一交易日、14:10 那档已过
+    _ds.get_db_conn = _failing_conn
+    r_err = L.check_once(now=_now12)
+    ck(bool(r_err.get('chain_errors')),
+       f'查询异常被如实记进 chain_errors（实得 {r_err.get("chain_errors")!r}）')
+    ck(r_err['alerts'] == [], '库查不动时 B 不误发（但也不能假装"一切正常"）')
+
+    builtins.print = _ecap
+    try:
+        L.alert_and_record(r_err, force=False)
+    finally:
+        builtins.print = _EOLD
+    ck(len(_EBUF) == 1, f'这一轮有一行出声（实得 {len(_EBUF)} 行）——改造前一行都没有')
+    ck(len(_SENT) == 1, f'异常首次出现 ⇒ 推送一次（实得 {len(_SENT)} 条）')
+    ck('看不见' in _SENT[0] and 'database is locked' in _SENT[0],
+       '正文说清"不是没事，是我看不见"，并带上异常原文')
+    try:
+        _SENT[0].encode('gbk')
+        ck(True, 'E 类正文 GBK 编得出（B8 那条规矩）')
+    except UnicodeEncodeError as e:
+        ck(False, f'E 类正文编不进 GBK：{e}')
+
+    _EBUF.clear()
+    _n0 = len(_SENT)
+    builtins.print = _ecap
+    try:
+        for _ in range(2):
+            L.alert_and_record(L.check_once(now=_now12), force=False)
+    finally:
+        builtins.print = _EOLD
+    ck(len(_SENT) == _n0, f'同一异常当天不重推（再多查两轮仍 {len(_SENT)} 条）')
+    ck(len(_EBUF) == 0, f'同一异常文本不重复打日志（实得 {len(_EBUF)} 行）')
+
+    _ds.get_db_conn = _failing_conn2
+    _EBUF.clear()
+    builtins.print = _ecap
+    try:
+        L.alert_and_record(L.check_once(now=_now12), force=False)
+    finally:
+        builtins.print = _EOLD
+    ck(len(_SENT) == _n0, f'异常文本变了但仍是同一天 ⇒ 不重推（按天去重，实得 {len(_SENT)} 条）')
+    ck(len(_EBUF) == 1, f'换了新异常必须再打一行日志（实得 {len(_EBUF)} 行）')
+    ck('no such table' in (_EBUF[0] if _EBUF else ''), '日志里带的是新的异常原文，不是旧的那条')
+
+    # 取连接失败也必须进 errors（原来 `conn = get_db_conn()` 写在 try 外面，
+    # "库打不开"这一类会直接从 _count_chain 逃出去，B 一条不判、还只剩一行线程异常）
+    _ds.get_db_conn = _failing_conn2
+    r_conn = L._count_chain(_now12.strftime('%Y-%m-%d'))
+    ck(r_conn['errors'].startswith('OSError'),
+       f'取连接异常同样落在 errors 里（实得 {r_conn["errors"]!r}）')
+    _ds.get_db_conn = _orig_get
+
+    _EBUF.clear()
+    _n1 = len(_SENT)
+    builtins.print = _ecap
+    try:
+        # 连接已恢复：这一轮判据里没有 chain_errors ⇒ 一条都不该推
+        L.alert_and_record(L.check_once(now=_now12), force=False)
+        ck(len(_SENT) == _n1, '库恢复正常 ⇒ E 类不再推（实得仍 ' + str(len(_SENT)) + ' 条）')
+        # 再喂一个**当天没出现过的新文本**（去掉连接桩之后已经查不到异常了，所以手动构造 res）
+        L.alert_and_record({'enabled': True, 'day': _now12.strftime('%Y-%m-%d'),
+                            'alerts': [], 'skipped': '',
+                            'chain_errors': 'RuntimeError: 又一种新异常 text xyz'}, force=False)
+        ck(any('又一种新异常 text xyz' in x for x in _EBUF),
+           '异常文本换了 ⇒ 日志必须再打一行（去重只按"文本变没变"，不是一律沉默）')
+        r_ok = L.check_once(now=_now12)
+    finally:
+        builtins.print = _EOLD
+    ck(len(_SENT) == _n1, '库恢复后不再推 E 类')
+    ck('chain_errors' not in r_ok, '恢复正常时判据不留异常痕迹')
+finally:
+    _ds.get_db_conn = _orig_get
+    import services.support.push as _P
+    _P.push_wecom_webhook = _orig_push12
+    builtins.print = _EOLD
+    c12.close()
+    dbmod.use_db_path(_ORIGIN_DB12)
+    os.remove(tmp12)
 
 
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
