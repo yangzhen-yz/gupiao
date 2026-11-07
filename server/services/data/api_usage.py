@@ -321,7 +321,7 @@ def merge_legacy_other_rows(date: str) -> int:
     旧键读进内存、每 60 秒复写一次。
     """
     from db.database import get_db_conn
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     moved = 0
     try:
         for host, (provider, interface) in _LEGACY_OTHER.items():

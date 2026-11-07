@@ -90,7 +90,7 @@ def upsert_rows(symbol: str, rows: List[List]) -> int:
         recs.append((symbol, d, name, o, h, l, cl, vol))
     if not recs:
         return 0
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     conn.executemany(
         'INSERT INTO index_daily (symbol, date, name, open, high, low, close, volume) '
         'VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(symbol, date) DO UPDATE SET '

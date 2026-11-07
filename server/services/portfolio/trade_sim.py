@@ -40,7 +40,7 @@ def _today() -> str:
 # ---------- 基础读写 ----------
 def _ensure_sim_account(user_id: int) -> None:
     """确保每个用户有模拟账户行；并做每日基准重置（日亏封顶用）"""
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     cur = conn.cursor()
     cur.execute('SELECT cash, day_start_value, day_start_date FROM sim_accounts WHERE user_id=?', (user_id,))
     row = cur.fetchone()
@@ -149,7 +149,7 @@ def expire_stale_pending_sells(user_id: int, today: Optional[str] = None) -> int
     ②前端与统计只认 pending/filled/rejected 三态，加新状态页面会显示不出来。
     作废原因写进 reject_reason，用户在建议列表里看得见为什么这张单没了。"""
     today = today or _today()
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         cur = conn.execute(
             "UPDATE sim_orders SET status='rejected', reject_reason=? WHERE user_id=? "
@@ -298,7 +298,7 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
             err = _check_buy(user_id, sym, price, qty, day_start, cash_v, positions, day_start, day_pnl)
         else:
             err = _check_sell(user_id, sym, qty, price, positions, _today())
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         if err:
             conn.execute('''INSERT INTO sim_orders
                 (user_id, symbol, name, side, proposed_price, proposed_qty, source, status, reject_reason)
@@ -361,7 +361,7 @@ async def generate_proposals(user_id: int, sources: List[str], symbols: Optional
 
     # 1) 收评明日买入计划
     if 'tomorrow_plan' in sources:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         row = conn.execute(
             'SELECT focus_json FROM daily_market_reviews ORDER BY review_date DESC LIMIT 1').fetchone()
         conn.close()
@@ -471,7 +471,7 @@ async def manual_sell(user_id: int, symbol: str, qty: Optional[int] = None) -> D
     err = _check_sell(user_id, pos['symbol'], qty, price, positions, _today())
     if err:
         return {'success': False, 'message': err}
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     cur = conn.execute('''INSERT INTO sim_orders
         (user_id, symbol, name, side, proposed_price, proposed_qty, source, status, reason)
         VALUES (?,?,?,?,?,?,?,?,?)''',
@@ -484,7 +484,7 @@ async def manual_sell(user_id: int, symbol: str, qty: Optional[int] = None) -> D
                              'name': pos['name'], 'proposed_qty': qty}, price)
     except Exception:
         # 成交写入失败：删掉刚落的 pending 单，避免审计里留下一条"虚假待执行"
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('DELETE FROM sim_orders WHERE id=? AND user_id=?', (order_id, user_id))
         conn.commit(); conn.close()
         raise
@@ -545,14 +545,14 @@ async def execute_sim(user_id: int) -> Dict:
 
 
 def _reject(order_id: int, user_id: int, reason: str):
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     conn.execute('UPDATE sim_orders SET status=?, reject_reason=? WHERE id=? AND user_id=?',
                  ('rejected', reason, order_id, user_id))
     conn.commit(); conn.close()
 
 
 def _fill_buy(user_id: int, o: Dict, price: float):
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     cur = conn.cursor()
     row = cur.execute('SELECT shares, cost_price, buy_date FROM sim_positions WHERE user_id=? AND symbol=?',
                       (user_id, o['symbol'])).fetchone()
@@ -575,7 +575,7 @@ def _fill_buy(user_id: int, o: Dict, price: float):
 
 
 def _fill_sell(user_id: int, o: Dict, price: float):
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     cur = conn.cursor()
     qty = o['proposed_qty']
     row = cur.execute('SELECT shares, buy_date FROM sim_positions WHERE user_id=? AND symbol=?',
@@ -680,7 +680,7 @@ async def get_sim_state(user_id: int) -> Dict:
 
 
 def reset_sim(user_id: int) -> Dict:
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     conn.execute('DELETE FROM sim_positions WHERE user_id=?', (user_id,))
     conn.execute('DELETE FROM sim_orders WHERE user_id=?', (user_id,))
     conn.execute('UPDATE sim_accounts SET cash=?, day_start_value=?, day_start_date=? WHERE user_id=?',

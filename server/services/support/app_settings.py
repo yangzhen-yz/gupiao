@@ -151,6 +151,13 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'candidate_pool_shadow_enabled', 'cfg': 'CANDIDATE_POOL_SHADOW_ENABLED', 'kind': 'bool',
+        'label': '海选层影子留痕（只写新表，不参与判定）', 'group': '数据与门槛', 'live': True,
+        'note': '逐条记录被哪道海选门槛挡掉 + 次日表现，攒够 20 个交易日才裁决；'
+                '关掉 = 不建表、不写行，逐字节等于没这项',
+        'impact': None,
+    },
+    {
         'key': 'loser_criterion', 'cfg': 'RECOMMEND_LOSER_CRITERION', 'kind': 'enum',
         'label': '亏损黑名单判据', 'group': '推荐避让黑名单', 'live': True,
         'options': [{'value': 't1', 'label': '只看 T+1（老行为）'},
@@ -738,7 +745,7 @@ def set_value(key: str, incoming: Any, user: str = '') -> Dict[str, Any]:
     if not ok:
         return {'ok': False, 'error': val_or_err}
     s = spec(key)
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         _ensure_table(conn)
         # 改得跟默认值一样就删掉覆盖行：留着它，以后 config 默认值调整时会被旧覆盖"钉住"，
@@ -791,7 +798,7 @@ def reset_value(key: str, user: str = '') -> Dict[str, Any]:
     """删掉覆盖，回到 config.py 的默认值（界面上的"恢复默认"）。"""
     if key not in _SPEC_INDEX:
         return {'ok': False, 'error': f'不允许修改的配置项: {key}'}
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         _ensure_table(conn)
         conn.execute('DELETE FROM app_settings WHERE key=?', (key,))

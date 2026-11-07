@@ -302,9 +302,17 @@ def _sync_collect() -> Dict:
             return fb
         return _empty_snapshot(f'非交易时段({phase or "未知"})')
 
-    # 2) 东财熔断中：不硬打。先试新浪备源（sentiment_alt），再退快照/收评——
-    #    直接退收评会把昨天的连板高度/炸板率当成今天的（2026-10-23 6板显示5板即此因）。
-    if _em_guard().skip('clist'):
+    # 2) 东财熔断中：不硬打。**11-06 起按主机家族分开判**。
+    #    clist(push2delay) 与三池(push2ex) 是两条链路——近 14 天实测失败率 47.5% vs 1.0%。
+    #    原来只看 skip('clist') 一把闸：11-06 09:15:04 clist 一次连接被重置就把明明可用的
+    #    三池一起关到 13:16，连板梯队/炸板率整维置缺 → 33 行"退潮/冰点"快照全标 stale=1
+    #    → 转弱推送、修复推送、减仓影子整天静音（用户当天问"为什么没推大盘转弱"）。
+    #    现在只有两条链路**都**停手才整体降级；单边停时另一边照取，缺的那维由下面的
+    #    池子空判定去走新浪备源/当日快照。关掉 EASTMONEY_FAMILY_GATE_ENABLED 即回到旧行为。
+    guard = _em_guard()
+    main_cooling = guard.skip('clist')
+    pools_cooling = guard.skip('pools')
+    if main_cooling and pools_cooling:
         alt = _alt_collect(now)
         if alt:
             return alt
@@ -314,14 +322,16 @@ def _sync_collect() -> Dict:
         return _empty_snapshot('东财冷却中')
 
     today_str = now.strftime('%Y%m%d')
-    yest_pool = _yesterday_zt_pool(now)
+    yest_pool = _yesterday_zt_pool(now) if not pools_cooling else []
 
-    zt_pool = _em_zt_pool_get(today_str, pagesize=SENTIMENT_ZT_POOL_PAGESIZE,
-                              retries=2, timeout=6.0) or []
-    zb_pool = _em_zb_pool_get(today_str, retries=2, timeout=6.0) if zt_pool else []
-    dt_pool = _em_zt_pool_get(today_str, pool_type='dt',
-                              pagesize=SENTIMENT_ZT_POOL_PAGESIZE,
-                              retries=2, timeout=6.0) or []
+    # 三池只受 pools 家族停调影响；clist 在冷却时它们仍然是当场的新鲜数
+    zt_pool = [] if pools_cooling else (_em_zt_pool_get(
+        today_str, pagesize=SENTIMENT_ZT_POOL_PAGESIZE, retries=2, timeout=6.0) or [])
+    zb_pool = [] if pools_cooling else (_em_zb_pool_get(today_str, retries=2, timeout=6.0)
+                                        if zt_pool else [])
+    dt_pool = [] if pools_cooling else (_em_zt_pool_get(
+        today_str, pool_type='dt', pagesize=SENTIMENT_ZT_POOL_PAGESIZE,
+        retries=2, timeout=6.0) or [])
     breadth = _fetch_market_breadth()
     ladder = _calc_lianban_ladder(zt_pool)
 
@@ -332,12 +342,17 @@ def _sync_collect() -> Dict:
         _POOL_SAVE_TS = time.time()
         save_pools(now.strftime('%Y-%m-%d'), zt_pool, zb_pool, dt_pool)
 
-    # 熔断计数：涨停池空（重试后仍拿不到）记一次失败；正常拿到即复位。
-    # 盘中全市场零涨停基本不存在，误判的代价也只是 5 分钟内走收评兜底，可自愈。
-    if zt_pool:
-        _em_guard().ok('clist')
-    else:
-        _em_guard().fail('clist')
+    # 熔断计数（11-06 改口径）：涨停池的成败**只记到 pools 家族**。
+    # 原来记在 'clist' 上，等于让 push2ex 的表现去决定 push2delay 能不能用（反向也成立：
+    # clist 的封禁会伪装成"池子取不到"）。是我们主动停的（pools_cooling）就不记，
+    # 否则会把已经抬到当日 23:59 的停调一次次往后推。
+    # 盘中全市场零涨停基本不存在，误判的代价也只是 5 分钟内走备源/收评兜底，可自愈。
+    if not pools_cooling:
+        if zt_pool:
+            guard.ok('pools', clear_domain=False)
+        else:
+            guard.fail('pools', kind='flaky')
+    if not zt_pool:
         # 涨停池重试后仍为空：不要拿 0 涨停算出一个假的“冰点”周期。
         # 先试新浪备源，再退当日最近盘中快照，最后退收评；两者都带 stale，只提示不拦。
         alt = _alt_collect(now)
@@ -645,7 +660,7 @@ def persist_final_snapshot(now: Optional[datetime] = None) -> Dict:
     try:
         if not _ensure_final_table():
             return {'written': False, 'reason': 'table_missing'}
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('INSERT OR REPLACE INTO sentiment_final_daily '
                      '(sent_date, cycle, score, source, data_ts, indicators, payload) '
                      'VALUES (?,?,?,?,?,?,?)',

@@ -1141,7 +1141,7 @@ async def _log_shadow_gate_adjustment(now, date_key, pool, zone_dropped, top3,
             r['onlineTop3'] = r['symbol'] in top3_syms
             rows.append(r)
 
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             _ensure_shadow_gate_table(conn)
             for r in rows:
@@ -1802,6 +1802,22 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
                         _labs.setdefault(_sym, {}).update(_t)
                 except Exception as _e:
                     print(f'[策略快照] rev20 影子失败（列留空）: {type(_e).__name__}: {_e}')
+                # 修⑥①（2026-11-07，影子）：抗跌因子——大盘跌的时候这票扛不扛。
+                # 基准=sh000001 近 20 个已收盘日，三条口径（相对最大回撤 pp / 下跌日 beta /
+                # 抗跌日占比）与"板块腿为什么先不接"见 services/pick/anti_drop_shadow.py 顶部；
+                # 本地日K落后的票一律不算（11-06 炸板影子那次就是栽在拿旧序列算）。
+                # **只填快照 antiDrop 字段，不改候选、不改分数、不改动作。**
+                try:
+                    from services.pick.anti_drop_shadow import anti_drop_labs
+                    _ad_labs, _ad_meta = await anti_drop_labs(all_results)
+                    for _sym, _t in _ad_labs.items():
+                        _labs.setdefault(_sym, {}).update(_t)
+                    if _ad_meta.get('asked'):
+                        print(f"[快照] 抗跌影子：算 {_ad_meta.get('computed')}/{_ad_meta.get('asked')} 只"
+                              f"（日K落后 {_ad_meta.get('stale')}、不足 {_ad_meta.get('notEnough')}），"
+                              f"基准 {_ad_meta.get('bench')} {str(_ad_meta.get('indexDays'))} 天")
+                except Exception as _e:
+                    print(f'[策略快照] 抗跌影子失败（字段留空）: {type(_e).__name__}: {_e}')
                 if shadow_payload:
                     def _lab(_sym):
                         return _labs.setdefault(_sym, {}) if _sym else {}

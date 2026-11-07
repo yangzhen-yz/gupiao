@@ -439,7 +439,7 @@ def record_daily(days=0):
     kc = (g.get('影子放行') or {}).get('close') or {}
     ec = (g.get('影子挡掉') or {}).get('close') or {}
     today = datetime.now().strftime('%Y-%m-%d')
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         conn.execute(DDL)
         conn.execute('DELETE FROM recommend_shadow_eval WHERE eval_date=?', (today,))

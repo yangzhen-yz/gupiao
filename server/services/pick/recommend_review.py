@@ -424,7 +424,7 @@ def run_recommendation_review() -> Dict:
 
     summary = _aggregate(perf)
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.cursor()
         cur.execute('''CREATE TABLE IF NOT EXISTS recommendation_review (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -32,7 +32,7 @@ TRIGGER_WEAKEN = 'sentiment_weaken'
 def _ensure_table() -> bool:
     try:
         from db.database import get_db_conn
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('''CREATE TABLE IF NOT EXISTS exit_signal_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sig_date TEXT NOT NULL,
@@ -111,7 +111,7 @@ def record_sentiment_reduce(user_id: int, pos: Dict, sentiment: Dict,
         if not _ensure_table():
             return False
         from db.database import get_db_conn
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.execute(
             'INSERT OR IGNORE INTO exit_signal_log '
             '(sig_date, ts, user_id, symbol, name, trigger_key, cycle, cycle_score, '
