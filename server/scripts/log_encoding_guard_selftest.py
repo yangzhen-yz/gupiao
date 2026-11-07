@@ -110,10 +110,12 @@ J_BAD = "def broken(:\n    print('⚠')\n"
 ck(G.scan_print_sites(J_BAD, 'server/core/bad.py') == [], '解析不了的文件不崩检查器（返回空由 L1 负责拦）')
 
 # ========== [4] report() 的退出码与分级 ==========
-print('[4] report()：兜底在位=只报数放行；兜底坏了=拦下（这才是"机制"而不是文档）')
+print('[4] report()：存量清零后 L1 与 L2 都阻断（11-07 用户拍板把 L2 从"只报数"升级成阻断）')
 _ok_code, det_ok = G.report(staged=False, paths=['server/core/scheduler.py'], quiet=True)
-ck(_ok_code == 0, f'真入口 + 真代码 → 退出码 0（实得 {_ok_code}）')
-ck(det_ok['unsafePrints'] >= 8, f'风险面读数带回来了（{det_ok["unsafePrints"]} 处 / {det_ok["files"]} 文件）')
+ck(_ok_code == 0, f'真入口 + 已清干净的 scheduler → 退出码 0（实得 {_ok_code}）')
+ck(det_ok['unsafePrints'] == 0,
+   f'运行期 print 的高危字符存量归 0（实得 {det_ok["unsafePrints"]} 处 / {det_ok["files"]} 文件）'
+   '——这条为 0 才有资格谈阻断，否则升级第一天就把所有提交全拦死')
 ck(det_ok['mainHasFallback'] is True, '明细里带 mainHasFallback，供会话与日志复核')
 
 _orig_read = G._read
@@ -124,6 +126,37 @@ try:
     ck(det_bad['blocking'] is True, 'blocking 标志与退出码一致')
 finally:
     G._read = _orig_read
+
+# ========== [4b] L2 的现场反证：真往运行期目录放一条带高危符号的 print ==========
+print('[4b] L2 现场反证（临时探针文件，不入库、跑完即删）')
+_probe_rel = 'server/core/zz_probe_log_guard.py'
+_probe_abs = os.path.join(os.path.dirname(SERVER), 'server', 'core', 'zz_probe_log_guard.py')
+io.open(_probe_abs, 'w', encoding='utf-8').write(
+    "def f():\n    print('[探针] \u26a0\ufe0f 这条是故意写的，用来证明 L2 会拦')\n")
+try:
+    _p_code, det_p = G.report(staged=False, paths=[_probe_rel], quiet=True)
+    ck(_p_code == 1, f'新增一条带高危符号的运行期 print → 退出码 1（实得 {_p_code}）')
+    ck(bool(det_p['samples']) and det_p['samples'][0][1] == 2,
+       f'要指到具体行号，不然没法改（实得 {det_p["samples"]}）')
+finally:
+    os.remove(_probe_abs)
+ck(not os.path.exists(_probe_abs), '探针已删除（不留进工作树，更不入库）')
+
+# ========== [4c] L2 不该误伤：注释里的历史说明、以及送企微/前端的业务文本 ==========
+print('[4c] 不误伤：注释与业务文本里的高危字符不在 L2 射程内')
+_ck_rel = 'server/core/zz_probe_log_guard2.py'
+_ck_abs = os.path.join(os.path.dirname(SERVER), 'server', 'core', 'zz_probe_log_guard2.py')
+io.open(_ck_abs, 'w', encoding='utf-8').write(
+    "# 历史说明：这条以前带 \u26a0 会崩（注释，不打印）\n"
+    "_CARD = '\u26a0\ufe0f 减仓回避'      # 业务文本，走企微/前端，不经过 GBK 管道\n"
+    "def f():\n    print('[ok] 这条打印是纯中文，GBK 编得出')\n")
+try:
+    _c_code, det_c = G.report(staged=False, paths=[_ck_rel], quiet=True)
+    ck(_c_code == 0 and det_c['unsafePrints'] == 0,
+       f'注释与业务文本里的高危字符没被拦（实得退出码 {_c_code}、计数 {det_c["unsafePrints"]}）'
+       '——否则升级第一天就会逼人删掉说明文字')
+finally:
+    os.remove(_ck_abs)
 
 # ========== [5] 接线层：B8 真挂在 pre-commit 上 ==========
 print('[5] 接线层：.githooks/pre-commit 里的 B8 必须在位且能阻断')

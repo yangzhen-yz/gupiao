@@ -14,17 +14,20 @@
 "下一次重启就打死它所在的任务"**，而且不会有任何静态信号——崩的是运行期，写它的人早下班了。
 11-04 复核时文档里写着"下一步（未做）：把这条做成 .githooks 的机制拦截"，本文件就是那一步。
 
-两条规则
+两条规则（11-07 用户拍板后 L2 也升级为阻断）
 --------
-- **L1（阻断）入口编码兜底必须在位**：`app/main.py` 里必须同时找得到
+- **L1 入口编码兜底必须在位**：`app/main.py` 里必须同时找得到
   ① 真的 `reconfigure(` 调用、② GBK 家族编码探测（gbk/cp936/gb2312/gb18030 至少一个）、
-  ③ 它包在 `try` 里（兜底自身绝不影响启动）。三者缺一 → 拦下，别提交。
-- **L2（计数＋提醒，兜底不在位时升级为阻断）运行期 print 里的 GBK 不安全字符**：
-  扫 `app/ core/ services/` 的 `print(...)` **语句**（AST，不是整行匹配），逐条试 `encode('gbk')`。
-  这条不要求谁去改文案，它是**风险面读数**：11-02 文档写 17 处，11-07 实测 25 处——
-  "计数会随新增日志无感增长"正是当时担心的事，现在它每笔提交都会被打印出来。
-  兜底在位时 L2 只报数不拦（因为按现有设计，兜底就是让这 25 处不必逐行改写）；
-  兜底不在位时每一处都是实弹，直接拦。
+  ③ 它包在 `try` 里（兜底自身绝不影响启动）、④ 顶层真的调用了那个兜底函数。
+  四者缺一 → 拦下，别提交。
+- **L2 运行期 print 里不许出现 GBK 编不出的字符**：扫 `app/ core/ services/` 的
+  `print(...)` **语句**（AST，不是整行匹配），逐条试 `encode('gbk')`，有命中就拦。
+  这条以前只报数（当时存量 25 处，逐行改文案不在计划里，靠 L1 兜住）；
+  11-07 把存量清成 0 之后改成阻断——**从此"新写一条 ⚠ 日志"在提交阶段就被挡住，
+  而不是等下一次重启在线上崩一次**。改法是换等价文本，不是加转义：
+  `⚠️ → [警告]`、`▸ → >`、`◂ → <`（都 GBK 编得出，视觉提示和可 grep 性都没丢）。
+  注意口径：只管**会被打印的语句**。注释、docstring、以及要送到企微卡片/前端的业务文本
+  （那些走 UTF-8、不经过这条 GBK 管道）都不在这条的射程里，误拦只会逼人把说明文字删掉。
 
 判据为什么用 AST 而不是 grep
 ----------------------------
@@ -254,7 +257,7 @@ def report(staged: bool = False, paths: Optional[List[str]] = None,
 
     n = len(sites)
     detail = {'l1': l1, 'unsafePrints': n, 'files': len(rels),
-              'samples': sites[:8], 'blocking': bool(l1), 'mainHasFallback': not l1}
+              'samples': sites[:8], 'blocking': bool(l1) or n > 0, 'mainHasFallback': not l1}
     if not quiet:
         if l1:
             print(f'[日志编码] L1 入口兜底缺失/改坏（{len(l1)} 条）：')
@@ -262,16 +265,18 @@ def report(staged: bool = False, paths: Optional[List[str]] = None,
                 print(f'  [L1] {MAIN_REL}'
                       + (f':{h["line"]}' if h['line'] else '') + f'  {h["detail"]}')
         print(f'[日志编码] L2 运行期 print 里 GBK 编不出的语句：{n} 处 / 扫 {len(rels)} 个文件'
-              '（入口兜底在位时这些都不必逐行改写，这里只报风险面读数）')
+              '（11-07 起这一条也阻断——存量已清成 0，新写的要拦住）')
         for rel, ln, seg in sites[:8]:
             print(f'      {rel}:{ln}  {seg}')
         if n > 8:
             print(f'      …另有 {n - 8} 处（--all 全量可见）')
-    # 只有 L1 才阻断：兜底在位 ⇒ 这 n 处打不崩；兜底没了 ⇒ 每一处都是实弹
-    if l1:
-        if not quiet:
-            print('[日志编码] 结论：拦下。要么把 `app/main.py` 那块兜底恢复回来，'
-                  '要么说清为什么这次不需要它。')
+    if l1 and not quiet:
+        print('  上面 L1 说清了 app/main.py 那段兜底现在缺哪一块。')
+    if (l1 or n) and not quiet:
+        print('[日志编码] 结论：拦下。改法是把符号换成 GBK 编得出的等价文本'
+              '（⚠️→[警告]、▸→>、◂→<），不是删日志说明、也不是加转义；'
+              'L1 那几种则要把入口那块恢复回来。')
+    if l1 or n:
         return 1, detail
     return 0, detail
 
