@@ -1960,7 +1960,7 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
                 modes[(r.get('symbol') or '').lower()] = item['mode']
             _relay = [i['name'] for i in rec_items if i.get('mode') == 'relay']
             if _relay:
-                print(f'[推荐模式] ⚠️ 接力票出现在推荐里（矩阵判"不接力"、实测次日开盘卖六格全负）：'
+                print(f'[推荐模式] [警告] 接力票出现在推荐里（矩阵判"不接力"、实测次日开盘卖六格全负）：'
                       f'{"、".join(_relay)} —— 这条本该被 4.6/4.7 或门槛挡住，出现即说明有漏口')
             print('[推荐模式] ' + '、'.join(
                 f"{i['name']}={_ml(i.get('mode', ''))}" for i in rec_items))

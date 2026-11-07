@@ -286,7 +286,7 @@ def run(limit: int = 0, dry_run: bool = False, retry_done: bool = False) -> Dict
                 consec_blocked += 1
                 if consec_blocked >= 3:
                     stats['aborted'] = f'连续 {consec_blocked} 只拿不到腾讯前复权（限流），剩余下次再跑'
-                    print(f'[除权重算] ⚠️ {stats["aborted"]}')
+                    print(f'[除权重算] [警告] {stats["aborted"]}')
                     break
             else:
                 consec_blocked = 0

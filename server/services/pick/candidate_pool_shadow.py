@@ -271,9 +271,14 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
     conn = _conn()
     try:
         _ensure_table(conn)
-        days = conn.execute(
-            'SELECT COUNT(DISTINCT pool_date) FROM candidate_pool_shadow WHERE t1_filled=1'
-        ).fetchone()[0]
+        _dates = [str(r[0])[:10] for r in conn.execute(
+            'SELECT DISTINCT pool_date FROM candidate_pool_shadow WHERE t1_filled=1'
+        ).fetchall()]
+        # 修⑧：样本钟只数"当天确实生成过推荐批次"的日子（11-06 调度冻结那天 0 批次，
+        # 11-07 周六手工点一次又会留一行），被排除的日期与原因一起带回去，不静默少算。
+        from services.support import sample_days
+        _sd = sample_days.filter_sample_days(_dates)
+        days = len(_sd['counted'])
         groups: Dict[str, List[float]] = {}
         highs: Dict[str, List[float]] = {}
         for r in conn.execute(
@@ -290,7 +295,8 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
                 k2 = f'{band} | 只被「{_LABELS.get(rej, rej)}」挡'
                 groups.setdefault(k2, []).append(float(ret))
         out = {'ready': days >= min_days, 'days': days, 'min_days': min_days,
-               'groups': {}}
+               'sampleDays': _sd['counted'], 'skipped': _sd['skipped'],
+               'calendarSource': _sd['calendarSource'], 'clockRule': _sd['rule'], 'groups': {}}
         for k, v in sorted(groups.items()):
             n = len(v)
             if n < 10:
@@ -308,9 +314,12 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
 
 
 def print_eval(res: Optional[Dict] = None) -> None:
+    from services.support import sample_days
     res = res or evaluate()
     print(f"[海选影子] 已回填 {res['days']} 个交易日（判据 ≥{res['min_days']}）"
           f" → {'可裁决' if res['ready'] else '样本不足，未裁决'}")
+    if res.get('skipped'):
+        print(f"  [样本钟] {sample_days.describe(res)}")
     for k, s in res['groups'].items():
         print(f"  {k:<44s} n={s['n']:<5d} 次日收盘均值 {s['mean']:>6.2f}% "
               f"胜率 {s['win']:>5.1f}% 中位 {s['median']:>6.2f}%"

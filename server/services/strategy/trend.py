@@ -2263,7 +2263,7 @@ async def scan_trend_scan_results(force: bool = False):
                       f'（判定层未把它们当成有利空，但本轮不进自动加池；'
                       f'明细里 details.annStatus 逐票可查）')
             if _ann['suspect']:
-                print(f'[趋势扫描] ⚠️ 公告查过且成功的有 {_ann["checkedOk"]} 只，'
+                print(f'[趋势扫描] [警告] 公告查过且成功的有 {_ann["checkedOk"]} 只，'
                       f'但查到的公告条数合计 0 —— 几乎不可能是真的，'
                       f'多半是接口参数/返回结构又改版了（11-07 就栽在 stock_list 要裸码、'
                       f'带前缀照样回 200 但恒空），利空否决此刻等于整块失效，去查 '

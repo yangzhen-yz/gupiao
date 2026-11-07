@@ -292,7 +292,12 @@ def evaluate(min_days: int = 20) -> Dict:
         try:
             rs = conn.execute('SELECT trade_date,zbc_em,zbc_tx,touched_tx,sealed_close_tx,'
                               'pool FROM zhaban_shadow WHERE zbc_em IS NOT NULL').fetchall()
-            days = conn.execute('SELECT COUNT(DISTINCT trade_date) FROM zhaban_shadow').fetchone()[0]
+            # 天数只数"当天有可比样本"的日子。原来数的是整张表的 DISTINCT trade_date，
+            # 于是**东财停调日**（那天只有自算行、zbc_em 全 NULL）也会被计进 20 天的钟——
+            # 那才是本影子真正的"空日"。它和推荐批次无关（11-06 实测 54 只全部可比，
+            # 是真样本），所以修⑧ 的统一样本日口径**故意不套在这个影子上**，
+            # 口径写进返回值，别让人以为它跟海选影子同一个分母。
+            days = len({str(r[0])[:10] for r in rs})
         except sqlite3.Error:
             return {'ready': False, 'error': 'zhaban_shadow 表还不存在（一天都还没跑）', 'days': 0}
     finally:
@@ -318,6 +323,7 @@ def evaluate(min_days: int = 20) -> Dict:
                   if em_seal.get(str(r[5] or '')) is not None
                   and int(r[4] or 0) == em_seal[str(r[5] or '')])
     return {'ready': days >= min_days, 'days': days, 'n': n,
+            'clockRule': '样本日 = 当天东财 zbc 真值与腾讯分时自算同时在场（不套修⑧ 的推荐批次口径）',
             'exact_rate_pct': round(same / n * 100, 2),
             'mean_abs_diff': round(ae, 3),
             'mean_bias_tx_minus_em': round(sum(diff) / n, 3),

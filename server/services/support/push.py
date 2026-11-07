@@ -95,7 +95,7 @@ def _resolve_wecom_bin() -> Optional[str]:
     if found:
         print(f'[推送] wecom-cli 通道就绪: {found}')
     else:
-        print('[推送] ⚠️ 找不到 wecom-cli，所有企业微信推送都不会发出。找过：'
+        print('[推送] [警告] 找不到 wecom-cli，所有企业微信推送都不会发出。找过：'
               + '；'.join(tried)
               + '。可设置环境变量 WECOM_CLI_BIN 指向 exe 绝对路径')
     return found
@@ -228,7 +228,7 @@ def push_wecom_markdown(content: str) -> bool:
     if sent_via:
         print('[推送] 已发送（通道=群机器人 webhook，兜底生效）')
         return True
-    print('[推送] ⚠️ 两条通道都没发出去：aibot 权限过期且未配置 webhook。'
+    print('[推送] [警告] 两条通道都没发出去：aibot 权限过期且未配置 webhook。'
           '请建一个只有自己的企微群、加"自定义机器人"，'
           '把 webhook 地址写进 server/wecom_webhook.json（{"webhook_url": "..."}）')
     return False

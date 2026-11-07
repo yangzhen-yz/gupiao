@@ -474,5 +474,5 @@ def send_to_user(user_id: int, content: str, personal: bool = True) -> Dict:
             return {'ok': True, 'via': 'global-aibot', 'errors': errors}
     except Exception as e:
         errors.append(f'aibot {e}')
-    print(f'[推送通道] ⚠️ 账号{user_id} 没有任何可用通道送达：{errors}')
+    print(f'[推送通道] [警告] 账号{user_id} 没有任何可用通道送达：{errors}')
     return {'ok': False, 'via': 'none', 'errors': errors}

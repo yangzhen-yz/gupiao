@@ -16,6 +16,7 @@
 #   git config --local hooks.docsync.enabled  false   # B5 文档未同步（只提醒，本来就不拦）
 #   git config --local hooks.txlock.enabled   false   # B6 事务内等外部 IO（只提醒，2026-11-03 新增）
 #   git config --local hooks.dbhygiene.enabled false  # B7 自测没换库就写库（阻断，2026-11-07 新增）
+#   git config --local hooks.logencoding.enabled false # B8 日志编码：入口兜底没了 / 新写 GBK 编不出的 print（都阻断，2026-11-07）
 # 整体停用：git config --local --unset core.hooksPath
 #
 # 失败信息一律给出"怎么改对"，不给出"怎么绕过"（不提供 --no-verify 建议）。
@@ -186,6 +187,41 @@ if enabled dbhygiene; then
         fi
     else
         echo "⚠ 没找到 python 解释器，自测换库检查已跳过（本次放行）"
+    fi
+fi
+
+# ---------------------- B8 运行期日志编码兜底被删/改坏（阻断，2026-11-07 新增）
+# 规则 L1/L2、判据为什么用 AST 取整条 print 语句而不是 grep 整行，都写在
+# server/scripts/log_encoding_guard.py 文件头；正反用例钉在 server/scripts/log_encoding_guard_selftest.py。
+# 为什么值得拦：看护把 stdout 重定向进 GBK 管道，一条打不出的日志会把它所在的任务一起
+# 打死（10-26 那次 [推荐模式] 告警崩了 16 次、连带吞掉后面的汇总日志，就是这个形态）。
+# L1 守"保护消失"（入口那段 reconfigure），L2 守"引信不再被装回去"（新写的 print）。
+# 顺序记一下：11-07 是先把 25 处存量换成 GBK 编得出的等价文本、确认 --all 读数为 0，
+# 才把 L2 从只报数升级成阻断——反过来做会让当天每一笔提交都被误拦。
+if enabled logencoding; then
+    py_bin8=''
+    for cand in python python3 py; do
+        if command -v "$cand" >/dev/null 2>&1; then py_bin8="$cand"; break; fi
+    done
+    if [ -n "$py_bin8" ]; then
+        if ! "$py_bin8" server/scripts/log_encoding_guard.py --staged; then
+            echo "✗ 已拦截：上面 L1/L2 说清了这次是哪种情况——"
+            echo "    L1 = app/main.py 那段日志编码兜底缺了哪一块；"
+            echo "    L2 = 新增了 GBK 编不出的运行期 print（列出文件与行号）。"
+            echo "  改法："
+            echo "    L1：把那段 _make_log_utf8_safe 恢复回来（探到 gbk/cp936/gb2312/gb18030 才动手、"
+            echo "         收 UTF-8 + errors=replace、整块包在 try 里、顶层真的要调用它）。"
+            echo "    L2：把符号换成 GBK 编得出的等价文本——警告 emoji(U+26A0 U+FE0F) 写成 [警告]、"
+            echo "         三角箭头(U+25B8 / U+25C2) 写成 > 和 <。"
+            echo "         别删日志里的说明，也别只加转义；注释和业务文本（送企微/前端的）不归这条管。"
+            echo "  背景：那条管道是 GBK，一条打不出的日志会把它所在的任务一起打死（10-26 起崩过 16 次），"
+            echo "  所以 11-07 把存量 25 处清零后，这一条从【只报数】升级成阻断——新写的当场挡，"
+            echo "  而不是等下一次重启在线上崩一次再回头查日志。"
+            echo "  停用（不建议）：git config --local hooks.logencoding.enabled false"
+            exit 1
+        fi
+    else
+        echo "⚠ 没找到 python 解释器，日志编码兜底检查已跳过（本次放行）"
     fi
 fi
 
