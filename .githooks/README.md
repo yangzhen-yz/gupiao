@@ -106,7 +106,7 @@ git reset -q server/scripts/zz_probe_selftest.py && rm server/scripts/zz_probe_s
 
 # B8 判据双向验证（同一条规矩：先拿坏样本反证，再说它拦得住）
 python server/scripts/log_encoding_guard_selftest.py   # 期望：25/25（L1 五种坏法 + L2 现场反证 + 注释/业务文本不误伤 + 合法写法放行那一侧）
-python server/scripts/log_encoding_guard.py --all      # 期望：退出码 0，且 L2 读数已经是 0 处 / 扫 140 个文件（25 处存量已于 11-07 清零）
+python server/scripts/log_encoding_guard.py --all      # 期望：退出码 0，且 L2 读数已经是 0 处 / 扫 141 个文件（11-07 复量；文件数会随新增模块浮动，别把它当判据，判据是 0 处）（25 处存量已于 11-07 清零）
 # 现场演一次"真能拦住"（只注释入口那行调用、不产生提交，跑完原样还原）：
 python - <<'EOF'
 import io
