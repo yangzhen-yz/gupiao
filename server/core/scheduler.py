@@ -266,11 +266,11 @@ def _serial_prewarm(fn):
     def _wrapper(*args, **kwargs):
         time.sleep(_PREWARM_START_DELAY)
         with _PREWARM_GATE:
-            print(f'[预热 {datetime.now():%H:%M:%S}] ▸ {fn.__name__} 开始')
+            print(f'[预热 {datetime.now():%H:%M:%S}] > {fn.__name__} 开始')
             try:
                 return fn(*args, **kwargs)
             finally:
-                print(f'[预热 {datetime.now():%H:%M:%S}] ◂ {fn.__name__} 结束')
+                print(f'[预热 {datetime.now():%H:%M:%S}] < {fn.__name__} 结束')
                 time.sleep(_PREWARM_GAP)
     return _wrapper
 
@@ -583,7 +583,7 @@ def run_scheduler():
         try:
             pool = build_candidate_pool()
             if not pool:
-                print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 盘前海选为空，今日推荐退回热搜池'
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 盘前海选为空，今日推荐退回热搜池'
                       f'（请检查 18:15 日K同步是否成功：python scripts/backfill_kline.py --mode sync）')
             else:
                 print(f'[定时任务 {datetime.now():%H:%M:%S}] 盘前海选完成：{len(pool)} 只入池')
@@ -1111,7 +1111,7 @@ def run_scheduler():
         server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         script = os.path.join(server_dir, 'scripts', 'db_backup.py')
         if not os.path.exists(script):
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 备份脚本缺失: {script}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 备份脚本缺失: {script}')
             return
         # 周六全量，其余增量
         mode = 'full' if datetime.now().weekday() == 5 else 'incremental'
@@ -1128,7 +1128,7 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 数据库自动备份已拉起'
                   f'（{mode}，pid {p.pid}，日志 analysis_out/db_backup.log）')
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 数据库备份拉起失败: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 数据库备份拉起失败: {e}')
 
     def job_api_usage_flush():
         """每 60s 把内存计数器落库（api_usage_daily），跨天自动归档，防丢当日计数。"""
@@ -1170,7 +1170,7 @@ def run_scheduler():
                    f'（< {KLINE_POOL_MIN_COVERAGE*100:.0f}%，同步像跑到一半）')
         else:
             why = f'今天（{today}）这根K线没进来' + (f'（同步异常：{sync_err}）' if sync_err else '')
-        print(f'[盘后自检] ⚠️ 本地日K库最新 {latest}，{why}')
+        print(f'[盘后自检] [警告] 本地日K库最新 {latest}，{why}')
         key = f'{today}|{latest}|{covered}'
         if key in _KLINE_ALERTED:
             return
@@ -1240,12 +1240,12 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 收盘快照(主路)：拿到 {st.get("got")} 只、'
                   f'写入 {st.get("written")} 条、停牌跳过 {st.get("stale_stamp", 0) + st.get("zero_vol", 0)} 只、'
                   f'除权待重算 {st.get("restated")} 只 → 覆盖 {c1}/{u1}'
-                  + (f'｜⚠️ 拒写: {st.get("rejected")}' if st.get('rejected') else ''))
+                  + (f'｜[警告] 拒写: {st.get("rejected")}' if st.get('rejected') else ''))
             if st.get('rejected'):
                 sync_err = f"收盘快照与备路口径不符: {st['rejected']}"
         except Exception as e:
             sync_err = e
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 收盘快照(主路)异常: {type(e).__name__}: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 收盘快照(主路)异常: {type(e).__name__}: {e}')
 
         # ── 备路：baostock 增量同步（仅在主路没把覆盖度喂够时才敲门；内部有封禁冷却门禁） ──
         c1, u1 = _cov_now()
@@ -1266,7 +1266,7 @@ def run_scheduler():
                     get_engine().sync_today_bulk()
                 except Exception as e:
                     sync_err = sync_err or e
-                    print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 本地日K增量同步(备路)异常: {e}')
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 本地日K增量同步(备路)异常: {e}')
         try:
             from services.data.kline_history import history_available
             if history_available():
@@ -1274,7 +1274,7 @@ def run_scheduler():
                 res = asyncio.run(refresh_rps(RPS_PERIOD_DAYS))
                 print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地库同步后 RPS 刷新完成：{res}')
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ RPS 向量化刷新异常: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] RPS 向量化刷新异常: {e}')
         # 流动性统计跟着日K走（2026-11-04）：日K刚写进来，20 日窗口就该换新一天，否则保活兜底
         # 最长要 6 小时才补——选票范围的"流动性"那层会整天停在昨天的窗口上。单独一段 try：
         # 它失败只让范围变旧，不拖住日K同步的结论（与上面的 RPS、下面的名录同法）。
@@ -1285,7 +1285,7 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 本地日K同步后 流动性统计刷新完成：'
                   f'{_n} 只（{time.time() - _t:.1f}s）')
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 流动性统计刷新异常'
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 流动性统计刷新异常'
                   f'（选票范围会用旧窗口，最长到保活兜底 6 小时）: {e}')
         # 名录（代码→名称、在市/退市、ST 标记）每天跟着刷一次：股票范围里"剔除 ST/*ST"
         # 完全依赖这张表，而 ST 帽子是随时戴随时摘的 —— 名录过期就等于范围失效。
@@ -1312,9 +1312,9 @@ def run_scheduler():
                 if n == -2:
                     print(f'[定时任务 {datetime.now():%H:%M:%S}] 股票名录同步跳过（baostock 冷却）')
                 elif n < 0:
-                    print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步失败（ST 判定可能过期）')
+                    print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 股票名录同步失败（ST 判定可能过期）')
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 股票名录同步异常: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 股票名录同步异常: {e}')
         # 只有最后一个重试时刻还没等到数据才算真失败（16:05 那种"baostock 还没出当天EOD"
         # 不是故障，半夜叫警报只会让人以为系统坏了）
         _alert_kline_stale(sync_err, final=datetime.now().strftime('%H:%M') >= KLINE_HISTORY_SYNC_LAST)
@@ -1336,9 +1336,9 @@ def run_scheduler():
             st = restate_queue.run(limit=KLINE_RESTATE_LIMIT)
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 除权重算：成功 {st["ok"]}（无需调整 {st["noop"]}）、'
                   f'跳过 {st["skip"]}、失败 {st["fail"]}，改 {st["rows"]} 根K线'
-                  + (f'｜⚠️ {st["aborted"]}' if st.get('aborted') else ''))
+                  + (f'｜[警告] {st["aborted"]}' if st.get('aborted') else ''))
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 除权重算异常: {type(e).__name__}: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 除权重算异常: {type(e).__name__}: {e}')
 
     def job_matrix_rerun():
         """一次性把买法四张表重跑成"选股范围 2462 只"口径（用户 2026-10-16 选定：冷却结束后自动跑）。
@@ -1372,7 +1372,7 @@ def run_scheduler():
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 买法矩阵重跑已拉起（pid {p.pid}，'
                   f'日志 server/analysis_out/rerun.log；脚本会自己等 baostock 冷却解除）')
         except Exception as e:
-            print(f'[定时任务 {datetime.now():%H:%M:%S}] ⚠️ 买法矩阵重跑拉起失败: {e}')
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] [警告] 买法矩阵重跑拉起失败: {e}')
 
     # ---- 注册定时任务 ----
     # 热搜榜：非交易日不跑，没意义

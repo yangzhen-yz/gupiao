@@ -158,7 +158,7 @@ def compute_summary() -> Dict[str, Any]:
         p = parity_check()
         out['previewParity'] = p
         if not p.get('ok'):
-            print(f"[配置] ⚠️ 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
+            print(f"[配置] [警告] 预览逻辑与真实范围不一致（预览 {p.get('preview')} vs 真实 {p.get('actual')}）"
                   f" —— settings_preview 漏了条件，得补")
         out['staleOutOfSync'] = stale_no_sync_count()
     except Exception as e:

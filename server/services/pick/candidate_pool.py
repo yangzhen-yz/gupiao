@@ -197,7 +197,7 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
                 else f"最新 {fresh['latest']} 在选股范围里只覆盖 "
                      f"{fresh['covered']}/{fresh['universe']} 只 = {fresh['coverage']*100:.1f}% "
                      f"（< {min_coverage()*100:.0f}%，同步像跑到一半）")
-        print(f'[候选池] ⚠️ 本地日K不可用：{_why}，本次不出池（退回热搜池）。'
+        print(f'[候选池] [警告] 本地日K不可用：{_why}，本次不出池（退回热搜池）。'
               f'请先补同步：python scripts/backfill_kline.py --mode sync')
         return []
     try:
@@ -229,7 +229,7 @@ def build_pool(now: Optional[datetime] = None, persist: bool = True) -> List[Dic
         print(f'[候选池] 股票范围 {universe.describe_selectable()}：{before} → {n_scope} 只'
               f'（数据范围 {universe.eligible_count()} 只，同步与覆盖率仍按它算）')
         if df.empty:
-            print('[候选池] ⚠️ 过滤后一只都不剩（股票范围配置或名录缺失），本次不出池')
+            print('[候选池] [警告] 过滤后一只都不剩（股票范围配置或名录缺失），本次不出池')
             return []
         df = df.sort_values(['symbol', 'date'])
         g = df.groupby('symbol', group_keys=False)
