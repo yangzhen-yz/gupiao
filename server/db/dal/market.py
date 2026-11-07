@@ -123,7 +123,7 @@ def load_daily_market_reviews() -> List[Dict]:
 
 def save_daily_market_reviews(reviews: List[Dict]) -> bool:
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         for review in reviews:
             review_date = review.get('date', '')
@@ -309,7 +309,7 @@ def save_optimization_history(module: str, parameter_set: str = '',
     方便回滚后区分同一张表里的两类记录。
     """
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         _ensure_optimizer_v2_columns(cursor)
         cursor.execute('''
@@ -369,7 +369,7 @@ def save_theme_member_daily(rows: List[Dict], theme: str = 'robot') -> int:
     try:
         from datetime import datetime
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.executemany('''
             INSERT INTO theme_member_daily
@@ -438,7 +438,7 @@ def save_cls_pool_daily(day: str, rows: List[Dict]) -> int:
             ))
         if not data:
             return 0
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             conn.executemany('''
                 INSERT INTO cls_pool_daily
@@ -486,7 +486,7 @@ def save_cls_plate_daily(day: str, rows: List[Dict]) -> int:
             ))
         if not data:
             return 0
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             conn.executemany('''
                 INSERT INTO cls_plate_daily
@@ -534,7 +534,7 @@ def save_theme_chain_daily(day: str, chains: List[Dict]) -> int:
                 len(members), json.dumps(members, ensure_ascii=False),
                 c.get('note'), now,
             ))
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             conn.execute('DELETE FROM theme_chain_daily WHERE trade_date = ?', (day,))
             conn.executemany('''
@@ -616,3 +616,105 @@ def load_cls_pool_daily(day: str) -> Dict[str, List[Dict]]:
         print(f'[数据库] 读取财联社四池失败 day={day}: {str(error)}')
         return {}
 
+
+
+def save_dragon_tiger_rows(rows: List[Dict]) -> int:
+    """东财龙虎榜逐票落库（2026-11-06）。
+
+    rows 就是东财 `RPT_DAILYBILLBOARD_DETAILS` 返回的原始条目（字段名沿用接口：
+    TRADE_DATE/SECURITY_CODE/SECURITY_NAME_ABBR/EXPLANATION/BILLBOARD_NET_AMT/...），
+    这里只做 symbol 前缀归一（600123 → sh600123）和 upsert，**不改任何口径**，
+    这样停调日读回来还能喂给同一个聚合函数。
+
+    失败只打印、不抛：这是留档兜底，取数链路（内存缓存/评分）不该被它拖住。
+    写入即写即提交（11-03 锁库事故的规矩：不在事务里等外部源）。
+    """
+    if not rows:
+        return 0
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data = []
+        for r in rows:
+            code = str(r.get('SECURITY_CODE') or '')
+            if not code or len(code) != 6 or not code.isdigit():
+                continue
+            if code.startswith('6'):
+                sym = 'sh' + code
+            elif code.startswith(('0', '3')):
+                sym = 'sz' + code
+            else:
+                continue        # 北交所等与现有聚合口径一致：不参与
+
+            def _num(key):
+                try:
+                    v = r.get(key)
+                    return float(v) if v not in (None, '') else None
+                except (TypeError, ValueError):
+                    return None
+
+            data.append((
+                str(r.get('TRADE_DATE') or '')[:10], sym,
+                str(r.get('SECURITY_NAME_ABBR') or ''),
+                str(r.get('EXPLANATION') or '').strip(),
+                _num('BILLBOARD_NET_AMT'), _num('BILLBOARD_BUY_AMT'), _num('BILLBOARD_SELL_AMT'),
+                _num('CHANGE_RATE'), _num('CLOSE_PRICE'), _num('FREE_MARKET_CAP'), now,
+            ))
+        if not data:
+            return 0
+        conn = get_db_conn(wait_for_lock=True)
+        try:
+            conn.executemany('''
+                INSERT INTO dragon_tiger_daily
+                    (trade_date, symbol, name, reason, net_amt, buy_amt, sell_amt,
+                     change_rate, close_price, float_mcap, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'eastmoney', ?)
+                ON CONFLICT(trade_date, symbol, reason) DO UPDATE SET
+                    name=excluded.name, net_amt=excluded.net_amt, buy_amt=excluded.buy_amt,
+                    sell_amt=excluded.sell_amt, change_rate=excluded.change_rate,
+                    close_price=excluded.close_price, float_mcap=excluded.float_mcap,
+                    created_at=excluded.created_at''', data)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(data)
+    except Exception as error:
+        print(f'[数据库] 龙虎榜落库失败: {str(error)}')
+        return 0
+
+
+def load_dragon_tiger_rows_since(since_date: str) -> List[Dict]:
+    """读 since_date（含）以来的龙虎榜留档，字段名**还原成东财接口的那套**。
+
+    为什么要还原：`smartmoney._aggregate` 的聚合口径（symbol 前缀、net_amt 求和、
+    appearances 计数、max_change、reasons 去重）已经过线上验证，停调回退必须走同一段代码，
+    不能另写一份"看起来一样"的聚合 —— 两份口径迟早会漂。
+    """
+    try:
+        conn = get_db_conn(fast_fail=True)      # 只读留档，拿不到锁就当没数据，不排队
+        try:
+            rows = conn.execute(
+                '''SELECT trade_date, symbol, name, reason, net_amt, buy_amt, sell_amt,
+                          change_rate, close_price, float_mcap
+                   FROM dragon_tiger_daily WHERE trade_date >= ?
+                   ORDER BY trade_date DESC''', (since_date,)).fetchall()
+        finally:
+            conn.close()
+        out = []
+        for r in rows:
+            d = dict(r)
+            out.append({
+                'TRADE_DATE': d.get('trade_date'),
+                'SECURITY_CODE': (d.get('symbol') or '')[2:],
+                'SECURITY_NAME_ABBR': d.get('name'),
+                'EXPLANATION': d.get('reason'),
+                'BILLBOARD_NET_AMT': d.get('net_amt'),
+                'BILLBOARD_BUY_AMT': d.get('buy_amt'),
+                'BILLBOARD_SELL_AMT': d.get('sell_amt'),
+                'CHANGE_RATE': d.get('change_rate'),
+                'CLOSE_PRICE': d.get('close_price'),
+                'FREE_MARKET_CAP': d.get('float_mcap'),
+            })
+        return out
+    except Exception as error:
+        print(f'[数据库] 读取龙虎榜留档失败 since={since_date}: {str(error)}')
+        return []

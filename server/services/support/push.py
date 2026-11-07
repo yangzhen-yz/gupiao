@@ -567,16 +567,35 @@ def _prev_bar_for(symbol: str) -> dict:
 
 
 def _market_limit_ups() -> float:
-    """今天全市场涨停家数（读情绪快照，不在同步链路里 await 异步任务）。"""
+    """今天全市场涨停家数（读情绪快照，不在同步链路里 await 异步任务）。
+
+    2026-11-07 修两处，两处叠在一起才致命：
+      · **键读错了**：老代码取顶层 `d['limitUp']`，而快照顶层根本没有这个键，
+        涨停家数实际在 `indicators.limitUpCount`（`recommend.py:1606` 取的就是对的）。
+        实测 11-06 最后一条快照：顶层无 `limitUp`、`indicators.limitUpCount=32`。
+        后果是推送链路每票的矩阵判定永远拿到 `limitUp=0`，矩阵里那条
+        "极热日闸门（涨停 >120 家 → 减仓日、不开新仓）"**在推送侧永远不触发**，
+        而推荐侧会触发 —— 同一个市场状态，两条链路给出不一样结论。
+      · **SQL 没有当日过滤**：`ORDER BY ts DESC LIMIT 1` 跨天取最新。这条以前被
+        "永远读到 0"掩盖着；键修对之后它就变成真风险（今天开盘前会拿昨天的家数
+        决定今天开不开新仓），所以必须一起改。
+      现在按 `sent_date=今天` 取；读不到就返回 0 并维持"不触发闸门"的老行为
+      —— 宁可不拦，也不拿昨天的数拦今天。
+    """
     try:
         conn = get_db_conn()
         try:
-            row = conn.execute('SELECT payload FROM market_sentiment_snapshots '
-                               'ORDER BY ts DESC LIMIT 1').fetchone()
+            row = conn.execute(
+                'SELECT payload FROM market_sentiment_snapshots '
+                'WHERE sent_date=? ORDER BY ts DESC LIMIT 1',
+                (datetime.now().strftime('%Y-%m-%d'),)).fetchone()
         finally:
             conn.close()
         d = json.loads(row[0]) if row and row[0] else {}
-        return float(d.get('limitUp') or 0)
+        v = (d.get('indicators') or {}).get('limitUpCount')
+        if v is None:
+            v = d.get('limitUp')          # 历史快照/老口径兜底，别让旧行读成 0
+        return float(v or 0)
     except Exception:
         return 0.0
 
@@ -598,7 +617,7 @@ def pushed_today(date_str: str) -> int:
 
 def _ensure_table():
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('''CREATE TABLE IF NOT EXISTS push_sent_log (
             push_date TEXT NOT NULL,
             symbol   TEXT NOT NULL,
@@ -632,7 +651,7 @@ def _already_pushed(date_str: str, symbol: str) -> bool:
 
 def _mark_pushed(date_str: str, symbol: str, score=None, channel: str = 'screener'):
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute(
             'INSERT OR IGNORE INTO push_sent_log (push_date, symbol, pushed_at, score, channel) '
             'VALUES (?,?,?,?,?)',

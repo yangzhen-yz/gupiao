@@ -26,6 +26,7 @@ git config --local --unset core.hooksPath
 | B4 凭据/绝对路径 | 本次**新增行**里出现本机绝对路径（`D:\` `d:\` `C:\Users` `c:\users`）、带 key 的 webhook URL（`webhook/send?key=` 后跟 ≥8 位）、或 `corpsecret` 紧跟 ≥12 位字面量（扫 .py/.js/.ts/.vue/.json/.yaml，排除 `server/static`） | **阻断** | 路径走配置项；webhook 留在已被 `.gitignore` 排除的 `server/wecom_webhook.json` |
 | B5 文档同步 | 改了 `server/**` 或 `client-vue/src/**` 但没暂存任何文档 | **只提醒**（不阻断） | 按 AGENTS.md 清单同步 5 份文档 |
 | B6 事务持锁 | 本次**新增行**落在"同一函数体内第一条 DML 之后、下一个 `commit()` 之前"的窗口里，且窗口内出现 `await` / `requests` / `fetch_*` / `sleep` 等外部 IO（判据在 `server/scripts/tx_holding_scan.py`，白名单式） | **只提醒**（不阻断） | 外部拉数挪到事务之外，或逐条写完就 `conn.commit()` 把写锁交还 |
+| B7 自测换库 | 暂存的 `server/scripts/*selftest*.py` 里「会写库却没有任何隔离（没 `use_db_path`、没把 `get_db_conn` 换成桩、也不是全临时路径）」，或给 `database`/`config`/`dal_state` 的 `SQLITE_DB_PATH` 赋值（11-05 拆分后静默无效），或直连 `gupiao.db`/`history_kline.db` 且没写 `mode=ro`（判据在 `server/scripts/db_hygiene_check.py`，规则 R1/R2/R3） | **阻断**（`analysis_out/` 里的同名一次性脚本只提示） | 顶部加 `import db.database as dbmod; dbmod.use_db_path(临时库)`；只读复核就写 `sqlite3.connect("file:…?mode=ro", uri=True)` |
 | pre-push | 远程 sha 不在本地历史里（非快进） | **阻断** | `git fetch` + `git rebase` 后正常 push；个人分支最多用 `--force-with-lease` |
 | pre-push 全树 | push 时工作树里仍有**已跟踪但未提交**的改动（`M`/`A`/`D`/`R`；未跟踪 `??` 不拦） | **阻断** | 按 CONTRIBUTING 第 6 节的清单把这些路径也逐路径提交（别人的就在提交说明里标归属），或与用户确认后 `git stash push` 这批路径 |
 
@@ -55,6 +56,8 @@ pre-push 全树 特别说明（2026-11-05 新增，规矩出处见 AGENTS.md「�
 并列出全部残留路径；`hooks.pushwhole.enabled false` 之后同一条命令退出码 0、零输出。未跟踪（`??`）故意不拦——
 切分支不会带走未跟踪文件，而本仓常年有几十个在建/产物文件，拦它们会天天误伤到逼人停用整套机制（那比漏检更糟）。
 
+B7 特别说明（2026-11-07 新增）：这一项**阻断**，和 B5/B6 只提醒不同，理由是它的失效方式是「不报错」——写错库的自测照样打印全绿，假数据却进了生产库。本仓实拍两次：10-19 把 `2099-` 测试日期写进 `westock_snapshot`/`data_cross_check`，11-06 又一次污染；第二次的处置是「退出前连真库 DELETE 擦干净」，那等于拿生产库当擦布（11-07 已把 `fundflow_selftest`/`westock_crosscheck_selftest` 两处改成只读核对 + 漏了判 FAIL）。判据两次踩坑都写在检查器文件头：整行正则会被「函数名长名单字符串」骗（误报 `database_split_selftest`），整段调用原文会被「坏样本源码字符串」骗（误报它自己的长期自测）；现在只看 AST 的 callee 名判写、只看 `connect`/`execute` 的参数判路径与 SQL。双向验证：`python server/scripts/selftest_db_hygiene_selftest.py` 28/28（含「合法写法必须放行」那一侧），`db_hygiene_check.py --all` 对 `server/scripts/` 报 0 处阻断。
+
 ## 单独关某一项（每项独立开关，关掉必须完全等于没这项检查）
 
 ```sh
@@ -64,6 +67,7 @@ git config --local hooks.artifacts.enabled false   # B3
 git config --local hooks.secret.enabled    false   # B4
 git config --local hooks.docsync.enabled   false   # B5
 git config --local hooks.txlock.enabled    false   # B6
+git config --local hooks.dbhygiene.enabled false   # B7
 git config --local hooks.pushforce.enabled false   # pre-push
 git config --local hooks.pushwhole.enabled false   # pre-push 全树
 ```
@@ -85,6 +89,16 @@ git show 92c732d:server/services/strategy/strategy.py > /tmp/strategy_old.py
 python server/scripts/tx_holding_scan.py --selfcheck /tmp/strategy_old.py   # 期望：命中 1（行 870）
 python server/scripts/tx_holding_scan.py --selfcheck server/services/strategy/strategy.py  # 期望：0
 python server/scripts/tx_holding_scan.py                                    # 全仓扫描（人工排查）
+
+# B7 判据双向验证（同样要拿坏样本反证，否则"报 0"没有意义）：
+python server/scripts/selftest_db_hygiene_selftest.py   # 期望：28/28（含必须放行那一侧）
+python server/scripts/db_hygiene_check.py --all         # 期望：阻断级 0（analysis_out 只提示）
+# 现场演一次"真能拦住"（造一个坏自测、暂存、跑 hook、再撤掉，不产生提交）：
+printf %s\n 'import db.database as d' 'd.SQLITE_DB_PATH="/tmp/x.db"' \
+  'd.get_db_conn().execute("INSERT INTO t VALUES (1)")' > server/scripts/zz_probe_selftest.py
+git add server/scripts/zz_probe_selftest.py
+git hook run pre-commit; echo $?    # 期望：打印 R2/R1 并非 0（拦住了）
+git reset -q server/scripts/zz_probe_selftest.py && rm server/scripts/zz_probe_selftest.py
 ```
 
 ## 还缺的一层（只能人工在网页做）

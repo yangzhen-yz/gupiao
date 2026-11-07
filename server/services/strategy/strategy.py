@@ -780,7 +780,7 @@ async def backtest_yesterday_predictions() -> Dict:
         
         yesterday = latest_trading_day.isoformat()
 
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
 
         # 先补验所有历史未验证的预测（非今日）

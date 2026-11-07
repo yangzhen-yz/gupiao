@@ -2,7 +2,8 @@
 import json, re, asyncio, requests, time
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date, timedelta
-from app.config import (TENCENT_QUOTE_API, TENCENT_KLINE_API, SINA_QUOTE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, KLINE_START_DATE, KLINE_DATA_LIMIT, CHANGE_RANK_TOP_N, TURNOVER_RANK_TOP_N, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS)
+from app.config import (TENCENT_QUOTE_API, TENCENT_KLINE_API, SINA_QUOTE_API, EASTMONEY_HOT_LIST_API, EASTMONEY_ANN_API, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT, DELISTING_KEYWORDS, FORBIDDEN_KEYWORDS, SECTOR_NAME_EXCLUDE_ENABLED, KLINE_START_DATE, KLINE_DATA_LIMIT, CHANGE_RANK_TOP_N, TURNOVER_RANK_TOP_N, TREND_ANNOUNCEMENT_CACHE_TTL, TREND_ANNOUNCEMENT_LOOKBACK_DAYS, ANN_UNKNOWN_RETRY_SEC,
+                       NEG_ANN_CALIBRATED, REALTIME_CACHE_RECLAIM_SEC, REALTIME_CACHE_MAX_KEYS)
 from services.data import source_health
 from db.database import load_stock_basic_info, save_stock_basic_info, load_hot_search_ranking, load_stock_concept_tags
 
@@ -16,6 +17,10 @@ _realtime_cache: Dict[str, Tuple[float, str]] = {}
 _ths_hot_cache: Dict[str, Tuple[float, list]] = {}
 
 # 利空公告关键词（出现任一即判定为"重大利空 / 减持 / 立案"）
+# ⚠️ 这张表在 2026-11-07 之前其实是**死表**：公告接口要裸 6 位码，老代码传的是带前缀的
+#   `stock_list=sh600519`，接口回 HTTP 200 但 `list` 恒空 —— 与"这只票没公告"完全同形，
+#   所以利空否决从上线那天起一次都没生效过。取数修对后表开始真的参与判定，
+#   它自身的质量问题随之变成新风险，见下面 NEG_ANN_EXCLUDE_PHRASES 与校准说明。
 NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
     '减持', '减持计划', '股份减持', '集中竞价减持', '大宗交易减持',
     '立案', '立案调查', '调查通知书', '调查公告', '被立案',
@@ -27,6 +32,43 @@ NEGATIVE_ANNOUNCEMENT_KEYWORDS = [
     '债券违约', '债务逾期', '无法偿还', '资金占用', '违规担保',
     '高管变动', '董事长辞职', '总经理辞职', '实际控制人变更',
 ]
+
+# 命中关键词之后再看的**排除短语**（校准开关 `NEG_ANN_CALIBRATED`，关掉＝原表逐字命中）。
+# 依据是实测：可交易范围前 300 只、近 20 日共 1998 条标题，原表命中 33 条/19 只，
+# 其中至少 9 条是误命中（清单与逐条例证见 `docs/工程知识库.md` 当日那条 +
+# `analysis_out/ann_kw_audit.json`）：
+#   · "重大事项报告制度"、"防范控股股东及关联人资金占用管理办法" —— 公司制度文件名；
+#   · "未减持公司股份并提前终止减持计划" —— 说的恰恰是没减持；
+#   · "最近五年被证券监管部门…采取监管措施或处罚情况的公告" —— 再融资例行披露；
+#   · "撤销其他风险警示"（摘帽）、"…撤诉裁定" —— 方向相反或已了结。
+# '撤销'/'撤诉' 有极低概率排掉一条真利空（如"撤销股东大会决议"），按"制度文件名与
+# 未减持这类明显噪声更常见"取舍，且这里只影响趋势名单的剔除、不影响任何价格判定。
+NEG_ANN_EXCLUDE_PHRASES = [
+    '制度', '管理办法', '防范', '未减持', '提前终止减持', '最近五年',
+    '撤诉', '撤销',
+]
+# 裸 'ST' / '*ST' 是两字母子串，命中的是标题开头的**公司名前缀**（"ST绝味:…权益分派实施公告"
+# 这类，实测一次样本里 5 条），把一家正在摘帽的公司判成利空，方向整个反了。
+# ST/退市风险本来已由选股范围层剔除（`UNIVERSE_EXCLUDE_ST`）+ 本表 '风险警示'/'退市'/
+# '终止上市' 覆盖，不需要靠子串去猜 → 校准开启时跳过这两个关键词。
+ST_LIKE_KEYWORDS = ('ST', '*ST')
+# 命中位置紧邻"副"字 → 职务级误命中（"副总经理辞职"命中 '总经理辞职'、
+# "副董事长辞职"命中 '董事长辞职'）。实测各 1~2 条。
+SUB_PREFIX_GUARDED_KEYWORDS = ('董事长辞职', '总经理辞职')
+
+
+def _negative_hit_calibrated(title: str, kw: str) -> bool:
+    """关键词已命中，再判断这条算不算利空（校准口径）。"""
+    if kw in ST_LIKE_KEYWORDS:
+        return False
+    if any(p in title for p in NEG_ANN_EXCLUDE_PHRASES):
+        return False
+    if kw in SUB_PREFIX_GUARDED_KEYWORDS:
+        i = title.find(kw)
+        if i > 0 and title[i - 1] == '副':
+            return False
+    return True
+
 
 TENCENT_API = TENCENT_QUOTE_API
 MAX_RETRIES = 2  # 2026-07-08 优化：3→2，腾讯偶尔超时1次重试足够，避免 3 RTT=1.5s
@@ -144,6 +186,64 @@ def _valid_symbols(symbols: str) -> List[str]:
         if re.match(r'^(sh|sz)\d{6}$', s):
             out.append(s)
     return out
+
+
+def _realtime_cache_key(symbols: str) -> str:
+    """行情缓存的标准化键（2026-11-07 修④）：代码去重 + 小写 + 按字典序拼串。
+
+    原来直接拿调用方传进来的整串（`symbols.lower()`）当键，两个后果：
+    ① 同一批票换个顺序就是两份缓存（全站十几个调用点各拼各的，重复率不低）；
+    ② 键空间由外部输入决定、无上限，`_realtime_cache` 又只在读的时候判龄、从不回收条目，
+       所以它会一直长（单条按每票 150~200 字符估，全市场一次约 20KB）。
+
+    **这里故意不按 `_valid_symbols` 过滤**：那种子请求（比如北交所 `bj` 代码）腾讯照样返回数据，
+    若键里只剩沪深那几只，A 请求"sh600000,bj430047"就会命中 B 请求"sh600000"留下的那份，
+    少一行的数据被当成全量返回——归一化不能以丢票为代价。脏串（空 token）剔掉即可，
+    真正的畸形代码由取数那一步处理，键照原样参与，反正有上限与回收兜着。
+    返回 `''` 表示"这批里没有代码"——那种请求既不查缓存也不写缓存。
+    ⚠️ 命中时返回的是**按排序后顺序**拼出来的那一份原始串。已逐个核过全部调用点：
+    多码请求的消费方都按 `symbol` 建映射（`services/ops/action_desk.py`、
+    `services/pick/recommend.py`、`routers/scan.py` 等），按 `[0]` 取第一条的那几处
+    （`fetch_stock_data`、`routers/stock.py:40/154/206`、`position.py:489`、`trend.py:2027`）
+    传的都是单只代码，与顺序无关。**将来若有调用方按请求顺序去数返回行，得改它或改这里。**
+    """
+    toks = {t.strip().strip(';').lower() for t in (symbols or '').split(',') if t.strip().strip(';')}
+    return ','.join(sorted(toks))
+
+
+def _realtime_cache_get(key: str) -> Optional[str]:
+    """按标准化键读行情缓存（TTL 内才算命中）；空键 = 不缓存。
+
+    ⚠️ 入参必须是 `_realtime_cache_key()` 的返回值，不能直接塞调用方那串代码——
+    那样等于绕过归一化，同一批票换个顺序又会多占一份（自测里专门有一条盯着这点）。
+    """
+    if not key:
+        return None
+    hit = _realtime_cache.get(key)
+    if hit and (time.time() - hit[0]) < REALTIME_CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def _realtime_cache_put(key: str, data: str) -> None:
+    """写行情缓存，并在写入时顺手回收（原来只有"读的时候判龄"这一半）。
+
+    两道闸：先带走超龄条目（`REALTIME_CACHE_RECLAIM_SEC`，默认 60 秒 = TTL 的 12 倍），
+    再按最旧淘汰到硬上限（`REALTIME_CACHE_MAX_KEYS`，默认 400 条 ≈ 8MB）。
+    淘汰代价可控：最旧的那批早过了 5 秒 TTL，本来也不会再命中。
+    """
+    if not key:
+        return
+    now = time.time()
+    _realtime_cache[key] = (now, data)
+    overdue = [k for k, (ts, _v) in _realtime_cache.items()
+               if now - ts > REALTIME_CACHE_RECLAIM_SEC]
+    for k in overdue:
+        _realtime_cache.pop(k, None)
+    if len(_realtime_cache) > REALTIME_CACHE_MAX_KEYS:
+        oldest = sorted(_realtime_cache.items(), key=lambda kv: kv[1][0])
+        for k, _v in oldest[: len(_realtime_cache) - REALTIME_CACHE_MAX_KEYS]:
+            _realtime_cache.pop(k, None)
 
 
 def _sina_num(fields: List[str], idx: int, default: float = 0.0) -> float:
@@ -285,12 +385,12 @@ async def fetch_with_retry(symbols: str) -> str:
     """
     global _tencent_down_until, _last_fallback_log
 
-    symbols_lower = (symbols or '').lower()
-    # 2026-07-08 优化：5 秒内同 symbol 直接返回缓存
-    now = time.time()
-    cached = _realtime_cache.get(symbols_lower)
-    if cached and (now - cached[0]) < REALTIME_CACHE_TTL:
-        return cached[1]
+    cache_key = _realtime_cache_key(symbols)
+    # 2026-07-08 优化：5 秒内同一批票直接返回缓存
+    # 2026-11-07 修④：键换成标准化后的代码集合（顺序无关），并给这份缓存加上回收与上限
+    cached = _realtime_cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     last_err: Optional[Exception] = None
     sina_err: Optional[Exception] = None
@@ -303,7 +403,7 @@ async def fetch_with_retry(symbols: str) -> str:
         try:
             data = await asyncio.to_thread(_fetch_sina_quotes, symbols)
             source_health.ok('quote_sina', (time.time() - t0) * 1000)
-            _realtime_cache[symbols_lower] = (time.time(), data)
+            _realtime_cache_put(cache_key, data)
             return data
         except Exception as err:
             source_health.fail('quote_sina', err)
@@ -332,7 +432,7 @@ async def fetch_with_retry(symbols: str) -> str:
         try:
             data = await asyncio.to_thread(_sync_fetch)
             # 2026-07-08 优化：写入缓存（5 秒 TTL）
-            _realtime_cache[symbols_lower] = (time.time(), data)
+            _realtime_cache_put(cache_key, data)
             source_health.ok('quote_tencent', (time.time() - t0) * 1000)
             _tencent_down_until = 0.0
             return data
@@ -351,7 +451,7 @@ async def fetch_with_retry(symbols: str) -> str:
         try:
             data = await asyncio.to_thread(_fetch_sina_quotes, symbols)
             source_health.ok('quote_sina', (time.time() - t0) * 1000)
-            _realtime_cache[symbols_lower] = (time.time(), data)
+            _realtime_cache_put(cache_key, data)
             # 兜底日志限流：最多 60 秒一条，避免 5 秒轮询刷屏
             if time.time() - _last_fallback_log > 60:
                 _last_fallback_log = time.time()
@@ -897,7 +997,7 @@ def split_batch_raw(raw: str) -> Dict[str, str]:
 
     2026-10-24（性能）：趋势扫描已为板块动量把整池 100 只/批拉过一遍行情，
     但结果只用了涨跌幅就丢弃，process_one_stock 又逐只单拉 ~1300 次腾讯请求
-    （_realtime_cache 按整串 key 缓存，单码 key 命不中）。拆串后单码原始串
+    （_realtime_cache 的键是"这一批代码的集合"，单码 key 与整池 key 不是同一个集合，命不中）。拆串后单码原始串
     可直接作为 realtime_raw 传参复用，格式与单码请求完全同构（v_XX="~分隔"），
     parse_realtime_fields / parse_tencent_batch_data 均可直接消费单段。
     """
@@ -1222,31 +1322,51 @@ def _strip_eastmoney_jsonp(raw: str) -> str:
     return raw
 
 
-async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> List[Dict]:
-    """
-    拉取个股近 N 天公告。返回 list，每项 { title, art_code, notice_date, columns_name }。
-    含内存缓存（TREND_ANNOUNCEMENT_CACHE_TTL 秒）。
-    接口限流友好：失败时返回空列表，不抛异常（避免趋势扫描中断）。
+ANN_OK, ANN_COOLING, ANN_ERROR = 'ok', 'cooling', 'error'
+# unknown 状态只缓存 `ANN_UNKNOWN_RETRY_SEC` 秒（值在 `app/cfg_strategy.py`，实测 60 秒），
+# 正常结果仍按上面的 TREND_ANNOUNCEMENT_CACHE_TTL（3600 秒）：停调/抖动期间一只票被误标一次，
+# 不该让整个小时内的所有判定继续把"查过且没有利空"当事实；当日停调本身每 30 分钟放一次探测，
+# 60 秒的重试口径保证闸门一解除就立刻回到真数据。
+
+
+async def _fetch_announcements(symbol: str, lookback_days: int = None) -> Tuple[List[Dict], str, str]:
+    """个股近 N 天公告 → `(公告列表, status, reason)`。
+
+    `status` 三态（2026-11-07 加，修"利空静默放行"）：
+      · `'ok'`      真的查到了 —— **列表为空也算 ok**，那只票确实没有近 20 日公告；
+      · `'cooling'` 是我们自己停调中（东财 `ann` 闸门关着），一个请求都没发；
+      · `'error'`   发了但没成功（超时 / HTTP / 解析失败）。
+    后两态统称 unknown。老契约"失败返回空、不抛异常"保持不变，只是**不再让失败和
+    "确实没有"长得一模一样**——要做保守动作的调用方读 `status`，不读列表长度。
     """
     if lookback_days is None:
         lookback_days = TREND_ANNOUNCEMENT_LOOKBACK_DAYS
     sym = symbol.lower()
 
-    # 缓存
     cached = _announcement_cache.get(sym)
-    if cached and (time.time() - cached[0]) < TREND_ANNOUNCEMENT_CACHE_TTL:
-        return cached[1].get('announcements', [])
+    if cached:
+        _ts, _payload = cached
+        _st = _payload.get('status', ANN_OK)
+        _ttl = TREND_ANNOUNCEMENT_CACHE_TTL if _st == ANN_OK else ANN_UNKNOWN_RETRY_SEC
+        if (time.time() - _ts) < _ttl:
+            return _payload.get('announcements', []), _st, _payload.get('reason', '')
 
-    def _sync_fetch() -> List[Dict]:
+    def _sync_fetch() -> Tuple[List[Dict], str, str]:
         # 2026-10-20：接入共享熔断 eastmoney_guard（scope 'ann'）。趋势扫描逐票调这里，
-        # 东财被封当天曾白打几百次（今日 ann 378 次/115 失败的来源之一）。冷却期内
-        # 静默返回空列表——本函数契约本来就是"失败返回空、不抛异常"，调用方无感。
+        # 东财被封当天曾白打几百次（今日 ann 378 次/115 失败的来源之一）。冷却期内仍返回
+        # 空列表（契约不变），但状态必须是 'cooling' —— 原注释写的"调用方无感"正是这次要修
+        # 的那个洞：利空否决在停调日静默失效，而没人看得出它失效了。
         from services.data import eastmoney_guard
         if eastmoney_guard.skip('ann'):
-            return []
+            return [], ANN_COOLING, '东财公告接口在停调/冷却中（一个请求都没发）'
         try:
             cutoff = date.today() - timedelta(days=lookback_days)
             # 东方财富公告 API：ann_type=A 全部公告，page_size=50
+            # ⚠️ `stock_list` 必须传**裸 6 位码**（实测 2026-11-07）：传 `sh600519` 这种带前缀的
+            # 写法接口照样回 HTTP 200，但 `list` 恒空、`total_hits=0` —— 与"这只票确实没公告"
+            # 一模一样。老代码传的就是带前缀的 sym，于是利空否决**从上线那天起就没生效过**，
+            # 而没人看得出来（缓存里存的就是"空 = 正常"）。前缀剥掉，缓存键仍用原来的 sym。
+            _bare = re.sub(r'^(sh|sz|bj)', '', sym)
             url = EASTMONEY_ANN_API
             params = {
                 'cb': '',
@@ -1254,7 +1374,7 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
                 'page_index': 1,
                 'ann_type': 'A',
                 'client_source': 'web',
-                'stock_list': sym,
+                'stock_list': _bare,
                 'f_node': 0,
                 's_node': 0,
             }
@@ -1271,9 +1391,15 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
             except Exception:
                 data = json.loads(_strip_eastmoney_jsonp(r.text))
             # 接口返回结构：data.list = [{ art_code, title, notice_date, columns_name, ... }]
+            payload = data.get('data') if isinstance(data, dict) else None
+            if not isinstance(payload, dict) or 'list' not in payload:
+                # HTTP 层是成功的（闸门按成功记），但**结构不对就是没查到**，
+                # 绝不折算成"这只票没有公告"——把两种形状混成一个正是这次要修的洞。
+                eastmoney_guard.ok('ann')
+                return [], ANN_ERROR, f'公告接口结构异常(data={type(payload).__name__})'
             eastmoney_guard.ok('ann')
             items = []
-            for grp in (data.get('data') or {}).get('list', []) or []:
+            for grp in payload.get('list') or []:
                 # list 可能是嵌套的二级 list
                 if isinstance(grp, list):
                     for it in grp:
@@ -1297,43 +1423,80 @@ async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> L
                     'notice_date': notice_date,
                     'columns_name': it.get('columns_name') or '',
                 })
-            return out
+            return out, ANN_OK, ''
         except Exception as e:
             eastmoney_guard.fail('ann', e)
             print(f'[公告] 拉取 {symbol} 公告失败: {e}')
-            return []
+            return [], ANN_ERROR, f'{type(e).__name__}: {e}'[:120]
 
     try:
-        anns = await asyncio.to_thread(_sync_fetch)
+        anns, status, reason = await asyncio.to_thread(_sync_fetch)
     except Exception as e:
         print(f'[公告] 异步拉取 {symbol} 公告失败: {e}')
-        anns = []
+        anns, status, reason = [], ANN_ERROR, f'{type(e).__name__}: {e}'[:120]
 
-    _announcement_cache[sym] = (time.time(), {'announcements': anns})
+    _announcement_cache[sym] = (time.time(), {'announcements': anns,
+                                              'status': status, 'reason': reason})
+    return anns, status, reason
+
+
+async def fetch_stock_announcements(symbol: str, lookback_days: int = None) -> List[Dict]:
+    """历史入口：只返回公告列表本体，契约一字未改（失败/停调都返回 `[]`、不抛异常）。
+
+    要区分"确实没有"与"没查到"请用 `announcement_check()`——本函数把状态抹掉了，
+    而"把两者混为一谈"正是 11-07 之前利空否决会在停调日静默失效的形状。
+    """
+    anns, _status, _reason = await _fetch_announcements(symbol, lookback_days)
     return anns
 
 
 def check_negative_announcement(announcements: List[Dict]) -> Dict:
     """
     检查公告列表中是否含利空关键词。
-    返回: { hasNegative: bool, hits: [str] }
+    返回: { hasNegative: bool, hits: [str], excludedHits: int }
+
+    `excludedHits` 是被校准口径排掉的条数（只在 `NEG_ANN_CALIBRATED=True` 时非零），
+    留着是为了"排错了能被发现"：哪天趋势名单少拦了一批利空票，这个数就是第一条线索。
+    返回体多一个键不影响任何老调用方（它们只读 hasNegative/hits）。
     """
+    calibrated = bool(NEG_ANN_CALIBRATED)
     if not announcements:
-        return {'hasNegative': False, 'hits': []}
+        return {'hasNegative': False, 'hits': [], 'excludedHits': 0}
     hits = []
+    excluded = 0
     for ann in announcements:
         title = ann.get('title', '') or ''
         # 标题命中关键词 → 记录
         for kw in NEGATIVE_ANNOUNCEMENT_KEYWORDS:
             if kw in title:
+                if calibrated and not _negative_hit_calibrated(title, kw):
+                    excluded += 1
+                    continue      # 换下一个关键词再判一次（'制度' 排掉的不等于别的词也不命中）
                 hits.append(f'[{ann.get("notice_date", "")}] {title}（命中:{kw}）')
                 break  # 一条公告只记一次
-    return {'hasNegative': bool(hits), 'hits': hits}
+    return {'hasNegative': bool(hits), 'hits': hits, 'excludedHits': excluded}
+
+
+async def announcement_check(symbol: str, lookback_days: int = None) -> Dict:
+    """利空检查的三态版本：`hasNegative/hits` 之外再给 `status / unknown / reason / annCount`。
+
+    `hasNegative` 语义不变（unknown 时仍是 False —— **绝不把接口抖动判成利空**，
+    与 `momentum_zone.py` 开头"没有数据不做判决"同口径）。给保守动作用的是 `unknown`：
+    不知道该不该拦的时候，不是放行、也不是误杀，而是把这一票从**不可逆动作**
+    （如趋势高分自动进股票池）里摘出来，同时把本轮未知只数如实报出来。
+    """
+    anns, status, reason = await _fetch_announcements(symbol, lookback_days)
+    res = check_negative_announcement(anns)
+    res['status'] = status
+    res['unknown'] = status != ANN_OK
+    res['reason'] = reason if status != ANN_OK else ''
+    res['annCount'] = len(anns)
+    return res
 
 
 async def has_negative_announcement(symbol: str) -> Dict:
     """
-    综合：拉公告 + 关键词检测。
+    综合：拉公告 + 关键词检测。历史入口名，现转发到 `announcement_check`；
+    老调用方读的 `hasNegative/hits` 两个键一字未改，`status/unknown` 是新增可读项。
     """
-    anns = await fetch_stock_announcements(symbol)
-    return check_negative_announcement(anns)
+    return await announcement_check(symbol)

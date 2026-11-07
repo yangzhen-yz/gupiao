@@ -55,7 +55,7 @@ _TOKEN_CACHE: Dict = {'token': None, 'exp': 0.0}
 
 def _ensure_table():
     """通道表 + 快反去重表（去重表 2026-10-14 起按 user_id 隔离，见 _migrate_alert_log）"""
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         conn.execute('''CREATE TABLE IF NOT EXISTS user_push_channels (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,7 +225,7 @@ def bind_aibot(user_id: int, chat_id: str, label: str = '') -> Tuple[bool, str, 
     if not ok:
         return False, f'确认消息没发出去，未绑定：{err}', None
     _ensure_table()
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn.execute('INSERT OR IGNORE INTO user_push_channels '
                  '(user_id, kind, target, label, verified_at, created_at) VALUES (?,?,?,?,?,?)',
@@ -289,7 +289,7 @@ def bind_userid(user_id: int, userid: str, label: str = '') -> Tuple[bool, str, 
     if not ok:
         return False, f'确认消息没发出去，未绑定：{err}', None
     _ensure_table()
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn.execute('INSERT OR IGNORE INTO user_push_channels '
                  '(user_id, kind, target, label, verified_at, created_at) VALUES (?,?,?,?,?,?)',
@@ -356,7 +356,7 @@ def bind_webhook(user_id: int, url: str, label: str = '') -> Tuple[bool, str, Op
     sent, serr = _post_webhook(url, content)
     if not sent:
         return False, f'地址校验通过但消息没发出去：{serr}', None
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn.execute('INSERT OR IGNORE INTO user_push_channels '
                  '(user_id, kind, target, label, verified_at, created_at) VALUES (?,?,?,?,?,?)',
@@ -370,7 +370,7 @@ def bind_webhook(user_id: int, url: str, label: str = '') -> Tuple[bool, str, Op
 
 def unbind(user_id: int, channel_id: int) -> bool:
     _ensure_table()
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     n = conn.execute('DELETE FROM user_push_channels WHERE id=? AND user_id=?',
                      (channel_id, user_id)).rowcount
     conn.commit()

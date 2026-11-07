@@ -40,7 +40,7 @@ def save_hot_stock_buttons(stocks: List[Dict], user_id: int = 1) -> bool:
     """整列表覆盖写入（只动该用户的行）"""
     conn = None
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM hot_stock_buttons WHERE user_id = ?', (int(user_id),))
         for stock in stocks:
@@ -80,7 +80,7 @@ def load_stock_concept_tags() -> Dict[str, List[str]]:
 
 def save_stock_concept_tags(tags: Dict[str, List[str]]) -> bool:
     try:
-        conn = get_db_conn(fast_fail=True)
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM stock_concept_tags')
         for symbol, tag_list in tags.items():

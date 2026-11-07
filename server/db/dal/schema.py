@@ -135,7 +135,7 @@ def _finish_ts_migration(cursor):
 
 def init_db():
     """初始化数据库表"""
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     try:
         cursor = conn.cursor()
         # 迁移第 1 步：重命名 UTC 时间戳的旧表（仅首次执行）
@@ -543,6 +543,30 @@ def init_db():
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_cls_plate_daily
             ON cls_plate_daily (trade_date, plate_type)''')
+        # 龙虎榜逐票落库（2026-11-06，用户要求"停调不能导致后续功能受影响"里的一条）。
+        # 此前龙虎榜**只在内存 `_dt_cache` 里**，进程重启即空、东财停调即整块没有：
+        # 它是评分的第 13 因子 smart_money（recommend/trend/scan 三处读），也是龙虎榜页
+        # 的全部内容 —— 是所有"只有东财一条路"的数据里唯一连旧值都留不住的。
+        # 粒度取接口原始粒度 (交易日, 股票, 上榜原因)：一只票一天可能因多个席位口径上榜，
+        # 压成一行会丢 reasons，聚合时又要把 reasons 复原，不如按原样存。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dragon_tiger_daily (
+                trade_date   TEXT NOT NULL,      -- YYYY-MM-DD（接口 TRADE_DATE）
+                symbol       TEXT NOT NULL,      -- 带市场前缀 sh600000（与本地库一致）
+                name         TEXT,
+                reason       TEXT NOT NULL,      -- EXPLANATION 原文，空原因记 ''
+                net_amt      REAL,               -- 元（BILLBOARD_NET_AMT）
+                buy_amt      REAL,
+                sell_amt     REAL,
+                change_rate  REAL,
+                close_price  REAL,
+                float_mcap   REAL,               -- 元（FREE_MARKET_CAP）
+                source       TEXT DEFAULT 'eastmoney',
+                created_at   TEXT,
+                PRIMARY KEY (trade_date, symbol, reason))''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_dragon_tiger_daily
+            ON dragon_tiger_daily (trade_date)''')
         # 动态热门板块链（2026-10-31，行动台主题卡）：当天从财联社概念榜选出的前 3 个板块
         # 及核心成分。只做展示，不进选股；成分明细同时写 theme_member_daily（chain_id 作 theme）。
         # 落库目的有二：重启后先显示最近一次的链（不必等接口），以及回溯"当天为什么是它"。
@@ -918,7 +942,7 @@ def save_api_usage_daily(rows) -> int:
         # 2026-11-03 从 fast_fail 摘回 30 秒（昨天分类分错了）：这不是"可重拉的缓存"，
         # 而是接口调用量的**审计留痕**——它是"东财 fail 比率为什么暴涨""哪个调用方没接闸门"
         # 这些判断的唯一依据，丢一天就永久补不回来（计数是累加值，没有源头可重算）。
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.executemany(
             '''INSERT INTO api_usage_daily(date, provider, interface, count, ok, fail)
@@ -971,7 +995,7 @@ def load_api_usage_history(days: int = 14) -> List[Dict]:
 def save_api_usage_limit(provider: str, interface: str, limit: int, updated_by: str = '') -> bool:
     """保存（upsert）某接口的每日上限。"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute(
             '''INSERT INTO api_usage_limits(provider, interface, daily_limit, updated_by, updated_at)

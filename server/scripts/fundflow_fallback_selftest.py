@@ -29,7 +29,8 @@ for suf in ('', '-wal', '-shm'):
         pass
 
 import db.database as dbmod
-dbmod.SQLITE_DB_PATH = _TMP
+dbmod.use_db_path(_TMP)      # 换库必须走这个函数：11-05 db 拆分后只赋值 dbmod.SQLITE_DB_PATH 是静默无效的，
+#                                    INSERT 会直接写进生产库 server/gupiao.db
 dbmod.init_db()
 
 # 本地行业表：造三条（含一条带国标码前缀，验证去码）
@@ -46,6 +47,11 @@ _c.close()
 
 import requests                                    # noqa: E402
 from services.data import eastmoney_guard as G     # noqa: E402
+# 本份自测会**真的**调用 ok/fail/reset（这是它要测的东西），而 guard 每次状态变化都原子落盘到
+# `server/data/eastmoney_guard_state.json`。不落盘钩子就会把测试造的停调写进真实状态文件，
+# 线上下一次重启时按那份文件恢复 → 白停一天（2026-11-07 复核时文件恰好已被写脏过，
+# 只是最后被脚本自己的 reset 抹平了，不能指望运气）。
+G._save_state_locked = lambda: None
 from services.data import fundflow as F            # noqa: E402
 
 FAILS = []
@@ -71,6 +77,7 @@ ck(G.classify(requests.exceptions.ConnectTimeout('t')) == 'blocked',
 ck(G.classify(RuntimeError('rc=100')) == 'flaky', '业务 rc 异常 → flaky')
 
 print('\n[2] 全域闸门：封的是 IP，不是某个接口')
+G.reset_all()        # 段前也全清一次（scope + 家族 + 全域），别拿上一段残留的状态判这一段
 G.reset_domain()
 for _s in list(G._state):
     G.reset(_s)
@@ -81,22 +88,40 @@ G.fail('clist', ConnectionError('RemoteDisconnected'))   # blocked 第 1 次
 ck(not G.skip('ztpool'), '一次连接被重置还不该全域停手（阈值 2）')
 ck(G.status('clist')['blockedStreak'] == 1,
    f'blocked 与 flaky 分开计数（实得 blockedStreak={G.status("clist")["blockedStreak"]}）')
-G.fail('ulist', ConnectionError('RemoteDisconnected'))   # blocked 第 2 次（换了个接口）
-ck(G.skip('ztpool') and G.skip('datacenter'),
-   '涨停池/龙虎榜是另外的 scope，但封的是 IP —— 全域闸门一开它们必须一起停手')
+G.fail('ulist', ConnectionError('RemoteDisconnected'))   # blocked 第 2 次（同家族 push2delay）
+# 2026-11-06 改口径：blocked 只关**出事的主机家族**。ulise/clist 都在 push2delay，
+# 一起停是对的；但涨停池(push2ex)/数据中心(datacenter-web)是另外两条链路——实测近 14 天
+# 失败率 pools 1.0%、datacenter 0.4%，把它们一起关正是 11-06 "退潮没推"的根因。
+ck(G.skip('clist') and G.skip('ulist'), '同家族（push2delay 的 clist/ulist）一起停')
+ck(not G.skip('pools') and not G.skip('datacenter'),
+   '其它主机家族不受牵连：push2ex 三池与 datacenter 照常请求')
+st = G.status('clist')
+ck(st['family'] == 'main' and st['familyCooling'] and st['familyRemainSec'] > 0,
+   f'状态里查得到本家族还剩多久（{st["familyRemainSec"]}s，recoverAt={st["familyRecoverAt"]}）'
+   f'——"为什么这页是旧的"要能一句话答')
+G.fail('pools', ConnectionError('RemoteDisconnected'))
+G.fail('pools', ConnectionError('RemoteDisconnected'))   # 第二个家族也挂 → 才判定封的是 IP
 st = G.status('datacenter')
 ck(st['domainCooling'] and st['domainRemainSec'] > 0,
-   f'状态里查得到全域还剩多久（{st["domainRemainSec"]}s）——"为什么这页是旧的"要能一句话答')
+   f'两个家族同时熔断才升级全域闸门（全域剩余 {st["domainRemainSec"]}s）；'
+   f'此时连 datacenter/公告也一起停：{G.skip("datacenter") and G.skip("ann")}')
 G.fail('clist', ConnectionError('RemoteDisconnected'))   # clist 自己累计到 2 次 blocked → 本接口也熔断
-ck(G.status('clist')['cooling'], 'clist 自己的冷却独立于全域闸门')
-G.ok('ztpool')                                # 任何一个东财请求成功 = IP 没被封
+ck(G.status('clist')['cooling'], 'clist 自己的冷却独立于家族/全域闸门')
+G.ok('pools', clear_domain=False)             # 三池成功只复位三池自己，不给 clist 提前探测
 st = G.status('clist')
-ck(not st['domainCooling'], '一次成功即解除全域闸门，不用等冷却到期')
-ck(st['cooling'] and G.skip('clist'),
-   '但 clist 自己那半小时不因别的接口成功而清零（各接口独立计数）')
+ck(st['familyCooling'], '边缘节点的成功不得替 main 家族解除停调')
+G.ok('clist')                                 # main 自己通了 = IP 没被封
+st = G.status('clist')
+ck(not st['domainCooling'] and not st['familyCooling'],
+   '一次成功即解除家族与全域闸门，不用等冷却到期')
 for _s in list(G._state):
     G.reset(_s)
 G.reset_domain()
+# ⚠️ 11-06 熔断改造后这里必须走 `reset_all()`：blocked 熔断除了 scope 冷却，还会把**主机家族**
+# 的 until 抬到当日 23:59:59（当日停调）。上面那两行只清 scope 与全域，家族层残留会让本进程
+# 后续所有段落都处在"main 停调中"——于是 [6]/[7]/[7b] 那 5 条断言看到的是"新浪根本没被试"，
+# 而这不是资金流逻辑坏了，是自测没复位干净（2026-11-07 就是这样误判过一次）。
+G.reset_all()
 
 print('\n[3] 假 HTTP：新浪排行映射')
 
@@ -266,7 +291,10 @@ d5 = asyncio.run(F.get_fund_flow_summary())
 ck(d5['stocks']['inflow'][0]['industry'] == '电气机械和器材制造业',
    f'快照行也补上本地行业（实得 {d5["stocks"]["inflow"][0]["industry"]!r}）')
 
-os.remove(_TMP)
+# ⚠️ 临时库不能在 [7c] 之后删：从 [7d] 起还要读写 `fund_flow_snapshot`，
+# 原来这句 `os.remove(_TMP)` 夹在中间，等于把库文件抽走再判后面那段 —— sqlite 会顺手
+# 新建一个**空文件**，于是日志出现 `no such table: fund_flow_snapshot`（11-07 复核时发现）。
+# 清理挪到全部段落跑完之后。
 print('\n[7d] 龄期按块判定：个股是今天的、非热点还是两天前的 → 整页不许挂"今日未刷新"')
 F._clist_circuit_open = lambda: False
 F._sina_stock_rankings = _stub_rank
@@ -286,6 +314,12 @@ ck(d6['stale'] is False,
    f'主口径（个股）本轮是新浪现取 → stale 不该被两天前的非热点拖累（实得 {d6["stale"]}）')
 ck('hidden' in (d6.get('staleBlocks') or []),
    f'但旧的那一块必须被点名（实得 {d6.get("staleBlocks")} / 各块龄期 {d6.get("blockAges")}）')
+
+for _suf in ('', '-wal', '-shm'):
+    try:
+        os.remove(_TMP + _suf)
+    except OSError:
+        pass
 
 print()
 print('全部通过' if not FAILS else f'失败 {len(FAILS)} 项: {FAILS}')

@@ -26,7 +26,8 @@ FAIL = []
 # ---- 防御性第一件事：立即桩掉 DB 快照读写（在任何测试逻辑之前） ----
 # 2026-10-19 事故：早期版本自测的盘中刷新路径把测试假数据（'流入0'等）写进了
 # 真实 gupiao.db 的 fund_flow_snapshot 表（15:56 污染 stocks/sectors 两行）。
-# 现改为 import 后立即 patch，并在退出时扫描清洗，双保险。
+# 现在 import 后立刻把 save_/load_ 换成内存桩（写入根本不落库），退出时再**只读**扫一遍
+# 真库做核对——漏了就报红，不再由自测去 DELETE（11-07 改，理由见 _cleanup_db 的说明）。
 _store = {}
 
 
@@ -44,23 +45,36 @@ ff.load_fund_flow_snapshot = _fake_load
 
 
 def _cleanup_db():
-    """退出前扫描真实 DB，清掉任何测试假名泄漏行（'流入N'/'流出N'/'行业N'）。"""
+    """退出前**只读**扫真库：发现测试假名泄漏就记一条 FAIL（11-07 从"DELETE 擦干净"改的）。
+
+    为什么不再删：2026-10-19 那次假数据（'流入0'）漏进真库后，老版本的处置是"退出前
+    DELETE 擦掉"——那等于拿生产库当擦布。`fund_flow_snapshot` 是收盘后判 `fresh_snap` 的
+    "最后成功快照"（11-03 就是因为它被误判才每次重走补算），自测去删它是在改线上状态；
+    而且擦完没人知道曾经漏过。现在只查不删：漏了就报红，怎么清由人决定。
+    判据与规则见 `scripts/db_hygiene_check.py` 的 R3。
+    """
+    rows = []
     try:
         import sqlite3
-        con = sqlite3.connect(os.path.join(_SRC_DIR, 'gupiao.db'), timeout=10)
-        rows = con.execute('SELECT snap_key, snap_json FROM fund_flow_snapshot').fetchall()
-        bad = []
-        for key, blob in rows:
-            if any(t in (blob or '') for t in ('"流入', '"流出', '"行业0"', '"弱行业')):
-                bad.append(key)
-        for key in bad:
-            con.execute('DELETE FROM fund_flow_snapshot WHERE snap_key=?', (key,))
-        con.commit()
-        con.close()
-        if bad:
-            print(f'[自测清洗] 已清除测试假数据泄漏行: {bad}')
+        _db = os.path.join(_SRC_DIR, 'gupiao.db')
+        con = sqlite3.connect(f'file:{_db}?mode=ro', uri=True, timeout=10)
+        try:
+            rows = con.execute('SELECT snap_key, snap_json FROM fund_flow_snapshot').fetchall()
+        finally:
+            con.close()
     except Exception as e:
-        print(f'[自测清洗] 扫描失败（不影响判定）: {e}')
+        print(f'[自测护栏] 真库只读扫描失败（不判定，只提示）: {e}')
+        return
+    bad = [k for k, blob in rows
+           if any(t in (blob or '') for t in ('"流入', '"流出', '"行业0"', '"弱行业'))]
+    if bad:
+        _ck = globals().get('ck')              # atexit 可能跑在 ck 定义之前（脚本早退时）
+        if _ck is not None:
+            _ck(False, f'真库发现自测假数据泄漏（本自测应全程走内存桩）：{bad}')
+        else:
+            print(f'[自测护栏] ✗ 真库发现自测假数据泄漏：{bad}')
+    else:
+        print('[自测护栏] 真库无泄漏行（只读核对通过）')
 
 
 import atexit
@@ -339,8 +353,19 @@ _wired = {
     'services/ops/review.py': "eastmoney_guard.skip('clist')",
     'services/strategy/rps.py': "eastmoney_guard.skip('clist')",
     'services/pick/recommend.py': "eastmoney_guard.skip('ulist')",
-    'app/api/routes.py': "eastmoney_guard.skip('clist')",
+    # 2026-11-06：routes.py 拆分后代理端点在 routers/data.py（原来这条断言指向
+    # app/api/routes.py，拆分当天就恒假了，只是没人重跑这份自测）
+    'app/api/routers/data.py': "eastmoney_guard.skip('clist')",
     'app/main.py': "eastmoney_guard.skip('clist')",
+    # 2026-11-06 补的六处漏接（11-06 用户要求"当天不通就别再戳"，这六处不接就停不住）：
+    # 三池走 push2ex，自己一个 scope，不再被 clist 连带停
+    'services/ops/review.py#pools': "eastmoney_guard.skip('pools')",
+    'services/strategy/sentiment.py': "guard.skip('pools')",
+    'services/data/valuation.py': "eastmoney_guard.skip('clist')",
+    'services/data/smartmoney.py': "eastmoney_guard.skip('datacenter')",
+    'services/data/smartmoney.py#push2': "eastmoney_guard.skip('push2')",
+    'services/data/fundamental.py': "eastmoney_guard.skip('datacenter')",
+    'services/data/market_cap.py': "eastmoney_guard.skip('push2')",
 }
 for rel, needle in _wired.items():
     path = rel.split('#')[0]

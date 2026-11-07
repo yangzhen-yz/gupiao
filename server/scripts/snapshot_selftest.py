@@ -11,7 +11,8 @@ if os.path.exists(_TMP):
     os.remove(_TMP)
 
 import db.database as dbmod
-dbmod.SQLITE_DB_PATH = _TMP                      # 写测试就先把连接指到临时库
+dbmod.use_db_path(_TMP)      # 换库必须走这个函数：11-05 db 拆分后只赋值 dbmod.SQLITE_DB_PATH 是静默无效的，
+#                                    INSERT 会直接写进生产库 server/gupiao.db   # 写测试就先把连接指到临时库
 
 from services.pick import strategy_snapshot as ss
 

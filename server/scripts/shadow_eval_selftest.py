@@ -27,7 +27,8 @@ for p in (_TMP, _KLINE):
 import app.config as cfg
 cfg.KLINE_HISTORY_DB_PATH = _KLINE
 import db.database as dbmod
-dbmod.SQLITE_DB_PATH = _TMP
+dbmod.use_db_path(_TMP)      # 换库必须走这个函数：11-05 db 拆分后只赋值 dbmod.SQLITE_DB_PATH 是静默无效的，
+#                                    INSERT 会直接写进生产库 server/gupiao.db
 
 from db.database import get_db_conn                     # noqa: E402
 

@@ -77,7 +77,7 @@ def _get_log(date_str: str, user_id: int, symbol: str, kind: str) -> Dict:
 def _mark(date_str: str, user_id: int, symbol: str, kind: str, price: float, note: str = ''):
     try:
         pc._ensure_table()
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('INSERT OR REPLACE INTO position_alert_log '
                      '(alert_date, user_id, symbol, kind, pushed_at, price, note) '
                      'VALUES (?,?,?,?,?,?,?)',
@@ -92,7 +92,7 @@ def _mark(date_str: str, user_id: int, symbol: str, kind: str, price: float, not
 def _unmark(date_str: str, user_id: int, symbol: str, kind: str):
     """发送失败时撤回去重标记 —— 否则这条止损信号当天就永久丢了"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('DELETE FROM position_alert_log '
                      'WHERE alert_date=? AND user_id=? AND symbol=? AND kind=?',
                      (date_str, user_id, symbol, kind))
@@ -361,7 +361,7 @@ async def push_t1_plan(user_id: int = 1) -> Dict:
         return {'pushed': 0, 'skipped': '非竞价时段'}
     date_str = now.strftime('%Y-%m-%d')
     pc._ensure_table()
-    conn = get_db_conn()
+    conn = get_db_conn(wait_for_lock=True)
     rows = conn.execute("SELECT alert_date, symbol, kind, price FROM position_alert_log "
                         "WHERE user_id=? AND note='t1_pending' AND alert_date<? "
                         "ORDER BY alert_date DESC", (user_id, date_str)).fetchall()
@@ -392,7 +392,7 @@ async def push_t1_plan(user_id: int = 1) -> Dict:
     if res.get('ok'):
         _mark(date_str, user_id, _MARKET_SYMBOL_KEY, 't1_plan', 0.0,
               json.dumps([i['symbol'] for i in items], ensure_ascii=False))
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute("DELETE FROM position_alert_log WHERE user_id=? AND note='t1_pending' "
                      "AND alert_date<?", (user_id, date_str))
         conn.commit()

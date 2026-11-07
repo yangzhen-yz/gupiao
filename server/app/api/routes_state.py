@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from typing import List, Dict, Optional
 import json, asyncio, time, re, inspect, threading, hashlib, gzip
 from datetime import date, datetime
-from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE, RECOMMEND_REVIEW_CACHE_ENABLED)
+from app.config import (STRATEGY_BACKTEST_PREDICTION_LIMIT, STRATEGY_BACKTEST_HISTORY_DAYS, DEFAULT_WEIGHTS, INDEX_SYMBOLS, TENCENT_QUOTE_API, SCAN_CONCURRENCY, HOT_STOCK_POOL, STRATEGY_INDUSTRY_NEUTRALIZATION_ENABLED, EASTMONEY_HEADERS, STRATEGY_SCORE_VALUES, FUND_FLOW_STOCK_TOP_N, FUND_FLOW_SECTOR_TOP_N, FUND_FLOW_HIDDEN_CHANGE_THRESHOLD, FUND_FLOW_HIDDEN_HOT_TOP_N, FUND_FLOW_HIDDEN_TOP_N, RPS_PERIOD_DAYS, SETTINGS_WRITE_USER_IDS, RPS_TOP_N, SMART_MONEY_DRAGON_TIGER_DAYS, PREDICT_SAVE_QUALITY_GATE, PREDICT_SAVE_LIMIT_UP_MIN, PREDICT_SAVE_MIN_SCORE, RECOMMEND_REVIEW_CACHE_ENABLED, REC_SIM_CACHE_MONTHS, REC_SIM_CACHE_BENCH, REC_SIM_CACHE_CAPITAL_DEFAULT, REC_SIM_CACHE_GAP_DEFAULT, REC_SIM_CACHE_LOTS_DEFAULT)
 from db.database import (get_db_conn, load_daily_recommendations, save_daily_recommendations, delete_daily_recommendations_by_date, load_trend_scan_results, load_stock_basic_info, save_stock_basic_info, load_stock_alias_map, load_hot_search_ranking, save_hot_search_ranking, load_user_scan_pool, save_user_scan_pool, load_hot_stock_buttons, save_hot_stock_buttons, load_stock_concept_tags, save_stock_concept_tags, load_daily_market_reviews, save_daily_market_reviews, load_strategy_factor_weights, save_strategy_factor_weights, add_stock_concept_tags, remove_stock_tag, FACTOR_DESCRIPTIONS, save_stock_industry, load_trend_backtest_reports, load_latest_trend_backtest_report, load_trend_backtest_records, daily_recs_write_version)
 from services.data.stock import (fetch_stock_data, fetch_eastmoney_hot_list, get_stock_name, get_kline_data, parse_tencent_batch_data, fetch_stock_concepts, is_forbidden_stock, calculate_ma, fetch_with_retry, _sync_get, has_delisting_risk, detect_quote_source, quote_route_status)
 from services.strategy.strategy import backtest_yesterday_predictions, save_predictions, calc_stock_score_v2, apply_industry_neutralization
@@ -145,6 +145,41 @@ _HOT_SCAN_CACHE_TTL = 45  # 秒
 _HOT_SCAN_STALE_MAX = 86400  # 秒
 _HOT_SCAN_REFRESHING: Dict[str, float] = {}   # {cache_key: 上次后台刷新时间}，20s 节流
 _HOT_SCAN_CTX = threading.local()             # 后台刷新线程内置 compute=True，避免递归再进缓存分支
+# 2026-11-07（修④）：这份缓存原来**没有上限、没有淘汰、过期也不回收**，而它的键是
+# "自选池代码串的排列组合"、单值又是全站最大（120 只全字段）——等于任何带 `codes` 参数
+# 的公开请求都能永久占一份内存。下面三件套与复盘那对 `_remember/_touch` 同构：
+# 先回收真正过服役上限的，仍超限就按**最久没被读过**淘汰。淘汰看 `used` 不看 `ts`，
+# 理由与 11-04 那次一样（按 ts 淘汰时一串垃圾参数会把前端真正在用的那份挤出去）。
+_HOT_SCAN_MAX_KEYS = 8
+
+
+def hot_scan_key(codes_list) -> str:
+    """一串代码 → 稳定短键（16 位 sha1 + 只数）。
+
+    老写法是 `','.join(sorted(set(codes)))`：键长随池子大小线性增长（全站最大的单值缓存
+    就挂在这条长键上），而且同一份内容的空格/大小写差异都会变成新键。
+    把只数拼进键是为了防止"两份不同内容恰好哈希相同"互串——宁可键长一点也不能认错缓存。
+    """
+    norm = ','.join(sorted({str(c).strip().lower() for c in (codes_list or []) if str(c).strip()}))
+    return f'{hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]}#{len(norm.split(",")) if norm else 0}'
+
+
+def _remember_hot_scan(key: str, data, ts: float) -> None:
+    """写入前回收 + 按 `used` 淘汰（见上面注释）。"""
+    for k in [k for k, v in _HOT_SCAN_CACHE.items() if ts - v['ts'] >= _HOT_SCAN_STALE_MAX]:
+        _HOT_SCAN_CACHE.pop(k, None)
+    while len(_HOT_SCAN_CACHE) >= _HOT_SCAN_MAX_KEYS:
+        least = min(_HOT_SCAN_CACHE,
+                    key=lambda k: _HOT_SCAN_CACHE[k].get('used', _HOT_SCAN_CACHE[k]['ts']))
+        _HOT_SCAN_CACHE.pop(least, None)
+    _HOT_SCAN_CACHE[key] = {'ts': ts, 'used': ts, 'data': data}
+
+
+def _touch_hot_scan(key: str) -> None:
+    """命中即标记"这份刚被读过"，供上面的最久未用淘汰用。"""
+    hit = _HOT_SCAN_CACHE.get(key)
+    if hit:
+        hit['used'] = time.time()
 
 def _invalidate_hot_scan_cache():
     """清空批量扫描缓存（添加/移除自选股后调用，避免脏缓存）"""
@@ -534,6 +569,35 @@ _REC_SIM_TTL = 1800                # 秒：底层一天才变一次（14:45 推�
 # 智能推荐页 10s 的共同根因。统一走文件顶部导入的 services.support.swr：
 # 过期先返旧值，重算放后台线程；24h 内绝不把冷算压在用户请求上。
 # 启动预热仍在 scheduler 里提前付掉首次 cold。
+
+
+def rec_params_cacheable(months, capital=None, gap=None, lots=None, bench=None) -> bool:
+    """回测三接口的参数是否落在"前端真会发"的白名单里（2026-11-07 修④）。
+
+    为什么要有这个判定：`/api/recommend-sim`、`/api/recommend-sim-batch`、
+    `/api/recommend-excess` 都不鉴权（11-04 逐个 grep `Depends(current_user)` 核实），
+    键里的 `months` 是自由 int、`capital`/`gap` 是自由 float。`swr.put(max_keys=…)` 的淘汰
+    按 ts 扔**最旧一半**，所以来一串垃圾参数不会清空整张表，但会把前端真正在用的那一份挤掉，
+    代价是一次冷算（`excess` 实测 7.4 秒，前端默认 10 秒超时）。调大上限没用——键空间无界时
+    多少槽都会被占满。正解是白名单外一律现算、不入表（`swr_get(cacheable=False)`）：
+    别人乱试参数只是自己多等一会儿，挤不到别人的缓存。
+
+    传 `None` 表示"这次调用的键里没有这个参数"（batch 与 excess 就没有 lots/bench）。
+    ⚠️ 这里的默认值必须与 `get_recommend_sim_api` 的函数签名一致，改了签名要一起改
+    `cfg_recommend.REC_SIM_CACHE_*`；对不上时白名单会把前端在用的组合挡在表外，
+    退化成"每次都冷算"（比现状更糟）。`scripts/cache_whitelist_selftest.py` 里有
+    一条 inspect.signature 的漂移守卫专门盯这件事。
+    """
+    ok = months in REC_SIM_CACHE_MONTHS
+    if capital is not None:
+        ok = ok and capital == REC_SIM_CACHE_CAPITAL_DEFAULT
+    if gap is not None:
+        ok = ok and gap == REC_SIM_CACHE_GAP_DEFAULT
+    if lots is not None:
+        ok = ok and bool(lots) == REC_SIM_CACHE_LOTS_DEFAULT
+    if bench is not None:
+        ok = ok and (1 if bench else 0) in REC_SIM_CACHE_BENCH
+    return ok
 
 
 

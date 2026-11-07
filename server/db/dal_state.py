@@ -138,32 +138,54 @@ DEFAULT_STOCK_TAGS = {
 _OPTIMIZER_V2_SCHEMA_READY = False
 
 
-def get_db_conn(fast_fail: bool = False):
-    """获取 SQLite 数据库连接
+def get_db_conn(wait_for_lock: bool = False, fast_fail: Optional[bool] = None):
+    """获取 SQLite 数据库连接 —— **默认是"2 秒抢不到就失败"，要等锁得点名**（2026-11-07 修⑤翻的）。
 
-    fast_fail=True 只给**缓存/快照类**写入用：抢不到写锁就按 DB_CACHE_WRITE_BUSY_TIMEOUT_MS
-    （默认 2 秒）快速失败，调用方原有的 try/except 会把它变成"这次没缓存上，下次重拉"，
-    而不是把请求线程压成 30 秒排队。决策留痕（strategy_snapshot / 推荐批次 / 收评 / 权重）
-    与用户数据（持仓 / 自选 / 本金）**不要**传这个参数——那些行丢了就永久答不了，宁可等。
-    为什么这样分级：WAL 同时只允许一个写者，而 2026-11-03 的实测里锁被占了 1 小时以上，
-    期间连 /api/health 都排队 8~30 秒（X-Process-Time 只有 1~2ms，说明耗时全在中间件之前）。
+    两种意图：
+
+    - 默认（什么都不传）：`busy_timeout = DB_CACHE_WRITE_BUSY_TIMEOUT_MS`（2 秒）。抢不到写锁就抛
+      `database is locked`，调用方现成的 `except` 会打印"保存 X 失败"并把这次丢掉，下一轮重拉/重写。
+      适用于缓存类、可重拉的数据快照，以及**盘中高频**的影子/告警落库（那种点一旦等 30 秒，
+      卡住的是整个事件循环，见下）。
+    - `wait_for_lock=True`：`busy_timeout = DB_TRACE_WRITE_BUSY_TIMEOUT_MS`（30 秒）。给"丢了就永久
+      答不了"的行：决策留痕（`strategy_snapshot` / 推荐批次 / 收评 / 权重 / 预测记录）、用户数据
+      （持仓 / 自选 / 标签 / 按钮 / 本金 / 推送绑定 / 账号）、模拟盘的钱与订单、接口用量累加。
+
+    为什么把方向翻过来（11-04 那条"要么分完、要么反过来"选的就是反过来）：老写法是"默认等 30 秒、
+    缓存类点名快速失败"，而 `database.py` 之外实测还有 **115 处** `get_db_conn()` 从没分类过 ——
+    默认方向决定了这上百处**没点名**的点的失败方式，靠人记住传参数是守不住的。翻过来之后漏点儿的
+    代价从"全站排队 30 秒"变成"这一行没落库、日志里看得见"：11-03 那次真正的全站卡死（写锁被占 1 小时+，
+    连 `/api/health` 都排队 8~30 秒，`X-Process-Time` 只有 1~2ms 说明耗时全在中间件之前）放大器就是长等。
+
+    `fast_fail` 是 11-03 那版的老参数名，**语义原样保留**（`True`=快速失败，跟现在默认一致；
+    `False`=等 30 秒，等于现在的 `wait_for_lock=True`），所以历史调用点不会因为翻转而改变行为。
+    新代码一律写 `wait_for_lock=`，`scripts/db_writelock_default_selftest.py` 里有静态守卫盯着：
+    凡是写留痕表的点必须点名，漏一处就报红。
+
+    为什么不走 `app_settings` 覆盖表：`app_settings.py` 顶层就 `from db.database import get_db_conn`，
+    它的 `value()` 自己要用数据库连接，接进来会无限递归 —— 所以这几项改完要重启后端才生效。
     """
-    timeout_ms = 30000
-    if fast_fail:
-        try:
-            from app.config import DB_FAST_FAIL_ENABLED, DB_CACHE_WRITE_BUSY_TIMEOUT_MS
-            if DB_FAST_FAIL_ENABLED:
-                # 下限 100ms：防止配置页/手改成 0 之后变成"永远抢不到锁"
-                timeout_ms = max(100, int(DB_CACHE_WRITE_BUSY_TIMEOUT_MS))
-        except Exception:
-            timeout_ms = 30000      # 读不到配置就退回改造前的 30 秒，绝不因新开关而变短
+    if fast_fail is not None:
+        wait_for_lock = not fast_fail        # 老名字的老语义：fast_fail=False 就是"要等锁"
+    timeout_ms = 30000                       # 读不到配置时的兜底 = 改造前的行为，绝不因新开关而变短
+    try:
+        from app.config import (DB_FAST_FAIL_ENABLED, DB_CACHE_WRITE_BUSY_TIMEOUT_MS,
+                                DB_TRACE_WRITE_BUSY_TIMEOUT_MS)
+        if not DB_FAST_FAIL_ENABLED:
+            # 总开关关掉：所有写入一律长等，逐字节等于分级改造之前
+            timeout_ms = max(100, int(DB_TRACE_WRITE_BUSY_TIMEOUT_MS))
+        elif wait_for_lock:
+            timeout_ms = max(100, int(DB_TRACE_WRITE_BUSY_TIMEOUT_MS))
+        else:
+            timeout_ms = max(100, int(DB_CACHE_WRITE_BUSY_TIMEOUT_MS))
+    except Exception:
+        timeout_ms = 30000
+    # 下限 100ms：防止配置页/手改成 0 之后变成"永远抢不到锁"
     # isolation_level='IMMEDIATE'：写语句隐式以 BEGIN IMMEDIATE 开启事务，一开始就抢写锁。
     # 避免 DEFERRED 事务「先读后写」升级锁时 SQLite 不重试 busy_timeout 直接返回 SQLITE_BUSY。
     conn = sqlite3.connect(SQLITE_DB_PATH, timeout=timeout_ms / 1000.0, isolation_level='IMMEDIATE')
     conn.row_factory = sqlite3.Row
     # busy_timeout 必须先于 journal_mode 设置：切换 WAL 本身也需要抢数据库锁。
-    # 30s 是上限而非典型等待耗时：定时任务并发时单个写事务可能持续数秒，
-    # 原来的 5s 会在这种情况下直接抛 "database is locked"。
     conn.execute("PRAGMA busy_timeout=%d" % timeout_ms)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

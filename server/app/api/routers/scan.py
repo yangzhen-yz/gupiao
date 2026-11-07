@@ -185,12 +185,16 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         # 15s 时单用户每轮必过期）。命中缓存直接返回，跳过网络批量拉取 + 资金流 + RPS + 评分等重计算。
         # 2026-10-30 加陈旧兜底：45s 过期但未超 10 分钟 → 立即返回旧数据并后台刷新，
         # 用户请求从此最多等"缓存命中"级别的耗时；只有完全无缓存（重启后首次）或 force 才同步算。
-        cache_key = ','.join(sorted(set(codes_list)))
+        # 2026-11-07（修④）：键换成"内容 sha1 + 只数"的稳定短键，不再直接拼整串代码。
+        # 原来键长随池子大小线性增长，而这份缓存挂的是全站最大的单值（120 只全字段），
+        # 又同时缺上限、缺淘汰、过期不回收 ⇒ 任何带 codes 参数的公开请求都能永久占一份内存。
+        cache_key = hot_scan_key(codes_list)
         _now_ts = time.time()
         _cached = _HOT_SCAN_CACHE.get(cache_key)
         _compute_now = force or getattr(_HOT_SCAN_CTX, 'compute', False)
         if not _compute_now and _cached:
             _age = _now_ts - _cached['ts']
+            _touch_hot_scan(cache_key)      # 命中即记"这份刚被读过"，淘汰时按最久未用扔
             if _age < _HOT_SCAN_CACHE_TTL:
                 return _scan_as_of_json(_cached['data'], _cached['ts'])
             if _age < _HOT_SCAN_STALE_MAX:
@@ -463,9 +467,11 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
         
         print(f'[批量扫描] 完成: {len(response)} 只, 耗时 {(time.time() - t0):.1f}s')
 
-        # 2026-08-31 性能优化：写入内存缓存（TTL 15s），下次轮询直接命中
+        # 2026-08-31 性能优化：写入内存缓存（TTL 45s），下次轮询直接命中
+        # 2026-11-07（修④）：改成走 `_remember_hot_scan`——先回收过服役上限的，仍超过
+        # `_HOT_SCAN_MAX_KEYS=8` 就按最久没被读的淘汰；原来是裸赋值，只堆不扔。
         _ts_now = time.time()
-        _HOT_SCAN_CACHE[cache_key] = {'ts': _ts_now, 'data': response}
+        _remember_hot_scan(cache_key, response, _ts_now)
         return _scan_as_of_json(response, _ts_now)
     except Exception as error:
         print(f'批量扫描失败: {str(error)}')

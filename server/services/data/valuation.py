@@ -50,9 +50,21 @@ def fetch_all_valuation() -> List[Dict]:
 
     Returns:
         [{symbol, pe, pb}, ...]（未做百分位，原始值）
+
+    2026-11-06 接入共享熔断（scope 'clist'）：这里是闸门覆盖缺口里最费钱的一处——
+    它绕过了 `fundflow` 里那层冷却判断直接翻页，封禁日整晚 50+ 页挨 403/重置，
+    等于替 IP 续封，而且拿回来的是空页。停调期返回 []，调用方本来就把空当"本次不更新"
+    （`update_valuation_task` 拿到空直接 return，库里旧分位原样保留），行为不变。
     """
     if not VALUATION_ENABLED:
         return []
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('clist'):
+            print('[估值] 东财 clist 在冷却/当日停调中，本次跳过（沿用库内旧分位）')
+            return []
+    except Exception:
+        pass
     rows: List[Dict] = []
     pn = 1
     while True:

@@ -107,7 +107,7 @@ def _f(v) -> Optional[float]:
 def _ensure_table() -> bool:
     try:
         from db.database import get_db_conn
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             conn.execute('''CREATE TABLE IF NOT EXISTS exit_seal_shadow (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

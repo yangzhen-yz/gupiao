@@ -97,7 +97,7 @@ def sync() -> int:
                 continue
             recs.append((f'{prefix}{pure}', pure, str(x.get('industryCode') or ''),
                          str(x.get('industry') or ''), now))
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         try:
             conn.execute(DDL)
             conn.execute('DELETE FROM stock_industry_map')      # 整表换水，不留旧行业

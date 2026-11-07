@@ -12,11 +12,13 @@
 """
 import time
 import threading
-from typing import (Dict, List)
+from typing import (Dict, List, Optional, Tuple)
 from datetime import datetime, timedelta
 import requests
 
-from app.config import SMART_MONEY_DRAGON_TIGER_DAYS
+from app.config import (SMART_MONEY_DRAGON_TIGER_DAYS, DRAGON_TIGER_PERSIST,
+                        DRAGON_TIGER_DB_FALLBACK)
+from db.database import load_dragon_tiger_rows_since, save_dragon_tiger_rows
 
 DRAGON_API = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
 DRAGON_HEADERS = {
@@ -29,7 +31,7 @@ DRAGON_COLUMNS = ('TRADE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,SECUCODE,'
                   'EXPLANATION,CHANGE_RATE,CLOSE_PRICE,FREE_MARKET_CAP')
 
 # 缓存(龙虎榜日级变动,1 小时 TTL 足够)
-_dt_cache: Dict = {'ts': 0, 'days': 0, 'map': {}, 'list': []}
+_dt_cache: Dict = {'ts': 0, 'days': 0, 'map': {}, 'list': [], 'source': ''}
 # 2026-11-04：刷新后台化（SWR）。旧实现缓存一失效就同步拉东财，timeout=15s，
 # 直接把 /api/stock/{symbol}/full 拖到 16.7~23.9s（线上实测）。龙虎榜是日级数据，
 # 晚一两分钟更新对评分毫无影响，绝不该压在用户请求的关键路径上。
@@ -65,7 +67,13 @@ def _latest_settled_trade_date() -> str:
 
 
 def _fetch_dragon_page(page_size: int = 1000) -> List[Dict]:
-    """拉取最近 pageSize 条龙虎榜记录(按交易日期倒序)"""
+    """拉取最近 pageSize 条龙虎榜记录(按交易日期倒序)
+
+    2026-11-06 接入共享熔断（scope 'datacenter'，域名 datacenter-web）：此前这里是
+    闸门覆盖缺口，封禁日照样裸打。注意**停调时不能返回 []**——上层
+    `_refresh_dt_cache` 会拿返回值整份覆盖内存缓存，返回空等于"把昨天的榜单清空"，
+    所以跳过判定放在 `_refresh_dt_cache` 里（跳过就不动缓存）。
+    """
     params = {
         'reportName': DRAGON_REPORT,
         'columns': DRAGON_COLUMNS,
@@ -76,19 +84,58 @@ def _fetch_dragon_page(page_size: int = 1000) -> List[Dict]:
         'ut': 'b2884a393a59ad64002292a3e90d46a5',
     }
     # 从 15s 单超时收紧为 (连接 3s, 读取 6s)：后台刷新线程可以慢慢等，请求链路不等
-    r = requests.get(DRAGON_API, params=params, headers=DRAGON_HEADERS, timeout=(3, 6))
-    r.raise_for_status()
-    data = r.json()
+    from services.data import eastmoney_guard
+    try:
+        r = requests.get(DRAGON_API, params=params, headers=DRAGON_HEADERS, timeout=(3, 6))
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        eastmoney_guard.fail('datacenter', e)
+        raise
+    eastmoney_guard.ok('datacenter', clear_domain=False)
     if not data.get('success'):
         return []
     res = data.get('result') or {}
     return res.get('data') or []
 
 
-def _aggregate(days: int = 5) -> Dict:
-    """聚合近 days 个交易日龙虎榜,返回 (symbol_map, sorted_list, latest_trade_date)"""
+def _dragon_rows(days: int = 5) -> Tuple[List[Dict], str]:
+    """取龙虎榜原始行：东财优先，取不到就回退 `dragon_tiger_daily` 留档。
+
+    返回 (rows, source)，source ∈ {'eastmoney', 'db'}——前端与"为什么这页是 X 号的榜"
+    都靠它，不能只在日志里说。
+
+    2026-11-06 新增的这条回退是为了补一个真空洞：龙虎榜此前**只有内存缓存**，
+    进程重启即空、东财停调即整块没有，而它是评分的第 13 因子（smart_money）。
+    关掉 `DRAGON_TIGER_DB_FALLBACK` 即回到改造前（停调时保持旧缓存、不读库）。
+    """
+    from services.data import eastmoney_guard
+    since = (datetime.now() - timedelta(days=days * 2 + 4)).strftime('%Y-%m-%d')
+    if eastmoney_guard.skip('datacenter'):
+        if not DRAGON_TIGER_DB_FALLBACK:
+            return [], 'eastmoney'
+        return load_dragon_tiger_rows_since(since), 'db'
+    try:
+        rows = _fetch_dragon_page(1000)
+    except Exception as e:
+        print(f'[聪明钱] 龙虎榜接口失败，回退库内留档: {type(e).__name__}: {e}')
+        return (load_dragon_tiger_rows_since(since), 'db') if DRAGON_TIGER_DB_FALLBACK else ([], 'eastmoney')
+    if rows and DRAGON_TIGER_PERSIST:
+        saved = save_dragon_tiger_rows(rows)        # 即写即提交；失败只打印
+        if saved:
+            print(f'[聪明钱] 龙虎榜留档 {saved} 行（覆盖写，幂等）')
+    return rows, 'eastmoney'
+
+
+def _aggregate(days: int = 5, rows: Optional[List[Dict]] = None) -> Dict:
+    """聚合近 days 个交易日龙虎榜,返回 (symbol_map, sorted_list, latest_trade_date)
+
+    `rows` 传入时直接用（东财与库内留档字段名一致，聚合口径必须同一段代码走到底，
+    写两份"看起来一样"的聚合迟早会漂）；不传时按老路自己拉接口。
+    """
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    rows = _fetch_dragon_page(1000)
+    if rows is None:
+        rows = _fetch_dragon_page(1000)
     agg: Dict[str, Dict] = {}
     latest_trade_date = ''
     for row in rows:
@@ -136,10 +183,21 @@ def _aggregate(days: int = 5) -> Dict:
 
 
 def _refresh_dt_cache(days: int = 5) -> None:
-    """拉东财并原子替换缓存。只允许后台刷新线程 / 展示页手动 force 调用。"""
-    symbol_map, sorted_list, latest_trade_date = _aggregate(days)
+    """取数（东财优先、留档兜底）并原子替换缓存。只允许后台线程 / 手动 force 调用。
+
+    两条规矩：
+      · **拿到空结果不许覆盖缓存**（2026-11-06）——接口停调又恰好库里没留档时，
+        继续往下走会算出空 map，把上次成功的榜单整份抹掉，第 13 因子当场归零；
+      · 缓存里带 `source`（eastmoney/db）与 `asOf`，龙虎榜页与评分侧要能说清
+        "这是今天的榜，还是 10-31 的留档"。
+    """
+    rows, source = _dragon_rows(days)
+    if not rows:
+        return
+    symbol_map, sorted_list, latest_trade_date = _aggregate(days, rows=rows)
     _dt_cache.update({'ts': time.time(), 'days': days, 'map': symbol_map,
-                      'list': sorted_list, 'latest_trade_date': latest_trade_date})
+                      'list': sorted_list, 'latest_trade_date': latest_trade_date,
+                      'source': source})
 
 
 def _spawn_dt_refresh(days: int = 5) -> bool:
@@ -200,6 +258,8 @@ def get_dragon_tiger(days: int = 5, top_n: int = 30, force: bool = False) -> Dic
         'latestTradeDate': latest_trade_date,
         'stocks': sorted_list[:top_n],
         'totalOnBoard': len(sorted_list),
+        # 2026-11-06：'db' 表示这份榜来自 dragon_tiger_daily 留档（东财停调/失败时）
+        'source': _dt_cache.get('source') or 'eastmoney',
     }
 
 
@@ -242,6 +302,15 @@ def get_northbound_market(force: bool = False) -> Dict:
     now = time.time()
     if not force and _nb_cache['ts'] and now - _nb_cache['ts'] < _NB_CACHE_TTL and _nb_cache['data']:
         return _nb_cache['data']
+    from services.data import eastmoney_guard
+    if eastmoney_guard.skip('push2'):
+        # 停调中：有旧值就沿用旧值（宁旧不假），没有才给全 0 + error，口径由前端显示
+        if _nb_cache['data']:
+            return _nb_cache['data']
+        return {'date': '', 'sh_net': 0, 'sz_net': 0, 'total': 0,
+                'month_sh': 0, 'month_sz': 0, 'sentiment': 'neutral',
+                'updated': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'error': '东财 push2 冷却/当日停调中'}
     try:
         r = requests.get(_NB_API, params={
             'fields1': 'f1,f3',
@@ -249,6 +318,7 @@ def get_northbound_market(force: bool = False) -> Dict:
             'ut': 'b2884a393a59ad64002292a3e90d46a5',
         }, headers=_NB_HEADERS, timeout=15)
         j = r.json()
+        eastmoney_guard.ok('push2', clear_domain=False)
         d = (j.get('data') or {})
         sh = d.get('hk2sh') or {}
         sz = d.get('hk2sz') or {}
@@ -276,7 +346,11 @@ def get_northbound_market(force: bool = False) -> Dict:
         _nb_cache.update({'ts': now, 'data': result})
         return result
     except Exception as e:
+        eastmoney_guard.fail('push2', e)
         print(f'[聪明钱] 北向资金获取失败: {e}')
+        # 失败也别把旧值丢掉：有旧缓存就继续给旧缓存（下面这行在 11-06 之前是直接给全 0）
+        if _nb_cache['data']:
+            return _nb_cache['data']
         return {'date': '', 'sh_net': 0, 'sz_net': 0, 'total': 0,
                 'month_sh': 0, 'month_sz': 0, 'sentiment': 'neutral',
                 'updated': datetime.now().strftime('%Y-%m-%d %H:%M'), 'error': str(e)}

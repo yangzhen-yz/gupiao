@@ -18,6 +18,18 @@ SQLITE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 
 DB_FAST_FAIL_ENABLED = True            # 总开关。False=所有写入仍用 30000ms，逐字节等于改造前
 DB_CACHE_WRITE_BUSY_TIMEOUT_MS = 2000  # 缓存/快照类写入的 busy_timeout（毫秒），留痕类不受影响
 
+# ---- 默认方向翻过来（2026-11-07，修⑤）----
+# 上面那套分级是"默认等 30 秒、缓存类点名快速失败"，问题在于**没点名的新写法自动落到长等**：
+# 11-04 实测 database.py 之外还有 114 处 `get_db_conn()` 从没分类过，也就是说那 114 处的
+# 失败方式全靠"没人记得改"来决定 —— 11-03 那次全站排队 8~30 秒，放大器正是这种长等。
+# 现在反过来：**默认就是 2 秒快速失败**，只有点名 `wait_for_lock=True` 的留痕类才等
+# `DB_TRACE_WRITE_BUSY_TIMEOUT_MS`。漏点的代价从"全站多等 30 秒"变成"这一行没落库"，
+# 后者轻得多：留痕类每一处都在 DAL 里有 `print('保存 X 失败')` 的现成出口，看得见；
+# 而长等是悄悄把整站拖死的（那次连 /api/health 都在排队）。
+# 哪些算留痕、为什么这么分，见 `scripts/db_writelock_default_selftest.py` 的 TRACE_TABLES
+# 与 `docs/工程知识库.md`「写锁分级：默认快速失败 + 留痕白名单」。
+DB_TRACE_WRITE_BUSY_TIMEOUT_MS = 30000  # 点名要等锁的留痕/用户数据写入的 busy_timeout（毫秒）
+
 # ---- 盘中写锁哨兵（2026-11-03）----
 # 独立连接试 BEGIN IMMEDIATE，等超阈值就拿不到 → 推企微，附"最后写入几分钟前 + 最近任务锚点"。
 # 这三项已接进 app_settings 覆盖表（配置页「数据库与写锁」，live=True 可盘中热改），
@@ -39,4 +51,4 @@ EASTMONEY_HEADERS = {
 }
 
 
-__all__ = ['DB_CACHE_WRITE_BUSY_TIMEOUT_MS', 'DB_FAST_FAIL_ENABLED', 'DB_LOCK_SENTINEL_COOLDOWN_MIN', 'DB_LOCK_SENTINEL_ENABLED', 'DB_LOCK_SENTINEL_THRESHOLD_SEC', 'EASTMONEY_HEADERS', 'SQLITE_DB_PATH']
+__all__ = ['DB_CACHE_WRITE_BUSY_TIMEOUT_MS', 'DB_FAST_FAIL_ENABLED', 'DB_LOCK_SENTINEL_COOLDOWN_MIN', 'DB_LOCK_SENTINEL_ENABLED', 'DB_LOCK_SENTINEL_THRESHOLD_SEC', 'DB_TRACE_WRITE_BUSY_TIMEOUT_MS', 'EASTMONEY_HEADERS', 'SQLITE_DB_PATH']

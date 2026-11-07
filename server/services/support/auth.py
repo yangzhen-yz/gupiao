@@ -62,7 +62,7 @@ def create_user(username: str, password: str, display_name: str = ''
         return False, f'密码至少 {AUTH_MIN_PASSWORD_LEN} 位', None
 
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.cursor()
         cur.execute('SELECT id FROM users WHERE username = ?', (username,))
         if cur.fetchone():
@@ -125,7 +125,7 @@ def change_password(user_id: int, old_password: str, new_password: str
     if len(new_password) < AUTH_MIN_PASSWORD_LEN:
         return False, f'新密码至少 {AUTH_MIN_PASSWORD_LEN} 位'
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.cursor()
         cur.execute('SELECT * FROM users WHERE id = ?', (int(user_id),))
         row = cur.fetchone()
@@ -160,7 +160,7 @@ def authenticate(username: str, password: str
             return None, None, f'密码错误次数过多，请 {left} 秒后再试'
 
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.cursor()
         cur.execute('SELECT * FROM users WHERE username = ?', (username,))
         row = cur.fetchone()
@@ -225,7 +225,7 @@ def logout(token: str) -> bool:
     if not token:
         return False
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cur = conn.cursor()
         cur.execute('DELETE FROM user_sessions WHERE token = ?', (token,))
         conn.commit()

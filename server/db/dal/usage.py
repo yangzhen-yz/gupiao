@@ -10,7 +10,7 @@ def save_api_usage_daily(rows) -> int:
         # 2026-11-03 从 fast_fail 摘回 30 秒（昨天分类分错了）：这不是"可重拉的缓存"，
         # 而是接口调用量的**审计留痕**——它是"东财 fail 比率为什么暴涨""哪个调用方没接闸门"
         # 这些判断的唯一依据，丢一天就永久补不回来（计数是累加值，没有源头可重算）。
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.executemany(
             '''INSERT INTO api_usage_daily(date, provider, interface, count, ok, fail)
@@ -63,7 +63,7 @@ def load_api_usage_history(days: int = 14) -> List[Dict]:
 def save_api_usage_limit(provider: str, interface: str, limit: int, updated_by: str = '') -> bool:
     """保存（upsert）某接口的每日上限。"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute(
             '''INSERT INTO api_usage_limits(provider, interface, daily_limit, updated_by, updated_at)

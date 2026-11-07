@@ -308,6 +308,15 @@ def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, r
         失败返回 []。
     """
     url = _EM_ZT_POOL_URL if pool_type == 'zt' else _EM_DT_POOL_URL
+    # 11-06：三池走 push2ex，与 push2delay 的 clist 不是一条链路（近 14 天失败率
+    # 1.0% vs 47.5%），所以它有自己的 scope，不再被 clist 的熔断连带停掉。
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('pools'):
+            print(f'[收评] {pool_type}pool 跳过：东财 pools 家族在冷却/停调中')
+            return []
+    except Exception:
+        pass
     sort_type = 'fbt:asc' if pool_type == 'zt' else 'fund:asc'
     params = {
         'ut': _EM_POOL_UT,
@@ -324,6 +333,13 @@ def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, r
             r.raise_for_status()
             data = r.json()
             pool = (data.get('data') or {}).get('pool') or []
+            try:
+                from services.data import eastmoney_guard
+                # clear_domain=False：push2ex 通不代表 push2delay 通，不能让三池的成功
+                # 替 clist/ulist 提前探测（那正是 10-23 给 appdata 定同样的规矩的理由）
+                eastmoney_guard.ok('pools', clear_domain=False)
+            except Exception:
+                pass
             return pool
         except Exception as e:
             last_err = e
@@ -337,6 +353,11 @@ def _em_zt_pool_get(date_str: str, pool_type: str = 'zt', pagesize: int = 500, r
                 time.sleep(0.5 * (attempt + 1))
     print(f'[收评] {pool_type}pool 重试后仍失败（{attempt + 1}/{retries} 次）'
           f' date={date_str} err={last_err}')
+    try:
+        from services.data import eastmoney_guard
+        eastmoney_guard.fail('pools', last_err)
+    except Exception:
+        pass
     return []
 
 
@@ -422,7 +443,18 @@ def _em_clist_get(fid: str, fs: str, fields: str, pz: int, po: int = 1, pn: int 
 def _em_zb_pool_get(date_str: str, pagesize: int = 500, retries: int = 3, timeout: float = 12.0) -> List[Dict]:
     """东方财富炸板池专用API（曾涨停但开板未回封）。
     失败返回 []。
+
+    2026-11-06：补上共享熔断（scope 'pools'，与涨/跌停池同域 push2ex）。此前这里是
+    闸门覆盖缺口里最坏的一种——**既在打接口（3 次重试 × 12s 全跑完才认输，等于给封禁
+    续命），又算不出数**（返回 [] 后炸板率照样置缺）。现在冷却/停调期内直接返回 []，
+    连接级失败不再重试。
     """
+    try:
+        from services.data import eastmoney_guard
+        if eastmoney_guard.skip('pools'):
+            return []
+    except Exception:
+        pass
     params = {
         'ut': _EM_POOL_UT,
         'dpt': 'wz.ztzt',
@@ -437,12 +469,28 @@ def _em_zb_pool_get(date_str: str, pagesize: int = 500, retries: int = 3, timeou
             r = _requests.get(_EM_ZB_POOL_URL, params=params, headers=_EM_POOL_HEADERS, timeout=timeout)
             r.raise_for_status()
             data = r.json()
+            try:
+                from services.data import eastmoney_guard
+                eastmoney_guard.ok('pools', clear_domain=False)
+            except Exception:
+                pass
             return (data.get('data') or {}).get('pool') or []
         except Exception as e:
             last_err = e
+            try:
+                from services.data import eastmoney_guard
+                if not eastmoney_guard.should_retry(e):
+                    break
+            except Exception:
+                pass
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
     print(f'[收评] 炸板池全部{retries}次重试失败 date={date_str} err={last_err}')
+    try:
+        from services.data import eastmoney_guard
+        eastmoney_guard.fail('pools', last_err)
+    except Exception:
+        pass
     return []
 
 
