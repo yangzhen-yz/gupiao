@@ -226,17 +226,42 @@ async def _no_gems(a, b, c):
     return []
 
 
+def _pick_ts(final: bool, base: float = None) -> float:
+    """挑一个落在指定那一侧（定版 / 未定版）、且龄期 > 2h 的快照时间戳。
+
+    11-07 修⑩-4：本文件原来五处写死 `time.time() − 6/8 小时`当"超龄快照"，
+    但 2026-10-31 线上给 closed 分支加了 `_snapshot_final(ts)` 这道判据
+    （ts 不早于「最近一个交易日 15:05」= 收盘定版，休市时既不算旧、也不再走新浪全市场重算，
+    因为重算出来的还是同一份，实测首开约 15 秒）。周末/夜间一跑，now−6h 落在周五收盘之后
+    ⇒ 判据说"这是定版" ⇒ 补算不发起、stale 不亮 ⇒ 五条断言全红，而线上行为是对的。
+    今天这 5 条红就是那 5 处写法过期（`fundflow_selftest` 另有 2 条同源）。
+    定版那一侧的正例由 `fundflow_selftest.py` 第 [4] 组覆盖，这里只把"未定版"这一侧钉死。
+    """
+    base = base if base is not None else time.time()
+    step = 0
+    while step < 400:
+        ts = base - step * 3600
+        if (base - ts) > F._STALE_AFTER_SEC and bool(F._snapshot_final(ts)) == final:
+            return ts
+        step += 1
+    raise AssertionError('找不到落在期望那一侧的快照时间戳（判据本身又变了？）')
+
+
+_TS_OLD = _pick_ts(False)
+print(f'[口径] 本次"超龄快照"用 {_TS_OLD}（{F._snapshot_final(_TS_OLD)} = 定版？）——'
+      f'按判据现挑，不写死小时数')
+
 F._sina_stock_rankings = _stub_rank
 F._sina_sector_rankings = _no_sector
 F._sina_hidden_gems = _no_gems
 
 F._LAST_GOOD['stocks'] = {'data': {'inflow': [{'symbol': 'old'}], 'outflow': []},
-                          'ts': time.time() - 6 * 3600}      # 6 小时前的旧快照
-F._LAST_GOOD['sectors'] = {'data': {}, 'ts': time.time() - 6 * 3600}
-F._LAST_GOOD['hidden'] = {'data': [], 'ts': time.time() - 6 * 3600}
+                          'ts': _TS_OLD}               # 未定版的旧快照（该补算）
+F._LAST_GOOD['sectors'] = {'data': {}, 'ts': _TS_OLD}
+F._LAST_GOOD['hidden'] = {'data': [], 'ts': _TS_OLD}
 F._CACHE.clear()
 d = asyncio.run(F.get_fund_flow_summary())
-ck('sina' in calls_now, '收盘后快照超龄 → 用新浪排行补算当日排名（不再拿昨天的数）')
+ck('sina' in calls_now, '收盘后快照超龄（未定版）→ 用新浪排行补算当日排名（不再拿昨天的数）')
 ck(d['dataSource']['stocks'] == 'sina', f'来源标成 sina（实得 {d["dataSource"]}）')
 ck(d['stale'] is False, '补算成功就不该再挂"离线快照"警示')
 
@@ -252,7 +277,7 @@ ck(d2['dataSource']['stocks'] == 'snapshot' and d2['stocks']['inflow'][0]['symbo
 print('\n[7] 熔断只关东财：东财冷却时备源必须继续顶上（10-19 就是这条把页面冻在两天前的数上）')
 F._clist_circuit_open = lambda: True
 F._LAST_GOOD['stocks'] = {'data': {'inflow': [{'symbol': 'old2'}], 'outflow': []},
-                          'ts': time.time() - 8 * 3600}
+                          'ts': _TS_OLD}                 # 未定版超龄（原写死 8 小时前）
 calls_now.clear()
 F._CACHE.clear()
 d3 = asyncio.run(F.get_fund_flow_summary())
@@ -270,7 +295,7 @@ async def _dead_rank(top_n):
 
 F._sina_stock_rankings = _dead_rank
 F._LAST_GOOD['stocks'] = {'data': {'inflow': [{'symbol': 'old3'}], 'outflow': []},
-                          'ts': time.time() - 8 * 3600}
+                          'ts': _TS_OLD}                 # 未定版超龄（原写死 8 小时前）
 F._CACHE.clear()
 d4 = asyncio.run(F.get_fund_flow_summary())
 ck(d4['stocks']['inflow'] and d4['stocks']['inflow'][0]['symbol'] == 'old3',

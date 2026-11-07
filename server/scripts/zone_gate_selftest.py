@@ -157,5 +157,50 @@ _push_src = open(os.path.join(os.path.dirname(__file__), '..', 'services', 'supp
 ck('gate_stock as _zone_gate' in _push_src and '_zone_gate(stock)' in _push_src,
    'push.py _pass_filter 调用 gate_stock')
 
+print('\n[9] 推送侧 ST 复核：判据坏了要"否决这一只"，不许静默放行（11-07 修⑩-6）')
+import builtins as _b9
+import services.support.push as _P
+import services.data.universe as _U
+
+ck(_P._st_name_veto({'symbol': 'sh600001', 'name': '*ST 华业'}) is True, 'ST 名称 ⇒ 否决')
+ck(_P._st_name_veto({'symbol': 'sh600002', 'name': '退市整理票'}) is True, '名称含"退" ⇒ 否决')
+ck(_P._st_name_veto({'symbol': 'sz000001', 'name': '平安银行'}) is False, '正常名称 ⇒ 放行')
+
+_orig_is_st = _U.is_st_name
+_buf9, _old_print9 = [], _b9.print
+
+
+def _cap9(*a, **k):
+    line = ' '.join(str(x) for x in a)
+    if 'ST 名称' in line:            # 只截这一类，其余照原样输出（不吞 ck 回显）
+        _buf9.append(line)
+    else:
+        _old_print9(line, **k)
+
+
+def _boom_st(name):
+    raise ImportError('模拟判据本身坏掉')
+
+
+try:
+    _U.is_st_name = _boom_st
+    _b9.print = _cap9
+    try:
+        v = _P._st_name_veto({'symbol': 'sz000004', 'name': '某只票'})
+    finally:
+        _b9.print = _old_print9
+    ck(v is True, '判据抛异常 ⇒ 仍然否决（原来是 pass，等于把风险票放过去）')
+    ck(len(_buf9) == 1 and '复核不可用' in _buf9[0], f'坏掉这一件事必须看得见（实得 {len(_buf9)} 行）')
+except Exception as e:
+    ck(False, f'异常路径本身抛出来了: {type(e).__name__}: {e}')
+finally:
+    _U.is_st_name = _orig_is_st
+    _b9.print = _old_print9
+
+ck('_st_name_veto(stock)' in open(os.path.join(os.path.dirname(__file__), '..',
+                                               'services', 'support', 'push.py'),
+                                  encoding='utf-8').read(),
+   '_pass_filter 真的调这条否决（不是写了个没人调的函数）')
+
 print('\n' + ('全部通过' if not FAILS else f'失败 {len(FAILS)} 项：{FAILS}'))
 sys.exit(1 if FAILS else 0)

@@ -19,16 +19,24 @@
 三种合法隔离（都认）
 --------------------
 1. `dbmod.use_db_path(路径)` —— 同时改 `database` 与 `dal_state` 两份，推荐；
-2. 把 `get_db_conn` 换成桩（`某模块.get_db_conn = lambda ...`），写入落到内存/临时文件；
+2. 把 `get_db_conn` 换成桩 —— **只算打在"真正执行写入的那个模块"上**（如
+   `from db.dal import recommend as dr; dr.get_db_conn = 桩`）；
 3. 所有 `sqlite3.connect(...)` 的目标都是临时路径（`tempfile`/`mkstemp`/`gettempdir`/`:memory:`）。
 
-三条规则
+四条规则
 --------
 - **R1 会写库却没有上面任何一种隔离** —— 一定在写生产库。
 - **R2 换库方式写错**：给 `config`/`database`/`dal_state` 这类门面或副本赋 `SQLITE_DB_PATH=`。
   赋给**被测模块自己**的那个全局是有效的（如 `eval_lab.SQLITE_DB_PATH`：
   `eval_lab.py:28` 是 `from app.config import SQLITE_DB_PATH`，`:46` 调用时才读），不算违规。
 - **R3 直连生产库文件**（`gupiao.db`／`history_kline.db`／`SQLITE_DB_PATH`）且不是 `mode=ro`。
+- **R4（11-07 新加）把 `get_db_conn` 的桩打在门面/共享层上**（`db.`、`dbmod.`、`database.`、
+  `db.dal_state.` 这些别名）——和 R2 是同一件事的另一半：11-05 `database.py` 拆分后，
+  各 DAL 模块用的是自己那份星号副本，赋在门面上的桩**对写入路径完全无效**。
+  实拍漏口：`scripts/daily_recs_cache_selftest.py` 从 11-05 起每次跑都往真库
+  `daily_recommendations`/`recommendation_batches` 写假批次，而检查器一直把那句赋值
+  当成"已隔离"（老版第二条合法隔离写得太宽）。现在门面桩**既不算隔离、又单独报 R4**；
+  同一文件里若已有 `use_db_path`，桩可以只是故障注入，不报。
 
 判据为什么长这样（两条都是踩出来的）
 ------------------------------------
@@ -69,6 +77,8 @@ PROD_DB = re.compile(r'gupiao\.db|history_kline\.db|history_minute\.db|SQLITE_DB
 READ_ONLY = re.compile(r'mode=ro|mode%3Dro')
 WRITE_TEXT = re.compile(r'INSERT\s|REPLACE\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM', re.I)
 LEAF_CALLEE = lambda name: (name or '').split('.')[-1]     # noqa: E731
+# `X.get_db_conn = 桩` 里的 X 落在门面/共享层 ⇒ 桩对写入路径无效（见文件头 R4）
+FACADE_STUB_ROOT = re.compile(r'^(?:' + FACADE + r')(?:\.(?:database|dal_state))?$')
 
 
 def _callee(node: ast.Call) -> str:
@@ -141,8 +151,15 @@ def scan_source(rel: str, src: str) -> List[Dict]:
     assigns = _assign_targets(src)
 
     swapped = any(LEAF_CALLEE(c['callee']) == 'use_db_path' for c in calls)
-    stubbed = any(t['target'].endswith('.get_db_conn') or t['target'] == 'get_db_conn'
-                  for t in assigns)
+    # 桩分两种：打在**被测模块自己**的名字上有效（真隔离），打在门面/共享层别名上无效。
+    # 老版本把后者也算作"已隔离"，于是 `daily_recs_cache_selftest` 那种一路写进真库的
+    # 脚本连续两周检查器全绿（11-07 体检实拍，见本文件头 R4）。
+    stub_targets = [t for t in assigns
+                    if t['target'].endswith('.get_db_conn') or t['target'] == 'get_db_conn']
+    stub_facade = [t for t in stub_targets
+                   if '.' in t['target']
+                   and FACADE_STUB_ROOT.match(t['target'].rsplit('.', 1)[0])]
+    stubbed = bool([t for t in stub_targets if t not in stub_facade])
     prod_conns = [c for c in calls
                   if LEAF_CALLEE(c['callee']) == 'connect'
                   and PROD_DB.search(c['args']) and not READ_ONLY.search(c['args'])]
@@ -155,6 +172,12 @@ def scan_source(rel: str, src: str) -> List[Dict]:
         hits.append({'rule': 'R1', 'line': wline,
                      'detail': '会写库但没有任何隔离（没 use_db_path、没把 get_db_conn 换成桩、'
                                '也不是全临时路径）→ 写的就是生产库'})
+    if stub_facade and not swapped:
+        hits.append({'rule': 'R4', 'line': stub_facade[0]['line'],
+                     'detail': f'{stub_facade[0]["target"]} = 桩 打在门面/共享层上，'
+                               '11-05 拆分后各 DAL 用的是自己那份星号副本 → 这行对写入路径无效，'
+                               '别拿它当隔离；换库请调 dbmod.use_db_path(路径)，'
+                               '要注桩就打在真正执行写入的那个模块上'})
     if not swapped:
         m = FACADE_ASSIGN.search(src)
         if m:
