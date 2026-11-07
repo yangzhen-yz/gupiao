@@ -39,7 +39,7 @@ def load_strategy_factor_weights() -> Dict:
 def save_strategy_factor_weights(weights_data: Dict) -> bool:
     """保存动态权重"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         for factor_name, data in weights_data.items():
             # 跳过非法因子 key（防止前端传入未识别的英文 key 写入数据库）
@@ -73,7 +73,7 @@ def save_strategy_factor_weights(weights_data: Dict) -> bool:
 def save_predictions(predictions: List[Dict]) -> bool:
     """保存扫描预测记录"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         for p in predictions:
             cursor.execute(

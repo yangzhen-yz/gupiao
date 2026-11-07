@@ -122,7 +122,7 @@ def save_daily_recommendations(daily_recommendations: List[Dict],
             daily_recommendations = daily_recommendations[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
         import datetime as _dt
         stamp = batch_time or _dt.datetime.now().strftime('%H:%M:%S')
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         for idx, rec_group in enumerate(daily_recommendations):
             rec_date = rec_group.get('date', '')
@@ -223,7 +223,7 @@ def delete_daily_recommendations_by_date(rec_date: str) -> bool:
     删除类操作必须显式 DELETE，不能依赖 save 的替换语义。
     """
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM daily_recommendations WHERE rec_date = ?', (rec_date,))
         deleted = cursor.rowcount

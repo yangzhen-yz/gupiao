@@ -42,7 +42,7 @@ def load_user_scan_pool(user_id: Optional[int] = None) -> List[str]:
 def save_user_scan_pool(symbols: List[str], user_id: int = 1) -> bool:
     """整池覆盖写入（只动该用户的行，不再清空全表）"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM user_scan_pool WHERE user_id = ?', (int(user_id),))
         for symbol in symbols:
@@ -81,7 +81,7 @@ def load_user_positions(user_id: int = 1) -> List[Dict]:
 def save_user_position(pos: Dict, user_id: int = 1) -> bool:
     """新增/更新一条持仓（按 (user_id, symbol) 去重，不同用户互不覆盖）"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('''INSERT INTO user_positions (user_id, symbol, name, cost_price, shares, buy_date, note, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))
@@ -103,7 +103,7 @@ def save_user_position(pos: Dict, user_id: int = 1) -> bool:
 def delete_user_position(symbol: str, user_id: int = 1) -> bool:
     """按 (user_id, symbol) 删除持仓 —— 只能删自己的"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM user_positions WHERE user_id = ? AND symbol = ?',
                        (int(user_id), symbol.lower()))
@@ -125,7 +125,7 @@ def save_position_trade_log(rec: Dict, user_id: int = 1) -> bool:
     except Exception:
         return False
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('''INSERT INTO position_trade_log
             (trade_date, user_id, symbol, name, source, shares_before, price, qty,
              shares_after, cost_price_after, realized_pnl, note)
@@ -182,7 +182,7 @@ def get_user_capital(user_id: int = 1) -> float:
 def save_user_capital(principal: float, user_id: int = 1, note: str = '') -> bool:
     """写入初始本金（每个账号一行，重复保存为更新）"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('''INSERT INTO user_capital (user_id, principal, note, updated_at)
             VALUES (?, ?, ?, datetime('now', '+8 hours'))
             ON CONFLICT(user_id) DO UPDATE SET
@@ -215,7 +215,7 @@ def add_user_realized_pnl(delta: float, user_id: int = 1) -> float:
     if delta is None:
         return None
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         conn.execute('''INSERT INTO user_realized_pnl (user_id, realized_pnl, trades, updated_at)
             VALUES (?, ?, 1, datetime('now', '+8 hours'))
             ON CONFLICT(user_id) DO UPDATE SET

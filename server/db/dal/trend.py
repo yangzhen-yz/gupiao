@@ -388,7 +388,7 @@ def load_trend_dimension_weights() -> Dict:
 def save_trend_dimension_weights(weights_data: Dict) -> bool:
     """保存 D1-D4 趋势维度权重"""
     try:
-        conn = get_db_conn()
+        conn = get_db_conn(wait_for_lock=True)
         cursor = conn.cursor()
         _ensure_optimizer_v2_columns(cursor)
         for dim_key, data in weights_data.items():
