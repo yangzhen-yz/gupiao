@@ -831,6 +831,21 @@ def scan_once(scan_max: Optional[int] = None) -> List[Dict]:
     except Exception as s_err:
         print(f'[龙头影子] 本轮写入异常（不影响主链路）: {type(s_err).__name__}: {s_err}')
 
+    # T2.7：持久化候选票当日完整分钟 bar，供 dragon_backtest.simulate() 复盘真实收益。
+    # 落库失败只打印，绝不打断扫描主链路；UPSERT 保证每只票留当日最完整一根。
+    try:
+        from services.pick import dragon_minute_store as _dms
+        _saved = 0
+        for r in results:
+            b = r.get('bars')
+            if b:
+                _dms.save_minute(today, r['symbol'], b)
+                _saved += 1
+        if _saved:
+            print(f'[龙头分钟bar] 本轮落库 {_saved} 只')
+    except Exception as m_err:
+        print(f'[龙头分钟bar] 本轮落库异常（不影响主链路）: {type(m_err).__name__}: {m_err}')
+
     hits = []
     for r in results:
         pt = r['best'] if r['best']['score'] >= r['point']['score'] else r['point']
