@@ -46,6 +46,8 @@ from app.config import (SLOW_DATA_HOLDER_NUM_WEEKDAYS, SLOW_DATA_FUNDAMENTAL_WEE
 from app.config import WESTOCK_CROSSCHECK_TIME
 from app.config import EVAL_LAB_ENABLED, EVAL_LAB_TIME, EVAL_LAB_WEEKDAY
 from app.config import AUCTION_SNAPSHOT_ENABLED, AUCTION_SNAPSHOT_TIME, AUCTION_SNAPSHOT_BATCH
+from app.config import (AUCTION_DIP_SHADOW_ENABLED, AUCTION_DIP_MORNING_TIME,
+                        AUCTION_DIP_RETRY_TIME, AUCTION_DIP_EVENING_TIME)
 from app.config import MINUTE5_FORWARD_ENABLED, MINUTE5_FORWARD_TIME
 # 盘中龙头通道（2026-11-01）：默认关，影子期只落库不推送
 from app.config import (INTRADAY_DRAGON_ENABLED, INTRADAY_DRAGON_START,
@@ -942,6 +944,37 @@ def run_scheduler():
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 竞价快照失败: {e}')
 
+    def job_auction_dip_morning():
+        """竞价低吸臂影子·判定轮（2026-11-07，影子台账第 20 条）：把"昨日涨停池×今日竞价快照"
+        按缺口分五档落 auction_dip_shadow。**只记录**——不改评分、不改门槛、不改推送。
+        纯本地读（池子+快照都已落库），不发网络请求、不阻塞 09:45 推荐；快照没采到就跳过并写明原因
+        （竞价事后补不回，一张错表比没有表更坏）。09:40 还有一班幂等补跑。"""
+        try:
+            from services.pick import auction_dip_shadow as _ads
+            if not _ads.enabled():
+                return
+            r = _ads.run_morning()
+            if r.get('skipped'):
+                print(f"[竞价低吸影子] 跳过：{r['skipped']}")
+            elif r.get('error'):
+                print(f"[竞价低吸影子] 未落库: {r['error']}")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 竞价低吸影子判定轮失败: {e}')
+
+    def job_auction_dip_evening():
+        """竞价低吸臂影子·回填轮（2026-11-07，台账第 20 条）：日K五批（18:15~20:15）之后，
+        把日内腿/隔夜腿/合计腿/同日范围等权基准能补的补上，历史缺行一起自愈。
+        排 20:40：在出口分叉 20:35 之后，两条影子各写各的表、互不依赖。"""
+        try:
+            from services.pick import auction_dip_shadow as _ads
+            if not _ads.enabled():
+                return
+            r = _ads.run_evening()
+            if r.get('error'):
+                print(f"[竞价低吸影子] 回填失败: {r['error']}")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 竞价低吸影子回填轮失败: {e}')
+
     def job_minute5_forward():
         """收盘后采集活跃票 5 分钟线（默认关）。"""
         if not _today_is_trading():
@@ -1461,6 +1494,12 @@ def run_scheduler():
     # 采 2462 只约 41 次请求、10 秒内完成，9:45 推荐前早已结束
     schedule.every().day.at(AUCTION_SNAPSHOT_TIME).do(_warp_trading_only(job_auction_snapshot))
 
+    # 竞价低吸臂影子（2026-11-07，台账第 20 条）：9:31 判定（快照 9:25 采完之后）、9:40 幂等补一班，
+    # 20:40 回填三条腿（日K五批 18:15~20:15 之后）；只写旁路表，不改评分/门槛/推送
+    schedule.every().day.at(AUCTION_DIP_MORNING_TIME).do(_warp_trading_only(job_auction_dip_morning))
+    schedule.every().day.at(AUCTION_DIP_RETRY_TIME).do(_warp_trading_only(job_auction_dip_morning))
+    schedule.every().day.at(AUCTION_DIP_EVENING_TIME).do(_warp_trading_only(job_auction_dip_evening))
+
     # 收盘后 5 分钟线前向采集（2026-10-22，默认关）：只采当天推荐/持仓/海选池活跃票，
     # 15:05 跑完不耽误 15:10 收评；替代已被 baostock 判黑卡住的逐只分钟线
     schedule.every().day.at(MINUTE5_FORWARD_TIME).do(_warp_trading_only(job_minute5_forward))
@@ -1583,6 +1622,11 @@ def run_scheduler():
           f'落 westock_snapshot + data_cross_check；行情不一致告警、资金流记符号冲突）')
     print(f'[定时任务]   - {AUCTION_SNAPSHOT_TIME}: 集合竞价快照（腾讯批量，落 auction_snapshot；'
           f'仅竞价窗口 09:24~09:31 写入，晚跑拒写）')
+    print(f'[定时任务]   - {AUCTION_DIP_MORNING_TIME}/{AUCTION_DIP_RETRY_TIME}: 竞价低吸臂影子判定'
+          f'（昨日涨停池×今日竞价缺口分五档，落 auction_dip_shadow；只记录不改动作，'
+          f'{"已启用" if AUCTION_DIP_SHADOW_ENABLED else "默认关"}）')
+    print(f'[定时任务]   - {AUCTION_DIP_EVENING_TIME}: 竞价低吸臂影子回填（日内/隔夜/合计三条腿'
+          f'+同日范围等权基准，历史缺行自愈；只记录）')
     print(f'[定时任务]   - {MINUTE5_FORWARD_TIME}: 5分钟线前向采集（活跃票，落 minute_5m；'
           f'{"已启用" if MINUTE5_FORWARD_ENABLED else "默认关"}）')
     print(f'[定时任务]   - 每周{"一二三四五六日"[EVAL_LAB_WEEKDAY]} {EVAL_LAB_TIME}: '
