@@ -283,11 +283,22 @@ def diagnose_position(pos: Dict, quote: Optional[Dict], market_change: float,
 
     # 统一卖出计划（2026-10-22）：三机制并列。默认只挂 exit_plan 展示，
     # 不改变上述任何动作；只有 exit_rules_live_enabled=True 才接管。
+    _qchg = float(quote.get('changePercent')) if quote and quote.get('changePercent') is not None else None
     try:
-        from services.portfolio.exit_rules import plan_exit
+        from services.portfolio.exit_rules import plan_exit, gather_sell_context
+        # 用户4条卖点所需真实数据（best-effort；缺数据由 exit_rules 侧标记 unavailable，不误触发）
+        _ctx = gather_sell_context(sym, quote)
         plan = plan_exit(symbol=sym, cost=cost, price=price, buy_date=buy_date,
                          stop_price=stop_price, target_price=out['target_price'],
-                         trailing=trailing, trend_result=tr)
+                         trailing=trailing, trend_result=tr,
+                         day_gain_pct=_qchg,
+                         now_hm=datetime.now().strftime('%H:%M'),
+                         market_down=(market_change < 0),
+                         yest_limit_up=_ctx.get('yest_limit_up', False),
+                         vol_today=_ctx.get('vol_today'),
+                         vol_yest=_ctx.get('vol_yest'),
+                         limit_down=(_qchg is not None and _qchg <= -9.5),
+                         sector_down=_ctx.get('sector_down'))
         out['exit_plan'] = plan
         if plan.get('enabled') and plan.get('live') and plan.get('action') == 'exit' \
                 and out.get('action') != 'stop_loss':

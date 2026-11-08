@@ -58,7 +58,12 @@ def _global_on() -> bool:
 def plan_exit(*, symbol: str, cost: float, price: float, buy_date: str = '',
               stop_price: Optional[float] = None, target_price: Optional[float] = None,
               trailing: Optional[Dict] = None, trend_result: Optional[Dict] = None,
-              today: Optional[date] = None) -> Dict:
+              today: Optional[date] = None,
+              yest_limit_up: bool = False, vol_today: Optional[float] = None,
+              vol_yest: Optional[float] = None, day_gain_pct: Optional[float] = None,
+              now_hm: Optional[str] = None, late_spike: bool = False,
+              limit_down: Optional[bool] = None, market_down: bool = False,
+              sector_down: bool = False) -> Dict:
     """生成统一卖出计划。所有入参都由 `position.py` 已经算好的值传入，本函数不再取数。
 
     返回：
@@ -117,6 +122,65 @@ def plan_exit(*, symbol: str, cost: float, price: float, buy_date: str = '',
                    (f'持有{days_held}天，未到时间止损条件' if days_held is not None else
                     '买入日期缺失，时间止损不计'))
 
+    # ---------- 用户 4 条卖点（2026-11-08，影子先行）----------
+    # 每条独立、缺数据则 available=False（绝不误触发），与既有三机制并列；
+    # 只算计划不动作，仅 exit_rules_live_enabled=True 才接管（见 position.py 映射）。
+    user4_on = bool(_set('exit_rules_user4_enabled', 'EXIT_RULES_USER4_ENABLED', True))
+    _now = (now_hm or datetime.now().strftime('%H:%M'))
+    _market_down = bool(market_down)
+    _day_gain = day_gain_pct  # 今日涨跌幅%；缺失则相关规则不可用，严禁回落到持仓盈亏
+
+    # 规则1：昨涨停 + 今量≥2倍昨 + 涨幅<5% → 放量滞涨/出货
+    u1_avail, u1_hit, u1_detail = False, False, '数据缺失（需昨涨停标记+今/昨量能）'
+    if user4_on and yest_limit_up and vol_today and vol_yest and vol_yest > 0 and _day_gain is not None:
+        u1_avail = True
+        u1_ratio = vol_today / vol_yest
+        u1_hit = (u1_ratio >= 2.0) and (_day_gain < 5.0)
+        u1_detail = (f'昨涨停+今量{u1_ratio:.1f}×昨(≥2)但涨幅{_day_gain:+.1f}%<5%，放量滞涨疑似出货'
+                     if u1_hit else
+                     f'昨涨停+今量{u1_ratio:.1f}×昨、涨幅{_day_gain:+.1f}%，未触发滞涨')
+
+    # 规则2：14:00 后突然拉升 → 尾盘偷袭（需调用方给出 late_spike 检测）
+    u2_avail, u2_hit, u2_detail = False, False, '数据缺失（需尾盘拉升检测 late_spike）'
+    if user4_on and late_spike:
+        u2_avail = True
+        u2_hit = _now >= '14:00'
+        u2_detail = (f'{_now} 尾盘拉升→减仓信号' if u2_hit else
+                     f'{_now} 早于14:00，尾盘偷袭不触发')
+
+    # 规则3：持仓（非当日买入）跌停 → 能走一定要走（T+1 纪律）
+    u3_avail, u3_hit, u3_detail = False, False, '数据缺失（需跌停标记）'
+    if user4_on and limit_down is not None:
+        u3_avail = True
+        if limit_down:
+            if days_held is not None and days_held >= 1:
+                u3_hit = True
+                u3_detail = '持仓跌停且为前日买入，T+1 可卖，立即离场'
+            else:
+                u3_detail = '当日买入跌停，T+1 无法卖出，次日再处理'
+        else:
+            u3_detail = (f'现价未跌停（{_day_gain:+.1f}%），不触发'
+                         if _day_gain is not None else '现价未跌停，不触发')
+
+    # 规则4：大盘下跌 + 个股红盘但涨幅<5% → 逆势抗跌，防次日补跌
+    u4_avail, u4_hit, u4_detail = False, False, '大盘方向缺失'
+    if user4_on and _market_down and _day_gain is not None:
+        u4_avail = True
+        # 用户规则4 = 大盘+板块“都下跌”才走。板块方向已知时严格按双跌判定；
+        # 未知时按大盘弱近似（保守不误杀：只有板块明确未跌才放行为不触发）。
+        if sector_down is True:
+            _sector_note = '板块同步下跌，'
+            u4_hit = (0.0 < _day_gain < 5.0)
+        elif sector_down is False:
+            _sector_note = '但板块未下跌（与规则不符），'
+            u4_hit = False
+        else:
+            _sector_note = '板块方向未接入（暂按大盘弱近似），'
+            u4_hit = (0.0 < _day_gain < 5.0)
+        u4_detail = (f'大盘下跌+个股红盘{_day_gain:+.1f}%<5%：{_sector_note}次日补跌概率大'
+                     if u4_hit else
+                     f'大盘下跌但个股{_day_gain:+.1f}%（非“红盘小涨”区间，或板块未同跌），不触发')
+
     mechs = [
         {'id': 'fixed', 'label': '固定止损', 'hit': fixed_hit,
          'line': _round(effective_stop), 'detail': fixed_detail, 'available': bool(effective_stop)},
@@ -124,10 +188,20 @@ def plan_exit(*, symbol: str, cost: float, price: float, buy_date: str = '',
          'line': _round(ma20), 'detail': logic_detail, 'available': bool(ma20)},
         {'id': 'time', 'label': '时间止损', 'hit': time_hit,
          'line': None, 'detail': time_detail, 'available': days_held is not None},
+        {'id': 'u1', 'label': '放量滞涨', 'hit': u1_hit,
+         'line': None, 'detail': u1_detail, 'available': u1_avail},
+        {'id': 'u2', 'label': '尾盘偷袭', 'hit': u2_hit,
+         'line': None, 'detail': u2_detail, 'available': u2_avail},
+        {'id': 'u3', 'label': '持仓跌停', 'hit': u3_hit,
+         'line': None, 'detail': u3_detail, 'available': u3_avail},
+        {'id': 'u4', 'label': '逆势抗跌', 'hit': u4_hit,
+         'line': None, 'detail': u4_detail, 'available': u4_avail},
     ]
     hit = next((m['id'] for m in mechs if m['hit']), '')
     labels = {'fixed': '止损离场', 'logic': f'逻辑离场（跌破MA{ma_days}）',
-              'time': '时间止损（持有到期未达标）'}
+              'time': '时间止损（持有到期未达标）',
+              'u1': '出货离场（放量滞涨）', 'u2': '尾盘减仓（偷袭）',
+              'u3': '跌停离场', 'u4': '逆势减仓（防补跌）'}
     out = {
         'enabled': True,
         'live': live,
@@ -144,6 +218,61 @@ def plan_exit(*, symbol: str, cost: float, price: float, buy_date: str = '',
     }
     if target_price:
         out['target'] = _round(float(target_price))
+    return out
+
+
+def gather_sell_context(symbol: str, quote: Optional[dict] = None) -> Dict:
+    """为 u1/u4 准备真实数据（best-effort，缺数据即返回空，绝不误触发）。
+
+    返回 {yest_limit_up, vol_today, vol_yest, sector_down}：
+      · yest_limit_up：昨日收盘≈涨停价（主板 10% 近似；ST/科创/创业板的 5%/20% 暂未细分）；
+      · vol_today/vol_yest：今量/昨量（手），u1 量比用；
+      · sector_down：板块当日方向（best-effort；本地暂缺实时板块涨跌缓存 → 恒为 None，
+        由 u4 逻辑按“未知则按大盘弱近似”处理，不会因未知而误触发）。
+    仅在持仓诊断（position.py）调用，单票少、本地只读 kline_cache，开销可忽略。
+    """
+    out = {'yest_limit_up': False, 'vol_today': None, 'vol_yest': None, 'sector_down': None}
+    if not symbol:
+        return out
+    # 今日成交量（实时 quote）
+    if isinstance(quote, dict):
+        for k in ('volume', 'vol', 'volume_hand'):
+            v = quote.get(k)
+            if v is not None:
+                try:
+                    out['vol_today'] = float(v)
+                except (TypeError, ValueError):
+                    out['vol_today'] = None
+                break
+    # 昨日 K 线（本地 kline_cache，日级，盘后更新）
+    try:
+        import json as _json
+        from datetime import date as _date
+        from db.dal_state import get_db_conn
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT kline_json FROM kline_cache WHERE symbol=?", (symbol,))
+        row = cur.fetchone()
+        if row and row[0]:
+            arr = _json.loads(row[0])
+            if len(arr) >= 1:
+                today = _date.today().strftime('%Y-%m-%d')
+                # 取严格早于今日的最近一根 = 昨日（若缓存已含今日则用前一根，避免用错日）
+                yest = None
+                for r in reversed(arr):
+                    if r[0] < today:
+                        yest = r
+                        break
+                if yest is None:
+                    yest = arr[-1]
+                prec = float(yest[2])            # 昨收
+                vol_yest = float(yest[5])        # 昨量(手)
+                lim = round(prec * 1.1 + 1e-9, 2)
+                out['yest_limit_up'] = abs(prec - lim) < 0.011
+                out['vol_yest'] = vol_yest
+    except Exception:
+        # 任何取数异常都不应让卖出判定误触发：保持默认空值
+        pass
     return out
 
 
