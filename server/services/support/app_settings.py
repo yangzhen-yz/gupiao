@@ -515,6 +515,16 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'auction_dip_shadow_enabled', 'cfg': 'AUCTION_DIP_SHADOW_ENABLED', 'kind': 'bool',
+        'label': '竞价低吸臂影子（昨日涨停×今日竞价缺口分档）', 'group': '数据与门槛', 'live': True,
+        'note': '每交易日 9:31（09:40 幂等补一班）把"昨日涨停池×今日竞价快照"按缺口分五档落 '
+                'auction_dip_shadow，20:40 回填竞价买→收盘卖/拿隔夜/次日开盘卖三条腿与同日范围等权基准。'
+                '样本内：昨日涨停+今日深低开>3% 日内腿 +1.36%（t=1.98）；追涨 gap≥7% 隔夜 −2.61%。'
+                '**只记录，不改评分/门槛/推送**；判据预注册：≥20 交易日、深低开(可成交)净超额≥0.5pp、'
+                '按日 t≥2、≥2/3 天正号（影子台账第 20 条）。关掉＝不建表不写行，逐字节等于没这项',
+        'impact': None,
+    },
+    {
         'key': 'westock_crosscheck_enabled', 'cfg': 'WESTOCK_CROSSCHECK_ENABLED', 'kind': 'bool',
         'label': '每日双源数据校验（16:30，westock 权威）', 'group': '策略快照', 'live': True,
         'note': '把本地资金流/行情与 westock（腾讯自选股）比对，落 westock_snapshot 与 '
