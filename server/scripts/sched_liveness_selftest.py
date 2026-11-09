@@ -296,15 +296,31 @@ print('[10] 真库只读：11-06 与 11-05 两天各判出什么')
 real = os.path.join(SERVER, 'gupiao.db')
 try:
     conn = sqlite3.connect(f'file:{real}?mode=ro', uri=True)
+    # 11-09 改口径：问的是"**那天**调度到底有没有产出"，所以按 created_at（写入日）数，
+    # 不按业务日。原来按业务日数，11-09 09:00 那班 RPS 往 pool_date='2026-11-06' 回填了
+    # 18 行，把"11-06 决策链全 0"这个既成历史照出来是 18，自测当场报红——线上判据没错，
+    # 是这条 smoke 的前提被后续回填污染了（与 11-07 修⑩④ 同一类病：改脚本不改线上）。
     for day, hh, mm, expect in [('2026-11-06', 14, 11, 'B'), ('2026-11-05', 14, 11, None),
                                 ('2026-09-21', 14, 11, None)]:
         alive = conn.execute('SELECT COUNT(*) FROM market_sentiment_snapshots WHERE sent_date LIKE ?',
                              (day + '%',)).fetchone()[0]
-        dec = [conn.execute(f'SELECT COUNT(*) FROM {tb} WHERE {col} LIKE ?', (day + '%',)).fetchone()[0]
+        dec = [conn.execute(f'SELECT COUNT(*) FROM {tb} WHERE created_at LIKE ?',
+                            (day + '%',)).fetchone()[0]
+               for tb, _col in L._DECISION_TABLES]
+        biz = [conn.execute(f'SELECT COUNT(*) FROM {tb} WHERE {col} LIKE ?', (day + '%',)).fetchone()[0]
                for tb, col in L._DECISION_TABLES]
         all_zero = all(x == 0 for x in dec)
         got = 'B' if (alive > 0 and all_zero) else None
-        ck(got == expect, f'{day}：情绪快照 {alive} 行、决策链 {dec} ⇒ 判据给 {got}（期望 {expect}）')
+        ck(got == expect, f'{day}：情绪快照 {alive} 行、当天写入的决策链 {dec} ⇒ 判据给 {got}'
+                          f'（期望 {expect}；业务日口径另为 {biz}，会被后续回填改写，不作断言）')
+    # 守上面那条注释的依据：候选池的业务日恒滞后于写入日。哪天它红了，说明 RPS 那班改成
+    # 写当天了，必须重新评估 B 判据里这张表该怎么数（而不是顺手把列名换成 created_at）。
+    _tot = conn.execute('SELECT COUNT(*) FROM daily_candidate_pool').fetchone()[0]
+    _same = conn.execute('SELECT COUNT(*) FROM daily_candidate_pool '
+                         'WHERE substr(created_at,1,10) = pool_date').fetchone()[0]
+    ck(_tot > 0 and _same == 0,
+       f'候选池 pool_date 恒滞后于写入日（{_tot} 行里相等的有 {_same} 行）——所以它在 B 的'
+       '"当天"口径里恒 0、不能当活着的证据；也不能换成 created_at（09:00 就写完，换了会漏报 11-06）')
     conn.close()
 except sqlite3.OperationalError as e:
     print('     真库读不了（跳过本组）：', e)
@@ -357,6 +373,24 @@ try:
     finally:
         builtins.print = _old_print
     ck(len(_buf) == 2, f'原因变了就重新打一行（实得 {len(_buf)} 行：{[x[-16:] for x in _buf]}）')
+
+    # --- 反证（11-09 线上抓出来的真回归）：同一个"窗口外"状态跨分钟连查，只许打 1 行 ---
+    # 上面那两组用的都是同一个 now，所以测不到"原因串里拼了当前时刻"这种坏法：
+    # 拼了 hh:mm 之后每分钟都算原因变了，实测线上 560 行刷屏。这里把时钟推进三分钟。
+    _buf.clear()
+    L._STATE.pop('last_skip_reason', None)
+    _r0 = L.check_once(now=dt.datetime(2026, 11, 9, 21, 0))
+    _r1 = L.check_once(now=dt.datetime(2026, 11, 9, 21, 1))
+    ck(_r0.get('skipped') == _r1.get('skipped'),
+       f'窗口外的原因串必须与时刻无关（21:00 与 21:01 实得 {_r0.get("skipped")!r} / {_r1.get("skipped")!r}）'
+       '——它是下游的去重键，拼了 hh:mm 就等于没有去重')
+    builtins.print = _cap
+    try:
+        for _m in (0, 1, 2):
+            L.alert_and_record(L.check_once(now=dt.datetime(2026, 11, 9, 21, _m)))
+    finally:
+        builtins.print = _old_print
+    ck(len(_buf) == 1, f'窗口外跨 3 分钟连查只打 1 行（实得 {len(_buf)} 行）——改造前每分钟一行 ≈ 880 行/天')
 
     _buf.clear()
     L._STATE['last_skip_reason'] = '故意预置成别的原因'

@@ -32,8 +32,12 @@
 
 所以 B 的成立条件是：交易日 **且** 当天 `market_sentiment_snapshots` 有行 **且**
 `daily_recommendations`/`strategy_snapshot*`/`daily_candidate_pool` 全 0 行。
-`daily_candidate_pool` 在 11-05 也是 0（该表 10-14 才起、且有独立开关），所以它只能进
-"全 0"那一侧、不能当必要条件。
+`daily_candidate_pool` 只能进"全 0"那一侧、不能当必要条件，真实原因 11-09 才量准：
+它的 `pool_date` **恒滞后一个交易日**（09:00 那班 RPS 用上一交易日的日K算，写的是昨天），
+真库 548 行里 `pool_date == date(created_at)` 的有 **0 行**。所以按"当天"去数它永远是 0，
+是纯冗余成员，不提供任何"活着"的证据。**也不许把它换成 `created_at`**：那样 11-06 会被判成
+活着（池子 09:00 就写完了，证明不了 09:45 之后循环还在跑），恰好漏掉本模块要抓的那次真事故。
+（早先此处写的理由是"该表 10-14 才起、有独立开关"，那不是主因，11-09 更正。）
 
 去重与限频
 ----------
@@ -173,7 +177,12 @@ def check_once(now: Optional[datetime] = None, force: bool = False) -> Dict:
     w_start, w_end = (SCHED_LIVENESS_WINDOW[0], SCHED_LIVENESS_WINDOW[1])
     hm = _hm_now(now)
     if not (w_start <= hm <= w_end):
-        res['skipped'] = f'不在观测窗口 {w_start}~{w_end} 内（现在 {hm}）'
+        # 原因串里**不许拼当前时刻**：下游 alert_and_record() 拿这条串当去重键
+        # （_STATE['last_skip_reason'] != why 才打一行），拼了 hh:mm 就每分钟都算
+        # "原因变了"，去重当场失效。11-09 线上实测抓到：日志里"本轮不发"579 行，
+        # 其中 560 行是同一句"不在观测窗口…（现在 hh:mm）"，正是 PR #13 要治的刷屏。
+        # 时刻信息没丢——打印那行前缀本来就带 [调度失活 HH:MM:SS]。
+        res['skipped'] = f'不在观测窗口 {w_start}~{w_end} 内'
         return res
 
     beat = beat_state()
