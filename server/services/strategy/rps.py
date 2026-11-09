@@ -16,7 +16,7 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, TENCENT_KLINE_API, KLINE_HISTORY_ENABLED,
+from app.config import (EASTMONEY_HEADERS, RPS_ENABLED, RPS_PERIOD_DAYS, RPS_MIN_SAMPLES, RPS_TOP_N, KLINE_START_DATE, KLINE_HISTORY_ENABLED,
                         RPS_PULLBACK_FROM_LOCAL, RPS_NAME_LIVE_MAX, RPS_LEADERBOARD_TTL)
 from db.database import get_db_conn
 from services.data.stock import _sync_get
@@ -125,9 +125,18 @@ def _clist_codes() -> List[str]:
 
 
 def _fetch_kline_for_rps(symbol: str, limit: int) -> List:
-    """同步拉前复权日线（独立 limit，避免受全局 KLINE_DATA_LIMIT 截断影响）。"""
+    """同步拉前复权日线（独立 limit，避免受全局 KLINE_DATA_LIMIT 截断影响）。
+
+    主机走 quota_guard 每日预算治理：ifzq 用量到 90% 预算即切 web.ifzq 备源，与 hot_chains
+    的 qfq 回填共用同一套备源，避免把 ifzq 单点打到被限流。
+    """
+    try:
+        from services.data.quota_guard import pick_host
+        host = pick_host('tencent_kline_qfq') or 'ifzq.gtimg.cn'
+    except Exception:
+        host = 'ifzq.gtimg.cn'
     today = date.today().isoformat()
-    url = f'{TENCENT_KLINE_API}?param={symbol},day,{KLINE_START_DATE},{today},{limit},qfq'
+    url = f'https://{host}/appstock/app/fqkline/get?param={symbol},day,{KLINE_START_DATE},{today},{limit},qfq'
     last_err = None
     for attempt in range(3):
         try:

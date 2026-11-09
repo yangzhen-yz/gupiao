@@ -26,11 +26,22 @@ import ipaddress
 from datetime import datetime
 from urllib.parse import urlparse
 
+# 每日预算治理：每次出站调用后按主机累加计数（只统计 quota_guard 登记过的主机）。
+# 单独 try 导入，quota_guard 即使缺失也不影响用量统计本身。
+try:
+    from services.data.quota_guard import bump as _quota_bump
+except Exception:  # pragma: no cover - 极端导入失败兜底
+    _quota_bump = None
+
 # ========== 第三方主机 → (provider, 默认 interface) ==========
 # interface 为 None 时按 path 细分（东财 push2delay 上挂了 clist/ulist/stock 多个业务）。
 _HOST_EXACT = {
     'qt.gtimg.cn': ('tencent', 'quote'),        # 腾讯即时行情
     'ifzq.gtimg.cn': ('tencent', 'kline'),      # 腾讯K线
+    # 2026-11-09 补：web.ifzq 与 ifzq 同接口同结构；hot_chains qfq 回填原用 web. 子域，
+    # 在生产机被限流导致 other:web.ifzq 失败率 50%~72%。回填已切到 ifzq，此处补登记防御性兜底，
+    # 万一任何路径仍打到 web. 子域，也归 tencent:kline 走统一上限治理，不再掉进 other 不计数。
+    'web.ifzq.gtimg.cn': ('tencent', 'kline'),
     'hq.sinajs.cn': ('sina', 'quote'),          # 新浪行情备源
     # 2026-10-23 修误分类：新浪备源实际走的是这个域（今天 736 次全挂在 other 下）
     'vip.stock.finance.sina.com.cn': ('sina', 'quote'),
@@ -129,6 +140,38 @@ def _url_str(url) -> str:
     return str(url)
 
 
+def _host_of(url) -> str:
+    """从出站 URL 取出小写主机名（供 quota_guard 按主机记每日预算用）。"""
+    try:
+        return (urlparse(_url_str(url)).hostname or '').lower()
+    except Exception:
+        return ''
+
+
+def _quota_count(url) -> None:
+    """把这次出站调用报给每日预算治理（quota_guard）。失败静默，绝不拖慢/打断真实请求。"""
+    if _quota_bump is None:
+        return
+    host = _host_of(url)
+    if not host:
+        return
+    try:
+        _quota_bump(host)
+    except Exception:
+        pass
+
+
+def _quota_flush() -> None:
+    """把 quota_guard 的当日计数落盘（在 api_usage.flush 里顺带调用，减少丢计数窗口）。"""
+    if _quota_bump is None:
+        return
+    try:
+        from services.data.quota_guard import flush as _q_flush
+        _q_flush()
+    except Exception:
+        pass
+
+
 def _is_internal(host: str) -> bool:
     if not host:
         return True
@@ -218,6 +261,7 @@ def flush() -> int:
     if not rows:
         return 0
     _persist(rows)
+    _quota_flush()
     return len(rows)
 
 
@@ -390,6 +434,7 @@ def _patch_requests():
         name = classify(url)
         if name is None:
             return orig(self, method, url, *a, **kw)
+        _quota_count(url)
         try:
             resp = orig(self, method, url, *a, **kw)
             ok = getattr(resp, 'status_code', 200) < 400
@@ -418,6 +463,7 @@ def _patch_httpx():
         name = classify(request.url)
         if name is None:
             return orig_send(self, request, *a, **kw)
+        _quota_count(request.url)
         try:
             resp = orig_send(self, request, *a, **kw)
             ok = getattr(resp, 'status_code', 200) < 400
@@ -431,6 +477,7 @@ def _patch_httpx():
         name = classify(request.url)
         if name is None:
             return await orig_asend(self, request, *a, **kw)
+        _quota_count(request.url)
         try:
             resp = await orig_asend(self, request, *a, **kw)
             ok = getattr(resp, 'status_code', 200) < 400
@@ -457,6 +504,7 @@ def _patch_urllib():
         name = classify(url)
         if name is None:
             return orig(url, *a, **kw)
+        _quota_count(url)
         try:
             resp = orig(url, *a, **kw)
             record(name, 1, ok=True)
