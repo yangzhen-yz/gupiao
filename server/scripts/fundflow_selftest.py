@@ -1,7 +1,8 @@
 """fundflow_selftest.py - 资金流向模块自测（2026-10-19 东财风控根治重构版）
 
 覆盖本次重构的六个面：
-  [1] 个股排名请求合并：inflow/outflow 1 次 _clist（原 2 次），正负拆分与截断正确
+  [1] 个股排名：inflow 降序 + outflow 升序 各 1 次 _clist（2026-11-09 修：原合并成 1 次降序导致
+      净流出榜恒空 → 改回 2 次），正负拆分与截断正确
   [2] 板块排名请求合并：行业+概念共 2 次 _clist（原 4 次），正负拆分、概念黑名单过滤
   [3] 快照 key 去参数化：恒存 'stocks'，不同 top_n 读取截断一致（修"测试参数刷新成功、
       默认参数读旧快照"割裂）
@@ -108,13 +109,13 @@ ff._sina_market_snapshot = _sina_none
 _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# ========== [1] 个股排名请求合并 ==========
-print('[1] 个股排名请求合并（原 2 次 → 1 次）')
+# ========== [1] 个股排名（inflow 降序 + outflow 升序，各一次） ==========
+print('[1] 个股排名（inflow 降序 + outflow 升序，各一次 clist）')
 import asyncio
 
 _calls = []
 _rows = []
-# f62 降序：正负混合 30 条（正 15 负 15）
+# 真实东财语义：f62 降序只回头部正数、f62 升序只回头部负数（全市场 ~5000 只，单页到不了负值）
 for i in range(15):
     _rows.append({'f12': f'{600000 + i}', 'f13': 1, 'f14': f'流入{i}',
                   'f2': 10.0, 'f3': 1.0, 'f62': 1e8 - i * 1e6, 'f100': '行业A'})
@@ -122,14 +123,28 @@ for i in range(15):
     _rows.append({'f12': f'{600100 + i}', 'f13': 1, 'f14': f'流出{i}',
                   'f2': 10.0, 'f3': -1.0, 'f62': -(1e7 + i * 1e6), 'f100': '行业B'})
 
+
+def _realistic_clist(fid, po, fs, fields, pz, pn=1):
+    """模拟东财真实排序：按 f62 升/降序返回头部 pz 条（po=1 降序、po=0 升序）。
+
+    关键点：升序(po=0)时**最负的排最前**，正是旧 bug 修复后 outflow 能取到数据的来源；
+    旧代码只调 po=1（全正头部）→ 列表里没有负数 → outflow 恒空，本桩可复现并拦截。
+    """
+    _calls.append({'fid': fid, 'po': po, 'fs': fs, 'pz': pz})
+    rows = sorted(_rows, key=lambda r: float(r.get('f62') or 0), reverse=(po == 1))
+    return rows[:pz]
+
+
 _orig_clist = ff._clist
-ff._clist = _stub_clist(_calls, None, _rows)
+ff._clist = _realistic_clist
 _r = asyncio.run(ff.get_stock_fund_flow_rankings(10))
 ff._clist = _orig_clist
-ck(len(_calls) == 1, '个股排名只发 1 次 clist 请求', f'实际 {len(_calls)} 次')
-ck(_calls and _calls[0]['pz'] == 100, '单次请求 pz=100（覆盖默认 top_n=50）')
+ck(len(_calls) == 2, '个股排名发 2 次 clist（inflow 降序 + outflow 升序）', f'实际 {len(_calls)} 次')
+ck(_calls[0]['po'] == 1 and _calls[1]['po'] == 0, '第1次 po=1（净流入）、第2次 po=0（净流出）')
+ck(_calls[0]['pz'] == 10 and _calls[1]['pz'] == 10, '两次均 pz=top_n=10')
 ck(len(_r['inflow']) == 10, 'inflow 截断到 top_n=10', f"实得 {len(_r['inflow'])}")
-ck(len(_r['outflow']) == 10, 'outflow 截断到 top_n=10', f"实得 {len(_r['outflow'])}")
+# 关键回归断言：旧代码只调 po=1（全正）→ outflow 恒空；本桩下新代码 po=0 能取到负数
+ck(len(_r['outflow']) == 10, 'outflow 截断到 top_n=10（净流出不再恒空）', f"实得 {len(_r['outflow'])}")
 ck(all(x['mainNetInflow'] > 0 for x in _r['inflow']), 'inflow 全为正')
 ck(all(x['mainNetInflow'] < 0 for x in _r['outflow']), 'outflow 全为负')
 ck(_r['inflow'][0]['mainNetInflow'] >= _r['inflow'][-1]['mainNetInflow'], 'inflow 降序')

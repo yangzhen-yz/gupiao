@@ -172,19 +172,27 @@ def _normalize_sector(item: Dict, rank: int) -> Dict:
 async def get_stock_fund_flow_rankings(top_n: int = FUND_FLOW_STOCK_TOP_N) -> Dict[str, List[Dict]]:
     """个股主力净流入 / 净流出排名。
 
-    2026-10-19 请求量治理：原为 inflow/outflow 两次请求，东财 IP 级风控实锤后
-    （封禁期间人气榜/涨停池通、clist 全断，10-17/10-19 两次封禁均因请求频率）
-    合并为**一次** f62 降序 pz=100：头部即净流入排名、尾部反转即净流出排名，
-    展示层按 top_n 截断。配合前端轮询 30s→120s，单页请求量降约 7 倍。
+    2026-11-09 修复（净流出榜恒为空的根因）：
+    原 2026-10-19 请求量治理把 inflow+outflow 合并为「一次 f62 降序 pz=100」，想用
+    「头部=净流入、尾部反转=净流出」省掉第二次请求。但实测单页降序只覆盖全市场 f62 最大的
+    前 top_n~100 只（今日这 100 只 f62 全为正、最小也有 +5.4 亿），尾部根本到不了负值 →
+    outflow 永远为空（右侧净流出榜恒显「暂无数据」）。板块因全列表仅 ~94 个、单页即全覆盖，
+    故不受影响，只有个股榜坏。
+
+    修复：inflow 走 f62 降序(po=1)，outflow 走 f62 升序(po=0)，各取 top_n。两次请求仍远低于
+    风控阈值（现 120s 轮询，全周期 ~5 次 clist，对比治理前 7 次/30s=840/hr 仍降约 5~7 倍）。
     """
+    fields = 'f12,f13,f14,f2,f3,f62,f100'
+
     def _sync():
-        # clist 单页硬限 100（东财上限）；top_n 默认 50，前后各取足够
-        pz = min(max(100, top_n), 100)
-        return _clist('f62', 1, _FS_ALL_A, 'f12,f13,f14,f2,f3,f62,f100', pz) or []
-    raw = await asyncio.to_thread(_sync)
-    items = [_normalize_stock(x) for x in raw]
-    inflow = [x for x in items if x['mainNetInflow'] > 0][:top_n]
-    outflow = [x for x in reversed(items) if x['mainNetInflow'] < 0][:top_n]
+        inflow_raw = _clist('f62', 1, _FS_ALL_A, fields, top_n) or []   # 降序 → 头部即净流入
+        time.sleep(0.2)                                               # 两次之间小憩，不连戳
+        outflow_raw = _clist('f62', 0, _FS_ALL_A, fields, top_n) or []  # 升序 → 头部即净流出
+        return inflow_raw, outflow_raw
+
+    in_raw, out_raw = await asyncio.to_thread(_sync)
+    inflow = [_normalize_stock(x) for x in in_raw if _to_float(x.get('f62')) > 0][:top_n]
+    outflow = [_normalize_stock(x) for x in out_raw if _to_float(x.get('f62')) < 0][:top_n]
     return {'inflow': inflow, 'outflow': outflow}
 
 
