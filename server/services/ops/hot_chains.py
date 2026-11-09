@@ -74,7 +74,12 @@ _EXTRA_BLOCK_SUBSTR = (
     '增持', '减持', '回购', '解禁', '股权激励', '机构调研', '股权转让',
 )
 
-_QFQ_URL = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
+# 2026-11-09 改：原用 web.ifzq.gtimg.cn，但生产机对该子域在并发突发下被腾讯限流
+# （用量页 other:web.ifzq.gtimg.cn 持续 50%~72% 失败，而 ifzq.gtimg.cn 同日 3479 次 0 失败）。
+# 两者接口路径 appstock/app/fqkline/get 与返回结构完全一致，故默认主源切到已验证健康的 ifzq。
+# 运行时实际主机由 quota_guard.pick_host('tencent_kline_qfq') 选（ifzq 用量到 90% 预算自动切 web.ifzq 备源），
+# 见 _fetch_qfq。本常量保留为「默认主源模板」，供自测断言与人工排查。
+_QFQ_URL = 'https://ifzq.gtimg.cn/appstock/app/fqkline/get'
 _UA = {'User-Agent': 'Mozilla/5.0'}
 
 _LOCK = threading.RLock()
@@ -278,8 +283,17 @@ def _history_stats(symbols: List[str]) -> Dict[str, Tuple[str, int]]:
 
 
 def _fetch_qfq(sym: str, n: int = BACKFILL_DAYS) -> List[Dict]:
-    """腾讯前复权日线（[date, open, close, high, low, volume]，升序）。"""
-    url = f'{_QFQ_URL}?param={sym},day,,,{n},qfq'
+    """腾讯前复权日线（[date, open, close, high, low, volume]，升序）。
+
+    主机走 quota_guard 的每日预算治理：ifzq 用量到 90% 预算即自动切 web.ifzq 备源，
+    避免把单点打到被限流（2026-11-09 web.ifzq 单日失败率 50%~72% 的教训）。
+    """
+    try:
+        from services.data.quota_guard import pick_host
+        host = pick_host('tencent_kline_qfq') or 'ifzq.gtimg.cn'
+    except Exception:
+        host = 'ifzq.gtimg.cn'
+    url = f'https://{host}/appstock/app/fqkline/get?param={sym},day,,,{n},qfq'
     for _ in range(2):
         try:
             resp = requests.get(url, headers=_UA, timeout=8)
