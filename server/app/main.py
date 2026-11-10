@@ -280,6 +280,16 @@ async def lifespan(app: FastAPI):
     # -fix: 全局改用 requests + asyncio.to_thread，不再需要 httpx 连接池
     scheduler_thread = threading.Thread(target=lambda: _lazy_start_scheduler(), daemon=True)
     scheduler_thread.start()
+    # HTTP 自愈探活（2026-11-09）：独立线程每 30s 探本机 /api/health，连续 3 次不应答就写
+    # server/data/backend_restart_requested 交给 SYSTEM 看护重启。**必须在这里起、不能放进
+    # run_scheduler**：它要抓的恰恰是"调度还在跑、HTTP 死了"（11-07 冻站 14 分钟、11-09
+    # 一次 WinError 64 关掉监听 socket），判据不能挂在被观察的循环上。
+    try:
+        from services.ops.http_liveness import start_watchdog as _start_http_liveness
+        _start_http_liveness()
+    except Exception as _hl_err:
+        print(f'[初始化] HTTP 自愈探活线程没起来（不致命，只是端口在听但 HTTP 不应答时'
+              f'没人写重启标志）: {type(_hl_err).__name__}: {_hl_err}')
     yield
 
 app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票行情、K线图、趋势发现", lifespan=lifespan)

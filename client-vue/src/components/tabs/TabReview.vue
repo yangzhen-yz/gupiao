@@ -432,6 +432,11 @@
               >
             </template>
           </div>
+          <!-- 2026-11-10：把「纸面胜率 ≠ 可成交收益」摆在明面，避免逻辑卡把负期望包装成机会 -->
+          <div class="section-note-small focus-honest">
+            <b>⚠ 口径提醒</b>：名单按「同来源同分数段的历史 T+1 盈利概率」排序，<b>不按评分排序</b>（总分 IC≈0.0137，实测没有预测力；三个来源分数量纲不同，横比无意义）。
+            「篮子盈利概率」是纸面历史统计；按真实可成交口径复算，六种买卖组合里五个为负，<b>当前策略期望尚未跑正</b>。下方逻辑卡只解释「为什么是它」，<b>不构成买入背书</b>。
+          </div>
           <div class="focus-grid">
             <div v-for="(s, i) in review.tomorrowFocus" :key="s.code" class="focus-card" @click="openStockKline(s)">
               <div class="focus-head">
@@ -457,20 +462,51 @@
                     >
                   </div>
                 </div>
-                <div class="focus-score" v-if="s.score > 0">
+                <div class="focus-score" v-if="s.score > 0"
+                  title="三个来源的评分量纲不同，横着比不成立；名单按历史同档 T+1 盈利概率排序，不按此分排序">
                   <div class="focus-score-val">{{ s.score }}</div>
-                  <div class="focus-score-lbl">策略分</div>
+                  <div class="focus-score-lbl">评分·非依据</div>
                 </div>
                 <!-- 入选依据：同来源同分数段的历史 T+1 胜率（名单就是按它排的，比策略分更有决策意义） -->
-                <div class="focus-win" v-if="s.expectedWinRate != null" :class="{ thin: s.expectedWinRate < 50 }">
+                <div class="focus-win" v-if="s.expectedWinRate != null" :class="{ thin: s.expectedWinRate < 50 }"
+                  title="同来源同分数段的历史 T+1 盈利概率；名单就是按它排序的（不是按策略分）">
                   <div class="focus-win-val">{{ s.expectedWinRate }}%</div>
-                  <div class="focus-win-lbl">T+1盈利概率</div>
+                  <div class="focus-win-lbl">入选依据</div>
                   <div class="focus-win-sub" v-if="s.expectedAvgRet != null">
                     均{{ s.expectedAvgRet >= 0 ? '+' : '' }}{{ s.expectedAvgRet }}%·{{ s.expectedSample }}笔
                   </div>
                 </div>
               </div>
               <div class="focus-reason" v-if="s.reason">{{ s.reason }}</div>
+              <!-- 买入逻辑卡（2026-11-10）：主线/热门链/题材/四池已落库事实，纯展示，不进评分/选票/推送 -->
+              <div v-if="s.logic" class="focus-logic" @click.stop>
+                <div class="logic-row" :class="{ hit: s.logic.chainHit }">
+                  <span class="logic-tag">主线/链条</span>
+                  <span class="logic-txt">{{ s.logic.chainText }}</span>
+                </div>
+                <div class="logic-row" v-if="s.logic.mainlineText">
+                  <span class="logic-tag">主线判定</span>
+                  <span class="logic-txt">{{ s.logic.mainlineText }}</span>
+                </div>
+                <div class="logic-row" v-if="s.logic.themeText || s.logic.poolText">
+                  <span class="logic-tag">题材/梯队</span>
+                  <span class="logic-txt">{{ s.logic.poolText }}<template v-if="s.logic.themeText"> · {{ s.logic.themeText }}</template></span>
+                </div>
+                <div class="logic-row" v-if="s.logic.upReason">
+                  <span class="logic-tag">归因原文</span>
+                  <span class="logic-txt">{{ s.logic.upReason }}</span>
+                </div>
+                <div class="logic-plates" v-if="s.logic.plates && s.logic.plates.length">
+                  板块标签：{{ s.logic.plates.join(' · ') }}
+                </div>
+                <div class="logic-risk" v-for="(r, ri) in s.logic.risk" :key="ri">⚠ {{ r }}</div>
+                <div class="logic-gaps" v-if="s.logic.gaps && s.logic.gaps.length">
+                  数据缺口：{{ s.logic.gaps.join('；') }}
+                </div>
+                <div class="logic-dates" v-if="s.logic.poolDay || s.logic.chainDay">
+                  数据日期：四池 {{ s.logic.poolDay || '—' }} · 热门链 {{ s.logic.chainDay || '—' }} · 主线 {{ s.logic.mainlineDay || '—' }}
+                </div>
+              </div>
               <div v-if="s.buyTiming" class="focus-timing">
                 <span class="timing-badge" :class="'timing-' + s.buyTiming.type">
                   {{ timingIcon(s.buyTiming.type) }} {{ s.buyTiming.label }}
@@ -479,7 +515,7 @@
               </div>
 
               <!-- 明日买入计划（2026-10-12）：条件 / 价格 / 止盈止损 / 否决条件 -->
-              <div v-if="s.tomorrowPlan" class="focus-plan" @click.stop>
+              <div v-if="s.tomorrowPlan && !s.tomorrowPlan.blocked" class="focus-plan" @click.stop>
                 <div class="plan-cond"><span class="plan-cond-ico">📋</span>{{ s.tomorrowPlan.condition }}</div>
                 <div class="plan-grid">
                   <div class="plan-item">
@@ -509,6 +545,11 @@
                   <span class="plan-veto-lbl">⛔ 不买</span>
                   <span class="plan-veto-txt">{{ s.tomorrowPlan.veto.join(' ； ') }}</span>
                 </div>
+              </div>
+              <!-- 已封板票：不给买入价/止盈止损/仓位，只讲清楚为什么不可执行 -->
+              <div v-else-if="s.tomorrowPlan?.blocked" class="focus-blocked" @click.stop>
+                <div class="blocked-title">⛔ 不可执行 · 仅观察</div>
+                <div class="blocked-reason">{{ s.tomorrowPlan.reason }}</div>
               </div>
 
               <!-- 加入实时行情页「热门股票快捷查询」（2026-10-23）：
@@ -1905,6 +1946,48 @@
     margin-top: 2px;
     line-height: 1.5;
   }
+  /* 买入逻辑卡（2026-11-10）：只摆已落库的结构化事实，不进评分/选票/推送 */
+  .focus-logic {
+    margin-top: 5px;
+    padding: 7px 9px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    font-size: 0.7rem;
+    line-height: 1.55;
+  }
+  .logic-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+  }
+  .logic-row + .logic-row {
+    margin-top: 3px;
+  }
+  .logic-tag {
+    flex-shrink: 0;
+    color: var(--text-tertiary);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .logic-txt {
+    color: var(--text-secondary);
+  }
+  .logic-row.hit .logic-txt {
+    color: #6366f1;
+    font-weight: 600;
+  }
+  .logic-plates,
+  .logic-dates,
+  .logic-gaps {
+    color: var(--text-tertiary);
+    font-size: 0.66rem;
+    margin-top: 3px;
+  }
+  .logic-risk {
+    color: #b45309;
+    margin-top: 3px;
+  }
   .focus-score {
     text-align: center;
     padding-left: 8px;
@@ -1985,6 +2068,12 @@
     margin: 4px 0 8px;
     line-height: 1.4;
   }
+  .focus-honest {
+    padding: 6px 9px;
+    border-left: 2px solid #b45309;
+    background: rgba(180, 83, 9, 0.06);
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  }
   .focus-timing {
     display: flex;
     flex-wrap: wrap;
@@ -2032,6 +2121,26 @@
     background: #f8fafc;
     color: #475569;
     border-color: #e2e8f0;
+  }
+
+  /* 已封板票（2026-11-10）：不给买点，只显示不可执行原因 */
+  .focus-blocked {
+    margin-top: 4px;
+    padding: 8px 10px;
+    border: 1px solid rgba(180, 83, 9, 0.35);
+    background: rgba(180, 83, 9, 0.06);
+    border-radius: var(--radius-md);
+  }
+  .blocked-title {
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: #b45309;
+  }
+  .blocked-reason {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    margin-top: 3px;
+    line-height: 1.5;
   }
 
   /* 明日买入计划（2026-10-12）：收评看明天 —— 条件 / 价格 / 止盈止损 / 否决条件 */
