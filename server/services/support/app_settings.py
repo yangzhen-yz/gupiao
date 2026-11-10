@@ -454,6 +454,61 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'http_liveness_enabled', 'cfg': 'HTTP_LIVENESS_ENABLED', 'kind': 'bool',
+        'label': '后端 HTTP 自愈探活（连续失败写重启标志）', 'group': '运维与自愈', 'live': True,
+        'note': '11-07 事件循环卡死 14 分钟、11-09 一次 WinError 64 关掉监听 socket，'
+                '两次都是"进程活着、调度照跑、HTTP 不应答"。看护探的是 TCP 端口，'
+                '端口在听时它看不见这种死法。这里用独立线程每 30 秒探本机 /api/health，'
+                '连续 3 次失败就写 server/data/backend_restart_requested 交给 SYSTEM 看护重启。'
+                '端口没在听（refused）不算失败——那是看护 port_down 分支的地盘，'
+                '我们写标志只会让两路同时动手（3003 双进程老坑）；恢复后只撤销本进程写的那份标志。'
+                '关掉 = 不起线程、连探活都不做，逐字节等于没这项',
+        'impact': None,
+    },
+    {
+        'key': 'http_liveness_interval_sec', 'cfg': 'HTTP_LIVENESS_INTERVAL_SEC', 'kind': 'int',
+        'label': 'HTTP 探活间隔', 'group': '运维与自愈', 'live': False,
+        'min': 10, 'max': 300, 'step': 10, 'unit': '秒',
+        'note': '线程启动时读一次，改完要重启后端才生效。默认 30 秒；'
+                '与"连续失败次数"一起决定判死时间（30 秒 × 3 次 ≈ 90 秒）',
+        'impact': None,
+    },
+    {
+        'key': 'http_liveness_timeout_sec', 'cfg': 'HTTP_LIVENESS_TIMEOUT_SEC', 'kind': 'float',
+        'label': 'HTTP 探活单次超时', 'group': '运维与自愈', 'live': True,
+        'min': 1, 'max': 30, 'step': 1, 'unit': '秒',
+        'note': '/api/health 只回一行 JSON、不查库，正常是毫秒级；超过 5 秒说明事件循环'
+                '被占住了。调大只会拖慢发现时间，不建议超过 10 秒',
+        'impact': None,
+    },
+    {
+        'key': 'http_liveness_fail_streak', 'cfg': 'HTTP_LIVENESS_FAIL_STREAK', 'kind': 'int',
+        'label': '连续失败几次才写重启标志', 'group': '运维与自愈', 'live': True,
+        'min': 2, 'max': 10, 'step': 1, 'unit': '次',
+        'note': '一次慢响应不重启（重启代价大：启动要 190~751 秒）。'
+                '默认 3 次 = 大约 90 秒完全不应答才动手',
+        'impact': None,
+    },
+    {
+        'key': 'http_liveness_heal_cooldown_min', 'cfg': 'HTTP_LIVENESS_HEAL_COOLDOWN_MIN',
+        'kind': 'int',
+        'label': '自愈写标志的冷却', 'group': '运维与自愈', 'live': True,
+        'min': 5, 'max': 240, 'step': 5, 'unit': '分钟',
+        'note': '写完重启标志后这么多分钟内不重复写，防止看护没来得及处理时反复请求重启。'
+                '标志已存在且不是本进程写的，一律不覆盖',
+        'impact': None,
+    },
+    {
+        'key': 'http_liveness_start_grace_sec', 'cfg': 'HTTP_LIVENESS_START_GRACE_SEC',
+        'kind': 'int',
+        'label': 'HTTP 探活启动宽限期', 'group': '运维与自愈', 'live': True,
+        'min': 0, 'max': 1800, 'step': 60, 'unit': '秒',
+        'note': '刚起来的前几分钟缓存还在预热，偶尔慢一次不算死。'
+                '注意 uvicorn 是先跑 lifespan 再 bind 端口，启动期探活是 refused（本来就不计数），'
+                '这条挡的是"已监听但忙着预热"的那种抖动',
+        'impact': None,
+    },
+    {
         'key': 'eval_lab_enabled', 'cfg': 'EVAL_LAB_ENABLED', 'kind': 'bool',
         'label': '每周六跑因子体检（08:30）', 'group': '策略快照', 'live': True,
         'note': '本地日K上算 20 日反转/低波/缩量/60日动量/涨停拥挤度的 IC 与分组超额，'
