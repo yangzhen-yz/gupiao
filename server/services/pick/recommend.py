@@ -607,7 +607,10 @@ def gen_recommend_reason_server(stock: Dict, score_result: Dict) -> str:
             if weibi < 50 or turnover_rate > 15:
                 reasons.append('⚠ 涨停但封单偏弱/换手偏高，追板有风险')
             else:
-                reasons.append('已涨停，次日竞价关注')
+                # 2026-11-10：原文案「已涨停，次日竞价关注」与 push.py:472「已涨停，不推」冲突，
+                # 且 11-04 实测当天摸板按涨停价买整体 −0.28%（扣费 −0.41%），属负期望动作。
+                # 只改展示文案，不动评分、选票与推送判据。
+                reasons.append('已封板，按推送规则不追（仅观察）')
     except Exception:
         pass
 
