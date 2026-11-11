@@ -22,6 +22,12 @@
 口径说明：热门链用 `theme_chain_daily.members_json` 按股票代码**精确命中**；主线板块
 是行业名，只能用 `plates`/`themes` 做**标签包含匹配**，属近似口径，文案已注明
 「板块标签匹配口径」，不得写成「主线成分股确认」。
+
+时间维度（2026-11-10 修正）：本卡里的「今日封板」只是 **T 日盘中**的执行约束
+（此刻涨停买不进），**不等于「T+1 不可介入」**。明日 9:25 竞价是独立决策，
+由 `review.py` 的条件单 + `auctionGuard` 负责；本卡不下「可买 / 不可买」结论。
+那个 −0.28% / −5.15% 是「T 日摸板按涨停价买→次日开盘卖」的实测，
+否定的是当天打板，不能拿来否定次日竞价接力。
 """
 from typing import Dict, List, Optional
 import json
@@ -235,12 +241,14 @@ def build_card(code: str, pool_row: Optional[Dict], chain_hits: List[Dict],
                 card['mainlineStatus'] = 'unrelated'
                 card['mainlineText'] = f"与今日主线（{'、'.join(main_names[:2])}）不相关"
 
-    # 4) 票级风险：封板/炸板必须讲清楚，不把负期望包装成机会
+    # 4) 票级风险：封板/炸板必须讲清楚，不把负期望包装成机会。
+    # 2026-11-10 修正：这些数字测的是「T 日打板」，不是「T+1 竞价接力」，必须标清口径，
+    # 否则会被读成「明天也不能买」——push.py:558 矩阵里「昨日封板→可竞价低吸」是另一笔决策。
     if card['sealed']:
-        risk.append('今日已封板：系统推送规则「未涨停才推」，本票无买入空间，不提供买入动作')
-        risk.append('实测当天摸板按涨停价买整体 −0.28%（扣费 −0.41%）；次日炸板批 −5.15%')
+        risk.append('今日已封板：T 日盘中已无买入空间（不追）；T+1 竞价是独立决策，按条件单另判')
+        risk.append('T 日摸板按涨停价买整体 −0.28%（扣费 −0.41%）、炸板批 −5.15% —— 这是当天打板口径，不是次日竞价的证据')
     elif card['blowup']:
-        risk.append('今日炸板（曾涨停未回封）：实测该批 −5.15% / 胜率 5.2%')
+        risk.append('今日炸板（曾涨停未回封）：T 日尾盘接该批 −5.15% / 胜率 5.2%，不接')
     if card['mainlineStatus'] == 'unrelated':
         risk.append('不在当前主线，题材持续性缺少当日数据支撑')
     elif card['mainlineStatus'] == 'no_main':
@@ -248,8 +256,17 @@ def build_card(code: str, pool_row: Optional[Dict], chain_hits: List[Dict],
     return card
 
 
-def attach_focus_logic(focus_items: List[Dict], trade_date: str) -> int:
-    """给明日关注每只票挂 f['logic']。返回挂上的只数；失败返回 0 且不抛。"""
+def attach_focus_logic(focus_items: List[Dict], trade_date: str, *,
+                       code_key: str = 'code', pct_key: str = 'pctChg',
+                       out_key: str = 'logic') -> int:
+    """给每只票挂结构化买入逻辑卡。返回挂上的只数；失败返回 0 且不抛。
+
+    收评 `review.py` 用默认参数（写 `logic`）。行动台 `action_desk.py` 的「可介入」
+    卡片自带一条字符串 `logic`（评分/执行理由），故用 `out_key='themeLogic'` +
+    `code_key='symbol'` / `pct_key='changePercent'` 复用本函数，避免覆盖原字段。
+
+    三个 key 参数只为复用同一套聚合口径，不改变任何判定逻辑。
+    """
     if not focus_items:
         return 0
     try:
@@ -257,20 +274,20 @@ def attach_focus_logic(focus_items: List[Dict], trade_date: str) -> int:
         chain_idx, chain_day, _n = _chain_index()
         ml = _latest_mainline()
         for f in focus_items:
-            code = f.get('code') or ''
+            code = f.get(code_key) or ''
             key = _plain(code)
             card = build_card(code, pool_idx.get(key), chain_idx.get(key) or [],
                               ml, chain_day, pool_day)
             # 行情涨跌幅兜底：四池 15:10 后才落库，非四池票也可能当日封板
             try:
-                pct = float(f.get('pctChg'))
+                pct = float(f.get(pct_key))
             except (TypeError, ValueError):
                 pct = None
             if pct is not None and pct >= _LIMIT_PCT and not card['sealed']:
                 card['sealed'] = True
-                card['risk'].insert(0, '当日涨幅 ≥9.8%：按系统规则不追封板票，不提供买入动作')
-            f['logic'] = card
+                card['risk'].insert(0, '当日涨幅 ≥9.8%：T 日盘中不追封板；T+1 竞价按条件单另判')
+            f[out_key] = card
         return len(focus_items)
     except Exception as e:
-        print(f'[收评] 买入逻辑卡生成失败（不影响名单与评分）: {e}')
+        print(f'[买入逻辑卡] 生成失败（不影响名单与评分）: {e}')
         return 0

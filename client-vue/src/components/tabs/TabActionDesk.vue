@@ -481,7 +481,49 @@
               </div>
             </div>
             <p v-if="b.execHint" class="buy-note">⚠️ {{ b.execHint }}</p>
-            <p v-if="b.logic" class="buy-logic">{{ b.logic }}</p>
+            <p v-if="b.logic" class="buy-logic" title="评分/执行口径，不是题材归因">评分依据：{{ b.logic }}</p>
+            <!-- 买入逻辑卡（2026-11-10）：与收评同一套只读三表聚合，写 themeLogic 不覆盖上面的评分理由 -->
+            <div v-if="logicHas(b.themeLogic)" class="desk-logic" @click.stop>
+              <div class="dl-head">
+                <span class="dl-tag">买入逻辑</span>
+                <button type="button" class="dl-toggle" @click.stop="toggleLogic('buy-' + b.symbol)">
+                  {{ logicOpen['buy-' + b.symbol] ? '收起 ↑' : '展开理由 ↓' }}
+                </button>
+              </div>
+              <p v-if="!logicOpen['buy-' + b.symbol]" class="dl-brief" :title="logicBrief(b.themeLogic)">
+                {{ logicBrief(b.themeLogic) }}
+              </p>
+              <div v-else class="dl-full">
+                <div class="dl-row" :class="{ hit: b.themeLogic?.chainHit }">
+                  <span>主线/链条</span><b>{{ b.themeLogic?.chainText || '暂无数据' }}</b>
+                </div>
+                <div class="dl-row" v-if="b.themeLogic?.mainlineText">
+                  <span>主线判定</span><b>{{ b.themeLogic.mainlineText }}</b>
+                </div>
+                <div class="dl-row" v-if="b.themeLogic?.poolText || b.themeLogic?.themeText">
+                  <span>题材/梯队</span
+                  ><b
+                    >{{ b.themeLogic?.poolText
+                    }}{{ b.themeLogic?.themeText ? ' · ' + b.themeLogic.themeText : '' }}</b
+                  >
+                </div>
+                <div class="dl-row" v-if="b.themeLogic?.upReason">
+                  <span>归因原文</span><b>{{ b.themeLogic.upReason }}</b>
+                </div>
+                <div class="dl-plates" v-if="b.themeLogic?.plates?.length">
+                  板块标签：{{ b.themeLogic.plates.join(' · ') }}
+                </div>
+                <div class="dl-risk" v-for="(r, ri) in (b.themeLogic?.risk || [])" :key="ri">⚠ {{ r }}</div>
+                <div class="dl-gaps" v-if="b.themeLogic?.gaps?.length">
+                  数据缺口：{{ b.themeLogic.gaps.join('；') }}（不补 0、不编理由）
+                </div>
+                <div class="dl-dates">
+                  数据日期：四池 {{ b.themeLogic?.poolDay || '—' }} · 热门链
+                  {{ b.themeLogic?.chainDay || '—' }} · 主线 {{ b.themeLogic?.mainlineDay || '—' }}
+                </div>
+                <div class="dl-honest">逻辑卡只解释「为什么是它」，不构成买入背书；当前策略按可成交净口径复算，期望尚未跑正。</div>
+              </div>
+            </div>
           </article>
         </div>
         <button v-if="data.buyNow.length > LIST_LIMIT" class="expand-btn" @click="toggleList('buyNow')">
@@ -497,6 +539,12 @@
           >
             {{ d.name }} · {{ d.timingLabel || '待时机' }}
             <em v-if="d.vetoReason" class="deferred-why">{{ d.vetoReason }}</em>
+            <!-- 与收评同一套结构化买入逻辑（2026-11-10）：之前被 deferredBuys 投影裁掉 -->
+            <em
+              v-if="logicBrief(d.themeLogic)"
+              class="deferred-logic"
+              :title="logicBrief(d.themeLogic)"
+            >{{ logicBrief(d.themeLogic).slice(0, 28) }}{{ logicBrief(d.themeLogic).length > 28 ? '…' : '' }}</em>
           </button>
         </div>
         <div class="block-foot">
@@ -510,6 +558,11 @@
           <h3>🗓️ 明日计划</h3>
           <span class="block-meta">收评 {{ data.freshness.review || '--' }}</span>
         </header>
+        <!-- 与每日收评页同一套口径提醒：别让「买入逻辑」被读成买入背书 -->
+        <div class="desk-honest">
+          ⚠ 口径：名单按「同来源同分数段历史 T+1 盈利概率」排序，<b>不按评分</b>（总分 IC≈0.0137，无预测力）；
+          纸面胜率 ≠ 可成交净收益。封板票是 <b>T 日不追 + T+1 条件化竞价单</b>，不是「明日不可介入」。
+        </div>
         <div v-if="!data.tomorrowPlan.length" class="block-empty">
           今日收评还没有"重点关注"名单（15:10 左右生成）。可以先过一遍自选异动。
         </div>
@@ -554,6 +607,54 @@
               >
             </div>
             <p v-if="vetoText(t)" class="plan-veto">🚫 {{ vetoText(t) }}</p>
+            <!-- 买入逻辑卡（2026-11-10）：与每日收评同一套结构化事实，纯展示，不进评分/选票/推送 -->
+            <div v-if="logicHas(t.logic) || t.reason" class="desk-logic" @click.stop>
+              <div class="dl-head">
+                <span class="dl-tag">买入逻辑</span>
+                <button type="button" class="dl-toggle" @click.stop="toggleLogic('plan-' + t.symbol)">
+                  {{ logicOpen['plan-' + t.symbol] ? '收起 ↑' : '展开理由 ↓' }}
+                </button>
+              </div>
+              <p v-if="!logicOpen['plan-' + t.symbol]" class="dl-brief" :title="logicBrief(t.logic)">
+                {{ logicBrief(t.logic) || '该份收评未生成结构化归因（下一份收评起提供）' }}
+              </p>
+              <div v-else class="dl-full">
+                <div class="dl-row" :class="{ hit: t.logic?.chainHit }">
+                  <span>主线/链条</span><b>{{ t.logic?.chainText || '暂无数据' }}</b>
+                </div>
+                <div class="dl-row" v-if="t.logic?.mainlineText">
+                  <span>主线判定</span><b>{{ t.logic.mainlineText }}</b>
+                </div>
+                <div class="dl-row" v-if="t.logic?.poolText || t.logic?.themeText">
+                  <span>题材/梯队</span
+                  ><b>{{ t.logic?.poolText }}{{ t.logic?.themeText ? ' · ' + t.logic.themeText : '' }}</b>
+                </div>
+                <div class="dl-row" v-if="t.logic?.upReason">
+                  <span>归因原文</span><b>{{ t.logic.upReason }}</b>
+                </div>
+                <div class="dl-plates" v-if="t.logic?.plates?.length">板块标签：{{ t.logic.plates.join(' · ') }}</div>
+                <div class="dl-risk" v-for="(r, ri) in (t.logic?.risk || [])" :key="ri">⚠ {{ r }}</div>
+                <div class="dl-gaps" v-if="t.logic?.gaps?.length">
+                  数据缺口：{{ t.logic.gaps.join('；') }}（不补 0、不编理由）
+                </div>
+                <div class="dl-dates">
+                  数据日期：四池 {{ t.logic?.poolDay || '—' }} · 热门链 {{ t.logic?.chainDay || '—' }} · 主线
+                  {{ t.logic?.mainlineDay || '—' }}
+                </div>
+                <div class="dl-score" v-if="t.reason">评分依据（非买入理由）：{{ t.reason }}</div>
+                <div class="dl-auction" v-if="t.plan?.auctionGuard">
+                  ⏱ {{ t.plan.auctionGuard.timeSplit }}；{{ t.plan.auctionGuard.shadowStatus }}
+                </div>
+                <div class="dl-deprecated" v-if="t.plan?.blocked">
+                  ⛔ 该份收评生成于口径修正前：「今日封板」被误判成「明日不可介入」。现行口径是
+                  T 日不追 + T+1 条件化竞价单，请以下一次收评为准。
+                </div>
+                <div class="dl-honest">
+                  逻辑卡只解释「为什么是它」，不构成买入背书；真·利好（政策/业绩/订单）无结构化数据源，
+                  系统只有题材归因，不编利好。
+                </div>
+              </div>
+            </div>
           </article>
           <button v-if="data.tomorrowPlan.length > LIST_LIMIT" class="expand-btn" @click="toggleList('tomorrowPlan')">
             {{
@@ -1081,6 +1182,23 @@
     if (n >= 40) return 'risk-mid'
     return 'risk-low'
   }
+  // ===== 买入逻辑卡（2026-11-10）=====
+  // 与每日收评页同一套结构化事实（主线/热门链/题材/涨停原因/连板梯队），纯展示。
+  // 默认只给一行摘要，点「展开理由」才给全文 —— 行动台整页要压在 1.5 屏内。
+  const logicOpen = ref({})
+  function toggleLogic(key) {
+    logicOpen.value = { ...logicOpen.value, [key]: !logicOpen.value[key] }
+  }
+  function logicHas(l) {
+    return !!(l && (l.chainText || l.poolText || l.mainlineText))
+  }
+  function logicBrief(l) {
+    if (!l) return ''
+    return [l.chainText, l.mainlineText, l.poolText, l.themeText, l.upReason]
+      .filter(Boolean)
+      .join(' · ')
+  }
+
   // veto 在 focus_json 里是数组（多条否决条件）。直接 {{ }} 会把整个数组当 JSON 印到卡片上
   // （2026-10-13 手机截图里出现过 ["一字板 / T字板开盘 → 不排队","开盘涨幅...），这里拼成人话。
   function vetoText(t) {
@@ -1566,7 +1684,8 @@
   .buy-logic,
   .plan-cond,
   .plan-veto,
-  .buy-note {
+  .buy-note,
+  .dl-brief {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 1;
@@ -1578,7 +1697,8 @@
   .stack.open .buy-logic,
   .stack.open .plan-cond,
   .stack.open .plan-veto,
-  .stack.open .buy-note {
+  .stack.open .buy-note,
+  .stack.open .dl-brief {
     display: block;
     -webkit-line-clamp: unset;
     overflow: visible;
@@ -1589,7 +1709,8 @@
     .buy-logic,
     .plan-cond,
     .plan-veto,
-    .buy-note {
+    .buy-note,
+    .dl-brief {
       -webkit-line-clamp: 2;
     }
   }
@@ -1675,6 +1796,115 @@
     color: var(--accent-danger);
   }
 
+  /* ===== 买入逻辑卡（2026-11-10）=====
+     与每日收评同一套结构化事实，纯展示。默认一行摘要，点「展开理由」才给全文，
+     否则多区块叠加会把整页撑过 1.5 屏。 */
+  .desk-honest {
+    margin: 0.25rem 0 0.5rem;
+    padding: 5px 8px;
+    border-left: 2px solid #b45309;
+    background: rgba(180, 83, 9, 0.06);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+  .desk-logic {
+    margin-top: 0.375rem;
+    padding: 5px 7px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+  }
+  .dl-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .dl-tag {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    color: #6366f1;
+  }
+  .dl-toggle {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    font-size: 0.6875rem;
+    color: var(--accent-info);
+    background: transparent;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+  }
+  .dl-brief {
+    margin: 0.25rem 0 0;
+    font-size: 0.7rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+  .dl-full {
+    margin-top: 0.25rem;
+    font-size: 0.6875rem;
+    line-height: 1.55;
+  }
+  .dl-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+  }
+  .dl-row + .dl-row {
+    margin-top: 2px;
+  }
+  .dl-row span {
+    flex: 0 0 4.5rem;
+    color: var(--text-tertiary);
+    font-weight: 600;
+  }
+  .dl-row b {
+    flex: 1;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .dl-row.hit b {
+    color: #6366f1;
+    font-weight: 700;
+  }
+  .dl-plates,
+  .dl-dates,
+  .dl-gaps,
+  .dl-score,
+  .dl-honest {
+    margin-top: 3px;
+    color: var(--text-tertiary);
+    font-size: 0.66rem;
+  }
+  .dl-risk {
+    margin-top: 2px;
+    color: #b45309;
+    font-size: 0.66rem;
+  }
+  .dl-auction {
+    margin-top: 3px;
+    padding: 3px 5px;
+    border-left: 2px solid #6366f1;
+    background: rgba(99, 102, 241, 0.06);
+    color: var(--text-secondary);
+    font-size: 0.66rem;
+  }
+  .dl-deprecated {
+    margin-top: 3px;
+    padding: 3px 5px;
+    border-left: 2px solid #b45309;
+    background: rgba(180, 83, 9, 0.06);
+    color: #92400e;
+    font-size: 0.66rem;
+  }
+  .dl-honest {
+    border-top: 1px dashed var(--border-subtle);
+    padding-top: 3px;
+  }
+
   /* 买入时机徽章（与智能推荐页同一套语义色） */
   .timing-badge {
     display: inline-flex;
@@ -1750,6 +1980,15 @@
     font-size: 0.6875rem;
     line-height: 1.3;
     color: var(--accent-warning);
+    white-space: normal;
+  }
+  .deferred-logic {
+    display: block;
+    margin-top: 1px;
+    font-style: normal;
+    font-size: 0.6875rem;
+    line-height: 1.3;
+    color: var(--text-secondary);
     white-space: normal;
   }
 
@@ -2408,5 +2647,19 @@
   }
   [data-theme='dark'] .act-card.urgent {
     border-left-color: var(--accent-danger);
+  }
+  [data-theme='dark'] .desk-honest {
+    background: rgba(180, 83, 9, 0.12);
+  }
+  [data-theme='dark'] .dl-tag,
+  [data-theme='dark'] .dl-row.hit b {
+    color: #a5b4fc;
+  }
+  [data-theme='dark'] .dl-risk {
+    color: #fbbf24;
+  }
+  [data-theme='dark'] .dl-deprecated {
+    color: #fbbf24;
+    background: #241d10;
   }
 </style>

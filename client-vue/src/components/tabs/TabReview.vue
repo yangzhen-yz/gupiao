@@ -545,11 +545,40 @@
                   <span class="plan-veto-lbl">⛔ 不买</span>
                   <span class="plan-veto-txt">{{ s.tomorrowPlan.veto.join(' ； ') }}</span>
                 </div>
+                <!-- 封板票的 T+1 竞价分档（2026-11-10 修正）：T 日盘中买不进 ≠ 明日不可介入。
+                     上方条件单才是现行可执行口径；下方五档是影子参考，不覆盖条件单、不裁决。 -->
+                <div v-if="s.tomorrowPlan.auctionGuard" class="auction-guard" @click.stop>
+                  <div class="ag-title">{{ s.tomorrowPlan.auctionGuard.title }}</div>
+                  <div class="ag-split">{{ s.tomorrowPlan.auctionGuard.timeSplit }}</div>
+                  <div class="ag-rule">{{ s.tomorrowPlan.auctionGuard.rule }}</div>
+                  <div class="ag-arms">
+                    <div v-for="a in s.tomorrowPlan.auctionGuard.arms" :key="a.key"
+                      class="ag-arm" :class="'ag-' + a.direction">
+                      <span class="ag-arm-label">{{ a.label }}</span>
+                      <span class="ag-arm-mean" v-if="a.mean != null">
+                        {{ a.mean > 0 ? '+' : '' }}{{ a.mean.toFixed(3) }}% <small>n={{ a.n }}</small>
+                      </span>
+                      <span class="ag-arm-mean" v-else>—</span>
+                      <span class="ag-arm-action">{{ a.action }}</span>
+                    </div>
+                  </div>
+                  <div class="ag-note" v-if="!s.tomorrowPlan.auctionGuard.basisAvailable">
+                    {{ s.tomorrowPlan.auctionGuard.basisNote }}
+                  </div>
+                  <div class="ag-warn">{{ s.tomorrowPlan.auctionGuard.conflict }}</div>
+                  <div class="ag-note">{{ s.tomorrowPlan.auctionGuard.shadowStatus }}</div>
+                  <div class="ag-note">{{ s.tomorrowPlan.auctionGuard.mainlineNote }}</div>
+                  <div class="ag-risk" v-for="(r, ri) in s.tomorrowPlan.auctionGuard.risk" :key="ri">⚠ {{ r }}</div>
+                </div>
               </div>
-              <!-- 已封板票：不给买入价/止盈止损/仓位，只讲清楚为什么不可执行 -->
+              <!-- 兼容：11-10 修正前生成的收评带 blocked，口径已废止，明确标注避免继续误导 -->
               <div v-else-if="s.tomorrowPlan?.blocked" class="focus-blocked" @click.stop>
-                <div class="blocked-title">⛔ 不可执行 · 仅观察</div>
+                <div class="blocked-title">⛔ 旧版口径（已废止）· 仅观察</div>
                 <div class="blocked-reason">{{ s.tomorrowPlan.reason }}</div>
+                <div class="blocked-reason">
+                  该收评生成于时间维度修正前：「今日封板」被误当作「明日不可介入」。
+                  当前口径为「T 日不追 + T+1 条件化竞价单」，请以下一次收评为准。
+                </div>
               </div>
 
               <!-- 加入实时行情页「热门股票快捷查询」（2026-10-23）：
@@ -2123,7 +2152,94 @@
     border-color: #e2e8f0;
   }
 
-  /* 已封板票（2026-11-10）：不给买点，只显示不可执行原因 */
+  /* 封板票 T+1 竞价分档（2026-11-10）：影子方向只作参考，不覆盖上方条件单 */
+  .auction-guard {
+    margin-top: 7px;
+    padding: 8px 9px;
+    border: 1px solid var(--border-subtle);
+    border-top: 2px solid #6366f1;
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    font-size: 0.69rem;
+    line-height: 1.55;
+  }
+  .ag-title {
+    font-weight: 700;
+    color: #4338ca;
+    font-size: 0.72rem;
+  }
+  .ag-split {
+    color: var(--text-secondary);
+    margin-top: 3px;
+  }
+  .ag-rule,
+  .ag-note {
+    color: var(--text-tertiary);
+    margin-top: 3px;
+    font-size: 0.66rem;
+  }
+  .ag-arms {
+    margin-top: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ag-arm {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 5px;
+    border-radius: 3px;
+  }
+  .ag-arm-label {
+    flex: 0 0 30%;
+    color: var(--text-secondary);
+  }
+  .ag-arm-mean {
+    flex: 0 0 25%;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .ag-arm-mean small {
+    font-weight: 400;
+    color: var(--text-tertiary);
+  }
+  .ag-arm-action {
+    flex: 1;
+    color: var(--text-tertiary);
+    font-size: 0.65rem;
+  }
+  /* A 股约定：正收益红、负收益绿（浅底，light theme 下文字保持深色可读） */
+  .ag-positive {
+    background: rgba(185, 28, 28, 0.06);
+  }
+  .ag-positive .ag-arm-mean {
+    color: #b91c1c;
+  }
+  .ag-negative {
+    background: rgba(21, 128, 61, 0.06);
+  }
+  .ag-negative .ag-arm-mean {
+    color: #15803d;
+  }
+  .ag-unknown .ag-arm-mean {
+    color: var(--text-tertiary);
+  }
+  .ag-warn {
+    margin-top: 5px;
+    padding: 4px 6px;
+    border-left: 2px solid #b45309;
+    background: rgba(180, 83, 9, 0.06);
+    color: #92400e;
+    font-size: 0.66rem;
+  }
+  .ag-risk {
+    margin-top: 3px;
+    color: #b45309;
+    font-size: 0.66rem;
+  }
+
+  /* 已封板票（2026-11-10 修正前口径，仅兼容历史收评） */
   .focus-blocked {
     margin-top: 4px;
     padding: 8px 10px;
