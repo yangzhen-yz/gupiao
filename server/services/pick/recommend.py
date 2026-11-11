@@ -334,6 +334,62 @@ def exec_rates(max_age: float = 600.0) -> Dict:
     return r
 
 
+_EXIT_SIM_CACHE: Dict = {'ts': 0.0, 'data': {}}
+
+
+def exit_sim_rates(max_age: float = 600.0) -> Dict:
+    """可成交模拟最新一轮的「次日开盘卖 vs 拿到次日收盘」对照（默认出口文案用）。
+
+    2026-11-11 方向 1：卡片默认出口收敛到次日开盘卖。数字不写死——写死的实测数
+    会过期（exec_rates 头部那条教训），这里读 rec_sim_daily 最新 run_date 的
+    filled_open / filled_close 两行（低吸真正成交口径，与卡片 execHint 同一锚点）。
+    缺表/缺行/读失败一律返回 {}，调用方退回纯定性文案，绝不出现 "None%"。
+    只读本地库、零外部请求；10 分钟缓存与 exec_rates 同节奏。
+    """
+    import time as _t
+    now = _t.time()
+    if now - _EXIT_SIM_CACHE['ts'] < max_age and _EXIT_SIM_CACHE['data']:
+        return _EXIT_SIM_CACHE['data']
+    d: Dict = {}
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            rows = conn.execute(
+                "SELECT key, avg_equal, win_rate, trades, window_since, window_until "
+                "FROM rec_sim_daily WHERE run_date=(SELECT MAX(run_date) FROM rec_sim_daily) "
+                "AND key IN ('filled_open','filled_close')").fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            d[str(r[0])] = {'avg': r[1], 'win': r[2], 'n': r[3],
+                            'since': r[4], 'until': r[5]}
+    except Exception as e:
+        print(f'[默认出口] 可成交模拟对照数没拿到（文案退回定性口径）: {type(e).__name__}: {e}')
+    _EXIT_SIM_CACHE.update({'ts': now, 'data': d})
+    return d
+
+
+def _default_exit_note() -> str:
+    """非封板票的默认出口提醒（2026-11-11 方向 1，只改提醒层）。
+
+    为什么默认次日开盘卖：可成交模拟六组合里「低吸成交→次日开盘卖」是唯一持续为正
+    的组合，同入场拿到次日收盘显著更差（卖法差是期望差的主来源之一）。封板票有自己的
+    exitNote（子集口径，等出口分叉影子裁决），不走这里。数字活取 exit_sim_rates()，
+    取不到就只给纪律不给数——不写会过期的死数字，也不编数。
+    """
+    head = ('默认出口：次日 9:15-9:25 竞价挂卖、开盘即走，不默认拿到次日收盘。')
+    d = exit_sim_rates()
+    o, c = d.get('filled_open') or {}, d.get('filled_close') or {}
+    if o.get('avg') is None or o.get('win') is None:
+        return head + '同批票「开盘卖 vs 拿到收盘」的对照数字见回测页「每日监控点」。'
+    seg = (f"可成交模拟（{o.get('since')}~{o.get('until')}，低吸成交 {o.get('n')} 笔）："
+           f"开盘卖 {o['avg']:+.2f}%/笔、胜率 {o['win']}%")
+    if c.get('avg') is not None and c.get('win') is not None:
+        seg += f"；拿到次日收盘 {c['avg']:+.2f}%/笔、{c['win']}%"
+    return head + seg + '。'
+
+
 def _vol5_for_stock(stock: Dict) -> Optional[float]:
     """单票近 5 日已实现波动率（%），供 buy_range 算动态带宽。
 
@@ -431,6 +487,11 @@ def _apply_exec_honesty(stock: Dict, bsp: Dict, rates: Optional[Dict] = None,
                 '摸板就买整体 −0.28%（32.1% 当天炸板、那批 −5.15%）——确认封死才买。'
                 '持有到次日收盘只 +1.97%/59.3%，亏超 5% 涨到 11.4%。'
                 '竞价高开超过 5% 不追（高开 +5~8% 追板持有到次日收盘 -0.11%/46.5%、亏超 5% 30.7%）')
+        else:
+            # 2026-11-11 方向 1：默认出口提醒从"仅封板票"扩到全部推荐卡。
+            # 只改提醒层——评分、选票、门槛、买卖点数字一律不动；封板子集文案保持
+            # 原样（等 exit_seal 分叉影子 12-03 裁决）。数字活取 rec_sim_daily 最新一轮。
+            timing['exitNote'] = _default_exit_note()
     except Exception as e:
         print(f'[执行诚实化] 按票计算失败（回落全局文案）: {type(e).__name__}: {e}')
     return bsp

@@ -580,6 +580,17 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'push_gate_shadow_enabled', 'cfg': 'PUSH_GATE_SHADOW_ENABLED', 'kind': 'bool',
+        'label': '推送超价闸门影子（现价 vs 买入参考价上限）', 'group': '数据与门槛', 'live': True,
+        'note': '每条盘中达标推送成功后，把"推送时现价比买入上限高多少"（buyTiming.overPct，'
+                '与推荐卡同一核心口径）记进 push_gate_shadow，20:45 回填"按推送价买→次日开盘卖"的毛/净腿。'
+                '闸门假设：overPct>0＝在追高（复盘追入 T+1 胜率 46.8%）。**只记录，不拦推送、'
+                '不改评分/门槛/文案**；裁决按日配对：≥20 个放行组与被拦组当天都有样本的交易日、'
+                '放行组净均值−被拦组净均值≥0.5pp、按日 t≥2（影子台账第 22 条）。'
+                '关掉＝不建表不写行，推送链路逐字节等于没这项',
+        'impact': None,
+    },
+    {
         'key': 'westock_crosscheck_enabled', 'cfg': 'WESTOCK_CROSSCHECK_ENABLED', 'kind': 'bool',
         'label': '每日双源数据校验（16:30，westock 权威）', 'group': '策略快照', 'live': True,
         'note': '把本地资金流/行情与 westock（腾讯自选股）比对，落 westock_snapshot 与 '
