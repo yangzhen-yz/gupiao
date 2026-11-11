@@ -4,7 +4,7 @@
 要守的不变量只有一句：**运行期 print 打不崩，靠的是 `app/main.py` 入口那段编码兜底。**
 
 线上实拍（见 `docs/工程知识库.md` 11-02 那条）：看护把后端 stdout 重定向进
-`server/server_supervised.log`，那条管道是 **GBK**。于是一条带 `⚠` 的 `print` 不是难看，
+`server/logs/server_supervised.log`（11-10 前在 server/ 根），那条管道是 **GBK**。于是一条带 `⚠` 的 `print` 不是难看，
 而是抛 `UnicodeEncodeError` **把它的调用方一起打死**——`[推荐模式]` 接力票告警自 10-26 起
 崩了 16 次，连带吞掉后面那条标签汇总。修法是入口一次性 `reconfigure` 成 UTF-8 +
 `errors='replace'`（只在探到 GBK 家族时动手），**没有逐行改写那些文案**：一处入口治同类问题，

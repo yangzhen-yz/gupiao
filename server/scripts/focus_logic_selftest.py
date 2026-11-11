@@ -1,12 +1,20 @@
-"""focus_logic_selftest.py - 买入逻辑卡 / 封板拦截 / 主线裁决闸门的长期回归自测
+"""focus_logic_selftest.py - 买入逻辑卡 / 封板票 T+1 竞价条件单 / 主线裁决闸门的长期回归自测
 
-守的线上不变量：
+守的线上不变量（2026-11-10 修正）：
   1. 逻辑卡只摆已落库事实，缺数据只写 gaps，绝不编「利好」、绝不补 0；
   2. 逻辑卡**不改选票结果**（code/score/expectedWinRate 原样，只新增 logic 键）；
-  3. 已封板票在收评里不给任何可执行买入动作（无买点/止盈/仓位、文案不诱导）；
-  4. 主线影子判据没到时闸门必须拒绝上线，且**不是永远拒绝**（样本够要能 READY）。
+  3. **T 日与 T+1 必须分开**：今日封板＝今日盘中买不进（不追），
+     不等于明日 9:25 竞价不可介入。封板票必须保留条件式买入计划，
+     不许再出现「不可执行·仅观察 / blocked」一刀切；
+  4. 竞价分档卡只作影子方向参考：必须标「未裁决」、不得下「可买/放行」指令、
+     不得把主线当放行条件（主线判据 INSUFFICIENT）；
+  5. 主线影子判据没到时闸门必须拒绝上线，且**不是永远拒绝**（样本够要能 READY）；
+  6. **行动台不得再裁字段**：收评 focus_json 里的 `logic` / `reason` / `auctionGuard`
+     必须透传到「明日计划」卡片；「可介入」卡片复用同一套聚合但不得覆盖已有的
+     字符串 `logic`（评分理由）。
 
-全部用合成数据 + 打桩，不碰生产库、不发网络请求。
+合成数据 + 打桩，不碰生产库、不发网络请求（`_auction_guard` 一律注入 basis，
+`attach_focus_logic` 的三张表读取打桩）。
 用法：python server/scripts/focus_logic_selftest.py
 """
 import json
@@ -52,7 +60,7 @@ def mk_days(days, with_main=True):
     return {d: [(1, p)] for d in days}
 
 
-print('=== 买入逻辑卡 / 封板拦截 / 主线闸门 回归自测 ===')
+print('=== 买入逻辑卡 / T+1 竞价条件单 / 主线闸门 / 行动台透传 回归自测 ===')
 
 # [1] 代码归一化
 check(1, fr._plain('sz000525') == '000525'
@@ -120,7 +128,8 @@ try:
     n = fr.attach_focus_logic(items, '2026-11-09')
     card = items[0]['logic']
     check(8, n == 1 and card['sealed']
-          and any('不提供买入动作' in r for r in card['risk']))
+          and any('T+1' in r for r in card['risk'])
+          and not any('不提供买入动作' in r or '仅观察' in r for r in card['risk']))
     check(9, all(items[0][k] == v for k, v in before.items())
           and set(items[0]) - set(before) == {'logic'},
           '逻辑卡偷偷改了选票字段')
@@ -138,20 +147,26 @@ try:
 finally:
     fr._pool_data = _orig[0]
 
-# [11] 封板拦截对象不含任何可执行买点
-f = {}
-rv._mark_sealed_blocked(f)
-check(11, f['execBlocked'] is True and f['tomorrowPlan']['blocked'] is True
-      and not any(k in f['tomorrowPlan'] for k in ('buyLow', 'buyHigh', 'takeProfit', 'stopLoss', 'position'))
-      and '次日竞价' not in json.dumps(f, ensure_ascii=False))
+# [11] 封板票必须保留完整 T+1 条件式计划（反证：不许再一刀切拦掉）
+q_sealed = {'changePercent': 10.01, 'amplitude': 2.0, 'highRaw': 60.9, 'priceRaw': 60.9}
+bt = rv._simple_buy_timing(q_sealed)
+plan = rv._build_tomorrow_plan(q_sealed, bt)
+plan['auctionGuard'] = rv._auction_guard(basis={})
+f = {'buyTiming': bt, 'tomorrowPlan': plan}
+check(11, 'execBlocked' not in f and 'blocked' not in plan
+      and all(k in plan for k in ('buyLow', 'buyHigh', 'takeProfit', 'stopLoss', 'position', 'veto'))
+      and '次日竞价挂单' in plan['buyNote']
+      and plan['stopLossPct'] <= rv._TP_STOP_MAX_LIMIT_UP * 100 + 1e-6
+      and any('一字板' in v for v in plan['veto']),
+      json.dumps(plan, ensure_ascii=False)[:300])
 
-# [12] 时机判定：封板不诱导，非封板不受影响（反证）
-bt = rv._simple_buy_timing({'changePercent': 10.0, 'amplitude': 2.0,
-                            'highRaw': 11.0, 'priceRaw': 11.0})
+# [12] 时机判定：T 日/T+1 分开说，非封板不受影响（反证）
 bt2 = rv._simple_buy_timing({'changePercent': 3.0, 'amplitude': 2.0,
                              'highRaw': 10.3, 'priceRaw': 10.3})
-check(12, bt['label'] == '已封板·不追' and '竞价参与' not in bt['note']
-      and bt2['label'] != '已封板·不追' and '竞价参与' not in bt2['note'])
+check(12, bt['type'] == 'auction' and '条件单' in bt['label']
+      and '今日' in bt['note'] and '明日' in bt['note']
+      and '已封板·不追' not in bt['label'] and '仅观察' not in bt['note']
+      and bt2['type'] != 'auction' and '条件单' not in bt2['label'])
 
 # [13][14] 闸门：样本不足拒绝 / 样本足够放行（反证，防止闸门永远拒绝）
 days13 = [f'2026-01-{d:02d}' for d in range(1, 14)]
@@ -178,4 +193,162 @@ for d in days16[:2]:
 r = mv.evaluate(by, set(days16), '2099-01-01', max(days16))
 check(16, any('翻转' in g for g in r['gaps']) and r['intradayFlipDays'] == 2)
 
-print(f'\n=== 全部通过 {len(_PASSED)}/{16} ===')
+# ---- 17~23：竞价分档卡的边界与反证（2026-11-10 新增） ----
+BASIS = {
+    'deep_dip': {'n': 38, 'mean': 1.559},
+    'mild_dip': {'n': 145, 'mean': 0.691},
+    'flat': {'n': 132, 'mean': 0.379},
+    'high': {'n': 23, 'mean': -0.207},
+    'chase': {'n': 135, 'mean': -1.425},
+}
+g = rv._auction_guard(basis=BASIS)
+
+# [17] 五档齐全、方向与注入数据一致、绝不把影子方向写成放行指令
+check(17, [a['key'] for a in g['arms']] == ['deep_dip', 'mild_dip', 'flat', 'high', 'chase']
+      and [a['direction'] for a in g['arms']] ==
+      ['positive', 'positive', 'positive', 'negative', 'negative']
+      and all('仅参考' in a['action'] and '买' not in a['action'] for a in g['arms'])
+      and not any(k in json.dumps(g, ensure_ascii=False)
+                  for k in ('可以买入', '建议买入', '可介入即买', '已上线')))
+
+# [18] 影子未裁决 + 主线判据不足，两者都不得写成放行依据
+check(18, '未裁决' in g['shadowStatus'] and '不构成买入依据' in g['shadowStatus']
+      and 'INSUFFICIENT' in g['mainlineNote'] and '不作放行条件' in g['mainlineNote'])
+
+# [19] 时间维度必须明确分离，且现行条件单与影子方向的矛盾要摆出来（不掩盖、不偷改参数）
+check(19, '今日' in g['timeSplit'] and '独立决策' in g['timeSplit']
+      and '不覆盖条件单' in g['rule']
+      and '口径矛盾' in g['conflict'] and '未改参数' in g['conflict']
+      and '按现行条件单执行' in g['conflict'])
+
+# [20] basis 缺失优雅降级：不编数、不填 0、不抛异常
+g0 = rv._auction_guard(basis={})
+check(20, g0['basisAvailable'] is False
+      and all(a['mean'] is None and a['direction'] == 'unknown' for a in g0['arms'])
+      and '不填数' in g0['basisNote'])
+
+# [21] 小样本档不许给出方向（防止 n=1 的极端值被当成结论）
+g_small = rv._auction_guard(basis={'deep_dip': {'n': 3, 'mean': 99.0},
+                                   'chase': {'n': 2, 'mean': -99.0}})
+check(21, all(a['direction'] == 'unknown' and a['mean'] is None
+              for a in g_small['arms']))
+
+# [22] 反证：源码里不许再出现一刀切封板拦截（防止回退到旧口径）
+import inspect
+_src = inspect.getsource(rv)
+check(22, '_mark_sealed_blocked' not in _src
+      and "'blocked': True" not in _src
+      and '已封板·不追' not in _src)
+
+# [23] 非封板票绝不挂竞价分档卡（不越界）
+q_normal = {'changePercent': 3.0, 'amplitude': 2.0, 'highRaw': 10.3, 'priceRaw': 10.3}
+plan_n = rv._build_tomorrow_plan(q_normal, bt2)
+check(23, 'auctionGuard' not in plan_n and 'blocked' not in plan_n
+      and plan_n['stopLossPct'] > 0)
+
+# ---- 24~31：行动台买入逻辑卡透传（2026-11-10 新增） ----
+from services.ops import action_desk as ad  # noqa: E402
+
+_FAKE_FOCUS = [{
+    'code': 'sz000525', 'name': '红太阳', 'score': 78,
+    'expectedWinRate': 60.3, 'expectedAvgRet': 1.48, 'pctChg': 10.01,
+    'price': 8.88, 'reason': '融合分78分，委比为正',
+    'buyTiming': {'type': 'auction', 'label': '次日竞价·条件单'},
+    'logic': {'chainText': '今日热门链：农药链', 'poolText': '涨停池', 'gaps': []},
+    'tomorrowPlan': {'buyLow': 8.5, 'auctionGuard': {'title': '竞价分档'}},
+}]
+
+# [24] 投影层不许再裁掉买入逻辑 / 评分理由 / T+1 竞价条件单（本批修的正是这一层）
+p = ad._project_tomorrow_plan(_FAKE_FOCUS)[0]
+check(24, p['symbol'] == 'sz000525' and p['winRate'] == 60.3
+      and p['score'] == 78 and p['pctChg'] == 10.01
+      and p['logic']['chainText'] == '今日热门链：农药链'
+      and p['reason'] == '融合分78分，委比为正'
+      and p['timingLabel'] == '次日竞价·条件单'
+      and p['plan']['buyLow'] == 8.5
+      and p['plan']['auctionGuard']['title'] == '竞价分档')
+
+# [25] 旧收评没有逻辑卡时如实留空，绝不编理由（前端会标注「下一份收评起提供」）
+p_old = ad._project_tomorrow_plan([{'code': 'sh600000', 'name': 'X', 'reason': None}])[0]
+check(25, p_old['logic'] == {} and p_old['reason'] == '' and p_old['plan'] == {}
+      and ad._project_tomorrow_plan([]) == [])
+
+# [26][27] 复用聚合时的 key 参数：不覆盖评分理由字符串；默认参数行为不变
+_orig = (fr._pool_data, fr._chain_index, fr._latest_mainline)
+fr._pool_data = lambda d: ({}, '')
+fr._chain_index = lambda: ({}, '', 0)
+fr._latest_mainline = lambda: {}
+try:
+    items = [{'symbol': 'sz000525', 'changePercent': 10.01,
+              'logic': '评分理由原文', 'score': 78}]
+    n = fr.attach_focus_logic(items, '2026-11-10', code_key='symbol',
+                              pct_key='changePercent', out_key='themeLogic')
+    card = items[0]['themeLogic']
+    check(26, n == 1 and items[0]['logic'] == '评分理由原文'
+          and card['sealed'] is True  # changePercent 10.01 触发封板兜底
+          and card['chainText'] == '热门链：暂无数据'
+          and any('四池无该票' in g for g in card['gaps']),
+          json.dumps(card, ensure_ascii=False)[:240])
+
+    items2 = [{'code': 'sz000525', 'pctChg': 2.0}]
+    n2 = fr.attach_focus_logic(items2, '2026-11-10')
+    check(27, n2 == 1 and 'logic' in items2[0] and 'themeLogic' not in items2[0]
+          and not items2[0]['logic']['sealed'])
+finally:
+    fr._pool_data, fr._chain_index, fr._latest_mainline = _orig
+
+# [28] 空名单不读库、不抛异常
+check(28, ad._attach_buy_theme_logic([], '2026-11-10') == 0)
+
+# [29] 聚合失败必须静默：可介入名单不能因为逻辑卡挂掉而整块消失
+_orig_attach = fr.attach_focus_logic
+
+
+def _boom(*a, **kw):
+    raise RuntimeError('db down')
+
+
+fr.attach_focus_logic = _boom
+try:
+    items3 = [{'symbol': 'sz000525'}]
+    check(29, ad._attach_buy_theme_logic(items3, '2026-11-10') == 0
+          and 'themeLogic' not in items3[0])
+finally:
+    fr.attach_focus_logic = _orig_attach
+
+# [30] 反证：源码里不许回退到内联投影（历史上正是它裁掉了逻辑卡）
+_ad_src = inspect.getsource(ad)
+check(30, "'tomorrowPlan': _project_tomorrow_plan(" in _ad_src
+      and "'tomorrowPlan': [{'symbol'" not in _ad_src
+      and "'logic': f.get('logic') or {}" in _ad_src
+      and "'reason': f.get('reason') or ''" in _ad_src
+      and '_attach_buy_theme_logic(buy_now + deferred' in _ad_src)
+
+# [31] 前端两处卡片必须都渲染逻辑卡，且评分理由要标明「非买入理由」
+_vue = open(os.path.join(os.path.dirname(_SERVER), 'client-vue', 'src',
+                         'components', 'tabs', 'TabActionDesk.vue'),
+            encoding='utf-8').read()
+check(31, all(k in _vue for k in (
+    'logicHas(t.logic)', 'logicHas(b.themeLogic)', '评分依据（非买入理由）',
+    '不构成买入背书', 'T 日不追 + T+1 条件化竞价单',
+    't.plan?.auctionGuard', 't.plan?.blocked')))
+
+# [32] 「稍后时机」投影不许再把刚挂上的 themeLogic 裁掉（与 [30] 同类回归）
+_deferred = [{'symbol': 'sz000525', 'name': 'X', 'timingLabel': '尾盘',
+              'score': 71, 'vetoReason': '情绪退潮·涨幅已过5%不追高',
+              'themeLogic': {'chainText': '主线链条命中', 'poolDay': '2026-11-10'}}]
+_proj_d = ad._project_deferred_buys(_deferred)[0]
+check(32, _proj_d['themeLogic']['chainText'] == '主线链条命中'
+      and _proj_d['vetoReason'] == '情绪退潮·涨幅已过5%不追高'
+      and _proj_d['symbol'] == 'sz000525'
+      and ad._project_deferred_buys([]) == [])
+
+# [33] 反证：不许回退到内联投影；前端稍后时机 chip 必须真的显示一行理由
+check(33, "'deferredBuys': _project_deferred_buys(deferred)" in _ad_src
+      and "'deferredBuys': [{'symbol'" not in _ad_src
+      and 'logicBrief(d.themeLogic)' in _vue
+      and 'deferred-logic' in _vue)
+
+_TOTAL = 33
+assert len(_PASSED) == _TOTAL, f'用例数不对: {len(_PASSED)} != {_TOTAL}'
+print(f'\n=== 全部通过 {len(_PASSED)}/{_TOTAL} ===')

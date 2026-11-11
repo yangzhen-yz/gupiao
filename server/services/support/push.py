@@ -33,6 +33,7 @@ from app.config import (WECOM_PUSH_ENABLED, WECOM_AIBOT_ENABLED, WECOM_CLI_CHAT_
                         WECOM_PUSH_MIN_GAIN, WECOM_PUSH_MIN_VOL_RATIO, WECOM_PUSH_MAX_CHANGE,
                         WECOM_PUSH_SCAN_RECOMMEND_POOL, WECOM_PUSH_POOL_TOP_N, WECOM_PUSH_REC_TOP_N,
                         WECOM_PUSH_DAILY_LIMIT, WECOM_PUSH_MATRIX_VETO, WECOM_PUSH_MATRIX_LABEL,
+                        WECOM_PUSH_EXIT_NOTE,
                         WECOM_PUSH_APPLY_LOSER_BLACKLIST)
 from db.database import load_user_scan_pool, get_db_conn
 
@@ -230,7 +231,7 @@ def push_wecom_markdown(content: str) -> bool:
         return True
     print('[推送] [警告] 两条通道都没发出去：aibot 权限过期且未配置 webhook。'
           '请建一个只有自己的企微群、加"自定义机器人"，'
-          '把 webhook 地址写进 server/wecom_webhook.json（{"webhook_url": "..."}）')
+          '把 webhook 地址写进 server/config/wecom_webhook.json（{"webhook_url": "..."}）')
     return False
 
 
@@ -694,6 +695,9 @@ def _fmt_markdown(stocks: list, title: str) -> str:
         lines.append(f'{i}. **{name}**（{code}）')
         lines.append(f'   💰 现价 {price}｜涨幅 {change}%｜评分 {score}')
         lines.append(f'   🎯 预期涨幅 {gain:.1f}%｜量比 {vr:.1f}')
+        if WECOM_PUSH_EXIT_NOTE:
+            # 2026-11-11 方向 1：默认出口写进推送，不留给临场决定（与推荐卡 exitNote 同口径）。
+            lines.append('   🚪 默认出口：次日 9:15-9:25 竞价挂卖、开盘即走，不默认拿到次日收盘')
         if WECOM_PUSH_MATRIX_LABEL:
             m = matrix_of(s)
             v = m.get('verdict') or ''
@@ -752,6 +756,13 @@ async def push_candidates_task():
                              score=s.get('score'), channel='screener')
             print(f'[推送 {datetime.now():%H:%M:%S}] 已推送 {len(hits)} 只: '
                   f'{", ".join(s.get("name", "") for s in hits)}')
+            # 推送超价闸门影子（2026-11-11，台账第 22 条）：只记录"现价 vs 买入上限"的超价幅度，
+            # 收盘后回填次日开盘净收益攒对照。**不拦推送**——try/except 兜底，影子坏了也不影响推送本身。
+            try:
+                from services.pick import push_gate_shadow as _pgs
+                _pgs.record_pushed(hits, push_date=today)
+            except Exception as _e:
+                print(f'[推送闸门影子] 记录失败(不影响推送): {type(_e).__name__}: {_e}')
     except Exception as e:
         print(f'[推送 {datetime.now():%H:%M:%S}] 推送任务异常: {e}')
         import traceback

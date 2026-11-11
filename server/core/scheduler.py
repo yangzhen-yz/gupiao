@@ -48,6 +48,7 @@ from app.config import EVAL_LAB_ENABLED, EVAL_LAB_TIME, EVAL_LAB_WEEKDAY
 from app.config import AUCTION_SNAPSHOT_ENABLED, AUCTION_SNAPSHOT_TIME, AUCTION_SNAPSHOT_BATCH
 from app.config import (AUCTION_DIP_SHADOW_ENABLED, AUCTION_DIP_MORNING_TIME,
                         AUCTION_DIP_RETRY_TIME, AUCTION_DIP_EVENING_TIME)
+from app.config import PUSH_GATE_SHADOW_ENABLED, PUSH_GATE_SHADOW_EVENING_TIME
 from app.config import MINUTE5_FORWARD_ENABLED, MINUTE5_FORWARD_TIME
 # 盘中龙头通道（2026-11-01）：默认关，影子期只落库不推送
 from app.config import (INTRADAY_DRAGON_ENABLED, INTRADAY_DRAGON_START,
@@ -661,7 +662,7 @@ def run_scheduler():
         # 2026-11-04 修复（数据整天冻结）：调度器跑在**独立线程**，原来用 force=False 调用会命中
         # stale-while-revalidate 分支——那一支立即返回旧数据，把重扫挂到 `asyncio.create_task` 上，
         # 而任务挂在本函数 `asyncio.run` 的**临时 loop** 上：asyncio.run 一返回就把它取消，
-        # **扫描没跑完就不会落库**。实测证据：`server_supervised.log` 里当天 12 条"缓存过期…已启动后台
+        # **扫描没跑完就不会落库**。实测证据：`server/logs/server_supervised.log` 里当天 12 条"缓存过期…已启动后台
         # 重扫"（没有一条"已在跑"），而 age 每 30 分钟单调增长 1776s→14372s，说明每次都真的起了任务、
         # 只是从没跑完 → 当天数据冻结在第一次扫描（09:00:31）。注意 `_swr_refresh_inflight` 本身没有
         # 卡死：asyncio.run 收尾会取消挂起任务并执行它的 finally，探针与上面那 12 条日志都印证标志正常复位，
@@ -974,6 +975,20 @@ def run_scheduler():
                 print(f"[竞价低吸影子] 回填失败: {r['error']}")
         except Exception as e:
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 竞价低吸影子回填轮失败: {e}')
+
+    def job_push_gate_shadow_evening():
+        """推送超价闸门影子·回填轮（2026-11-11，台账第 22 条）：日K五批（18:15~20:15）之后，
+        把"按推送价买→次日开盘卖"的毛/净腿能补的补上，历史缺行一起自愈。
+        排 20:45：在竞价低吸臂 20:40 之后，两条影子各写各的表、互不依赖。**只记录，不拦推送**。"""
+        try:
+            from services.pick import push_gate_shadow as _pgs
+            if not _pgs.enabled():
+                return
+            r = _pgs.run_evening()
+            if r.get('error'):
+                print(f"[推送闸门影子] 回填失败: {r['error']}")
+        except Exception as e:
+            print(f'[定时任务 {datetime.now():%H:%M:%S}] 推送闸门影子回填轮失败: {e}')
 
     def job_minute5_forward():
         """收盘后采集活跃票 5 分钟线（默认关）。"""
@@ -1500,6 +1515,10 @@ def run_scheduler():
     schedule.every().day.at(AUCTION_DIP_RETRY_TIME).do(_warp_trading_only(job_auction_dip_morning))
     schedule.every().day.at(AUCTION_DIP_EVENING_TIME).do(_warp_trading_only(job_auction_dip_evening))
 
+    # 推送超价闸门影子（2026-11-11，台账第 22 条）：20:45 回填"按推送价买→次日开盘卖"净腿
+    # （日K五批之后、竞价低吸臂 20:40 之后）；只写旁路表，不拦推送/不改评分/门槛/文案
+    schedule.every().day.at(PUSH_GATE_SHADOW_EVENING_TIME).do(_warp_trading_only(job_push_gate_shadow_evening))
+
     # 收盘后 5 分钟线前向采集（2026-10-22，默认关）：只采当天推荐/持仓/海选池活跃票，
     # 15:05 跑完不耽误 15:10 收评；替代已被 baostock 判黑卡住的逐只分钟线
     schedule.every().day.at(MINUTE5_FORWARD_TIME).do(_warp_trading_only(job_minute5_forward))
@@ -1627,6 +1646,9 @@ def run_scheduler():
           f'{"已启用" if AUCTION_DIP_SHADOW_ENABLED else "默认关"}）')
     print(f'[定时任务]   - {AUCTION_DIP_EVENING_TIME}: 竞价低吸臂影子回填（日内/隔夜/合计三条腿'
           f'+同日范围等权基准，历史缺行自愈；只记录）')
+    print(f'[定时任务]   - {PUSH_GATE_SHADOW_EVENING_TIME}: 推送超价闸门影子回填（按推送价买→次日开盘卖'
+          f'毛/净腿，历史缺行自愈；只记录不拦推送，'
+          f'{"已启用" if PUSH_GATE_SHADOW_ENABLED else "默认关"}）')
     print(f'[定时任务]   - {MINUTE5_FORWARD_TIME}: 5分钟线前向采集（活跃票，落 minute_5m；'
           f'{"已启用" if MINUTE5_FORWARD_ENABLED else "默认关"}）')
     print(f'[定时任务]   - 每周{"一二三四五六日"[EVAL_LAB_WEEKDAY]} {EVAL_LAB_TIME}: '

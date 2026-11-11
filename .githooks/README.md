@@ -23,7 +23,7 @@ git config --local --unset core.hooksPath
 | B1 落后 | `git fetch origin <当前分支>` 成功，且 `! git merge-base --is-ancestor FETCH_HEAD HEAD` | **阻断** | `git pull --rebase origin <分支>` |
 | B2 批量混提 | 暂存的新增（`--diff-filter=A`）非产物文件 > 8，或**非产物**暂存文件总数 > 20（构建产物不计入，否则正常前端提交必被拦） | **阻断** | `git reset` 后逐路径 `git add`；按主题拆提交 |
 | B3 产物成对 | `server/static/assets/` 新增数 ≠ 删除数，或换了产物没带 `server/static/index.html` | **阻断** | 删增成对同提交 + 带上 index.html |
-| B4 凭据/绝对路径 | 本次**新增行**里出现本机绝对路径（`D:\` `d:\` `C:\Users` `c:\users`）、带 key 的 webhook URL（`webhook/send?key=` 后跟 ≥8 位）、或 `corpsecret` 紧跟 ≥12 位字面量（扫 .py/.js/.ts/.vue/.json/.yaml，排除 `server/static`） | **阻断** | 路径走配置项；webhook 留在已被 `.gitignore` 排除的 `server/wecom_webhook.json` |
+| B4 凭据/绝对路径 | 本次**新增行**里出现本机绝对路径（`D:\` `d:\` `C:\Users` `c:\users`）、带 key 的 webhook URL（`webhook/send?key=` 后跟 ≥8 位）、或 `corpsecret` 紧跟 ≥12 位字面量（扫 .py/.js/.ts/.vue/.json/.yaml，排除 `server/static`） | **阻断** | 路径走配置项；webhook 留在已被 `.gitignore` 排除的 `server/config/wecom_webhook.json` |
 | B5 文档同步 | 改了 `server/**` 或 `client-vue/src/**` 但没暂存任何文档 | **只提醒**（不阻断） | 按 AGENTS.md 清单同步 5 份文档 |
 | B6 事务持锁 | 本次**新增行**落在"同一函数体内第一条 DML 之后、下一个 `commit()` 之前"的窗口里，且窗口内出现 `await` / `requests` / `fetch_*` / `sleep` 等外部 IO（判据在 `server/scripts/tx_holding_scan.py`，白名单式） | **只提醒**（不阻断） | 外部拉数挪到事务之外，或逐条写完就 `conn.commit()` 把写锁交还 |
 | B7 自测换库 | 暂存的 `server/scripts/*selftest*.py` 里「会写库却没有任何隔离（没 `use_db_path`、没把 `get_db_conn` 换成桩、也不是全临时路径）」，或给 `database`/`config`/`dal_state` 的 `SQLITE_DB_PATH` 赋值（11-05 拆分后静默无效），或直连 `gupiao.db`/`history_kline.db` 且没写 `mode=ro`（判据在 `server/scripts/db_hygiene_check.py`，规则 R1/R2/R3） | **阻断**（`analysis_out/` 里的同名一次性脚本只提示） | 顶部加 `import db.database as dbmod; dbmod.use_db_path(临时库)`；只读复核就写 `sqlite3.connect("file:…?mode=ro", uri=True)` |

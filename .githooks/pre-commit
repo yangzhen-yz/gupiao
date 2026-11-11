@@ -102,7 +102,7 @@ fi
 # 当成凭据拦下（实测阻断了一次正常提交）。凭据从来不在函数名里，在**值**里，所以 v2 只认
 # 三种真形态：本机绝对路径、带 key 的 webhook URL、corpsecret 紧跟长字面量。
 # 收紧后仍拦得住真凭据（当场验过），但不再拦 `wecom_webhook.json` 的路径引用与函数名——
-# 那是正当做法（凭据本体在 .gitignore 排除的 server/wecom_webhook.json 里）。
+# 那是正当做法（凭据本体在 .gitignore 排除的 server/config/wecom_webhook.json 里）。
 if enabled secret; then
     bad=$(git diff --cached -U0 --diff-filter=ACM -- '*.py' '*.js' '*.jsx' '*.ts' '*.vue' '*.json' '*.yaml' '*.yml' ':(exclude)server/static' 2>/dev/null \
           | grep '^+' | grep -v '^+++' \
@@ -115,7 +115,7 @@ if enabled secret; then
         printf '%s\n' "$bad" | sed 's/^/      /'
         echo "   为什么拦：绝对路径让代码只能在这台机器跑；凭据一旦进提交就永久留在历史里。"
         echo "   正确做法：路径走配置项或环境变量（守护脚本里的硬编码路径留在仓库外），"
-        echo "             webhook 留在已被 .gitignore 排除的 server/wecom_webhook.json 里。"
+        echo "             webhook 留在已被 .gitignore 排除的 server/config/wecom_webhook.json 里。"
         echo "   （确要临时停用本项：git config --local hooks.secret.enabled false）"
         exit 1
     fi

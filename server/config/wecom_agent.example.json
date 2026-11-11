@@ -1,5 +1,5 @@
 {
-  "_说明": "企业微信「自建应用」单聊通道凭据。复制本文件为 server/wecom_agent.json 并填入管理员给的三个值，然后重启服务；也可用同名环境变量覆盖。wecom_agent.json 已在 .gitignore 里，不会入库。",
+  "_说明": "企业微信「自建应用」单聊通道凭据。复制本文件为 server/config/wecom_agent.json 并填入管理员给的三个值，然后重启服务；也可用同名环境变量覆盖。wecom_agent.json 已在 .gitignore 里，不会入库。",
   "_还差管理员一步": "应用详情 → 企业可信 IP 里加上本机出口 IP（发送失败时日志会直接打印当前 IP）；若要「点链接自助绑定」，还需在「网页授权及 JS-SDK」配一个公网可信域名并填 redirect_base",
   "corp_id": "",
   "agent_id": "",

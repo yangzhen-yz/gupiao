@@ -123,7 +123,12 @@ for label, st, want_type in cases:
            f'{label}：打板票带默认出口径（不是只写"次日竞价"，而是给出为什么）')
         ck('竞价关注' in bsp.get('buy', ''), f'{label}：封板票买入价仍是"竞价关注"（没被区间覆盖掉）')
     else:
-        ck('exitNote' not in t, f'{label}：非打板票不该冒出出口径')
+        # 2026-11-11 方向 1 改口径：非打板票也带默认出口提醒（原断言"不该冒出出口径"
+        # 锁的是改造前行为，已重写）。数字有无取决于本地 rec_sim_daily，两种形态都合法，
+        # 但纪律句必须在、且不许渲染出 None。
+        ck('次日 9:15-9:25 竞价挂卖' in (t.get('exitNote') or ''),
+           f'{label}：非打板票也带默认出口提醒（次日开盘卖）')
+        ck('None' not in (t.get('exitNote') or ''), f'{label}：出口文案不许出现 None')
 
 print('\n[5] 低吸口径的票确实比现价便宜（否则"挂低吸单"这颗按钮没意义）')
 bsp = R.calc_buy_sell_points(cases[1][1], score_result={'total': 72, 'label': 'B',
@@ -173,6 +178,46 @@ ck('None' not in h3 and 'None' not in h4, '缺键不许渲染成 None')
 ck('132次' not in h3 and '132次' not in h4 and '132' not in cfg.RECOMMEND_EXEC_HINT,
    '老常量里那句"复盘132次"已经不再出现在任何文案里')
 R._RATES_CACHE.update({'ts': 0.0, 'rates': {}})
+
+print('\n[8] 默认出口提醒（2026-11-11 方向 1）：数字活取、缺数定性、封板文案不动')
+# 8a 注入对照数：文案带实测数与样本窗，不写死
+_R8 = R.exit_sim_rates
+R.exit_sim_rates = lambda: {
+    'filled_open': {'avg': 0.8, 'win': 52.4, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'},
+    'filled_close': {'avg': -0.55, 'win': 43.7, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'}}
+n8 = R._default_exit_note()
+ck('次日 9:15-9:25 竞价挂卖' in n8 and '+0.80%' in n8 and '52.4%' in n8
+   and '-0.55%' in n8 and '43.7%' in n8 and '2026-08-09' in n8 and '103' in n8,
+   f'有对照数：纪律+两腿均值/胜率+样本窗（{n8[:60]}…）')
+ck('None' not in n8, '有数时不许出现 None')
+# 8b 缺数（表空/读失败）：退回定性，不编数
+R.exit_sim_rates = lambda: {}
+n8b = R._default_exit_note()
+ck('次日 9:15-9:25 竞价挂卖' in n8b and '回测页' in n8b and 'None' not in n8b
+   and '可成交模拟（' not in n8b, '缺数：只给纪律与看数位置，不编数字')
+# 8c 反证：缺一条腿/坏值（None）不许渲染成 "None%"，也不许硬凑另一腿
+R.exit_sim_rates = lambda: {'filled_open': {'avg': 0.8, 'win': 52.4, 'n': 103,
+                                            'since': 's', 'until': 'u'}}
+n8c = R._default_exit_note()
+ck('；拿到次日收盘' not in n8c and 'None' not in n8c, '缺收盘腿：不硬凑、不出 None')
+R.exit_sim_rates = lambda: {'filled_open': {'avg': None, 'win': 52.4, 'n': 103,
+                                            'since': 's', 'until': 'u'},
+                            'filled_close': {'avg': -0.55, 'win': 43.7, 'n': 103,
+                                             'since': 's', 'until': 'u'}}
+n8d = R._default_exit_note()
+ck('None' not in n8d and '可成交模拟（' not in n8d, '反证：开盘腿均值是 None → 整体退回定性')
+R.exit_sim_rates = _R8
+# 8e 缓存新鲜时不重算（与 exec_rates 同节奏）
+R._EXIT_SIM_CACHE.update({'ts': _t.time() + 9999, 'data': {'filled_open': {'avg': 1.0}}})
+ck(R.exit_sim_rates() == {'filled_open': {'avg': 1.0}}, '出口对照数缓存新鲜时不重读库')
+R._EXIT_SIM_CACHE.update({'ts': 0.0, 'data': {}})
+# 8f 封板票 exitNote 一字不动（子集口径等 exit_seal 分叉裁决，本批不碰）
+bsp8 = R.calc_buy_sell_points(cases[0][1], score_result={'total': 72, 'label': 'B',
+                                                         'base_scores': {'position': 50}},
+                              trend_details={'positionPct': 50})
+e8 = bsp8['buyTiming'].get('exitNote') or ''
+ck(e8.startswith('默认出口径：') and '+2.0%' in e8 and '确认封死才买' in e8,
+   '封板票仍是原子集口径文案（没被通用默认出口覆盖）')
 
 print()
 print('全部通过' if not FAILS else f'失败 {len(FAILS)} 项: {FAILS}')

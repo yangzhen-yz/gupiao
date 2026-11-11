@@ -80,7 +80,8 @@ def _simple_buy_timing(q: Dict) -> Dict:
 
     输入 q 为 parse_tencent_batch_data 解析的行情 dict（含 changePercent/amplitude/highRaw/priceRaw）。
     规则与 recommend.calc_buy_timing 的优先级一致但只用到行情字段（无角色/位置判定）：
-      1. 已涨停封板(≥9.8%)        → 次日竞价：当日买不到，次日 9:15-9:25 竞价参与
+      1. 已涨停封板(≥9.8%)        → 次日竞价条件单：今日盘中买不进（不追），
+                                    明日 9:25 按竞价缺口分档裁决（T+1 独立决策）
       2. 振幅≥5% 或 自高点回落≥2% → 尾盘买入：14:30 后确认全天形态再介入
       3. 涨幅≥5%                  → 早盘买入：次日情绪溢价在早盘
       4. 其余                     → 盘中灵活：均价线附近介入，不追尾盘急拉
@@ -91,15 +92,18 @@ def _simple_buy_timing(q: Dict) -> Dict:
     high = float(q.get('highRaw') or 0)
     price = float(q.get('priceRaw') or 0)
 
-    # 1. 已涨停封板 → 不可执行·仅观察（2026-11-10 修）
-    # 原文案让「次日 9:15-9:25 竞价参与」，但 push.py:472 明确「已涨停，不推（无买入空间）」，
-    # 且 11-04 实测当天摸板按涨停价买整体 −0.28%（扣费 −0.41%、t=−7.78）、炸板批 −5.15%/胜率 5.2%。
-    # 收评不该给一条系统自己禁止执行、且已知负期望的买入动作。
-    # 注：本函数只管时机标签；连买入计划一起拦由 4.7 的 _mark_sealed_blocked 统一处理。
+    # 1. 已涨停封板 → 次日竞价·条件单（2026-11-10 修正时间维度错配）
+    # T 日：push.py:472 `_pass_filter` 读的是实时 changePercent，判的是「此刻盘中已涨停、
+    #       没有买入空间」，管的是 T 日；push.py:558 矩阵里反而有「昨日封板→可竞价低吸」。
+    # T+1：收评写的就是「明天」，竞价接力是一笔独立决策，不该被 T 日约束连坐。
+    # 11-04 的 −0.28% / −5.15% 测的是「T 日摸板按涨停价买 → 次日开盘卖」，
+    # 否定的是当天打板，不是次日竞价接力——拿它禁 T+1 属证据错配。
+    # `_build_tomorrow_plan` 本来就有涨停票专用分支（更紧止损 / 竞价挂单 / 一字板否决）。
     if change_pct >= _SBT_LIMIT_UP:
         return {
-            'type': 'auction', 'label': '已封板·不追',
-            'note': '今日已封板，系统推送规则「未涨停才推」不追封板票；本票仅作观察，不提供买入动作'
+            'type': 'auction', 'label': '次日竞价·条件单',
+            'note': ('今日已封板＝今日盘中买不进，不追；明日 9:25 竞价是独立决策，'
+                     '按竞价缺口分档裁决，条件不满足就不买（详见竞价分档裁决卡）')
         }
 
     # 自日内高点回落幅度
@@ -124,25 +128,94 @@ def _simple_buy_timing(q: Dict) -> Dict:
     return {'type': 'intraday', 'label': '盘中灵活', 'note': '日内均价线附近介入为宜，避免尾盘急拉时追高'}
 
 
-def _mark_sealed_blocked(f: Dict) -> None:
-    """把「明日重点关注」里的已封板票统一改成不可执行·仅观察（2026-11-10）。
+# ==================== 封板票 T+1 竞价分档裁决（2026-11-10 修正） ====================
+# 11-10 上午曾把「今日封板」直接判成「明日无可执行买点」，是时间维度错配：
+#   · push.py:472 判的是 T 日盘中实时涨幅、管的是当天；push.py:558 明写「昨日封板→可竞价低吸」。
+#   · 11-04 的 −0.28%/−5.15% 测的是「T 日按涨停价打板→次日开盘卖」，不是 T+1 竞价接力。
+#   · `_build_tomorrow_plan` 本就有涨停票专用分支（is_limit_up 更紧止损、buy_range 竞价挂单、
+#     veto 一字板不排队），一刀切拦掉是倒退。
+# 现在恢复条件式计划，并挂一张竞价分档裁决卡：收评生成时不知道明天开成什么样，
+# 所以只给条件不给指令；9:25 撮合价出来后按档自行裁决，未命中就不买。
+# 影子未裁决，方向与数字只作参考，绝不升级成放行判据。
 
-    为什么不删票：名单由 `focus_winrate` 按历史同档胜率选出，改删等于动选票口径，
-    属策略层动作，需另走影子裁决。这里只把**行动建议**与推送规则对齐——
-    `push.py:472`「已涨停，不推（无买入空间）」，卡片不该再给竞价买点/止盈止损/仓位。
+_AUCTION_ARMS = (
+    ('deep_dip', '深低开 ≤−3%'),
+    ('mild_dip', '浅低开 −3～0%'),
+    ('flat', '平开 0～+3%'),
+    ('high', '高开 +3～+4%'),
+    ('chase', '追涨 ≥+4%'),
+)
 
-    buyTiming.type 仍保留 'auction' 只为前端徽章样式不丢，label/note 已改成不诱导。
+
+def _auction_shadow_basis() -> Dict:
+    """读 `auction_dip_shadow` 五档已回填的日内净均值（只读本地库，零外部请求）。
+
+    影子台账第 20 条：判据 ≥20 交易日 + 前向两遍都过，**当前未裁决**。
+    这里只取方向做条件卡参考，不把回溯基线写成可执行依据。
+    表不存在 / 缺列 / 库打不开一律返回 {}，调用方降级成「影子数据暂不可用」。
     """
-    f['execBlocked'] = True
-    f['buyTiming'] = {
-        'type': 'auction', 'label': '已封板·不追',
-        'note': '今日已封板，系统推送规则「未涨停才推」不追封板票；本票仅作观察，不提供买入动作',
-    }
-    f['tomorrowPlan'] = {
-        'blocked': True,
-        'reason': ('今日已封板 → 明日无可执行买点。按系统推送规则（未涨停才推）不追；'
-                   '实测当天摸板按涨停价买整体 −0.28%（扣费 −0.41%），'
-                   '次日炸板批 −5.15% / 胜率 5.2%。'),
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            rows = conn.execute(
+                'SELECT arm, COUNT(*), AVG(intraday_ret_pct) FROM auction_dip_shadow '
+                'WHERE intraday_ret_pct IS NOT NULL GROUP BY arm').fetchall()
+        finally:
+            conn.close()
+        return {str(r[0]): {'n': int(r[1] or 0), 'mean': round(float(r[2] or 0), 3)}
+                for r in rows}
+    except Exception:
+        return {}
+
+
+def _auction_guard(basis: Optional[Dict] = None) -> Dict:
+    """封板票的 T+1 竞价分档裁决卡（条件层；不改评分/选票/门槛/推送/线上参数）。
+
+    `basis` 可注入便于自测；None 时读本地影子表。
+    """
+    b = _auction_shadow_basis() if basis is None else (basis or {})
+    arms = []
+    for key, label in _AUCTION_ARMS:
+        d = b.get(key) or {}
+        n = int(d.get('n') or 0)
+        m = d.get('mean')
+        if not d or n < 10 or m is None:
+            arms.append({'key': key, 'label': label, 'mean': None, 'n': n,
+                         'direction': 'unknown', 'action': '样本不足·不据此决策'})
+            continue
+        m = float(m)
+        arms.append({
+            'key': key, 'label': label, 'mean': m, 'n': n,
+            'direction': 'positive' if m > 0 else 'negative',
+            'action': '影子方向为正（仅参考）' if m > 0 else '影子方向为负（仅参考）',
+        })
+    return {
+        'title': '明日 9:25 竞价分档（T+1 参考·影子未裁决）',
+        'timeSplit': ('今日封板＝今日盘中已无买入空间，不追；'
+                      '明日集合竞价是另一笔独立决策，两者不是一回事'),
+        'rule': ('收评生成时不知道明日竞价开成什么样 → 上方买入计划是条件式，'
+                 '9:25 撮合价出来后按条件单判；下方五档只是影子方向参考，'
+                 '**不覆盖条件单**，未命中条件就不买。影子裁决通过前，不下"可买/放弃"指令'),
+        'arms': arms,
+        'basisAvailable': bool(b),
+        'basisNote': ('五档数据来自本地 auction_dip_shadow（影子，未裁决）；'
+                      '表不可用时不填数、不编数'),
+        'shadowStatus': ('影子未裁决：auction_dip_shadow（台账第 20 条）要求 ≥20 交易日、'
+                         '前向两遍都过、按日聚类 t≥2；回溯基线与探针样本重叠，'
+                         '方向仅作参考，不构成买入依据'),
+        'mainlineNote': ('主线维度判据 INSUFFICIENT（13 个完整交易日 / 收盘档主线仅 3 天 / '
+                         '7 天盘中翻转，且 leaders 与连板高度共线），只作参考，不作放行条件'),
+        'conflict': ('⚠ 口径矛盾（如实摆出，未改参数）：现行条件单写的是「竞价高开 0～5% 参与」，'
+                     '而影子五档里低开/平开为正、高开/追涨为负 —— 现行区间排掉了影子最好的低开两档。'
+                     '两者口径不同（影子量的是竞价买→当日收盘的日内腿），不可直接比大小；'
+                     '冲突处一律按现行条件单执行，影子裁决通过后才谈调参'),
+        'risk': [
+            '一字板 / T字板开盘 → 竞价买不到，不排队',
+            '高开 ≥4% 追涨 → 影子方向为负；现行条件单追高上限 5%，4～5% 区间两者冲突，按条件单执行并自行收紧',
+            '板位越高越买不到：三板竞价 ≤+2% 可买到仅 39.4%，5 日大面 74.8%',
+            '以上均为影子/历史统计；当前策略按可成交净口径复算，期望仍未跑正',
+        ],
     }
 
 
@@ -1165,27 +1238,23 @@ async def generate_daily_review() -> Dict:
                 quote_map = {p['symbol'].lower(): p for p in parse_tencent_batch_data(raw)}
                 timed = 0
                 planned = 0
-                blocked = 0
+                guarded = 0
                 for f in tomorrow_focus:
                     sym = (f['code'] or '').lower()
                     q = quote_map.get(sym)
                     bt = rec_buy_timing.get(f['code'])
                     if not bt and q:
                         bt = _simple_buy_timing(q)
-                    # 2026-11-10：当日已封板 → 不给任何可执行买入动作。
-                    # 四池 15:10 后才落库，这里先用当日行情涨跌幅判（与 _SBT_LIMIT_UP 同阈值），
-                    # 稍后 4.7b 再用四池结果兜底一次。
+                    if bt:
+                        f['buyTiming'] = bt
+                        timed += 1
+                    # 当日封板只用来挂「T+1 竞价分档裁决卡」，不再拦掉买入计划。
+                    # 四池 15:10 后才落库，这里先用当日行情涨跌幅判；4.7b 再用四池结果兜底补挂。
                     try:
                         _chg = float(q.get('changePercent')) if q else None
                     except (TypeError, ValueError):
                         _chg = None
                     sealed_today = _chg is not None and _chg >= _SBT_LIMIT_UP
-                    if sealed_today:
-                        _mark_sealed_blocked(f)
-                        blocked += 1
-                    elif bt:
-                        f['buyTiming'] = bt
-                        timed += 1
                     if q:
                         # 当日涨跌幅%（2026-10-23 用户要求：明日关注要能直接看到今天涨跌了多少）。
                         # 收评生成时点拉的即是当日收盘行情，字段随收评一起落库，前端徽章直接展示；
@@ -1194,15 +1263,17 @@ async def generate_daily_review() -> Dict:
                             f['pctChg'] = q['changePercent']
                         if not f.get('price') and q.get('priceRaw'):
                             f['price'] = q['priceRaw']
-                        if not sealed_today:
-                            plan = _build_tomorrow_plan(
-                                q, bt or {}, ref=rec_ref_points.get(f['code']),
-                                score=float(f.get('score') or 0))
-                            if plan:
-                                f['tomorrowPlan'] = plan
-                                planned += 1
+                        plan = _build_tomorrow_plan(
+                            q, bt or {}, ref=rec_ref_points.get(f['code']),
+                            score=float(f.get('score') or 0))
+                        if plan:
+                            if sealed_today:
+                                plan['auctionGuard'] = _auction_guard()
+                                guarded += 1
+                            f['tomorrowPlan'] = plan
+                            planned += 1
                 print(f'[收评] 明日关注标注：买入时机 {timed}/{len(tomorrow_focus)} 只，'
-                      f'买入计划 {planned}/{len(tomorrow_focus)} 只，封板拦截 {blocked} 只')
+                      f'买入计划 {planned}/{len(tomorrow_focus)} 只，竞价条件单 {guarded} 只')
         except Exception as e:
             # 2026-10-12：原为静默吞异常，导致字段缺失时无从察觉，此处补堆栈日志
             import traceback
@@ -1211,13 +1282,14 @@ async def generate_daily_review() -> Dict:
 
         # 4.7b 买入逻辑卡（2026-11-10，A 方案第 1 层）：把已落库的主线/热门链/题材事实摆出来。
         # 纯展示，不进评分/选票/门槛/推送；缺数据如实标 gaps；失败不影响名单。
-        # 顺带用四池的封板判定补一次拦截：行情接口拉不到时，封板票仍不得给买入动作。
+        # 四池 15:10 后才落库：行情接口没拉到涨幅时，用四池封板判定给已生成的计划补挂竞价条件单。
         try:
             from services.ops.focus_reasons import attach_focus_logic
             logic_n = attach_focus_logic(tomorrow_focus, today_str)
             for f in tomorrow_focus:
-                if (f.get('logic') or {}).get('sealed') and not f.get('execBlocked'):
-                    _mark_sealed_blocked(f)
+                plan = f.get('tomorrowPlan')
+                if (f.get('logic') or {}).get('sealed') and plan and 'auctionGuard' not in plan:
+                    plan['auctionGuard'] = _auction_guard()
             print(f'[收评] 明日关注买入逻辑卡 {logic_n}/{len(tomorrow_focus)} 只')
         except Exception as e:
             print(f'[收评] 明日关注买入逻辑卡生成失败（不影响名单）: {e}')

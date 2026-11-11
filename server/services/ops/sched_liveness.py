@@ -44,7 +44,7 @@
 A 类同因冷却 `SCHED_LIVENESS_COOLDOWN_MIN` 分钟；B 类每天每档只发一次。
 **发送失败不写去重标记**（否则那条告警当天永久丢，这是过夜出口提醒那次定下的规矩）。
 留痕只在进程内存（重启即重置）——这是运维告警不是业务数据，为它建表得不偿失；
-真要审计，`server_supervised.log` 里每条都有对应打印。
+真要审计，`server/logs/server_supervised.log` 里每条都有对应打印。
 
 关掉开关（`SCHED_LIVENESS_ENABLED=False`，配置页 `sched_liveness_enabled`）时
 连数据库都不查、一条通知都不发，逐字节等于没这项；`start_watchdog()` 也不会起线程。
@@ -259,7 +259,7 @@ def _render(a: Dict, beat: Dict, now: datetime, covered: bool) -> str:
         # 处置动作也不一样：A 先找卡在哪个 job / 线程还在不在，B 先看是哪一环断了产。
         tail = ('\n含义：调度主循环这一段时间没跑完（线程可能退了，或卡在某个 job 里出不来）。'
                 '期间所有定时任务都不执行——海选、批次推荐、竞价与收盘快照、落库全停。')
-        act = ('处置：先在 server/server_supervised.log 找最后一条 "[定时任务" 与 "[预热"，'
+        act = ('处置：先在 server/logs/server_supervised.log 找最后一条 "[定时任务" 与 "[预热"，'
                '看卡在谁身上；确认循环停了就写 server/data/backend_restart_requested '
                '让看护重启（不要 taskkill）。')
     else:

@@ -290,6 +290,78 @@ def _build_buy_items(group: Dict, quote_map: Dict[str, Dict], allowed: tuple,
     return buy_now, deferred
 
 
+# ==================== 买入逻辑卡接入行动台（2026-11-10） ====================
+# 收评 focus_json 里每只票已带 `logic`（主线 / 热门链 / 题材 / 涨停原因 / 连板梯队，
+# 由 services/ops/focus_reasons.py 生成，纯展示、不进评分/选票/门槛/推送）。
+# 行动台原投影只取 symbol/name/score/winRate/plan，把 `logic` 与 `reason` 裁掉了 ——
+# 卡片只剩「融合分 XX 分 + 低吸区/止盈」，回答不了「为什么是它」。
+# 这里只做透传与复用，不新增任何判定；失败一律静默，绝不影响名单。
+
+
+def _project_tomorrow_plan(focus_items: List[Dict]) -> List[Dict]:
+    """把最新收评的「明日重点关注」投影成行动台卡片。
+
+    抽成纯函数是为了能回归自测「不丢字段」——历史上正是这一层把逻辑卡裁没了。
+    `logic` 可能为 {}（旧收评尚未生成逻辑卡），前端必须如实标注缺口，不许编。
+    """
+    return [{'symbol': _norm(f.get('code') or f.get('symbol')),
+             'name': f.get('name'),
+             'score': f.get('score'),
+             # 当日涨跌幅%（2026-10-23 用户要求：明日计划也要能看到当天涨跌了多少）。
+             # 收评落库时随行情写入；历史收评无此字段，前端批量拉实时行情兜底。
+             'pctChg': f.get('pctChg'),
+             # 现价（2026-10-26 用户要求）：只有涨跌幅和推荐价没法判断"现在离低吸区多远"。
+             # 这里是**收评生成时刻的价格**（盘后即当日收盘价），只作兜底：
+             # 前端会再拉一次实时行情覆盖它，拿不到才退回这个值并在 title 里标明来源。
+             'price': f.get('price'),
+             # 入选依据（同来源同分数段的历史 T+1 胜率）——名单就是按它排的
+             'winRate': f.get('expectedWinRate'),
+             'avgRet': f.get('expectedAvgRet'),
+             'timingLabel': (f.get('buyTiming') or {}).get('label'),
+             'timingType': (f.get('buyTiming') or {}).get('type'),
+             # 2026-11-10：买入逻辑卡（结构化事实）与收评原评分理由。
+             # reason 是「融合分/量比/委比」的评分口径，前端必须标注为评分依据、
+             # 不能当成买入理由；旧收评里的封板文案属已废止口径，前端会标出来。
+             'logic': f.get('logic') or {},
+             'reason': f.get('reason') or '',
+             # 整包透传：内含 T+1 竞价条件单 auctionGuard（封板票）或旧版 blocked
+             'plan': f.get('tomorrowPlan') or {}}
+            for f in (focus_items or [])]
+
+
+def _project_deferred_buys(deferred: List[Dict]) -> List[Dict]:
+    """「稍后时机」投影：与「此时机可介入」共用同一份 themeLogic，不许再裁掉。
+
+    2026-11-10 补：这一层原本是内联字典，只留 symbol/name/timingLabel/score/vetoReason，
+    `_attach_buy_theme_logic` 刚挂上的逻辑卡在这里被丢掉 —— 与明日计划是同一类 bug。
+    抽成纯函数是为了让自测能锁死「不丢字段」。
+    """
+    return [{'symbol': d['symbol'], 'name': d['name'],
+             'timingLabel': d['timingLabel'], 'score': d['score'],
+             # 被情绪硬否决的票要写清"为什么现在不让你买"
+             'vetoReason': d.get('vetoReason') or '',
+             'themeLogic': d.get('themeLogic') or {}}
+            for d in (deferred or [])]
+
+
+def _attach_buy_theme_logic(items: List[Dict], trade_date: str) -> int:
+    """给「此时机可介入 / 稍后时机」卡片补结构化买入逻辑（零外部请求）。
+
+    复用收评同一套聚合口径，但写到 `themeLogic`：这些卡片自带的 `logic` 是
+    `rec['reason']` 的评分/执行理由字符串，覆盖掉会丢信息。
+    """
+    if not items:
+        return 0
+    try:
+        from services.ops.focus_reasons import attach_focus_logic
+        return attach_focus_logic(items, trade_date,
+                                  code_key='symbol', pct_key='changePercent',
+                                  out_key='themeLogic')
+    except Exception as e:
+        print(f'[行动台] 买入逻辑卡生成失败（不影响可介入名单）: {e}')
+        return 0
+
+
 def _to_float(v) -> float:
     try:
         f = float(v)
@@ -554,6 +626,9 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
     gate = cycle_gate(sentiment)
     # 竞价/盘前看的是上一次生成的推荐（对标记"次日竞价"的票而言即昨日），盘中看当日
     buy_now, deferred = _build_buy_items(group, quote_map, allowed, gate)
+    # 2026-11-10：可介入/稍后时机卡片也要回答「为什么是它」。只读本地三张表，
+    # 与收评同一套聚合口径；失败静默，绝不拖慢或改变可介入名单。
+    _attach_buy_theme_logic(buy_now + deferred, group.get('date') or _today_str())
     watch_alerts = _build_watchlist(watch_symbols, quote_map) if live else []
     headline = _build_headline(phase, diag, actions, buy_now, alert, focus,
                                info.get('minutesToNext'), info.get('calendarCovered', True),
@@ -661,29 +736,10 @@ async def build_action_desk(user_id: int = 1, phase_override: str = '') -> Dict:
         'holdCount': sum(1 for p in (diag.get('positions') or [])
                          if p.get('action') not in _ACTIONABLE_ACTIONS),
         'buyNow': buy_now,
-        'deferredBuys': [{'symbol': d['symbol'], 'name': d['name'],
-                          'timingLabel': d['timingLabel'], 'score': d['score'],
-                          # 被情绪硬否决的票要写清"为什么现在不让你买"，
-                          # 否则用户只看见它从可介入区消失，下次就会怀疑系统在乱拦
-                          'vetoReason': d.get('vetoReason') or ''}
-                         for d in deferred],
-        'tomorrowPlan': [{'symbol': _norm(f.get('code') or f.get('symbol')),
-                          'name': f.get('name'),
-                          'score': f.get('score'),
-                          # 当日涨跌幅%（2026-10-23 用户要求：明日计划也要能看到当天涨跌了多少）。
-                          # 收评落库时随行情写入；历史收评无此字段，前端批量拉实时行情兜底。
-                          'pctChg': f.get('pctChg'),
-                          # 现价（2026-10-26 用户要求：只有涨跌幅和推荐价没法判断"现在离低吸区多远"）。
-                          # 这里是**收评生成时刻的价格**（盘后即当日收盘价），只作兜底：
-                          # 前端会再拉一次实时行情覆盖它，拿不到才退回这个值并在 title 里标明来源。
-                          'price': f.get('price'),
-                          # 入选依据（同来源同分数段的历史 T+1 胜率）——名单就是按它排的
-                          'winRate': f.get('expectedWinRate'),
-                          'avgRet': f.get('expectedAvgRet'),
-                          'timingLabel': (f.get('buyTiming') or {}).get('label'),
-                          'timingType': (f.get('buyTiming') or {}).get('type'),
-                          'plan': f.get('tomorrowPlan') or {}}
-                         for f in (focus.get('items') or [])],
+        # 2026-11-10：投影改走纯函数，买入逻辑卡不再被裁掉
+        'deferredBuys': _project_deferred_buys(deferred),
+        # 2026-11-10：投影改走纯函数，买入逻辑卡 / 评分理由 / T+1 竞价条件单不再被裁掉
+        'tomorrowPlan': _project_tomorrow_plan(focus.get('items') or []),
         'watchlistAlerts': watch_alerts,
         'watchlistCount': len(watch_symbols),
         'freshness': {
