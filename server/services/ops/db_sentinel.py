@@ -37,8 +37,14 @@ from typing import Any, Dict, Optional
 # 本文件在 server/services/ops/ 下，要到 server 根得往上走三层（ops→services→server）。
 # 首版只走两层，结果日志路径算成 server/services/server_supervised.log，
 # 告警里的"最近任务锚点"一直是读日志失败——自测补了断言才抓到。
+# 2026-11-10 根目录收敛：日志统一进 server/logs/（看护重定向同步改）；
+# 新文件还没产出的重启间隙回退旧路径，保证锚点不断。
 SERVER_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SUPERVISED_LOG = os.path.join(SERVER_DIR, 'server_supervised.log')
+SUPERVISED_LOG = os.path.join(SERVER_DIR, 'logs', 'server_supervised.log')
+if not os.path.exists(SUPERVISED_LOG):
+    _legacy_log = os.path.join(SERVER_DIR, 'server_supervised.log')
+    if os.path.exists(_legacy_log):
+        SUPERVISED_LOG = _legacy_log
 
 # 进程内状态：冷却计时 + 连续异常计数（重启清零，够用）
 _last_alert_ts = 0.0

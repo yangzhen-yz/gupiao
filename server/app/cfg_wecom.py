@@ -18,7 +18,7 @@ from .cfg_review import *
 from .cfg_auth import *
 
 def _wecom_agent_cred(name: str, default: str = '') -> str:
-    """自建应用凭据取值顺序：环境变量 → 本地文件 server/wecom_agent.json → 默认值。
+    """自建应用凭据取值顺序：环境变量 → 本地文件 server/config/wecom_agent.json → 默认值。
 
     为什么不要求管理员把三个值配成 Windows 环境变量：这台机器上服务是用
     `python run.py` 直接起的，环境变量得改系统设置并重启终端才生效，容易配错也难核对；
@@ -29,7 +29,7 @@ def _wecom_agent_cred(name: str, default: str = '') -> str:
         return v
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
-                               'wecom_agent.json'), encoding='utf-8') as f:
+                               'config', 'wecom_agent.json'), encoding='utf-8') as f:
             data = json.load(f)
         return str(data.get(_WECOM_AGENT_KEYS.get(name, name.lower())) or '').strip()
     except FileNotFoundError:
@@ -91,7 +91,8 @@ WECOM_CLI_BIN = os.environ.get('WECOM_CLI_BIN', '')
 # 每次都要人点链接或扫码续期 —— 对"止损必须按时叫醒我"这种用途不可靠。
 # 群机器人 webhook 是纯 HTTP POST，不过期、不依赖连接器进程，因此作为兜底：
 # aibot 发失败时自动改走 webhook，日志写清走的哪条通道。
-# 凭据（URL 里带 key）放本地文件 server/wecom_webhook.json，已加进 .gitignore 不入库。
+# 凭据（URL 里带 key）放本地文件 server/config/wecom_webhook.json，已加进 .gitignore 不入库
+# （2026-11-10 根目录收敛：凭据与模板统一进 server/config/，不再散在 server/ 根）。
 WECOM_WEBHOOK_ENABLED = True
 # 消息类型：**默认 text**。2026-10-14 实测：这个群是「微信↔企业微信」互通群，
 # 用户在**个人微信**里看它 —— markdown 消息在微信侧整条渲染成
@@ -100,7 +101,7 @@ WECOM_WEBHOOK_ENABLED = True
 WECOM_WEBHOOK_MSGTYPE = os.environ.get('WECOM_WEBHOOK_MSGTYPE', 'text')
 WECOM_WEBHOOK_URL = os.environ.get('WECOM_WEBHOOK_URL', '')           # 优先环境变量
 WECOM_WEBHOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  '..', 'wecom_webhook.json')          # 其次本地文件
+                                  '..', 'config', 'wecom_webhook.json')   # 其次本地文件
 WECOM_PUSH_INTERVAL_SEC = 60        # 盘中轮询间隔（秒），1 分钟级准实时
 WECOM_PUSH_START = '09:31'          # 盘中推送开始时间（连续竞价后）
 WECOM_PUSH_END = '14:57'            # 盘中推送结束时间（收盘前）

@@ -92,7 +92,7 @@ __all__ = ['probe', 'check_once', 'handle', 'start_watchdog', 'stop_watchdog',
 SERVER_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FLAG_REL = os.path.join('data', 'backend_restart_requested')
 
-# 进程内状态：重启即清零（运维告警不建表，审计看 server_supervised.log）
+# 进程内状态：重启即清零（运维告警不建表，审计看 server/logs/server_supervised.log）
 _STATE: Dict[str, Any] = {
     'started_ts': 0.0,
     'stop': False,

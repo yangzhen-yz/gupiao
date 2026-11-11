@@ -230,7 +230,7 @@ def push_wecom_markdown(content: str) -> bool:
         return True
     print('[推送] [警告] 两条通道都没发出去：aibot 权限过期且未配置 webhook。'
           '请建一个只有自己的企微群、加"自定义机器人"，'
-          '把 webhook 地址写进 server/wecom_webhook.json（{"webhook_url": "..."}）')
+          '把 webhook 地址写进 server/config/wecom_webhook.json（{"webhook_url": "..."}）')
     return False
 
 

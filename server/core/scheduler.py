@@ -661,7 +661,7 @@ def run_scheduler():
         # 2026-11-04 修复（数据整天冻结）：调度器跑在**独立线程**，原来用 force=False 调用会命中
         # stale-while-revalidate 分支——那一支立即返回旧数据，把重扫挂到 `asyncio.create_task` 上，
         # 而任务挂在本函数 `asyncio.run` 的**临时 loop** 上：asyncio.run 一返回就把它取消，
-        # **扫描没跑完就不会落库**。实测证据：`server_supervised.log` 里当天 12 条"缓存过期…已启动后台
+        # **扫描没跑完就不会落库**。实测证据：`server/logs/server_supervised.log` 里当天 12 条"缓存过期…已启动后台
         # 重扫"（没有一条"已在跑"），而 age 每 30 分钟单调增长 1776s→14372s，说明每次都真的起了任务、
         # 只是从没跑完 → 当天数据冻结在第一次扫描（09:00:31）。注意 `_swr_refresh_inflight` 本身没有
         # 卡死：asyncio.run 收尾会取消挂起任务并执行它的 finally，探针与上面那 12 条日志都印证标志正常复位，

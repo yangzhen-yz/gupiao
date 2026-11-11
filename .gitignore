@@ -16,10 +16,12 @@ __pycache__/
 *.db-shm
 *.db-wal
 server/ai_config.json
-# 企业微信群机器人 webhook（含 key，属凭据，绝不入库）
-server/wecom_webhook.json
+# 企业微信群机器人 webhook（含 key，属凭据，绝不入库；11-10 起统一在 server/config/）
+server/config/wecom_webhook.json
 # 企业微信自建应用凭据（corpsecret 属凭据，绝不入库）
-server/wecom_agent.json
+server/config/wecom_agent.json
+# 运行日志统一进 server/logs/（看护重定向，11-10 根目录收敛），绝不入库
+server/logs/
 .DS_Store
 Thumbs.db
 .workbuddy/
@@ -33,10 +35,10 @@ server/analysis_out/
 
 # ---------- 本地开发辅助与运行时状态（2026-10-17 清理，一律不入库）----------
 # .idea/ 是 IDE 状态；shot_internal.py 里写着公司内网地址；
-# market_alert.json 每 25 分钟被定时任务重写，进版本库只会产生噪声 diff。
+# market_alert.json 每 25 分钟被定时任务重写，进版本库只会产生噪声 diff；
+# 11-10 起迁 server/data/market_alert.json，由上面 /server/data/ 整目录排除，不再单列。
 .idea/
 shot_internal.py
-server/market_alert.json
 .playwright-cli/
 # 根目录的临时筛选输出（脚本本身的输出统一去 server/analysis_out/）
 /*.csv

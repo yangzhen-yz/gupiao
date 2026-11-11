@@ -1,4 +1,0 @@
-{
-  "_说明": "把本文件复制为 server/wecom_webhook.json，并将 webhook_url 换成你的群机器人地址（企微：建群→群设置→群机器人→添加「自定义机器人」，复制 Webhook 地址）。wecom_webhook.json 已在 .gitignore 里，不会入库。",
-  "webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=把这里换成你的-key"
-}
