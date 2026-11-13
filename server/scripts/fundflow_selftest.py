@@ -269,7 +269,43 @@ ck(_d_fresh['stale'] is False and _d_fresh['dataSource']['stocks'] == 'sina',
 
 # 定版那一侧（10-31 那条优化）：休市时超龄快照既不重算也不标旧——不测这一侧，
 # 下次有人"顺手把定版判据删掉"照样全绿。
-_ts_final = _pick_ts(True, _now)
+#
+# **11-13 再修（本批 peek 修复验证时发现，与 peek 改动无关）**：`_pick_ts(True, now)` 在
+# **每个交易日 15:05~17:05 这两小时里必然无解**——定版侧要求 ts ∈ [最近交易日15:05, now−2h)，
+# 15:30 跑时就是 [15:05, 13:30)，空集。原写法直接 raise，整套 61 条在第 22 条就中断，
+# 后面 39 条（板块兜底/概念/hidden/落盘 key）根本没跑到 —— 比"红一条"严重得多。
+# 12:2x 跑全绿是因为那时"最近交易日15:05"还是昨天，窗口非空；所以这是钟点盲区，不是回归。
+# 修法：窗口为空时**临时把龄期阈值降到 0**，用定版边界那一刻的 ts 走同一条分支。
+# 不变量是「定版 ⇒ 不重算不标旧」，与阈值具体数值无关；阈值降 0 反而把"龄期够新"这条
+# 逃生门关掉，只剩定版判据在起作用，隔离得更干净。窗口非空时仍走真实 7200 阈值。
+def _final_boundary(now: float):
+    """二分找 `_snapshot_final` 由假变真的那一刻（只用被测函数自己，不复制它的日历逻辑）。"""
+    hi, lo = now, now - 40 * 86400
+    if not ff._snapshot_final(hi):
+        return None
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if ff._snapshot_final(mid):
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+_orig_stale_after = ff._STALE_AFTER_SEC
+_lowered = False
+try:
+    _ts_final = _pick_ts(True, _now)
+except AssertionError:
+    _b = _final_boundary(_now)
+    # 只有"窗口可证为空"才允许降级；否则说明判据真变了，必须红。
+    if _b is None or _b < _now - _orig_stale_after or (_now - _b) <= 1:
+        raise
+    _ts_final = _b
+    ff._STALE_AFTER_SEC = 0
+    _lowered = True
+    print(f'  [注] 定版侧真实窗口为空（交易日 15:05~17:05 盲区）：临时把龄期阈值 '
+          f'{_orig_stale_after}s→0，用定版边界 ts={_ts_final:.0f} 隔离测同一分支')
 ff._LAST_GOOD['stocks']['ts'] = _ts_final
 ff._CACHE.clear()
 _sina_calls = {'n': 0}
@@ -288,6 +324,23 @@ ck(ff._snapshot_final(_ts_final) is True, f'挑出的时间戳确实在定版那
 ck(_d_final['dataSource']['stocks'] == 'snapshot' and _d_final['stale'] is False,
    '收盘定版快照（休市）不重算、也不标旧')
 ck(_sina_calls['n'] == 0, '定版那一侧压根不叫新浪补算（省下首开约 15 秒的全市场重算）')
+# 反证：同一个 ts，把定版判据打成 False，就必须回去叫新浪补算 —— 证明上面三条真是
+# 定版判据在起作用，而不是"这条路径压根不会重算"造成的假绿。
+_orig_final_fn = ff._snapshot_final
+ff._snapshot_final = lambda ts: False
+_sina_calls['n'] = 0
+ff._LAST_GOOD['stocks']['ts'] = _ts_final
+ff._CACHE.clear()
+ff._sina_stock_rankings = _sina_rank_counter
+_d_notfinal = asyncio.run(ff.get_fund_flow_summary(stock_top_n=25, sector_top_n=5,
+                                                   change_threshold=3.0, hot_top_n=30, hidden_top_n=20))
+ff._snapshot_final = _orig_final_fn
+ff._sina_stock_rankings = _orig_sina_rank2
+ck(_sina_calls['n'] >= 1, '反证：定版判据打成 False 后同一 ts 必须触发新浪补算（否则上面是假绿）',
+   f"calls={_sina_calls['n']}")
+if _lowered:
+    ff._STALE_AFTER_SEC = _orig_stale_after
+    ck(ff._STALE_AFTER_SEC == _orig_stale_after, '龄期阈值已还原（不污染后续断言）')
 # DB 里存的是去参数化 key（closed 分支不落盘，需切盘中刷新路径验证）
 ff._in_trading_window = lambda: True  # 盘中
 _calls3 = []
