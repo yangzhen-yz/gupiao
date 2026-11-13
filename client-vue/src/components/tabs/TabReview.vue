@@ -314,6 +314,7 @@
           <div class="dual-col">
             <div class="section-title-row">
               <div class="section-title-small">🔥 个股热度</div>
+              <span v-if="activeStockSource(review)" class="sector-source-tag">{{ activeStockSource(review) === 'sina' ? '新浪口径' : '东财' }}</span>
               <div class="tab-switch">
                 <button :class="['tab-btn', stockTab === 'gainer' ? 'active' : '']" @click="stockTab = 'gainer'">
                   涨幅榜
@@ -743,6 +744,14 @@
   // 主力资金：全市场按主力净流入排序前5（后端 review.topFunds 按 f62 全市场排序取前20，直接 slice(0,5)）
   function getTop5Funds(review) {
     return (review.topFunds || []).slice(0, 5)
+  }
+  // 当前个股热度 tab 的数据来源（东财 / 新浪兜底），用于标题角标
+  function activeStockSource(review) {
+    const map = { gainer: getTop5Gainers, loser: getTop5Losers, funds: getTop5Funds }
+    const fn = map[stockTab.value]
+    const list = fn ? fn(review) : []
+    if (!list.length) return ''
+    return list[0].source || 'eastmoney'
   }
   function formatInflow(n) {
     if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + '亿'

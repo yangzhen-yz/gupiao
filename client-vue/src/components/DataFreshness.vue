@@ -30,6 +30,8 @@
     loading: { type: Boolean, default: false },
     // 是否把"跨天"算作过期；关掉只用于纯提示的场景
     dayCompare: { type: Boolean, default: true },
+    // 纯日期量（如"当前推荐日期"）按日历日展示，不要渲染成 00:00 这种无意义时间
+    dateOnly: { type: Boolean, default: false },
   })
   defineEmits(['refresh'])
 
@@ -50,9 +52,12 @@
     if (!parsed.value) return '暂无数据'
     const hh = String(parsed.value.getHours()).padStart(2, '0')
     const mm = String(parsed.value.getMinutes()).padStart(2, '0')
-    if (isToday.value) return `${hh}:${mm}`
     const mo = String(parsed.value.getMonth() + 1).padStart(2, '0')
     const da = String(parsed.value.getDate()).padStart(2, '0')
+    const yyyy = parsed.value.getFullYear()
+    // dateOnly：把"推荐日期"这种纯日期量当日历日展示，而不是今天的时间 00:00
+    if (props.dateOnly) return `${yyyy}-${mo}-${da}`
+    if (isToday.value) return `${hh}:${mm}`
     return `${mo}-${da} ${hh}:${mm}`
   })
 

@@ -1,12 +1,20 @@
 """Domain router: review."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from ..routes_state import *
+from services.support.auth import current_user
 
 router = APIRouter()
 
 @router.post("/api/daily-review/generate", tags=["收评"])
-async def api_generate_daily_review():
+async def api_generate_daily_review(user: dict = Depends(current_user)):
+    """手动重跑当日收评并覆盖同日行。
+
+    2026-11-13 安全修复：该接口会触发数据库写入（INSERT OR REPLACE 覆盖当日收评），
+    此前为无鉴权公开 POST，固定隧道可达者均可触发重跑、覆盖当日数据。
+    现要求登录态；调度器与 main.py 启动钩子是直接 import ``generate_daily_review()``
+    函数调用、不经 HTTP，故本鉴权不影响 15:10 自动收评。
+    """
     try:
         print('[收评API] 开始生成今日收评...')
         review = await generate_daily_review()
