@@ -774,11 +774,30 @@ def peek_sector_flow() -> Dict:
     sweep（9.2s 事故同类）。本函数只按 内存缓存 → _LAST_GOOD → DB 快照 的顺序读，
     读到什么算什么，返回 {rows, src, ts}；src='none' 时由调用方降级。
     口径判别：行里带 chgCaliber 的是新浪×本地行业聚合（国标行业名），否则是东财 f62。
+
+    2026-11-13 修：候选里**选 ts 最新的一份**，不再「先命中先返回」。
+    _CACHE 按完整参数 key 存多份（不同 top_n 各一份、ts 各自独立），旧写法遍历到第一个
+    industry.inflow 非空的 entry 就 return，可能拿到几小时前那份，而 _LAST_GOOD 与 DB
+    快照明明是刚写的新数据（11-13 实拍：DB sectors 快照 12:11:36／8905 字节含真实行业行，
+    而主线快照 meta.sources 里 flowAt 是 **11-12 22:03**、flowAgeSec **53234**）。
+    同一个旧 ts 被两处当判据用，后果是连锁的：
+      · mainline._sync_score 判 flow_age > 2h → 11-13 10:04:53~12:54:17 共 **54 次**「无主线：
+        板块资金流缺失或超过 2 小时」（当日 104 次判定、0 次有主线）。13:00:16 起那份旧条目
+        被挤掉、flowAt 变 11-13 12:51，另 **40 次**（13:00:16~15:05:42）落到「暂无法判定
+        （数据不足）」这条 **未归类**分支——成因不同（sub 实际有 5 条、只是没主线），不由本修复解决；
+      · soft_refresh_sector_flow 的 1800s 节流 → 永不成立 → 每 180s 重算新浪 70 页
+        （11-13 全天 **88 次**、09:33:47~15:05:42、间隔中位 **187s**；上午 3 小时窗口 56 次。
+        按 30 分钟节流本该 ~12 次/日＝09:15~15:05 共 350 分钟 ÷ 30），每轮 ~18s 重活抢 GIL
+        把 uvicorn 事件循环饿死：/api/health 实测卡到 7.774s，自愈探活 11:49 连续 3 次失败写重启标志。
+    只改「选哪一份」，不改阈值、不改口径、不改任何写入路径；src='none' 的降级语义不变。
     """
+    best: Optional[Dict] = None
     for entry in _CACHE.values():
         sec = (entry.get('data') or {}).get('sectors') or {}
         if (sec.get('industry') or {}).get('inflow'):
-            return {'rows': sec, 'src': 'cache', 'ts': float(entry.get('ts') or 0)}
+            _ts = float(entry.get('ts') or 0)
+            if best is None or _ts > best['ts']:
+                best = {'rows': sec, 'src': 'cache', 'ts': _ts}
     lg = _LAST_GOOD.get('sectors')
     if not lg:
         snap = load_fund_flow_snapshot('sectors')
@@ -786,8 +805,10 @@ def peek_sector_flow() -> Dict:
             lg = snap
             _LAST_GOOD['sectors'] = lg
     if lg and lg.get('data'):
-        return {'rows': lg['data'], 'src': 'lastgood', 'ts': float(lg.get('ts') or 0)}
-    return {'rows': {}, 'src': 'none', 'ts': 0.0}
+        _ts = float(lg.get('ts') or 0)
+        if best is None or _ts > best['ts']:
+            best = {'rows': lg['data'], 'src': 'lastgood', 'ts': _ts}
+    return best if best is not None else {'rows': {}, 'src': 'none', 'ts': 0.0}
 
 
 async def soft_refresh_sector_flow(top_n: int = FUND_FLOW_SECTOR_TOP_N) -> bool:
