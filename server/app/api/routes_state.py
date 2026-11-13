@@ -625,8 +625,8 @@ def prewarm_recommend_excess(months: int = 6) -> float:
     import time as _t
     from services.pick import rec_sim
     t0 = _t.time()
-    data = rec_sim.open_hold_excess(months=months)
-    _EXCESS_CACHE[(months,)] = {'ts': _t.time(), 'data': data}
+    data = rec_sim.open_hold_excess(months=months, slippage_bps=10)
+    _EXCESS_CACHE[(months, 10)] = {'ts': _t.time(), 'data': data}
     return _t.time() - t0
 
 
