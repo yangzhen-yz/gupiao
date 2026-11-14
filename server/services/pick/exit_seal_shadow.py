@@ -38,7 +38,7 @@ import sqlite3
 from datetime import datetime
 from typing import Dict, List, Optional
 
-FEE_PCT = 0.13          # 双边费用口径（与 rec_sim / 复盘一致）
+FEE_PCT = 0.202         # 往返费用：佣金万五×2 + 卖出印花千1 + 双边过户万0.1
 KLINE_FROM = '2024-01-01'    # 取数下界：要完整历史才不会把窗口首根算成"无昨收"
 
 

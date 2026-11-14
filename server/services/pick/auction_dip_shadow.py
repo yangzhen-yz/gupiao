@@ -40,7 +40,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-FEE_PCT = 0.13            # 双边费用口径（与 rec_sim / 复盘 / exit_seal 一致）
+FEE_PCT = 0.202           # 往返费用：佣金万五×2 + 卖出印花千1 + 双边过户万0.1
 BUYABLE_GAP_MAX = 7.0     # 保守可成交上界：gap≥7% 常买不到竞价价（与 analysis_out 探针同口径）
 KLINE_PAD_DAYS = 20       # 取K线前后各垫 20 个自然日，跨节假日也够得着昨收与 T+1
 ARMS = ('deep_dip', 'mild_dip', 'flat', 'high', 'chase')
@@ -514,6 +514,7 @@ def evaluate(min_days: int = MIN_DAYS, forward_from: Optional[str] = None) -> Di
     out: Dict = {'ready': False, 'pass': False, 'days': 0, 'rows': 0,
                  'min_days': min_days, 'forward_from': forward_from,
                  'arms': {}, 'deep_dip': {}, 'chase_counterfactual': {},
+                 'feeModel': '策略与基准均扣双边0.202%比例近似费用',
                  'rule': f'≥{min_days}交易日 且 深低开(可成交)日内净超额≥{MIN_EXCESS_PP}pp '
                          f'且 按日t≥{MIN_T} 且 正号天数≥{MIN_POS_RATIO:.0%}；胜率只展示',
                  'clockRule': '数有可比行（日内腿已回填）的日子；对照的是涨停池×竞价快照，'
@@ -554,7 +555,7 @@ def evaluate(min_days: int = MIN_DAYS, forward_from: Optional[str] = None) -> Di
                 continue
             daily.setdefault(str(d), []).append(float(i_val) - FEE_PCT)
             if b_val is not None:
-                bench[str(d)] = float(b_val)
+                bench[str(d)] = float(b_val) - FEE_PCT
         excess = [sum(v) / len(v) - bench[d] for d, v in sorted(daily.items()) if d in bench]
         cs = cluster_stats(excess)
         out['deep_dip'] = dict(cs, buyable_days=len(daily),

@@ -21,6 +21,7 @@ import re
 import sys
 import tempfile
 import time
+from fastapi import HTTPException
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -87,9 +88,9 @@ def _stub_batch(months=3, capital=100000.0, auction_max_gap=5.0):
     return {'batch': months}
 
 
-def _stub_excess(months=6):
-    CALLS['excess'].append(months)
-    return {'rows': months}
+def _stub_excess(months=6, slippage_bps=10):
+    CALLS['excess'].append((months, slippage_bps))
+    return {'rows': months, 'slippageBpsPerSide': slippage_bps}
 
 
 import services.pick.rec_sim as RSIM                 # noqa: E402
@@ -157,19 +158,46 @@ ck(r_evict['cached'] is False,
 REC.rec_params_cacheable = _saved
 
 # ========== [3] excess 单独一份（被清空一次代价最大：冷算 7.4 秒） ==========
-print('[3] /api/recommend-excess：months=7 现算不入表；months=6 命中')
+print('[3] /api/recommend-excess：月份与滑点情景共同组成缓存键')
 CALLS['excess'].clear()
+_ret0 = RSIM._net_return_with_slippage(100.0, 101.0, 0)
+_ret10 = RSIM._net_return_with_slippage(100.0, 101.0, 10)
+_ret20 = RSIM._net_return_with_slippage(100.0, 101.0, 20)
+ck(_ret0 > _ret10 > _ret20,
+   f'买价上浮、卖价下调会随滑点增大降低净收益（{_ret0:.3f}>{_ret10:.3f}>{_ret20:.3f}）')
 e6a = asyncio.run(REC.get_recommend_excess_api(months=6))
 e6b = asyncio.run(REC.get_recommend_excess_api(months=6))
 ck(e6a['cached'] is False and e6b['cached'] is True,
    f'months=6 第一次冷、第二次命中（{e6a["cached"]}/{e6b["cached"]}）')
+e6zero = asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=0))
+e6twenty = asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=20))
+ck(e6zero['cached'] is False and e6zero['data']['slippageBpsPerSide'] == 0
+   and e6twenty['cached'] is False and e6twenty['data']['slippageBpsPerSide'] == 20,
+   '0/20 bp 情景分别现算并返回对应口径')
+ck(asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=0))['cached'] is True
+   and asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=20))['cached'] is True,
+   '0/20 bp 情景分别命中自己的缓存键')
 e7 = asyncio.run(REC.get_recommend_excess_api(months=7))
 ck(e7['success'] is True and e7['data']['rows'] == 7, 'months=7 结果照样对（不因为不缓存就报错）')
-ck(e7['cached'] is False and list(REC._EXCESS_CACHE) == [(6,)],
+ck(e7['cached'] is False and (7, 10) not in REC._EXCESS_CACHE,
    f'months=7 没进表：表内键 {list(REC._EXCESS_CACHE)}')
 e6c = asyncio.run(REC.get_recommend_excess_api(months=6))
-ck(e6c['cached'] is True and len(CALLS['excess']) == 2,
-   f'months=7 之后 months=6 仍命中（compute 共 {len(CALLS["excess"])} 次，应为冷算那 1 次 + 7 的 1 次）')
+ck(e6c['cached'] is True and len(CALLS['excess']) == 4,
+   f'months=7 之后 months=6/10bp 仍命中（compute 共 {len(CALLS["excess"])} 次）')
+e6other = asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=30))
+ck(e6other['cached'] is False and (6, 30) not in REC._EXCESS_CACHE,
+   '非白名单滑点仍可用但不占缓存槽')
+for invalid in (-1, 51, True, 10.5):
+    try:
+        asyncio.run(REC.get_recommend_excess_api(months=6, slippage_bps=invalid))
+        invalid_rejected = False
+    except HTTPException as error:
+        invalid_rejected = error.status_code == 422
+    ck(invalid_rejected, f'非法滑点 {invalid!r} 被拒绝')
+REC._EXCESS_CACHE.clear()
+RS.prewarm_recommend_excess()
+ck(list(REC._EXCESS_CACHE) == [(6, 10)],
+   f'启动预热写入默认 10bp 缓存键（实得 {list(REC._EXCESS_CACHE)}）')
 
 # ========== [4] 拆档 batch 与主曲线共用一张表：白名单外不占槽 ==========
 print('[4] /api/recommend-sim-batch：键形状不同（(\'batch\', …)）但不许牵连主曲线')
@@ -327,8 +355,10 @@ finally:
 print('[9] 接线：三处 swr_get 都带上 cacheable，且热扫描用短键')
 _r_src = open(os.path.join(HERE, '..', 'app', 'api', 'routers', 'recommend.py'),
               encoding='utf-8').read()
-ck(_r_src.count('cacheable=rec_params_cacheable(') == 3,
-   f'recommend.py 三处 swr_get 都接了白名单（实得 {_r_src.count("cacheable=rec_params_cacheable(")} 处）')
+_rec_cacheable_count = _r_src.count('cacheable=rec_params_cacheable(')
+_excess_cacheable = 'cacheable=(months == 6 and slippage_bps in (0, 10, 20))' in _r_src
+ck(_rec_cacheable_count == 2 and _excess_cacheable,
+   f'recommend.py 两处常规缓存白名单 + 超额滑点白名单（实得 {_rec_cacheable_count} + {_excess_cacheable}）')
 ck('cacheable: bool = True' in open(os.path.join(HERE, '..', 'services', 'support', 'swr.py'),
                                     encoding='utf-8').read(),
    'swr_get 有 cacheable 形参（默认 True，没接的调用点行为不变）')
@@ -337,9 +367,8 @@ _s_src = open(os.path.join(HERE, '..', 'app', 'api', 'routers', 'scan.py'),
 ck('hot_scan_key(' in _s_src and 'code_key(' not in _s_src.split('hot_scan_key')[0][-200:],
    '热扫描走标准化短键（§8.7 第 1 名，已收口）')
 _n_calls = (_r_src.count('swr_get(_REC_SIM_CACHE') + _r_src.count('swr_get(_EXCESS_CACHE'))
-ck(_r_src.count('cacheable=rec_params_cacheable(') == _n_calls,
-   f'每一处 swr_get(缓存表 …) 都带白名单：{ _n_calls} 处调用 / '
-   f'{_r_src.count("cacheable=rec_params_cacheable(")} 处接线')
+ck(_rec_cacheable_count + int(_excess_cacheable) == _n_calls,
+   f'每一处 swr_get(缓存表 …) 都带白名单：{ _n_calls} 处调用')
 
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
 if FAIL:

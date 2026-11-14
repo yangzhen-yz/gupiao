@@ -62,11 +62,12 @@ except Exception as e:
 
 
 # ========== [3] 内部/异常 URL 不计入第三方 ==========
+# 内网样例用 RFC1918 通用占位地址，不对应任何真实主机（原样例含真实环境 IP，11-13 已脱敏）
 print('[3] localhost / 内网 / 非 http 返回 None')
 _internals = [
     'http://localhost:3003/api/x',
     'http://127.0.0.1:8080/y',
-    'https://10.203.4.10:25000/z',
+    'https://10.0.0.1:25000/z',
     'not-a-url',
 ]
 for u in _internals:

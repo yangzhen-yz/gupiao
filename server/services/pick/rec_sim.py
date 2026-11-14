@@ -29,7 +29,7 @@
 
 分仓与资金：当日有几只推荐就均分**当时可用**现金，100 股一手（高价票因此会自动少买，
 这是真实约束不是 bug）；卖出资金当日可用，所以下午能接早盘的回款。
-费用：佣金万 2.5（单边最低 5 元）+ 印花税千 1（卖出）+ 过户费万 0.1（双边）。
+费用：佣金万 5（单边最低 5 元）+ 印花税千 1（卖出）+ 过户费万 0.1（双边）。
 """
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -39,7 +39,7 @@ from app.config import (REC_SIM_BOARD_PRICE_V2, REC_SIM_DEFER_LIMIT_DOWN, REC_SI
                         REC_SIM_SIZING_V2, REC_SIM_RISK_PER_TRADE, REC_SIM_STOP_PCT,
                         REC_SIM_MAX_POSITION_PCT, REC_SIM_MAX_EXPOSURE_PCT)
 
-FEE_RATE = 0.00025      # 佣金（单边）
+FEE_RATE = 0.0005       # 佣金（单边，万五）
 FEE_MIN = 5.0           # 单笔最低佣金
 STAMP = 0.001           # 印花税（卖出）
 TRANSFER = 0.00001      # 过户费（双边）
@@ -478,7 +478,8 @@ def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = 
 
 
 def open_hold_excess(months: int = 6, since: Optional[str] = None,
-                     hold_days: Tuple[int, ...] = (1, 3, 5, 10)) -> Dict:
+                     hold_days: Tuple[int, ...] = (1, 3, 5, 10),
+                     slippage_bps: int = 10) -> Dict:
     """次日开盘买入、持有 N 个交易日卖出的**可执行超额**（2026-10-22，P0 评估基座）。
 
     为什么单独算这一条：现有六条曲线是"次日就卖"的短线口径，回答不了
@@ -491,9 +492,15 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
       · 买入：推荐日下一交易日开盘；次日一字涨停买不到 → 跳过；
       · 卖出：买入后第 N 个交易日开盘；
       · 费用：买卖双边按 10 万名义本金计，和 rec_sim 主引擎同一套费率；
+      · 滑点：买卖各按 slippage_bps 基点恶化成交价；默认 10bp/边是情景假设，不是实测；
       · 基准：选股范围内所有票，同一买入日开盘买、同一持有期开盘卖，等权平均；
-      · 超额 = 推荐均值 - 当日基准均值，先逐条配对再平均（不是两个总数相减）。
+      · 超额：推荐和基准都扣相同费用/滑点，只在相同买入日有基准时配对。
+
+    此处历史股票范围按当前 selectable universe 回看，仍有幸存者偏差；前向口径另由
+    candidate_pool_shadow 只使用当日留存的股票范围快照。
     """
+    if type(slippage_bps) is not int or not 0 <= slippage_bps <= 50:
+        raise ValueError('slippage_bps must be an integer from 0 to 50')
     if not since:
         since = (datetime.now() - timedelta(days=months * 31)).strftime('%Y-%m-%d')
     import sqlite3
@@ -540,9 +547,8 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
             if not exit_px or exit_px <= 0:
                 _skip(f'持有{n}日开盘价无效')
                 continue
-            gross = (exit_px / o1 - 1) * 100
-            cost = _rt_cost_pct(o1, exit_px)
-            per_day[n].append({'date': b1[0], 'ret': gross - cost, 'month': b1[0][:7],
+            ret = _net_return_with_slippage(o1, exit_px, slippage_bps)
+            per_day[n].append({'date': b1[0], 'ret': ret, 'month': b1[0][:7],
                                'code': code, 'entry': o1, 'exit': exit_px})
 
     # 基准：仍用选股范围内全部票、同一买入日、同一持有期，但改成"票 × 交易日"矩阵一次算完。
@@ -599,7 +605,7 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
                 for i in range(len(kdays) - n):
                     a, b = row[i], row[i + n]
                     if a and b:
-                        s[i] += (b / a - 1.0) * 100.0
+                        s[i] += _net_return_with_slippage(a, b, slippage_bps)
                         c[i] += 1
         for n in hold_days:
             if n >= len(kdays):
@@ -607,30 +613,24 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
             for i in range(len(kdays) - n):
                 if not counts[n][i]:
                     continue
-                mg = sums[n][i] / counts[n][i]
-                # 费用按"买入额 10 万"线性：买 0.026%、卖 0.126%×卖出额/买入额。
-                # 逐票费用求平均 = 用均值算一次（佣金远高于 5 元最低线，不会触底）。
-                cost = ((FEE_RATE + TRANSFER) * 100.0
-                        + (FEE_RATE + STAMP + TRANSFER) * 100.0 * (1.0 + mg / 100.0))
-                bench[n][kdays[i]] = mg - cost
+                bench[n][kdays[i]] = sums[n][i] / counts[n][i]
 
     by_day = {}
     by_month: Dict[str, Dict[str, Dict]] = {}
     for n in hold_days:
         rows = per_day[n]
-        if not rows:
-            by_day[str(n)] = {'n': 0}
-            continue
-        ex_list = [x['ret'] - bench[n][x['date']] for x in rows if x['date'] in bench[n]]
-        bench_vals = [bench[n][x['date']] for x in rows if x['date'] in bench[n]]
+        paired = [x for x in rows if x['date'] in bench[n]]
+        ex_list = [x['ret'] - bench[n][x['date']] for x in paired]
+        bench_vals = [bench[n][x['date']] for x in paired]
         by_day[str(n)] = {
-            'n': len(rows), 'pairedN': len(ex_list),
-            'winRate': round(sum(1 for x in rows if x['ret'] > 0) / len(rows) * 100, 1),
-            'avg': round(sum(x['ret'] for x in rows) / len(rows), 2),
+            'n': len(paired), 'totalN': len(rows), 'pairedN': len(paired),
+            'winRate': round(sum(1 for x in paired if x['ret'] > 0) / len(paired) * 100, 1)
+            if paired else None,
+            'avg': round(sum(x['ret'] for x in paired) / len(paired), 2) if paired else None,
             'benchAvg': round(sum(bench_vals) / len(bench_vals), 2) if bench_vals else None,
             'excess': round(sum(ex_list) / len(ex_list), 2) if ex_list else None,
         }
-        for x in rows:
+        for x in paired:
             m = by_month.setdefault(x['month'], {}).setdefault(
                 str(n), {'n': 0, 'sum': 0.0, 'win': 0, 'exc': [], 'bench': []})
             m['n'] += 1
@@ -650,6 +650,11 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
         'until': days[-1] if days else '', 'recCount': len(recs), 'days': list(hold_days),
         'byDay': by_day, 'byMonth': by_month, 'skipped': skipped,
         'scopeText': scope_desc,
+        'slippageBpsPerSide': slippage_bps,
+        'feeModel': '佣金单边万五（最低5元）+卖出印花税千一+双边过户费万0.1',
+        'commissionRatePerSide': FEE_RATE,
+        'commissionMinimum': FEE_MIN,
+        'costModel': '费用按feeModel；双边滑点按指定基点恶化成交价。历史基准使用当前股票范围，存在幸存者偏差。',
         'generatedAt': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
@@ -659,6 +664,15 @@ def _rt_cost_pct(entry: float, exit_px: float) -> float:
     amt = 100000.0
     qty = amt / entry
     return (_fee_buy(amt) + _fee_sell(qty * exit_px)) / amt * 100.0
+
+
+def _net_return_with_slippage(entry: float, exit_px: float, slippage_bps: int) -> float:
+    """净收益率：买入价上浮、卖出价下调同一单边滑点，再扣双边费用。"""
+    slip = slippage_bps / 10000.0
+    entry_fill = entry * (1.0 + slip)
+    exit_fill = exit_px * (1.0 - slip)
+    gross = (exit_fill / entry_fill - 1.0) * 100.0
+    return gross - _rt_cost_pct(entry_fill, exit_fill)
 
 
 def benchmark(since: str) -> Dict:

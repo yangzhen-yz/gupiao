@@ -36,6 +36,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
 _FLAGS = ('ma', 'near', 'chg', 'vol', 'rank')
+FORWARD_START_DATE = '2026-11-06'
 _LABELS = {
     'ma': '均线未多头(close>MA20>MA60)',
     'near': '距60日高点超8%',
@@ -264,16 +265,31 @@ def fill_outcomes(kline_path: Optional[str] = None) -> Dict:
 
 
 # ---------------------------------------------------------------- 评估
-def evaluate(min_days: Optional[int] = None) -> Dict:
+def evaluate(min_days: Optional[int] = None,
+             forward_from: Optional[str] = None) -> Dict:
     """只读汇总：按涨幅段 × 是否进池、以及"被哪条单独挡掉"给均值/胜率。
-    天数不足直接 `ready=False`——影子没到期就写"未裁决"。"""
+    天数不足直接 `ready=False`——影子没到期就写"未裁决"。
+    正式裁决须传 forward_from，排除仅作方向性基线的历史回填。"""
     min_days = min_days or eval_days()
+    if forward_from is not None:
+        try:
+            if datetime.strptime(forward_from, '%Y-%m-%d').strftime('%Y-%m-%d') != forward_from:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError('forward_from must be a date in YYYY-MM-DD format')
     conn = _conn()
     try:
         _ensure_table(conn)
-        _dates = [str(r[0])[:10] for r in conn.execute(
-            'SELECT DISTINCT pool_date FROM candidate_pool_shadow WHERE t1_filled=1'
-        ).fetchall()]
+        date_sql = 'SELECT DISTINCT pool_date FROM candidate_pool_shadow WHERE t1_filled=1'
+        row_sql = (f'SELECT {_BAND_SQL} b, passed, in_pool, n_fail, rejected_by, '
+                   't1_close_ret_pct, t1_high_ret_pct FROM candidate_pool_shadow '
+                   'WHERE t1_filled=1')
+        params = ()
+        if forward_from is not None:
+            date_sql += ' AND pool_date>=?'
+            row_sql += ' AND pool_date>=?'
+            params = (forward_from,)
+        _dates = [str(r[0])[:10] for r in conn.execute(date_sql, params).fetchall()]
         # 修⑧：样本钟只数"当天确实生成过推荐批次"的日子（11-06 调度冻结那天 0 批次，
         # 11-07 周六手工点一次又会留一行），被排除的日期与原因一起带回去，不静默少算。
         from services.support import sample_days
@@ -281,10 +297,7 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
         days = len(_sd['counted'])
         groups: Dict[str, List[float]] = {}
         highs: Dict[str, List[float]] = {}
-        for r in conn.execute(
-                f'SELECT {_BAND_SQL} b, passed, in_pool, n_fail, rejected_by, '
-                't1_close_ret_pct, t1_high_ret_pct FROM candidate_pool_shadow '
-                'WHERE t1_filled=1').fetchall():
+        for r in conn.execute(row_sql, params).fetchall():
             band, passed, in_pool, n_fail, rej, ret, hi = r
             tag = ('进池' if in_pool else ('过筛未进池' if passed else '被挡'))
             key = f'{band} | {tag}'
@@ -295,6 +308,8 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
                 k2 = f'{band} | 只被「{_LABELS.get(rej, rej)}」挡'
                 groups.setdefault(k2, []).append(float(ret))
         out = {'ready': days >= min_days, 'days': days, 'min_days': min_days,
+               'forward_from': forward_from,
+               'sampleScope': 'forward' if forward_from else 'all (may include backfill)',
                'sampleDays': _sd['counted'], 'skipped': _sd['skipped'],
                'calendarSource': _sd['calendarSource'], 'clockRule': _sd['rule'], 'groups': {}}
         for k, v in sorted(groups.items()):
@@ -313,11 +328,16 @@ def evaluate(min_days: Optional[int] = None) -> Dict:
         conn.close()
 
 
-def print_eval(res: Optional[Dict] = None) -> None:
+def print_eval(res: Optional[Dict] = None,
+               forward_from: Optional[str] = None) -> None:
     from services.support import sample_days
-    res = res or evaluate()
-    print(f"[海选影子] 已回填 {res['days']} 个交易日（判据 ≥{res['min_days']}）"
-          f" → {'可裁决' if res['ready'] else '样本不足，未裁决'}")
+    res = res or evaluate(forward_from=forward_from)
+    if res.get('forward_from'):
+        print(f"[海选影子] 前向起算 {res['forward_from']}")
+    else:
+        print('[海选影子] 全量样本含历史回溯，仅作方向性基线')
+    print(f"已回填 {res['days']} 个交易日（判据 ≥{res['min_days']}）"
+          f" → {'可裁决' if res['ready'] and res.get('forward_from') else '样本不足/非前向口径，未裁决'}")
     if res.get('skipped'):
         print(f"  [样本钟] {sample_days.describe(res)}")
     for k, s in res['groups'].items():
@@ -418,6 +438,10 @@ def main() -> None:
     ap.add_argument('--fill', action='store_true', help='只补 T+1')
     ap.add_argument('--eval', action='store_true', help='打印汇总')
     ap.add_argument('--stats', action='store_true', help='表内天数/行数/抓取范围')
+    ap.add_argument('--forward-from', default=FORWARD_START_DATE,
+                    help=f'正式前向评估起算日，默认 {FORWARD_START_DATE}')
+    ap.add_argument('--all-samples', action='store_true',
+                    help='包含历史回溯样本，仅作方向性基线，不作正式裁决')
     a = ap.parse_args()
     if not enabled():
         print('开关 candidate_pool_shadow_enabled / CANDIDATE_POOL_SHADOW_ENABLED 已关，空跑')
@@ -437,7 +461,7 @@ def main() -> None:
         finally:
             conn.close()
     if a.eval or not (a.backfill or a.fill or a.stats):
-        print_eval()
+        print_eval(forward_from=None if a.all_samples else a.forward_from)
 
 
 if __name__ == '__main__':

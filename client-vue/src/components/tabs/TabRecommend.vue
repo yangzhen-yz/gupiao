@@ -37,7 +37,7 @@
       </button>
     </div>
     <div class="refresh-controls">
-      <div class="toggle-section"><span class="toggle-label">推荐成功率</span></div>
+      <div class="toggle-section"><span class="toggle-label">回测统计（非实盘）</span></div>
       <div class="last-update">{{ recommendStats }}</div>
     </div>
     <!-- 新鲜度（2026-10-13）：本页不轮询，若不标出"这是哪天的推荐"，收盘后很容易被当成今日信号 -->
@@ -45,6 +45,7 @@
       :updated="todayDate"
       :stale="!todayRecommend.length"
       :day-compare="false"
+      date-only
       label="当前推荐日期"
       stale-hint="今日推荐尚未生成"
       @refresh="loadRecommendations"
@@ -559,6 +560,19 @@
         reviewCachedNote.value = at
           ? `· 数据算于 ${at}${age >= 60 ? `（${Math.floor(age / 60)} 分钟前）` : ''}`
           : ''
+        // `t1` includes orders that never touched the reference price; use the
+        // estimated filled group and show its touch rate instead.
+        const filled = result.data.total?.t1_fill
+        const fillRate = result.data.total?.fill_rate
+        const recentDays = result.data.recent_days || 30
+        if (filled?.win_rate != null) {
+          const avg = filled.avg == null ? '--' : `${filled.avg >= 0 ? '+' : ''}${filled.avg}%`
+          recommendStats.value =
+            `近${recentDays}天按日K触价估算：成交组T+1胜率 ${filled.win_rate}% / 均值 ${avg}` +
+            `（n=${filled.n ?? '--'}），挂单触价率 ${fillRate ?? '--'}%；未扣费用/滑点`
+        } else {
+          recommendStats.value = `近${recentDays}天可成交样本不足，暂不能判断`
+        }
       }
     } catch (e) {
       console.error('加载推荐复盘失败:', e)

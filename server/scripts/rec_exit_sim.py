@@ -52,7 +52,7 @@ def main():
           f"（全部来自 14:45 收盘前快照）；日K最新到 {w['lastKlineDate']}")
     print(f"本金 {args.capital:,.0f} 元；分仓＝当日可用现金按推荐只数均分、100 股一手"
           f"{'（已放开整股）' if args.no_lots else ''}；"
-          f"费用＝佣金万2.5(最低5元)+印花税千1(卖)+过户万0.1；竞价纪律＝高开≤{args.auction_max_gap:g}%才追")
+          f"费用＝佣金万五(单边最低5元)+印花税千1(卖)+过户万0.1；竞价纪律＝高开≤{args.auction_max_gap:g}%才追")
     if d.get('benchmark', {}).get('available'):
         b = d['benchmark']
         print(f"同期背景（事后信息，只看行情冷热）：{b['from']}→{b['to']}，{b['count']} 只等权 {b['avgPct']:+.2f}%")

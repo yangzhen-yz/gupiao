@@ -646,6 +646,57 @@ def _em_batch_change_percent(codes: List[str], batch_size: int = 40,
     return result
 
 
+def _fetch_stocks_from_sina(kind: str, pages: int = 1) -> List[Dict]:
+    """新浪排行兜底（东财 clist 熔断冷却/超时时的 B 源）。
+
+    收评的三张个股榜——涨幅榜 / 跌幅榜 / 主力净流入——原本都只吊在东财 clist
+    （fid=f3 / fid=f62）上。10-19 起东财对 clist 做 IP 级风控，冷却期最长数小时；
+    冷却期内 `_em_clist_get` 直接 return []（不抛异常），于是这三张表静默落空
+    （正是 2026-11-13 用户看到的「主力资金 tab 为空」）。
+    这里经 fundflow 的新浪排行分页接盘：
+      · gainers → sort='changeratio', asc=0（涨跌幅降序）
+      · losers  → sort='changeratio', asc=1（涨跌幅升序）
+      · funds   → sort='r0_net',     asc=0（超大单净流入降序）
+    新浪 r0_net 是超大单净流入，比东财 f62（超大+大单）口径略窄；行带
+    source='sina'，前端据此打「新浪口径」角标，不假装与东财完全一致。
+    任一 list 拿不到（两层都失败）返回 []，调用方如实留空并记日志。
+    """
+    from services.data.fundflow import _sina_rank_rows
+    try:
+        if kind == 'gainers':
+            rows = _sina_rank_rows('changeratio', 0, pages)
+        elif kind == 'losers':
+            rows = _sina_rank_rows('changeratio', 1, pages)
+        elif kind == 'funds':
+            rows = _sina_rank_rows('r0_net', 0, pages)
+        else:
+            return []
+    except Exception as e:
+        print(f'[收评] 新浪兜底 {kind} 请求失败: {e}')
+        return []
+    out = []
+    for r in rows:
+        # 新浪 turnover 是「换手率 ×100」（如 1630.31 = 16.30%），东财 f8 已是百分比，
+        # 此处 /100 对齐收评 schema（否则会显示「换手 1630.31%」）。
+        # mainNetInflow 走新浪 r0_net（超大单净流入），比东财 f62（超大+大单）口径略窄，
+        # 行带 source='sina'，前端据此打「新浪口径」角标，不假装与东财完全一致。
+        _turnover = r.get('turnover', 0) or 0
+        try:
+            _turnover = float(_turnover) / 100.0
+        except (TypeError, ValueError):
+            _turnover = 0.0
+        out.append({
+            'name': r.get('name', ''),
+            'code': r.get('code', ''),
+            'changePercent': r.get('changePercent', 0),
+            'price': r.get('price', 0),
+            'turnoverRate': _turnover,
+            'mainNetInflow': r.get('mainNetInflow', 0),
+            'source': 'sina',
+        })
+    return out[:20]
+
+
 def _fetch_market_breadth() -> Dict:
     """市场宽度：汇总全部行业板块的上涨/下跌家数（东财行业板块覆盖全市场个股）
 
@@ -1035,42 +1086,63 @@ async def generate_daily_review() -> Dict:
                 except Exception as e:
                     print(f'[收评] 跌停股降级请求失败: {e}')
 
-            # 涨幅前20
+            # 涨幅前20（东财 clist → 新浪排行兜底）
+            _g = []
             try:
                 diff = _em_clist_get(fid='f3', po=1, pz=20, fs=_fs_all_a,
                                      fields='f2,f3,f7,f8,f12,f14,f62')
                 for item in diff:
-                    result['gainers'].append({
+                    _g.append({
                         'name': item.get('f14', ''), 'code': item.get('f12', ''),
                         'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
                         'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                        'source': 'eastmoney',
                     })
             except Exception as e:
-                print(f'[收评] 涨幅榜请求失败: {e}')
-            # 跌幅前20
+                print(f'[收评] 涨幅榜东财请求失败: {e}')
+            if not _g:
+                _g = _fetch_stocks_from_sina('gainers')
+                if _g:
+                    print(f'[收评] 涨幅榜东财不可用，已降级新浪备源 {len(_g)} 只')
+            result['gainers'] = _g
+            # 跌幅前20（东财 clist → 新浪排行兜底）
+            _l = []
             try:
                 diff = _em_clist_get(fid='f3', po=0, pz=20, fs=_fs_all_a,
                                      fields='f2,f3,f7,f8,f12,f14,f62')
                 for item in diff:
-                    result['losers'].append({
+                    _l.append({
                         'name': item.get('f14', ''), 'code': item.get('f12', ''),
                         'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
                         'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                        'source': 'eastmoney',
                     })
             except Exception as e:
-                print(f'[收评] 跌幅榜请求失败: {e}')
-            # 主力净流入全市场前20（按f62排序，与涨幅榜完全独立）
+                print(f'[收评] 跌幅榜东财请求失败: {e}')
+            if not _l:
+                _l = _fetch_stocks_from_sina('losers')
+                if _l:
+                    print(f'[收评] 跌幅榜东财不可用，已降级新浪备源 {len(_l)} 只')
+            result['losers'] = _l
+            # 主力净流入全市场前20（东财 clist fid=f62 → 新浪 r0_net 兜底）
+            _f = []
             try:
                 diff = _em_clist_get(fid='f62', po=1, pz=20, fs=_fs_all_a,
                                      fields='f2,f3,f7,f8,f12,f14,f62')
                 for item in diff:
-                    result['top_funds'].append({
+                    _f.append({
                         'name': item.get('f14', ''), 'code': item.get('f12', ''),
                         'changePercent': item.get('f3', 0), 'price': item.get('f2', 0),
                         'turnoverRate': item.get('f8', 0), 'mainNetInflow': item.get('f62', 0),
+                        'source': 'eastmoney',
                     })
             except Exception as e:
-                print(f'[收评] 主力资金榜请求失败: {e}')
+                print(f'[收评] 主力资金榜东财请求失败: {e}')
+            if not _f:
+                _f = _fetch_stocks_from_sina('funds')
+                if _f:
+                    print(f'[收评] 主力资金榜东财不可用，已降级新浪备源 {len(_f)} 只')
+            result['top_funds'] = _f
             # 收盘定版：盘中情绪每 3 分钟写一次，这里用收盘后的池子覆盖。
             # 首板次日溢价、炸板修复这类因子回测要的就是这份"最后谁封住了"。
             save_pools(datetime.now().strftime('%Y-%m-%d'), _zt_pool, _zb_pool, _dt_pool)

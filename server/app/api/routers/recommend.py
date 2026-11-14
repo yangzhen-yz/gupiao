@@ -180,7 +180,8 @@ async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, 
 
 
 @router.get("/api/recommend-excess", tags=["推荐记录"])
-async def get_recommend_excess_api(months: int = 6):
+async def get_recommend_excess_api(months: int = 6,
+                                   slippage_bps: int = 10):
     """次日开盘买入、持有 1/3/5/10 日的**可执行超额**（2026-10-22，P0 评估基座）。
 
     为什么不塞进 /api/recommend-sim：主曲线 0.2 秒，这里要多算一遍选股范围等权基准
@@ -192,14 +193,17 @@ async def get_recommend_excess_api(months: int = 6):
     基准是范围内**全部票**同一买入日、同一持有期等权，逐条配对后再平均。
     默认 6 个月而不是 3 个月：3 个月里 10 日样本不足 60 条，月度切片全是噪声。
     """
-    key = (months,)
+    if type(slippage_bps) is not int or not 0 <= slippage_bps <= 50:
+        raise HTTPException(status_code=422, detail='slippage_bps must be an integer from 0 to 50')
+    key = (months, slippage_bps)
     from services.pick import rec_sim
     try:
         data, state = _swr.swr_get(_EXCESS_CACHE, key,
-                                   lambda: rec_sim.open_hold_excess(months=months),
+                                   lambda: rec_sim.open_hold_excess(
+                                       months=months, slippage_bps=slippage_bps),
                                    ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
                                    label='rec-excess', gap=120, max_keys=6,
-                                   cacheable=rec_params_cacheable(months))
+                                   cacheable=(months == 6 and slippage_bps in (0, 10, 20)))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"可执行超额计算失败: {str(error)}")
     return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
@@ -310,4 +314,3 @@ async def generate_recommendations_api():
         return {"success": False, "error": "生成推荐失败，请稍后重试"}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"生成推荐失败: {str(error)}")
-

@@ -427,11 +427,24 @@
             <em v-else>正在算（冷启动约 8 秒）…</em>
           </summary>
           <template v-if="excess && excess.byDay['1']">
+            <div class="bt-fine">
+              {{ excess.feeModel || '双边费用按模拟器费率' }}；滑点情景：
+              <select v-model.number="slippageBps" @change="loadExcess">
+                <option :value="0">0 bp/边（理想成交）</option>
+                <option :value="10">10 bp/边（默认假设）</option>
+                <option :value="20">20 bp/边（较保守假设）</option>
+              </select>
+              当前结果：{{
+                excess.slippageBpsPerSide == null
+                  ? '服务端未返回滑点口径'
+                  : `${excess.slippageBpsPerSide} bp/边（假设值，非实测）`
+              }}；买价上浮、卖价下调。
+            </div>
             <table class="bt-table bt-ex-table">
               <thead>
                 <tr>
                   <th>持有</th>
-                  <th>样本</th>
+                  <th>配对 / 可算样本</th>
                   <th>扣费后均值</th>
                   <th>同期等权基准</th>
                   <th>超额</th>
@@ -442,11 +455,11 @@
                 <tr v-for="n in ['1', '3', '5', '10']" :key="'ex' + n">
                   <template v-if="excess.byDay[n]">
                     <td>{{ n }} 日</td>
-                    <td>{{ excess.byDay[n].n }}</td>
+                    <td>{{ excess.byDay[n].pairedN ?? '—' }} / {{ excess.byDay[n].totalN ?? '—' }}</td>
                     <td :class="signCls(excess.byDay[n].avg)">{{ pct(excess.byDay[n].avg) }}</td>
                     <td :class="signCls(excess.byDay[n].benchAvg)">{{ pct(excess.byDay[n].benchAvg) }}</td>
                     <td :class="signCls(excess.byDay[n].excess)">{{ pct(excess.byDay[n].excess) }}</td>
-                    <td>{{ excess.byDay[n].winRate }}%</td>
+                    <td>{{ excess.byDay[n].winRate == null ? '—' : excess.byDay[n].winRate + '%' }}</td>
                   </template>
                 </tr>
               </tbody>
@@ -456,7 +469,7 @@
                 这条回答的是"<b>这些票拿几天到底行不行</b>"，买价统一用<b>推荐日下一交易日开盘</b>， 不是推荐时的参考价
                 —— 后者混着推荐当天已经涨过的那段，算出来会好看得不真实。
                 基准是选股范围内<b>全部票</b>在同一买入日、同一持有期等权，逐条配对后平均，
-                所以超额不是"策略均值减指数涨幅"这种假 alpha。
+                所以超额不是"策略均值减指数涨幅"这种假 alpha。推荐与基准应用同一套手续费及双边滑点情景。
               </p>
               <p class="bt-fine">
                 窗口 {{ excess.since }} ~ {{ excess.until }} / {{ excess.recCount }} 条推荐 （固定 6
@@ -467,6 +480,10 @@
               <p class="bt-fine">
                 负超额的意思很直接：这批推荐次日开盘追进去、拿住，扣完费还不如同日买范围内一篮子。
                 它和上面六条曲线不矛盾 —— 上面回答"次日就卖"，这里回答"拿几天"。
+              </p>
+              <p class="bt-fine">
+                历史基准股票范围按当前选股范围回看，存在幸存者偏差；滑点为情景假设，不是逐笔实测。
+                前向样本仍需单独验证后才能判断策略是否有稳定超额。
               </p>
             </div>
           </template>
@@ -536,6 +553,7 @@
   const readIdx = ref(null)
   const excess = ref(null) // 次日开盘持有 N 日的可执行超额（独立接口，后到）
   const excessError = ref('')
+  const slippageBps = ref(10)
   const lab = ref(null) // 最近一次因子体检（每周六离线跑）
   const labError = ref('')
   const benchLoading = ref(false) // 同期等权背景单独要 2~3 秒，先出曲线再后台补它
@@ -834,16 +852,21 @@
   // 注意 `apiFetch` **只在网络错误/超时/401 抛异常，HTTP 500 是 resolve 一个 {detail} 对象的**
   // （09:28 实测：桩一个 500 只发出一次请求、页面也没有红字），所以"算失败"必须自己判结构：
   // 不判就会把 undefined 塞进 excess，标题永远挂着"正在算（冷启动约 8 秒）…"骗人。
+  let excessRequestId = 0
   async function loadExcess() {
+    const requestId = ++excessRequestId
     excessError.value = ''
     for (let attempt = 1; attempt <= 2; attempt++) {
       let d = null
       let why = ''
       try {
-        d = await apiFetch('/api/recommend-excess?months=6', { timeout: 30000 })
+        d = await apiFetch(`/api/recommend-excess?months=6&slippage_bps=${slippageBps.value}`, {
+          timeout: 30000,
+        })
       } catch (e) {
         why = e.message || String(e)
       }
+      if (requestId !== excessRequestId) return
       if (d && d.success && d.data) {
         excess.value = d.data
         excessError.value = ''

@@ -275,8 +275,10 @@ ev1 = ads.evaluate(min_days=1)
 ck(ev1['ready'] is True and ev1['pass'] is False and ev1['checks']['t_ok'] is False,
    f'min_days=1 时天数够了但单日 t 算不出 → 仍不放行（反证：不许拿1天出结论），实得 {ev1["checks"]}')
 ck(ev1['deep_dip']['excess_mean_pp'] is not None
-   and ev1['deep_dip']['excess_mean_pp'] > 0.5,
-   f'深低开(可成交)净超额确实 >0.5pp（所以卡住它的是 t 不是超额），实得 {ev1["deep_dip"]}')
+   and near(ev1['deep_dip']['excess_mean_pp'],
+            (1 / 0.95 - 1) * 100 - bench_i, 0.001)
+   and ev1['feeModel'] == '策略与基准均扣双边0.202%比例近似费用',
+   f'策略与基准同扣双边费用后超额仍等于毛超额、费用不造成偏差，实得 {ev1["deep_dip"]}')
 cs = ads.cluster_stats([0.5, 1.5, 1.0])
 ck(cs['days'] == 3 and near(cs['mean'], 1.0, 1e-3) and near(cs['t'], 3.46, 0.01)
    and cs['pos_ratio'] == 1.0, f'按日聚类已知值对数：mean=1/t≈3.46/全正，实得 {cs}')
